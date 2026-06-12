@@ -1,0 +1,22 @@
+Magic Mesh — third-party notices
+=================================
+
+Magic Mesh is licensed GPL-3.0-or-later (see LICENSE). It bundles / links the
+following third-party components, each under its own license:
+
+- libcosmic + the pop-os iced fork (GUIs: mde-files, mde-cosmic-applet,
+  mde-role-chooser) — MPL-2.0 (with permissive transitive deps).
+- iced 0.13/0.14 stack (other GUIs) — MIT.
+- The broad Rust crate ecosystem (tokio, serde, rusqlite, rustls, image, tar,
+  flate2, symphonia, cpal, etc.) — predominantly MIT / Apache-2.0 / BSD / Zlib /
+  Unicode-DFS, all GPL-3.0-compatible.
+
+A machine-readable bill of materials (CycloneDX SBOM) with the resolved license
+of every dependency is generated at release time (EFF-16). To regenerate it:
+
+    cargo cyclonedx --format json   # or: cargo deny check licenses
+
+GPL-3.0-or-later is compatible with MPL-2.0 and the permissive licenses above
+(the combined work is distributable under GPL-3.0-or-later). No bundled
+dependency imposes a license incompatible with GPL-3.0-or-later; should one be
+introduced, the `cargo deny check licenses` gate (EFF-16) fails the build.
