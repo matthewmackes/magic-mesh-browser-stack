@@ -11,6 +11,17 @@ following third-party components, each under its own license:
   flate2, symphonia, cpal, etc.) — predominantly MIT / Apache-2.0 / BSD / Zlib /
   Unicode-DFS, all GPL-3.0-compatible.
 
+Bundled upstream release binaries (BIRTHRIGHT-2 — shipped in the RPM under
+/usr/share/magic-mesh/vendor/ for air-gapped first-boot provisioning; fetched +
+sha256-verified at build time from the upstream releases, unmodified, and
+aggregated as separate executables invoked at runtime — not linked):
+
+- ntfy (cross-node notification broker, binwiederhier/ntfy) v2.24.0 —
+  Apache-2.0 / GPL-2.0 dual-licensed; used under Apache-2.0.
+- starship (the mesh bash prompt, starship/starship) v1.25.1 — ISC.
+
+Both are GPL-3.0-or-later-compatible and retain their own licenses.
+
 A machine-readable bill of materials (CycloneDX SBOM) with the resolved license
 of every dependency is generated at release time (EFF-16). To regenerate it:
 
