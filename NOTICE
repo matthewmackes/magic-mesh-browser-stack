@@ -1,7 +1,7 @@
-Magic Mesh — third-party notices
+MCNF — third-party notices
 =================================
 
-Magic Mesh is licensed GPL-3.0-or-later (see LICENSE). It bundles / links the
+MCNF is licensed GPL-3.0-or-later (see LICENSE). It bundles / links the
 following third-party components, each under its own license:
 
 - libcosmic + the pop-os iced fork (GUIs: mde-files, mde-cosmic-applet,
