@@ -25,6 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::process::Child;
 
 use crate::egui::{self, ColorImage};
+use crate::filter::{self, RequestFilter};
 use crate::frame::FrameReader;
 use crate::scm::{self, RecvOutcome};
 use crate::wire::{ControlMsg, EventMsg};
@@ -75,6 +76,10 @@ pub struct WebSession {
     title: String,
     last_seq: u64,
     pending: Option<ColorImage>,
+    /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
+    /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
+    /// injects a compiled one from the mackesd `adfilter` blob via [`Self::set_filter`].
+    filter: RequestFilter,
 }
 
 impl WebSession {
@@ -98,7 +103,29 @@ impl WebSession {
             title: String::new(),
             last_seq: 0,
             pending: None,
+            filter: RequestFilter::empty(),
         })
+    }
+
+    /// Attach a compiled ad-filter engine (builder form) — the shell compiles it
+    /// from the mackesd `adfilter` worker's replicated blob (BOOKMARKS-7).
+    #[must_use]
+    pub fn with_filter(mut self, filter: RequestFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Swap in a compiled ad-filter engine (e.g. after a fresh `adfilter` blob
+    /// syncs). Leaves the per-page counter of the new filter at its own state.
+    pub fn set_filter(&mut self, filter: RequestFilter) {
+        self.filter = filter;
+    }
+
+    /// Requests blocked by the ad-filter on the active page — the Browser
+    /// surface's "N blocked" indicator (BOOKMARKS-7).
+    #[must_use]
+    pub const fn blocked_count(&self) -> u32 {
+        self.filter.blocked_count()
     }
 
     /// Drain pending helper events without blocking. Maps the frame fd on
@@ -187,12 +214,33 @@ impl WebSession {
                 loading,
                 url,
             } => {
+                // A committed navigation to a new page host: re-anchor the ad-filter
+                // first-party (resetting the per-page block count) and push the fresh
+                // cosmetic user-stylesheet (BOOKMARKS-7). Same-page nav-state churn
+                // (loading true→false) leaves both untouched.
+                if self.filter.set_page(&url) {
+                    let css = self.filter.cosmetic_stylesheet();
+                    if !css.is_empty() {
+                        self.send(&ControlMsg::CosmeticFilters(css));
+                    }
+                }
                 self.nav = NavState {
                     url,
                     can_back,
                     can_forward,
                     loading,
                 };
+            }
+            EventMsg::ResourceRequest { id, url, resource } => {
+                // The helper asks whether to fetch a subresource — judge it against
+                // the ad-filter engine and answer BEFORE it hits the network.
+                let decision = self
+                    .filter
+                    .decide(&url, filter::resource_from_wire(resource));
+                self.send(&ControlMsg::ResourceVerdict {
+                    id,
+                    allow: !decision.is_block(),
+                });
             }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
@@ -334,6 +382,183 @@ impl WebSession {
 mod tests {
     use super::*;
     use crate::testkit;
+    use crate::wire::{self as w};
+    use mde_adblock::FilterListStore;
+    use std::io::Read;
+
+    /// A bundled-filter session over a bare socketpair (no shm/frame writer —
+    /// these tests drive only the request-policy + cosmetic protocol). Returns the
+    /// session (shell end) and the peer end that plays the helper.
+    fn filtered_session() -> (WebSession, UnixStream) {
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        let filter = RequestFilter::from_store(&FilterListStore::with_bundled());
+        let session = WebSession::from_stream(shell, None)
+            .expect("session")
+            .with_filter(filter);
+        (session, helper)
+    }
+
+    /// Write one framed helper event onto the peer socket.
+    fn send_event(peer: &UnixStream, msg: &EventMsg) {
+        let mut s: &UnixStream = peer;
+        s.write_all(&w::frame(&msg.encode())).expect("write event");
+    }
+
+    /// Read exactly one framed control message the session wrote back (blocking).
+    fn read_control(peer: &mut UnixStream) -> ControlMsg {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            if let Ok(Some(payload)) = w::take_frame(&mut buf) {
+                return ControlMsg::decode(&payload).expect("decode control");
+            }
+            let n = peer.read(&mut chunk).expect("read");
+            assert!(n > 0, "peer socket closed before a control frame arrived");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    #[test]
+    fn a_tracker_request_is_blocked_and_counted_over_the_seam() {
+        let (mut session, mut peer) = filtered_session();
+        // Commit a page so the first-party is set; the nav pushes a cosmetic
+        // stylesheet. Drive the session per-message (send → poll → read) — the
+        // established idiom in this file; a single poll over two queued frames
+        // races the socketpair buffering and can block the follow-up read.
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        let first = read_control_after_poll(&mut session, &mut peer);
+        assert!(matches!(first, ControlMsg::CosmeticFilters(_)));
+        // A bundled EasyPrivacy tracker subresource is judged + answered.
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 1,
+                url: "https://www.google-analytics.com/collect".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        let verdict = read_control_after_poll(&mut session, &mut peer);
+        assert_eq!(
+            verdict,
+            ControlMsg::ResourceVerdict {
+                id: 1,
+                allow: false
+            }
+        );
+        assert_eq!(session.blocked_count(), 1, "the blocked request is counted");
+    }
+
+    #[test]
+    fn a_benign_first_party_request_passes_over_the_seam() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        let _cosmetic = read_control_after_poll(&mut session, &mut peer);
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 2,
+                url: "https://news.example.com/app.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ResourceVerdict { id: 2, allow: true }
+        );
+        assert_eq!(session.blocked_count(), 0);
+    }
+
+    #[test]
+    fn a_mesh_request_is_exempt_over_the_seam() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 3,
+                url: "https://media.mesh/pagead/x".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::XmlHttpRequest),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ResourceVerdict { id: 3, allow: true }
+        );
+        assert_eq!(
+            session.blocked_count(),
+            0,
+            "*.mesh is never counted as blocked"
+        );
+    }
+
+    #[test]
+    fn a_committed_page_pushes_a_cosmetic_stylesheet() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        session.poll();
+        let ctrl = read_control(&mut peer);
+        assert!(
+            matches!(ctrl, ControlMsg::CosmeticFilters(_)),
+            "expected a cosmetic stylesheet, got {ctrl:?}"
+        );
+        if let ControlMsg::CosmeticFilters(css) = ctrl {
+            assert!(css.contains("display: none !important"));
+            assert!(css.contains(".advertisement"), "css = {css}");
+        }
+    }
+
+    /// Poll once then read the single control frame the session emitted (used when
+    /// a helper event triggers exactly one reply).
+    fn read_control_after_poll(session: &mut WebSession, peer: &mut UnixStream) -> ControlMsg {
+        session.poll();
+        read_control(peer)
+    }
+
+    #[test]
+    fn a_session_without_a_filter_allows_everything() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 4,
+                url: "https://doubleclick.net/ad".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Image),
+            },
+        );
+        session.poll();
+        // The default (empty) filter blocks nothing.
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ResourceVerdict { id: 4, allow: true }
+        );
+        assert_eq!(session.blocked_count(), 0);
+    }
 
     /// Poll until a frame lands (the fake helper's initial burst is already in the
     /// socket buffer, so one poll is enough — the loop just guards scheduling).

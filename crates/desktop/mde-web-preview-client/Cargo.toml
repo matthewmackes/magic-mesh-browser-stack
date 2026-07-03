@@ -66,6 +66,14 @@ live-helper = []
 # crates consume it.
 mde-egui = { path = "../../shared/mde-egui" }
 
+# BOOKMARKS-7 — the pure ad-filter engine (services tier). This crate holds the
+# compiled `Engine` shell-side: it judges each helper subresource query over the
+# session socket (`match_request` → block-before-fetch) and builds the cosmetic
+# user-stylesheet (`cosmetic_selectors`), and it parses the mackesd `adfilter`
+# worker's replicated filter-store blob (`FilterListStore::from_json`). An inward
+# desktop→services edge (the layered-tiers gate), like the VDI decoders' service deps.
+mde-adblock = { path = "../../services/mde-adblock" }
+
 # The read-only shm mmap of the received frame fd (`mman`) and the `SCM_RIGHTS`
 # fd hand-off over the session socket (`socket`). Same crate + version the
 # sandboxed helper (mde-web-preview) maps the WRITE side with, so the two ends of

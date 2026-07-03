@@ -45,6 +45,7 @@
 // to exactly one egui (no cross-surface version skew, §4).
 pub use mde_egui::egui;
 
+pub mod filter;
 pub mod frame;
 pub mod input;
 pub mod scm;
@@ -54,7 +55,13 @@ pub mod wire;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+pub use filter::{resource_from_wire, resource_to_wire, RequestFilter};
 pub use frame::{FrameReader, FrameSnapshot, PixelFormat, ReaderError};
 pub use input::map_event;
 pub use session::{NavState, SessionState, WebSession};
 pub use wire::{ControlMsg, EventMsg, InputEvent, WireError};
+
+// The ad-filter engine types the shell compiles a session's [`RequestFilter`]
+// from (BOOKMARKS-7). Re-exported so the Browser surface + the live-helper spawn
+// path resolve the SAME `mde_adblock` types this crate's seam speaks.
+pub use mde_adblock::{Decision, Engine, FilterListStore, ResourceType};
