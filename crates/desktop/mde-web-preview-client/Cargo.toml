@@ -1,0 +1,92 @@
+# mde-web-preview-client — the shell-side IPC + shm texture bridge for the
+# out-of-process Servo browser helper (BOOKMARKS-6; design:
+# `docs/design/mesh-bookmarks.md`).
+#
+# This is the SHELL's half of the browser seam. The sandboxed engine lives in the
+# workspace-EXCLUDED `mde-web-preview` crate (BOOKMARKS-5) — the heavy Servo
+# process that renders offscreen into a shared-memory frame. This crate consumes
+# that seam: it spawns the helper per session, drives it over a per-session
+# Unix-domain socket (a typed, length-prefixed control/event protocol), receives
+# the helper's shm frame fd via `SCM_RIGHTS`, maps it READ-ONLY, and — only when
+# the helper reports a fresh paint — turns the frame into an [`egui::ColorImage`]
+# the shell uploads to a `TextureHandle` (the same decode→upload shape the VDI
+# decoder crates use). Input events are scaled by `pixels_per_point` and forwarded
+# over the socket; a helper crash surfaces as an honest state, isolated per
+# session.
+#
+# It does NOT depend on `mde-web-preview` (that crate is its own workspace root,
+# excluded because Servo drags in a conflicting native sqlite link — see that
+# crate's manifest). The two share only the WIRE CONTRACT: the `MWP1` shm header
+# layout (mirrored in `frame.rs`) and the socket message set (`wire.rs`).
+#
+# Tier (§6): desktop-shell. Its only workspace edge points inward to the shared
+# `mde-egui` harness (egui types + the one toolkit resolution). `mde-shell-egui`
+# is its first caller (the Browser surface), exactly as `mde-vdi-rdp`/`-vnc` are
+# consumed by the Desktop surface.
+#
+# UNSAFE (§9): mapping the received fd READ-ONLY and reading the seqlock-published
+# frame is `unsafe` (a raw mmap + atomic reads), and receiving the fd over
+# `SCM_RIGHTS` hands back a raw descriptor. Like `mde-web-preview`, this crate
+# therefore declares its OWN `[lints]` table that ALLOWS `unsafe` (the workspace
+# default is `forbid`) and otherwise mirrors the workspace lints; every `unsafe`
+# block carries a `// SAFETY:` note and lives in a named module (`frame`, `scm`).
+[package]
+name        = "mde-web-preview-client"
+description = "BOOKMARKS-6 — the shell-side IPC + shm texture bridge for the sandboxed Servo browser helper (mde-web-preview, BOOKMARKS-5). Spawns the helper per session, drives it over a typed length-prefixed per-session Unix socket, receives the shm frame fd via SCM_RIGHTS, maps it read-only, and turns each paint-ready frame into an egui ColorImage the shell uploads to a texture; input is scaled by pixels_per_point and forwarded, and a helper crash surfaces as an isolated, honest state."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_web_preview_client"
+path = "src/lib.rs"
+
+[features]
+default = []
+# The `testkit` module — an in-process fake helper (a socketpair peer that
+# publishes a real `MWP1` shm frame + speaks the event protocol) so BOTH this
+# crate's tests and the shell's Browser-surface tests can exercise the full
+# socket + shm + texture-upload path headlessly, with no Servo process. Off by
+# default so no test scaffolding ships in a release build.
+testkit = []
+# The live helper spawn (`WebSession::spawn`) — really `Command::spawn`s the
+# `mde-web-preview` binary and wires it the session socket. It needs a GPU seat +
+# the helper teaching its `tab` mode to speak this socket (the gated BOOKMARKS-5
+# follow-up), so it is OFF by default; the unit-tested socket/shm/texture surface
+# never depends on it. Mirrors the VDI crates' `live-connect` gate.
+live-helper = []
+
+[dependencies]
+# The §4/§5 egui harness — the ONE toolkit resolution. This crate uses only the
+# egui types (ColorImage / TextureHandle / Event / Key / Color32); eframe/wgpu are
+# pulled transitively by the harness but unused here, exactly as the VDI decoder
+# crates consume it.
+mde-egui = { path = "../../shared/mde-egui" }
+
+# The read-only shm mmap of the received frame fd (`mman`) and the `SCM_RIGHTS`
+# fd hand-off over the session socket (`socket`). Same crate + version the
+# sandboxed helper (mde-web-preview) maps the WRITE side with, so the two ends of
+# the seam agree on the mapping semantics.
+# `socket` + `uio` = the `sendmsg`/`recvmsg` `SCM_RIGHTS` fd hand-off over the
+# session socket (the scatter/gather msg API lives behind `uio`); `mman` = the
+# read-only mmap of the received frame region; `fs` = the `memfd`/`ftruncate` the
+# `testkit` fake-helper writer needs to stand up an `MWP1` region without Servo.
+nix = { version = "0.29", features = ["socket", "uio", "mman", "fs"] }
+
+[lints.rust]
+# UNSAFE is ALLOWED here (mmap + SCM_RIGHTS) — see the crate header + §9. Every
+# `unsafe` block carries a `// SAFETY:` note and lives in `frame.rs` / `scm.rs`.
+unsafe_code             = "allow"
+unsafe_op_in_unsafe_fn  = "deny"
+missing_docs            = "warn"
+unused_must_use         = "deny"
+
+[lints.clippy]
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic       = "warn"
+todo        = "deny"
