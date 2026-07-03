@@ -1,0 +1,108 @@
+# mde-web-preview — the out-of-process, OS-sandboxed Servo browser helper
+# (BOOKMARKS-5; design: `docs/design/mesh-bookmarks.md`).
+#
+# A SEPARATE, security-critical process the shell spawns per browser session.
+# It embeds the interactive Servo web engine (JS on, tabs, links, back/forward,
+# address bar, media best-effort) behind a hard OS sandbox — user namespace +
+# seccomp-bpf + minimal caps + no-new-privs, one process per tab, cgroup v2
+# memory/CPU caps, read-only rootfs + tmpfs, and NO access to $HOME / keys /
+# mesh data. Zero telemetry, system-CA TLS with honest cert warnings, deny-all
+# sensitive web permissions, first-party session cookies cleared on close, no
+# persistent history, a generic non-identifying UA, GPU required.
+#
+# Tier (§6): desktop-shell helper bin. It renders offscreen into a shared-memory
+# frame the shell uploads to an egui texture (the IPC + input path is BOOKMARKS-6);
+# this crate provides the shm frame-emit SEAM that BOOKMARKS-6 consumes, plus the
+# headless "about:blank -> a frame arrives on the shm channel" test.
+#
+# WORKSPACE ISOLATION: this crate is its OWN workspace root (empty `[workspace]`
+# below) with its OWN Cargo.lock, and is `exclude`d from the parent workspace.
+# Reason: `servo` pulls `servo-storage` -> rusqlite 0.37 -> libsqlite3-sys 0.35
+# (a NON-optional dep, no feature gate) which collides on the native
+# `links = "sqlite3"` uniqueness rule with the mesh's rusqlite 0.32 /
+# libsqlite3-sys 0.30 (mackesd CA/nebula daemon, mde-bus, mde-files,
+# mde-bookmarks). Two packages can't link the same native lib in one Cargo.lock,
+# so the heavy engine gets its own lock/target. Build it with
+# `cargo build --manifest-path crates/desktop/mde-web-preview/Cargo.toml`
+# (NOT `-p` — it is not a workspace member). Follow-up (design Q52): unify the
+# workspace on rusqlite 0.37 to rejoin the single-workspace build.
+#
+# UNSAFE (§9 / design Q95): this is the ONE crate where `unsafe` is allowed, and
+# only inside the named FFI/sandbox/shm modules (each call carries a `// SAFETY:`
+# note). The workspace-wide `unsafe_code = "forbid"` cannot be relaxed by an inner
+# attribute, so this crate declares its own `[lints]` table that ALLOWS unsafe and
+# otherwise mirrors the workspace lints (deny todo/unwrap, warn pedantic/nursery).
+[workspace]
+
+[package]
+name        = "mde-web-preview"
+description = "BOOKMARKS-5 — the out-of-process, OS-sandboxed Servo browser helper: an interactive Servo web engine (JS on, tabs, links, back/forward, address bar, media best-effort) confined by a user namespace + seccomp-bpf + minimal caps + no-new-privs + cgroup v2 memory/CPU caps + a read-only rootfs/tmpfs with NO home/keys/data. Zero telemetry, system-CA TLS with honest cert warnings, deny-all sensitive perms, first-party session cookies cleared on close, no persistent history, a generic UA. Renders offscreen into a shared-memory frame (the shm seam BOOKMARKS-6 consumes); ships a headless about:blank -> frame-arrives test."
+version      = "12.0.0"
+edition      = "2021"
+rust-version = "1.88"
+license      = "GPL-3.0-or-later"
+authors      = ["Matthew Mackes <matthewmackes@gmail.com>"]
+repository   = "https://github.com/matthewmackes/magic-mesh"
+
+[[bin]]
+name = "mde-web-preview"
+path = "src/main.rs"
+
+[lib]
+name = "mde_web_preview"
+path = "src/lib.rs"
+
+[dependencies]
+# The interactive Servo web engine — the OFFICIAL servo-project publication on
+# crates.io (owners SimonSapin/larsbergstrom/jdm + the servo cargo-publish team;
+# repository github.com/servo/servo). Real libservo: WebView/WebViewBuilder,
+# Servo/ServoBuilder, back/forward (TraversalId), keyboard/mouse/wheel/touch/IME
+# input, and Software/OffscreenRenderingContext for headless offscreen frames.
+#   * `baked-in-resources` bakes Servo's resource files into the binary so the
+#     sandboxed helper needs NO external resource directory (no filesystem reach).
+#   * `js_jit` turns on the SpiderMonkey JIT (acceptance: "JS on").
+# `default-features = false` drops `clipboard` (arboard) — a sandboxed browser
+# must not reach the host clipboard (deny-all sensitive perms). Media (gstreamer)
+# stays OFF, so Servo selects the dummy media backend (honest degrade, "media
+# best-effort") and the airgapped farm build needs no gstreamer system libs.
+servo = { version = "0.3", default-features = false, features = ["baked-in-resources", "js_jit"] }
+
+# --- OS sandbox (Linux syscalls; unsafe confined to sandbox.rs) ---
+# Safe wrappers for unshare/mount/pivot_root/prctl/sethostname/uid-gid-maps.
+nix = { version = "0.29", features = ["sched", "mount", "user", "process", "fs", "hostname", "signal", "mman"] }
+# Raw constants + the couple of syscalls nix doesn't wrap (seccomp install path).
+libc = "0.2"
+# seccomp-bpf: build the syscall-allowlist BPF program (Firecracker's pure-Rust
+# assembler — no libseccomp system dep, airgap-friendly) and install it.
+seccompiler = "0.4"
+# Capability bounding-set drop (minimal caps): clear every capability from the
+# bounding + ambient + inheritable sets so the tab process holds none.
+caps = "0.5"
+
+# Geometry types that appear in Servo's public rendering API (the offscreen
+# read-back rect + physical size). Version-unified with Servo's own tree so the
+# `Box2D`/`Point2D`/`PhysicalSize` types are identical across the boundary.
+euclid = "0.22"
+dpi = "0.1"
+# URL type for navigation (WebView::load / WebViewBuilder::url take a url::Url);
+# version-unified with Servo's own url dep so the type is identical.
+url = "2"
+
+# Typed error plumbing (no raw unwrap/panic — workspace lints deny unwrap_used).
+anyhow = "1"
+
+[lints.rust]
+# UNSAFE is ALLOWED here (and ONLY here) — see the crate header + design Q95.
+# Every `unsafe` block carries a `// SAFETY:` note and lives in a named
+# FFI/sandbox/shm module (sandbox.rs, shm.rs).
+unsafe_code             = "allow"
+unsafe_op_in_unsafe_fn  = "deny"
+missing_docs            = "warn"
+unused_must_use         = "deny"
+
+[lints.clippy]
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic       = "warn"
+todo        = "deny"
