@@ -1,0 +1,34 @@
+# mde-adblock — the pure, headless matching-engine + filter-list service model
+# for the mesh-wide ad-blocker (BOOKMARKS-7, docs/WORKLIST.md).
+#
+# Services tier: an EasyList-style filter-list parser (network block/allow rules
+# + element-hide cosmetic rules), a request matcher
+# (`match_request(url, type, first_party) -> Decision`), a cosmetic-selector
+# extractor, and the serde-persisted, mesh-distributable filter-list STORE
+# (bundled seed lists + operator custom lists + a per-site allowlist + staleness
+# metadata). ZERO I/O: no Syncthing, no Bus, no wall clock, no Servo — that live
+# plumbing is the mackesd `adfilter` worker + the mde-web-preview wiring (both
+# follow-on units). Everything here is headless + unit-tested (the mde-bookmarks
+# / mde-chat pattern). No desktop-shell dep (the layered-tiers gate).
+[package]
+name        = "mde-adblock"
+description = "BOOKMARKS-7 — the pure, headless matching-engine + filter-list service model for the mesh-wide ad-blocker: an EasyList-style rule parser (network block/allow + cosmetic element-hide), a request matcher (match_request(url, type, first_party) -> Decision), a cosmetic-selector extractor, and the serde-persisted, mesh-distributable filter-list store (bundled seed lists + operator custom lists + per-site allowlist + staleness). No I/O; the live Syncthing/Bus replication is the mackesd adfilter worker and the in-browser blocking is the mde-web-preview wiring (follow-on)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The mesh-distributable filter-list store + the typed rule/decision model
+# round-trip as JSON (the "serialized engine blob" the mackesd adfilter leader
+# replicates over Syncthing). Same workspace serde the other mesh services use.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
