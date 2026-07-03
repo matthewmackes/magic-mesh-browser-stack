@@ -1,0 +1,117 @@
+policy_module(mde_web_preview, 1.0.0)
+
+########################################
+#
+# BOOKMARKS-9 — a confined, ENFORCING SELinux domain for the Servo browser
+# helper (`/usr/bin/mde-web-preview`, BOOKMARKS-5).
+#
+# This is defense-in-depth. The helper's PRIMARY confinement is the in-process
+# OS sandbox it installs on itself before it touches the network — a user
+# namespace + seccomp-bpf syscall allowlist + a fully-dropped capability
+# bounding set + no-new-privs + cgroup v2 memory/CPU caps + a pivot_root'd
+# read-only rootfs/tmpfs with NO access to $HOME, SSH keys, Nebula certs or
+# mesh data (see the crate header + docs/THREAT_MODEL.md). That sandbox is
+# always on and does not depend on SELinux.
+#
+# This module adds a SECOND, orthogonal MAC layer so that, wherever the node
+# runs SELinux Enforcing, the browser process is a distinct labelled domain with
+# an explicit least-privilege access set — and everything NOT listed below
+# (the operator's home, `~/.ssh`, `/etc/nebula`, `/etc/mackesd`, `/var/lib/*`)
+# is denied by the SELinux default-deny, which IS the confinement. There are no
+# blanket `unconfined_*` grants: this is a real confined domain, not a
+# permissive stub.
+#
+# NOTE (platform standard): the operator sets SELinux DISABLED platform-wide
+# (2026-06-20). Where SELinux is disabled the kernel never enforces this module
+# and the loader (setup-selinux-web-preview.sh) self-skips — the OS sandbox
+# above remains the operative confinement. This module ships + loads so that any
+# node re-enabling SELinux gets the confined domain with zero extra work.
+#
+########################################
+
+########################################
+#
+# Declarations
+#
+
+type mde_web_preview_t;
+type mde_web_preview_exec_t;
+application_domain(mde_web_preview_t, mde_web_preview_exec_t)
+role system_r types mde_web_preview_t;
+
+gen_require(`
+	type unconfined_t;
+	role unconfined_r;
+')
+
+# The desktop shell (mde-shell-egui) spawns the helper. On a shell that runs
+# unconfined, entering /usr/bin/mde-web-preview auto-transitions the child into
+# this confined domain and drops it into the operator's role set.
+role unconfined_r types mde_web_preview_t;
+domain_auto_trans(unconfined_t, mde_web_preview_exec_t, mde_web_preview_t)
+allow mde_web_preview_t unconfined_t:fd use;
+allow mde_web_preview_t unconfined_t:process sigchld;
+allow mde_web_preview_t unconfined_t:unix_stream_socket { connectto read write };
+
+########################################
+#
+# mde_web_preview_t local policy
+#
+
+# --- Self / sandbox bring-up -------------------------------------------------
+# The helper builds its OWN sandbox before locking itself with seccomp: it
+# unshares a user+mount+pid namespace, sets uid/gid maps, pivot_root's into a
+# tmpfs read-only rootfs, drops the capability bounding set, and sets rlimits.
+allow mde_web_preview_t self:capability { setuid setgid sys_chroot sys_admin };
+allow mde_web_preview_t self:cap_userns { setuid setgid sys_admin sys_chroot };
+allow mde_web_preview_t self:user_namespace create;
+allow mde_web_preview_t self:process { fork setsched setrlimit setpgid getsched signal signull setcap };
+allow mde_web_preview_t self:fifo_file rw_fifo_file_perms;
+allow mde_web_preview_t self:unix_stream_socket create_stream_socket_perms;
+allow mde_web_preview_t self:unix_dgram_socket create_socket_perms;
+# The shared-memory frame region (the shm seam BOOKMARKS-6 maps read-only) and
+# the anonymous tmpfs backing the sandbox rootfs.
+allow mde_web_preview_t self:shm create_shm_perms;
+fs_manage_tmpfs_files(mde_web_preview_t)
+fs_manage_tmpfs_dirs(mde_web_preview_t)
+fs_getattr_tmpfs(mde_web_preview_t)
+
+# --- Read-only program + resources ------------------------------------------
+# The helper reads only its own binary/libs, the system CA bundle (honest TLS),
+# fontconfig/font caches, and locale — never the operator's data.
+can_exec(mde_web_preview_t, mde_web_preview_exec_t)
+libs_exec_ld_so(mde_web_preview_t)
+libs_read_lib_files(mde_web_preview_t)
+files_read_etc_files(mde_web_preview_t)
+files_read_usr_files(mde_web_preview_t)
+miscfiles_read_localization(mde_web_preview_t)
+miscfiles_read_fonts(mde_web_preview_t)
+miscfiles_read_generic_certs(mde_web_preview_t)
+
+# --- GPU (offscreen render; GPU-required helper) ----------------------------
+# Servo renders offscreen through EGL/GBM on the DRI render node; no /dev/fb,
+# no seat/input devices.
+dev_rw_dri(mde_web_preview_t)
+dev_read_sysfs(mde_web_preview_t)
+
+# --- Network (the browser's job) --------------------------------------------
+# Outbound web fetch + DNS. The app-layer ad-filter blocks trackers before fetch
+# and the sandbox denies the mesh/overlay ranges; SELinux scopes this domain to
+# ordinary client networking (no listen/bind of privileged ports).
+corenet_tcp_connect_all_ports(mde_web_preview_t)
+corenet_tcp_sendrecv_all_ports(mde_web_preview_t)
+corenet_all_recvfrom_unlabeled(mde_web_preview_t)
+sysnet_dns_name_resolve(mde_web_preview_t)
+allow mde_web_preview_t self:tcp_socket create_stream_socket_perms;
+allow mde_web_preview_t self:udp_socket create_socket_perms;
+
+# --- Diagnostics -------------------------------------------------------------
+# stderr diagnostics only; no persistent history/log of browsed content.
+logging_send_syslog_msg(mde_web_preview_t)
+kernel_read_system_state(mde_web_preview_t)
+
+#
+# Everything else — the operator's home, ~/.ssh, /etc/nebula, /etc/mackesd,
+# /var/lib/mackesd, the mesh-storage tree — is DENIED by omission (SELinux
+# default-deny). That omission is the confinement; do not add blanket grants.
+#

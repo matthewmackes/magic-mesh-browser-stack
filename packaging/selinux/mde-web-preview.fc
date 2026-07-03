@@ -1,0 +1,6 @@
+# BOOKMARKS-9 — file contexts for the confined Servo browser helper.
+# Labels the helper binary so that spawning it auto-transitions the child into
+# the confined mde_web_preview_t domain (see mde-web-preview.te). The loader
+# runs `restorecon /usr/bin/mde-web-preview` after `semodule -i` so the label
+# takes on an already-installed binary.
+/usr/bin/mde-web-preview		--	gen_context(system_u:object_r:mde_web_preview_exec_t,s0)

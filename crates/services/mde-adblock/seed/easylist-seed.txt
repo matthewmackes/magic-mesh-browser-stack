@@ -1,0 +1,33 @@
+! Title: MCNF EasyList seed (bundled fallback subset)
+! Full list: https://easylist.to/easylist/easylist.txt
+||doubleclick.net^
+||ad.doubleclick.net^
+||googlesyndication.com^
+||pagead2.googlesyndication.com^
+||adservice.google.com^
+||googleadservices.com^
+||2mdn.net^
+||amazon-adsystem.com^
+||adnxs.com^
+||advertising.com^
+||moatads.com^
+||criteo.com^
+||criteo.net^
+||taboola.com^
+||outbrain.com^
+||adform.net^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||casalemedia.com^
+||smartadserver.com^
+||adroll.com^
+||media.net^
+/pagead/*
+/adsbygoogle
+##.ad-banner
+##.advertisement
+##.sponsored
+##.sponsored-content
+###ad-container
+###banner-ad

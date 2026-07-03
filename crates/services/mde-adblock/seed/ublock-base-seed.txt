@@ -1,0 +1,18 @@
+! Title: MCNF uBlock-base seed (bundled fallback subset)
+! Full list: https://ublockorigin.github.io/uAssets/filters/filters.txt
+||adsafeprotected.com^
+||adsrvr.org^
+||serving-sys.com^
+||demdex.net^
+||everesttech.net^
+||3lift.com^
+||sharethrough.com^
+||teads.tv^
+||yieldmo.com^
+||indexww.com^
+||bidswitch.net^
+##.ads
+##.ad-slot
+##.banner-ads
+##[id^="google_ads_"]
+##[class^="adunit"]

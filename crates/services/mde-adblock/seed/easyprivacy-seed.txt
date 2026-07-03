@@ -1,0 +1,24 @@
+! Title: MCNF EasyPrivacy seed (bundled fallback subset)
+! Full list: https://easylist.to/easylist/easyprivacy.txt
+||google-analytics.com^
+||ssl.google-analytics.com^
+||googletagmanager.com^
+||googletagservices.com^
+||stats.g.doubleclick.net^
+||scorecardresearch.com^
+||quantserve.com^
+||quantcount.com^
+||hotjar.com^
+||mixpanel.com^
+||segment.io^
+||segment.com^
+||fullstory.com^
+||amplitude.com^
+||bat.bing.com^
+||analytics.twitter.com^
+||facebook.com/tr^
+||matomo.cloud^
+||chartbeat.com^
+||newrelic.com^
+||nr-data.net^
+||branch.io^
