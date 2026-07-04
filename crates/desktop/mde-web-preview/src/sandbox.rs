@@ -8,8 +8,13 @@
 //!    for installing an unprivileged seccomp filter.
 //! 2. **cgroup v2 caps** — a per-tab child cgroup with `memory.max` + `cpu.max`
 //!    so one runaway page cannot exhaust the node's RAM or pin every core.
-//! 3. **user + mount + IPC + UTS + cgroup namespaces** (`unshare`) — no network
-//!    namespace ON PURPOSE (Q38: egress stays; only the ad-blocker filters).
+//! 3. **user + mount + IPC + UTS + cgroup + PID namespaces** (`unshare` + a
+//!    `fork`) — no network namespace ON PURPOSE (Q38: egress stays; only the
+//!    ad-blocker filters). The PID namespace makes host processes invisible and
+//!    lets a *fresh* `procfs` mount (an unprivileged userns can only mount proc
+//!    for a pid namespace it owns); because `CLONE_NEWPID` only takes effect for
+//!    a forked child, [`apply`] forks and the confined engine runs as the new
+//!    namespace's PID 1 while the original process supervises it.
 //! 4. **uid/gid maps** — mapped to a throwaway identity; the real user/keys are
 //!    invisible.
 //! 5. **read-only rootfs + tmpfs** — a fresh tmpfs root that bind-mounts ONLY
@@ -37,12 +42,13 @@
 //! privileged `apply` sequence performs the real syscalls at tab startup.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::prctl;
-use nix::unistd::{pivot_root, sethostname, Gid, Uid};
+use nix::unistd::{fork, pivot_root, sethostname, ForkResult, Gid, Pid, Uid};
 
 /// The confinement limits + identity for one sandboxed tab process.
 ///
@@ -202,19 +208,25 @@ pub fn dev_binds() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Apply the full sandbox to the CURRENT process, in the security-critical
-/// order. After this returns `Ok`, the process is confined and it is safe to
-/// initialise the web engine.
+/// Apply the full sandbox to the current process, in the security-critical order.
+///
+/// On success this forks: the original process becomes a thin **supervisor**
+/// (step 5) that only reaps + forwards signals and NEVER returns from `apply`,
+/// while the confined child — PID 1 of a fresh PID namespace — returns `Ok`. So
+/// the code after a successful `apply` runs exactly once, in the confined child,
+/// and it is safe to initialise the web engine there.
 ///
 /// # Errors
-/// Returns an error if any kernel isolation step fails (e.g. unprivileged user
-/// namespaces are disabled, or the cgroup subtree is not delegated). The caller
-/// MUST treat a failure as fatal and refuse to load web content unconfined.
+/// Returns an error (in the child, or in the pre-fork process) if any kernel
+/// isolation step fails (e.g. unprivileged user namespaces are disabled, or the
+/// cgroup subtree is not delegated). The caller MUST treat a failure as fatal and
+/// refuse to load web content unconfined.
 pub fn apply(policy: SandboxPolicy) -> Result<()> {
     // 1. no-new-privs (also the precondition for unprivileged seccomp).
     prctl::set_no_new_privs().context("PR_SET_NO_NEW_PRIVS")?;
 
-    // 2. cgroup memory/CPU caps — while we still see the host cgroup tree.
+    // 2. cgroup memory/CPU caps — while we still see the host cgroup tree. The
+    // forked child inherits this cgroup membership, so the caps bind it too.
     if let Err(e) = enter_cgroup(policy) {
         // Honest degrade: the other layers still apply. Surface it loudly.
         eprintln!("mde-web-preview: cgroup limits not applied ({e:#}); continuing with namespace+seccomp confinement");
@@ -230,35 +242,111 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
     let uid = Uid::current().as_raw();
     let gid = Gid::current().as_raw();
 
-    // 3. new user + mount + IPC + UTS + cgroup namespaces (NOT network).
+    // 3. new user + mount + IPC + UTS + cgroup + PID namespaces (NOT network).
+    // CLONE_NEWPID hides host processes AND is what lets step 6 mount a *fresh*
+    // procfs (an unprivileged userns may only mount proc for a pid namespace it
+    // owns); it only takes effect for a child, hence the fork in step 5.
     unshare(
         CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWIPC
             | CloneFlags::CLONE_NEWUTS
-            | CloneFlags::CLONE_NEWCGROUP,
+            | CloneFlags::CLONE_NEWCGROUP
+            | CloneFlags::CLONE_NEWPID,
     )
     .context("unshare (are unprivileged user namespaces enabled?)")?;
 
     // 4. identity maps (setgroups must be denied first, unprivileged) — using the
     // uid/gid captured ABOVE, never a post-unshare getuid() (the overflow id).
+    // Written by THIS task (which owns the new userns), before the fork; the child
+    // inherits the maps.
     std::fs::write("/proc/self/setgroups", "deny").context("setgroups deny")?;
     std::fs::write("/proc/self/uid_map", id_map_line(uid)).context("uid_map")?;
     std::fs::write("/proc/self/gid_map", id_map_line(gid)).context("gid_map")?;
 
-    // 5. read-only rootfs + tmpfs, then pivot into it.
+    // 5. fork so the child is PID 1 of the new PID namespace. The parent turns
+    // into a supervisor that forwards termination signals to the child and exits
+    // with its status; it never returns from apply(). Only the confined child
+    // proceeds. The process is single-threaded here (the engine is not yet built),
+    // so this fork is async-signal-safe.
+    match unsafe { fork() }.context("fork into pid namespace")? {
+        ForkResult::Parent { child } => supervise_child(child), // never returns
+        ForkResult::Child => {}
+    }
+
+    // --- confined child (PID 1 of the new pid namespace) from here on ---
+
+    // If the supervising parent dies, take the engine down with it (no orphaned,
+    // still-running tab). Best-effort: a failure here is not fatal to confinement.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+    }
+
+    // 6. read-only rootfs + tmpfs (incl. a fresh procfs), then pivot into it.
     build_rootfs().context("rootfs")?;
 
-    // 6. generic hostname (UTS namespace).
+    // 7. generic hostname (UTS namespace).
     sethostname(policy.hostname).context("sethostname")?;
 
-    // 7. drop every capability (mount setup is done).
+    // 8. drop every capability (mount setup is done).
     drop_all_capabilities().context("drop capabilities")?;
 
-    // 8. seccomp-bpf escape-syscall denylist (installed LAST).
+    // 9. seccomp-bpf escape-syscall denylist (installed LAST).
     install_seccomp().context("seccomp")?;
 
     Ok(())
+}
+
+/// The confined child's host-namespace PID, published for the signal-forwarding
+/// handler (which must be async-signal-safe — an atomic load + `kill` only).
+static SUPERVISED_CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// Async-signal-safe handler: forward the received signal to the confined child.
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let child = SUPERVISED_CHILD.load(Ordering::SeqCst);
+    if child > 0 {
+        unsafe {
+            libc::kill(child, sig);
+        }
+    }
+}
+
+/// Supervise the confined child: forward graceful-termination signals to it, reap
+/// it, and exit with its status. Never returns — the pre-fork process's sole job
+/// from here is to be a faithful proxy for the sandboxed engine's lifetime.
+fn supervise_child(child: Pid) -> ! {
+    SUPERVISED_CHILD.store(child.as_raw(), Ordering::SeqCst);
+    // Forward the signals a tab supervisor is expected to relay so the engine can
+    // shut down cleanly when BOOKMARKS-6 stops the tab.
+    let handler: extern "C" fn(libc::c_int) = forward_signal;
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        libc::sigemptyset(&raw mut sa.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+        }
+    }
+    // Reap, restarting across EINTR (our own forwarded signals interrupt it).
+    let mut status: libc::c_int = 0;
+    let code = loop {
+        let r = unsafe { libc::waitpid(child.as_raw(), &raw mut status, 0) };
+        if r == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break 1; // lost the child; fail closed
+        }
+        if libc::WIFEXITED(status) {
+            break libc::WEXITSTATUS(status);
+        }
+        if libc::WIFSIGNALED(status) {
+            break 128 + libc::WTERMSIG(status);
+        }
+        // Stopped/continued — keep waiting for a terminal status.
+    };
+    std::process::exit(code);
 }
 
 /// Create + enter a per-process child cgroup with the policy's memory/CPU caps.
@@ -338,17 +426,23 @@ fn build_rootfs() -> Result<()> {
         Some("size=256m,mode=1777"),
     )
     .context("mount /tmp")?;
-    // A fresh proc for the new pid view.
+    // A fresh proc for the new pid namespace (host processes invisible). This
+    // succeeds because apply() unshared CLONE_NEWPID and forked, so we are PID 1
+    // of a pid namespace our user namespace owns. If a fresh procfs is somehow
+    // refused, fall back to a read-only recursive bind of the existing /proc:
+    // read-only ⇒ no new write surface, and glibc/Servo keep a working /proc.
     let proc_dir = newroot.join("proc");
     std::fs::create_dir_all(&proc_dir)?;
-    mount(
+    if let Err(e) = mount(
         Some("proc"),
         &proc_dir,
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
-    )
-    .context("mount /proc")?;
+    ) {
+        eprintln!("mde-web-preview: fresh procfs unavailable ({e}); binding /proc read-only");
+        bind_readonly(Path::new("/proc"), newroot).context("mount /proc (ro bind fallback)")?;
+    }
 
     // pivot_root: swap the new tmpfs root in, detach the old one entirely.
     let oldroot = newroot.join("oldroot");
@@ -361,7 +455,8 @@ fn build_rootfs() -> Result<()> {
     Ok(())
 }
 
-/// Bind-mount `src` from the (pre-pivot) host into `newroot` read-only.
+/// Bind-mount `src` from the (pre-pivot) host into `newroot`, then make it — and
+/// every mount nested beneath it — read-only.
 fn bind_readonly(src: &Path, newroot: &Path) -> Result<()> {
     let rel = src.strip_prefix("/").unwrap_or(src);
     let dst = newroot.join(rel);
@@ -374,8 +469,8 @@ fn bind_readonly(src: &Path, newroot: &Path) -> Result<()> {
         }
         let _ = std::fs::File::create(&dst);
     }
-    // Bind, then remount the same target read-only (a plain MS_RDONLY bind is
-    // silently ignored by the kernel; the remount is what makes it stick).
+    // Recursive bind first (a plain MS_RDONLY on the bind itself is silently
+    // ignored by the kernel — the follow-up remount is what makes it stick).
     mount(
         Some(src),
         &dst,
@@ -384,19 +479,118 @@ fn bind_readonly(src: &Path, newroot: &Path) -> Result<()> {
         None::<&str>,
     )
     .with_context(|| format!("bind {}", src.display()))?;
-    mount(
-        None::<&str>,
-        &dst,
-        None::<&str>,
-        MsFlags::MS_BIND
-            | MsFlags::MS_REC
-            | MsFlags::MS_REMOUNT
-            | MsFlags::MS_RDONLY
-            | MsFlags::MS_NOSUID,
-        None::<&str>,
-    )
-    .with_context(|| format!("remount-ro {}", dst.display()))?;
+    // Make it read-only. See [`remount_readonly_tree`] for why a naive
+    // `MS_REMOUNT | MS_RDONLY` EPERMs in an unprivileged user namespace.
+    remount_readonly_tree(&dst)
+}
+
+/// Remount `root` and every mount nested beneath it read-only.
+///
+/// In an unprivileged user namespace, a bind mount inherits its source mount's
+/// LOCKED flags (`nosuid` / `nodev` / `noexec` and the `atime` policy). The
+/// kernel rejects — with `EPERM` — any `MS_REMOUNT` that would *clear* a locked
+/// flag, so a bare `MS_REMOUNT | MS_RDONLY` fails whenever the source carries
+/// e.g. `nosuid` (true of `/etc/resolv.conf`'s `/run` tmpfs, `/dev`, …). The fix
+/// is to read each mount's CURRENT flags from `/proc/self/mountinfo` and re-apply
+/// them, OR-ing in `MS_RDONLY`, so no locked flag is dropped. A recursive bind
+/// can pull in submounts — none may be left writable — so we walk the whole tree
+/// under `root`, deepest first.
+fn remount_readonly_tree(root: &Path) -> Result<()> {
+    let mut targets = mounts_at_or_under(root)?;
+    // Deepest paths first (a child before its parent); dedup identical points.
+    targets.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
+    targets.dedup();
+    for mp in targets {
+        let existing = current_mount_flags(&mp).unwrap_or_else(MsFlags::empty);
+        mount(
+            None::<&str>,
+            &mp,
+            None::<&str>,
+            // MS_BIND ⇒ per-mount (not superblock) remount; MS_RDONLY adds
+            // read-only; `existing` re-asserts the (locked) source flags so none
+            // is cleared; MS_NOSUID is extra hardening — harmless for /dev nodes,
+            // which stay usable because MS_RDONLY does not block device I/O.
+            MsFlags::MS_BIND
+                | MsFlags::MS_REMOUNT
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | existing,
+            None::<&str>,
+        )
+        .with_context(|| format!("remount-ro {}", mp.display()))?;
+    }
     Ok(())
+}
+
+/// Every mount point equal to `root` or nested beneath it, per `/proc/self/mountinfo`.
+fn mounts_at_or_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").context("read mountinfo")?;
+    Ok(mountinfo
+        .lines()
+        .filter_map(mountinfo_mount_point)
+        .filter(|mp| mp.starts_with(root))
+        .collect())
+}
+
+/// The current mount flags of the topmost mount at `target` (the LAST matching
+/// `/proc/self/mountinfo` line — later lines shadow earlier ones at a point).
+fn current_mount_flags(target: &Path) -> Option<MsFlags> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mountinfo.lines().rev().find_map(|line| {
+        (mountinfo_mount_point(line)? == *target).then(|| mountinfo_mount_flags(line))
+    })
+}
+
+/// Parse the mount-point field (field 5) of a `/proc/self/mountinfo` line,
+/// un-escaping the octal `\NNN` sequences the kernel uses for special chars.
+fn mountinfo_mount_point(line: &str) -> Option<PathBuf> {
+    line.split_whitespace()
+        .nth(4)
+        .map(|f| PathBuf::from(unescape_octal(f)))
+}
+
+/// Parse the per-mount option field (field 6) of a `/proc/self/mountinfo` line
+/// into the lockable [`MsFlags`]. Only the flags the kernel can lock across a
+/// user namespace matter for a read-only remount; fs-specific options are ignored.
+fn mountinfo_mount_flags(line: &str) -> MsFlags {
+    let mut flags = MsFlags::empty();
+    let Some(opts) = line.split_whitespace().nth(5) else {
+        return flags;
+    };
+    for opt in opts.split(',') {
+        match opt {
+            "ro" => flags |= MsFlags::MS_RDONLY,
+            "nosuid" => flags |= MsFlags::MS_NOSUID,
+            "nodev" => flags |= MsFlags::MS_NODEV,
+            "noexec" => flags |= MsFlags::MS_NOEXEC,
+            "noatime" => flags |= MsFlags::MS_NOATIME,
+            "nodiratime" => flags |= MsFlags::MS_NODIRATIME,
+            "relatime" => flags |= MsFlags::MS_RELATIME,
+            "strictatime" => flags |= MsFlags::MS_STRICTATIME,
+            _ => {}
+        }
+    }
+    flags
+}
+
+/// Un-escape the octal `\NNN` sequences `/proc/self/mountinfo` uses for space,
+/// tab, newline and backslash in its path fields.
+fn unescape_octal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                out.push(b as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Clear every capability from all sets so the confined engine holds none.
@@ -503,6 +697,45 @@ mod tests {
         .expect("filter builds");
         let program: BpfProgram = filter.try_into().expect("bpf compiles");
         assert!(!program.is_empty());
+    }
+
+    #[test]
+    fn mountinfo_mount_point_is_field_five() {
+        let line =
+            "36 35 0:32 / /usr rw,nosuid,nodev,relatime shared:1 - tmpfs tmpfs rw,size=1024k";
+        assert_eq!(mountinfo_mount_point(line), Some(PathBuf::from("/usr")));
+    }
+
+    #[test]
+    fn mountinfo_mount_point_unescapes_octal() {
+        // The kernel renders a space in a path as the octal escape `\040`.
+        let line = "1 2 0:3 / /mnt/with\\040space rw,relatime - tmpfs t rw";
+        assert_eq!(
+            mountinfo_mount_point(line),
+            Some(PathBuf::from("/mnt/with space"))
+        );
+        assert_eq!(unescape_octal("/usr/lib64"), "/usr/lib64");
+        assert_eq!(unescape_octal("/a\\011b"), "/a\tb");
+    }
+
+    #[test]
+    fn mountinfo_flags_preserve_the_lockable_set() {
+        // A remount that dropped any of these locked flags would EPERM in an
+        // unprivileged userns — the parser must recover every one so we re-assert
+        // them alongside MS_RDONLY.
+        let f = mountinfo_mount_flags(
+            "36 35 0:32 / /run rw,nosuid,nodev,noexec,relatime shared:1 - tmpfs tmpfs rw",
+        );
+        assert!(f.contains(MsFlags::MS_NOSUID));
+        assert!(f.contains(MsFlags::MS_NODEV));
+        assert!(f.contains(MsFlags::MS_NOEXEC));
+        assert!(f.contains(MsFlags::MS_RELATIME));
+        // rw ⇒ not read-only yet (the remount is what adds MS_RDONLY).
+        assert!(!f.contains(MsFlags::MS_RDONLY));
+
+        let ro = mountinfo_mount_flags("1 2 0:3 / /etc/resolv.conf ro,noatime - tmpfs t ro");
+        assert!(ro.contains(MsFlags::MS_RDONLY));
+        assert!(ro.contains(MsFlags::MS_NOATIME));
     }
 
     #[test]
