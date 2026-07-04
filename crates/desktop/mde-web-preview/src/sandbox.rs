@@ -220,6 +220,16 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
         eprintln!("mde-web-preview: cgroup limits not applied ({e:#}); continuing with namespace+seccomp confinement");
     }
 
+    // Capture our REAL uid/gid in the PARENT user namespace BEFORE step 3's
+    // unshare. THE FIX (sandbox-apply crash): once we enter the new, still-
+    // unmapped user namespace, getuid()/getgid() report the overflow id
+    // (`/proc/sys/kernel/overflowuid`, 65534) — capturing them there wrote a
+    // `uid_map` of `0 65534 1`, which the kernel rejects with EPERM because the
+    // single-line unprivileged exception must name the writer's OWN parent-ns id
+    // (e.g. 1000), not the overflow id. Read them here, while still mapped.
+    let uid = Uid::current().as_raw();
+    let gid = Gid::current().as_raw();
+
     // 3. new user + mount + IPC + UTS + cgroup namespaces (NOT network).
     unshare(
         CloneFlags::CLONE_NEWUSER
@@ -230,9 +240,8 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
     )
     .context("unshare (are unprivileged user namespaces enabled?)")?;
 
-    // 4. identity maps (setgroups must be denied first, unprivileged).
-    let uid = Uid::current().as_raw();
-    let gid = Gid::current().as_raw();
+    // 4. identity maps (setgroups must be denied first, unprivileged) — using the
+    // uid/gid captured ABOVE, never a post-unshare getuid() (the overflow id).
     std::fs::write("/proc/self/setgroups", "deny").context("setgroups deny")?;
     std::fs::write("/proc/self/uid_map", id_map_line(uid)).context("uid_map")?;
     std::fs::write("/proc/self/gid_map", id_map_line(gid)).context("gid_map")?;
