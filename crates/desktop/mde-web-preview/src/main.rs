@@ -7,10 +7,13 @@
 //! mde-web-preview warm [--width W] [--height H] [--sandbox]
 //! ```
 //!
-//! `render-once` boots the engine, loads `U` (default `about:blank`), publishes
-//! the first painted frame to an internal shm channel, prints `FRAME_OK`, and
-//! exits — the headless Definition-of-Done path and the binary self-test;
-//! `--sandbox` additionally applies the full OS sandbox first.
+//! `render-once` boots the engine, loads `U` (default `about:blank`), pumps
+//! until the page has loaded AND its content has composited (BUG-BROWSER-6:
+//! the FIRST frame is the pre-content shell-background clear), publishes the
+//! newest frame to an internal shm channel, prints `FRAME_OK`, and exits — the
+//! headless Definition-of-Done path and the binary self-test; `--sandbox`
+//! additionally applies the full OS sandbox first. `MDE_WEB_DEBUG=1` traces
+//! every capture (per-frame distinct/luma stats) to stderr.
 //!
 //! `tab` is the production per-tab process: it applies the OS sandbox, boots the
 //! engine, and continuously publishes frames to the shm channel (whose fd
@@ -29,7 +32,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use mde_web_preview::engine::Engine;
+use mde_web_preview::engine::{frame_stats, Engine};
 use mde_web_preview::sandbox::{self, SandboxPolicy};
 use mde_web_preview::shm::FrameChannel;
 use mde_web_preview::sock::{self, RecvOutcome};
@@ -78,9 +81,13 @@ fn render_once(args: &[String]) -> Result<()> {
 
     let channel = FrameChannel::create(width, height).context("create shm channel")?;
     let engine = Engine::new_headless(width, height, &url).context("boot engine")?;
+    // Wait for load-complete + the content composite, not the first frame — the
+    // first frame-ready fires for the initial EMPTY scene (the uniform
+    // shell-background clear), before the page's display list ever reaches
+    // WebRender (BUG-BROWSER-6).
     engine
-        .pump_until_frame(&channel, FIRST_FRAME_TIMEOUT)
-        .context("render first frame")?;
+        .pump_until_content_frame(&channel, FIRST_FRAME_TIMEOUT)
+        .context("render content frame")?;
 
     // Independently confirm a frame actually landed on the shm channel.
     let frame = channel
@@ -106,35 +113,10 @@ fn render_once(args: &[String]) -> Result<()> {
     if engine.force_emit(&channel).context("force emit")? {
         println!("FORCE_OK seq={}", channel.sequence());
     }
-    Ok(())
-}
 
-/// Cheap content stats over an RGBA frame: how many distinct byte values appear,
-/// and the mean luma (Rec. 601). A blank/white frame reads as `distinct` ~1–2 and
-/// `mean_luma` ~255; a real render spreads both.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::suboptimal_flops,
-    reason = "a pixel count fits an f64 mantissa exactly at these frame sizes, and the \
-              readable weighted-sum form is fine for a diagnostic luma stat (no mul_add)"
-)]
-fn frame_stats(pixels: &[u8]) -> (usize, f64) {
-    let mut seen = [false; 256];
-    for &b in pixels {
-        seen[b as usize] = true;
-    }
-    let distinct = seen.iter().filter(|&&s| s).count();
-    let mut luma_sum = 0.0f64;
-    let pixel_count = pixels.len() / 4;
-    for px in pixels.chunks_exact(4) {
-        luma_sum += 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
-    }
-    let mean_luma = if pixel_count == 0 {
-        0.0
-    } else {
-        luma_sum / pixel_count as f64
-    };
-    (distinct, mean_luma)
+    // Deep-debug probes (MDE_WEB_DEBUG only; no-op otherwise) — see the engine.
+    engine.debug_content_probe(Duration::from_secs(20));
+    Ok(())
 }
 
 /// The production per-tab process: sandbox, then speak the BOOKMARKS-6 socket

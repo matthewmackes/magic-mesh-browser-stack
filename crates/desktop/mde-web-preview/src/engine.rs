@@ -15,6 +15,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,6 +33,51 @@ use crate::shm::{FrameChannel, PixelFormat};
 /// population rather than announcing "Servo".
 pub const GENERIC_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+/// How long [`Engine::pump_until_content_frame`] keeps pumping after
+/// `LoadStatus::Complete` before force-compositing the final capture. The
+/// page's display list reaches WebRender asynchronously (scene-builder
+/// thread), so the composite that actually CONTAINS the page trails the DOM
+/// load event by a scene-build + frame-generation hop; this window lets the
+/// natural content frame-ready arrive, and the forced final composite then
+/// renders whatever newest frame WebRender holds.
+const POST_LOAD_SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether `MDE_WEB_DEBUG` per-capture tracing is enabled (read once).
+fn debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MDE_WEB_DEBUG").is_some())
+}
+
+/// Cheap content stats over an RGBA frame: how many distinct byte values appear,
+/// and the mean luma (Rec. 601). A blank/white frame reads as `distinct` ~1–2 and
+/// `mean_luma` ~255; a real render spreads both. Used by the `render-once`
+/// `FRAME_OK` report and the `MDE_WEB_DEBUG` per-capture trace.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "a pixel count fits an f64 mantissa exactly at these frame sizes, and the \
+              readable weighted-sum form is fine for a diagnostic luma stat (no mul_add)"
+)]
+pub fn frame_stats(pixels: &[u8]) -> (usize, f64) {
+    let mut seen = [false; 256];
+    for &b in pixels {
+        seen[b as usize] = true;
+    }
+    let distinct = seen.iter().filter(|&&s| s).count();
+    let mut luma_sum = 0.0f64;
+    let pixel_count = pixels.len() / 4;
+    for px in pixels.chunks_exact(4) {
+        luma_sum += 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
+    }
+    let mean_luma = if pixel_count == 0 {
+        0.0
+    } else {
+        luma_sum / pixel_count as f64
+    };
+    (distinct, mean_luma)
+}
 
 /// The security-hardened Servo preferences for a sandboxed preview tab.
 ///
@@ -105,6 +151,26 @@ impl WebViewDelegate for TabDelegate {
         // Deny-all sensitive web permissions (acceptance + design lock).
         request.deny();
     }
+
+    fn notify_crashed(&self, _webview: WebView, reason: String, backtrace: Option<String>) {
+        // A crashed content pipeline otherwise renders as a silent blank frame
+        // (the BUG-BROWSER-6 white-screen class) — always say so on stderr.
+        eprintln!("mde-web-preview: content pipeline CRASHED: {reason}");
+        if let Some(backtrace) = backtrace {
+            eprintln!("{backtrace}");
+        }
+    }
+
+    fn show_console_message(
+        &self,
+        _webview: WebView,
+        level: servo::ConsoleLogLevel,
+        message: String,
+    ) {
+        if debug_enabled() {
+            eprintln!("mde-web-preview[debug]: console {level:?}: {message}");
+        }
+    }
 }
 
 /// One embedded, sandboxed Servo tab rendering offscreen.
@@ -115,6 +181,8 @@ pub struct Engine {
     shared: Rc<Shared>,
     width: u32,
     height: u32,
+    /// When the engine booted — the `MDE_WEB_DEBUG` trace timebase.
+    booted: Instant,
 }
 
 impl Engine {
@@ -135,6 +203,11 @@ impl Engine {
             .event_loop_waker(Box::new(HeadlessWaker))
             .build();
         servo.set_delegate(Rc::new(HardenedServoDelegate));
+        if debug_enabled() {
+            // Route Servo's internal `log` records (constellation / paint /
+            // layout) to stderr, filtered by RUST_LOG — the deep-debug seam.
+            servo.setup_logging();
+        }
 
         let shared = Rc::new(Shared::default());
         let target = url::Url::parse(url).with_context(|| format!("parse url {url}"))?;
@@ -154,11 +227,20 @@ impl Engine {
             shared,
             width,
             height,
+            booted: Instant::now(),
         })
     }
 
-    /// Spin the engine until a frame is painted, publish it to `channel`, and
-    /// return. Bounded by `timeout`.
+    /// Spin the engine until the FIRST frame is composited, publish it to
+    /// `channel`, and return. Bounded by `timeout`.
+    ///
+    /// The first composite is generally the PRE-CONTENT one: registering the
+    /// webview sends the root-pipeline display list immediately, and WebRender
+    /// generates a frame of that still-empty scene (the shell-background clear)
+    /// before the page's own display list exists. So this is a liveness /
+    /// warm-up primitive ("the pipeline produces frames"), NOT a content
+    /// capture — for "the page is actually visible in the frame", use
+    /// [`Self::pump_until_content_frame`] (BUG-BROWSER-6).
     ///
     /// # Errors
     /// Fails if no frame is produced before `timeout`, or the read-back /
@@ -168,25 +250,73 @@ impl Engine {
         loop {
             self.servo.spin_event_loop();
 
-            if self.shared.frame_ready.replace(false) {
-                self.webview.paint();
-                // Read back BEFORE present(): read_to_image reads the context's
-                // BOUND (back) buffer, and present() swaps in an unpreserved one
-                // (PreserveBuffer::No) — a post-present read returns the empty /
-                // one-frame-stale buffer, never the frame paint() just rendered
-                // (the live "browser renders all-black" bug, 2026-07-05).
-                let pixels = self.read_back()?;
-                self.rendering_context.present();
-                if let Some(pixels) = pixels {
-                    channel
-                        .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
-                        .context("publish frame to shm")?;
-                    return Ok(());
-                }
+            if self.shared.frame_ready.replace(false) && self.capture_frame(channel, "first")? {
+                return Ok(());
             }
 
             if Instant::now() >= deadline {
                 anyhow::bail!("timed out after {timeout:?} waiting for the first frame");
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+    }
+
+    /// Spin the engine until the page has finished loading AND its content has
+    /// composited, publishing every captured frame to `channel` (the newest
+    /// frame wins on the seqlock channel). Bounded by `timeout`.
+    ///
+    /// Why not the first frame (BUG-BROWSER-6): the FIRST
+    /// `notify_new_frame_ready` predates layout — it announces the frame
+    /// WebRender generated for the initial, still-EMPTY root scene
+    /// (`Painter::clear_background()` + no content pipeline), which reads back
+    /// as a uniform shell-background frame no matter what the page contains.
+    /// Content arrives on a LATER frame-ready once script/layout ship the
+    /// page's display list. So: pump (publishing frames as they come) until
+    /// `LoadStatus::Complete`, keep pumping through a short settle window (the
+    /// content scene is built asynchronously), then force one final composite —
+    /// `paint()` renders the newest frame WebRender holds, so even a missed
+    /// frame-ready cannot leave a stale capture as the channel's latest.
+    ///
+    /// # Errors
+    /// Fails if nothing could be captured before `timeout`, or the read-back /
+    /// publish fails. If frames were published but the load never completed
+    /// (heavy pages that never report `Complete`), returns `Ok` — the newest
+    /// frame is on the channel, the same degrade the tab serve loop uses.
+    pub fn pump_until_content_frame(
+        &self,
+        channel: &FrameChannel,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut published = false;
+        let mut load_seen_at: Option<Instant> = None;
+        loop {
+            self.servo.spin_event_loop();
+
+            if self.shared.frame_ready.replace(false) {
+                published |= self.capture_frame(channel, "content-pump")?;
+            }
+
+            if load_seen_at.is_none() && self.shared.load_complete.get() {
+                load_seen_at = Some(Instant::now());
+            }
+
+            if let Some(at) = load_seen_at {
+                if at.elapsed() >= POST_LOAD_SETTLE {
+                    self.shared.frame_ready.set(false);
+                    published |= self.capture_frame(channel, "content-final")?;
+                    if published {
+                        return Ok(());
+                    }
+                    anyhow::bail!("no frame could be read back after load completion");
+                }
+            }
+
+            if Instant::now() >= deadline {
+                if published {
+                    return Ok(());
+                }
+                anyhow::bail!("timed out after {timeout:?} waiting for a content frame");
             }
             std::thread::sleep(Duration::from_millis(4));
         }
@@ -201,16 +331,7 @@ impl Engine {
     pub fn pump_step(&self, channel: &FrameChannel) -> Result<bool> {
         self.servo.spin_event_loop();
         if self.shared.frame_ready.replace(false) {
-            self.webview.paint();
-            // Read back BEFORE present() — see `pump_until_frame`.
-            let pixels = self.read_back()?;
-            self.rendering_context.present();
-            if let Some(pixels) = pixels {
-                channel
-                    .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
-                    .context("publish frame to shm")?;
-                return Ok(true);
-            }
+            return self.capture_frame(channel, "step");
         }
         Ok(false)
     }
@@ -234,17 +355,128 @@ impl Engine {
         // Consume any pending ready flag so a follow-up `pump_step` does not
         // re-publish this same frame as a "new" paint.
         self.shared.frame_ready.set(false);
+        self.capture_frame(channel, "forced")
+    }
+
+    /// Composite the current WebRender frame and publish it to `channel`:
+    /// `paint()`, read the pixels back, `present()`, emit. Returns whether a
+    /// frame was actually published (read-back can still be empty before the
+    /// very first paint). All pump paths funnel through here so the ordering
+    /// invariant and the `MDE_WEB_DEBUG` trace live in ONE place.
+    ///
+    /// Read back BEFORE `present()`: `read_to_image` reads the context's BOUND
+    /// (back) buffer, and `present()` swaps in an unpreserved one
+    /// (`PreserveBuffer::No`) — a post-present read returns the empty /
+    /// one-frame-stale buffer, never the frame `paint()` just rendered (the
+    /// live "browser renders all-black" bug, 2026-07-05).
+    fn capture_frame(&self, channel: &FrameChannel, tag: &str) -> Result<bool> {
         self.webview.paint();
-        // Read back BEFORE present() — see `pump_until_frame`.
         let pixels = self.read_back()?;
         self.rendering_context.present();
-        if let Some(pixels) = pixels {
-            channel
-                .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
-                .context("publish forced frame to shm")?;
-            return Ok(true);
+        let Some(pixels) = pixels else {
+            self.debug_trace(tag, None, channel);
+            return Ok(false);
+        };
+        channel
+            .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
+            .context("publish frame to shm")?;
+        self.debug_trace(tag, Some(&pixels), channel);
+        Ok(true)
+    }
+
+    /// `MDE_WEB_DEBUG` per-capture trace: when the capture happened, which pump
+    /// path produced it, whether the load had completed, and whether the pixels
+    /// carry content (distinct byte values + mean luma). Stats are computed
+    /// only when tracing is on.
+    fn debug_trace(&self, tag: &str, pixels: Option<&[u8]>, channel: &FrameChannel) {
+        if !debug_enabled() {
+            return;
         }
-        Ok(false)
+        let elapsed = self.booted.elapsed().as_millis();
+        let load = self.shared.load_complete.get();
+        if let Some(px) = pixels {
+            let (distinct, mean_luma) = frame_stats(px);
+            eprintln!(
+                "mde-web-preview[debug]: +{elapsed}ms {tag} seq={} load_complete={load} \
+                 distinct={distinct} mean_luma={mean_luma:.1}",
+                channel.sequence(),
+            );
+        } else {
+            eprintln!(
+                "mde-web-preview[debug]: +{elapsed}ms {tag} read_back=empty load_complete={load}"
+            );
+        }
+    }
+
+    /// BUG-BROWSER-6 debug probes (`MDE_WEB_DEBUG` only, no-op otherwise):
+    /// interrogate the live page and Servo's own screenshot pipeline to locate
+    /// where content stops flowing.
+    ///
+    /// * The JS probe proves whether script is alive and what the page THINKS
+    ///   its state is (`visibilityState`, viewport, body geometry, computed
+    ///   background) — a hidden/zero-sized document explains a skipped render.
+    /// * The screenshot probe drives Servo's own readiness pipeline (load +
+    ///   render-blocking + fonts + display lists uploaded + frame ready) and
+    ///   reads the composite back independently of our capture path: content
+    ///   here but not in `capture_frame` = our read is broken; a timeout here =
+    ///   the pipelines never produced render-ready display lists at all.
+    pub fn debug_content_probe(&self, timeout: Duration) {
+        if !debug_enabled() {
+            return;
+        }
+        let booted = self.booted;
+        self.webview.evaluate_javascript(
+            "[document.visibilityState, document.hidden, \
+              window.innerWidth+'x'+window.innerHeight, \
+              document.body && document.body.getBoundingClientRect().width+'x'+\
+              document.body.getBoundingClientRect().height, \
+              getComputedStyle(document.body).backgroundColor].join(' | ')",
+            move |result| {
+                eprintln!(
+                    "mde-web-preview[debug]: +{}ms js-probe: {result:?}",
+                    booted.elapsed().as_millis()
+                );
+            },
+        );
+
+        let screenshot_done: Rc<Cell<bool>> = Rc::default();
+        let done = screenshot_done.clone();
+        self.webview.take_screenshot(None, move |result| {
+            let elapsed = booted.elapsed().as_millis();
+            match result {
+                Ok(image) => {
+                    let pixels = image.into_raw();
+                    let (distinct, mean_luma) = frame_stats(&pixels);
+                    eprintln!(
+                        "mde-web-preview[debug]: +{elapsed}ms screenshot \
+                         distinct={distinct} mean_luma={mean_luma:.1}"
+                    );
+                }
+                Err(error) => {
+                    eprintln!("mde-web-preview[debug]: +{elapsed}ms screenshot FAILED: {error:?}");
+                }
+            }
+            done.set(true);
+        });
+
+        let deadline = Instant::now() + timeout;
+        while !screenshot_done.get() && Instant::now() < deadline {
+            self.servo.spin_event_loop();
+            if self.shared.frame_ready.replace(false) {
+                // The screenshot pipeline needs composites to drain its pending
+                // frames — paint like the serve loop would.
+                self.webview.paint();
+                let _ = self.read_back();
+                self.rendering_context.present();
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        if !screenshot_done.get() {
+            eprintln!(
+                "mde-web-preview[debug]: screenshot probe TIMED OUT after {timeout:?} — \
+                 the pipelines never reported render-ready display lists"
+            );
+        }
     }
 
     /// Read the whole framebuffer back into an RGBA byte buffer, if painted.
