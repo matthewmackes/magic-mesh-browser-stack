@@ -166,6 +166,35 @@ impl WebSession {
                 }
             }
         }
+        // Layer-A shm fallback (belt + self-heal): promote a fresh frame straight
+        // from the mapped region's seqlock sequence, independent of a `PaintReady`
+        // signal. This decouples going Live from paint-ready timing and self-heals
+        // the ordering hazard where a `PaintReady` arrived BEFORE `AttachFrame`
+        // mapped the reader (so its upload was skipped). Without it, a helper whose
+        // paint-ready is early, dropped, or slow would leave the surface stuck on
+        // "Loading the page…" forever even though a real frame is already published.
+        self.promote_from_shm_sequence();
+    }
+
+    /// If the mapped reader's published sequence advanced past what we last
+    /// uploaded, take that frame — the shm-sequence path to Live that does not
+    /// depend on a `PaintReady`. A no-op before the fd is attached, before the
+    /// first published frame, or when the last `PaintReady` already uploaded it.
+    fn promote_from_shm_sequence(&mut self) {
+        let Some(reader) = self.reader.as_ref() else {
+            return;
+        };
+        let seq = reader.sequence();
+        // Zero = nothing published yet; odd = writer mid-frame; equal = already
+        // uploaded (by a `PaintReady` or an earlier fallback).
+        if seq == 0 || seq % 2 != 0 || seq == self.last_seq {
+            return;
+        }
+        if let Some(snap) = reader.snapshot() {
+            self.pending = Some(snap.to_color_image());
+            self.last_seq = seq;
+            self.state = SessionState::Live;
+        }
     }
 
     /// Parse and dispatch every complete frame buffered so far.
@@ -586,6 +615,96 @@ mod tests {
         assert!(session.take_frame().is_none());
         assert_eq!(session.nav().url, "about:blank");
         assert_eq!(session.title(), "about:blank");
+    }
+
+    #[test]
+    fn a_mapped_frame_without_paint_ready_still_goes_live() {
+        // Layer-A: the helper attaches the shm fd + publishes a frame but NEVER
+        // sends a PaintReady. The session must still upload the frame and go Live
+        // from the seqlock sequence alone (the fix for a helper whose paint-ready
+        // is dropped/slow — the "stuck on Loading the page…" class of bug).
+        use crate::frame::PixelFormat;
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        let writer =
+            testkit::FrameWriter::create(testkit::FAKE_W, testkit::FAKE_H).expect("shm writer");
+        writer
+            .emit(
+                testkit::FAKE_W,
+                testkit::FAKE_H,
+                PixelFormat::Rgba8,
+                &testkit::gradient(testkit::FAKE_W, testkit::FAKE_H),
+            )
+            .expect("emit a frame");
+        // Attach the fd — but send NO PaintReady.
+        scm::send_frame_with_fd(&helper, &EventMsg::AttachFrame.encode(), writer.raw_fd())
+            .expect("attach fd");
+
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.poll();
+
+        assert_eq!(
+            session.state(),
+            &SessionState::Live,
+            "the shm-sequence fallback must promote to Live without a PaintReady"
+        );
+        let img = session
+            .take_frame()
+            .expect("a frame is available via the shm fallback");
+        assert_eq!(
+            img.size,
+            [testkit::FAKE_W as usize, testkit::FAKE_H as usize]
+        );
+        // Keep the writer + helper end alive until the frame has been read.
+        drop(helper);
+        drop(writer);
+    }
+
+    #[test]
+    fn a_paint_ready_before_attach_frame_still_reaches_live() {
+        // The ordering hazard: PaintReady arrives BEFORE the fd is attached, so the
+        // reader is still None and its upload is skipped. When AttachFrame then maps
+        // the reader, Layer-A must self-heal and promote the already-published frame.
+        use crate::frame::PixelFormat;
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        let writer =
+            testkit::FrameWriter::create(testkit::FAKE_W, testkit::FAKE_H).expect("shm writer");
+        writer
+            .emit(
+                testkit::FAKE_W,
+                testkit::FAKE_H,
+                PixelFormat::Rgba8,
+                &testkit::gradient(testkit::FAKE_W, testkit::FAKE_H),
+            )
+            .expect("emit a frame");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+
+        // PaintReady FIRST — no reader yet, so it must not go Live or lose the frame.
+        send_event(
+            &helper,
+            &EventMsg::PaintReady {
+                seq: writer.sequence(),
+            },
+        );
+        session.poll();
+        assert_ne!(
+            session.state(),
+            &SessionState::Live,
+            "an early PaintReady with no mapped reader must not go Live"
+        );
+        assert!(session.take_frame().is_none(), "nothing uploaded yet");
+
+        // Now the fd attaches; Layer-A promotes from the live shm sequence.
+        scm::send_frame_with_fd(&helper, &EventMsg::AttachFrame.encode(), writer.raw_fd())
+            .expect("attach fd");
+        session.poll();
+        assert_eq!(
+            session.state(),
+            &SessionState::Live,
+            "AttachFrame + a live shm sequence self-heals the early PaintReady"
+        );
+        assert!(session.take_frame().is_some(), "the frame is now uploaded");
+        drop(helper);
+        drop(writer);
     }
 
     #[test]

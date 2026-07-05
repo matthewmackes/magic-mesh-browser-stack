@@ -19,6 +19,18 @@
 pub mod engine;
 pub mod sandbox;
 pub mod shm;
+pub mod sock;
+
+// The socket wire contract (`ControlMsg`/`EventMsg` + the length-prefix framing)
+// is SHARED with `mde-web-preview-client` by `#[path]`-including its ONE source
+// file here, so the byte encodings on the BOOKMARKS-6 seam have a single source of
+// truth and cannot silently drift. This excluded crate can't *depend* on the
+// client crate (it is its own workspace root — see the manifest), but it CAN
+// compile the same file: the format, not the crate, is shared. The bytes are
+// additionally pinned by `tests/protocol_golden.rs` (mirrored in the client's
+// `wire` tests), so an accidental un-share would break a golden, not ship quietly.
+#[path = "../../mde-web-preview-client/src/wire.rs"]
+pub mod wire;
 
 pub use engine::{secure_preferences, Engine, GENERIC_USER_AGENT};
 pub use sandbox::SandboxPolicy;

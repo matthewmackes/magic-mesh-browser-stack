@@ -69,7 +69,10 @@ servo = { version = "0.3", default-features = false, features = ["baked-in-resou
 
 # --- OS sandbox (Linux syscalls; unsafe confined to sandbox.rs) ---
 # Safe wrappers for unshare/mount/pivot_root/prctl/sethostname/uid-gid-maps.
-nix = { version = "0.29", features = ["sched", "mount", "user", "process", "fs", "hostname", "signal", "mman"] }
+# `socket` + `uio` = the `sendmsg`/`recvmsg` `SCM_RIGHTS` fd hand-off + framed
+# control/event I/O over the per-session socket (the helper end of BOOKMARKS-6,
+# in `sock.rs`) — the SAME features + version the client maps the read side with.
+nix = { version = "0.29", features = ["sched", "mount", "user", "process", "fs", "hostname", "signal", "mman", "socket", "uio"] }
 # Raw constants + the couple of syscalls nix doesn't wrap (seccomp install path).
 libc = "0.2"
 # seccomp-bpf: build the syscall-allowlist BPF program (Firecracker's pure-Rust

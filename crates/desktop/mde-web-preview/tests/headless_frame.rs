@@ -48,4 +48,38 @@ fn about_blank_produces_a_frame_on_the_shm_channel() {
         !stdout.contains("bytes=0"),
         "the frame was empty.\nstdout={stdout}"
     );
+    // The render aid: distinct-byte + mean-luma stats ride the FRAME_OK line.
+    assert!(
+        stdout.contains("distinct=") && stdout.contains("mean_luma="),
+        "the render-once content stats are missing.\nstdout={stdout}"
+    );
+
+    // force_emit acceptance: the watchdog path publishes a frame with NO fresh
+    // frame-ready, advancing the shm sequence past the first paint. This is the
+    // same code path the `tab` serve loop's first-frame watchdog uses to guarantee
+    // a slow/heavy page never leaves the shell stuck on "Loading the page…".
+    let frame_seq = seq_after(&stdout, "FRAME_OK").expect("a FRAME_OK seq");
+    let force_seq = seq_after(&stdout, "FORCE_OK");
+    assert!(
+        force_seq.is_some(),
+        "force_emit did not publish a FORCE_OK line.\nstdout={stdout}"
+    );
+    let force_seq = force_seq.expect("asserted Some above");
+    assert!(
+        force_seq > frame_seq,
+        "force_emit did not advance the sequence: FRAME_OK seq={frame_seq}, FORCE_OK seq={force_seq}\nstdout={stdout}"
+    );
+    assert_eq!(
+        force_seq % 2,
+        0,
+        "a published (stable) sequence must be even"
+    );
+}
+
+/// Parse the `seq=<n>` value out of the line beginning with `tag` in `stdout`.
+fn seq_after(stdout: &str, tag: &str) -> Option<u64> {
+    let line = stdout.lines().find(|l| l.trim_start().starts_with(tag))?;
+    let rest = line.split("seq=").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }

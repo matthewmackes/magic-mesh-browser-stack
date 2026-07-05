@@ -207,6 +207,36 @@ impl Engine {
         Ok(false)
     }
 
+    /// Force a frame onto `channel` WITHOUT waiting for a fresh
+    /// `notify_new_frame_ready` — the tab serve loop's first-frame watchdog.
+    ///
+    /// Some pages (heavy SPAs, ad-laden sites) paint but are slow to signal a
+    /// frame-ready / never report `LoadStatus::Complete`, so a delivery keyed
+    /// purely on `notify_new_frame_ready` can leave the shell stuck on "Loading
+    /// the page…" indefinitely. This spins the loop once, then paints, presents,
+    /// reads the framebuffer back, and publishes it regardless of the ready flag,
+    /// so the shell always gets *a* frame (and goes Live). Returns whether a frame
+    /// was actually published (read-back can still be empty before the very first
+    /// paint). Keyed on a delivered frame, never on load completion.
+    ///
+    /// # Errors
+    /// Fails only if the read-back / publish fails.
+    pub fn force_emit(&self, channel: &FrameChannel) -> Result<bool> {
+        self.servo.spin_event_loop();
+        // Consume any pending ready flag so a follow-up `pump_step` does not
+        // re-publish this same frame as a "new" paint.
+        self.shared.frame_ready.set(false);
+        self.webview.paint();
+        self.rendering_context.present();
+        if let Some(pixels) = self.read_back()? {
+            channel
+                .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
+                .context("publish forced frame to shm")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Read the whole framebuffer back into an RGBA byte buffer, if painted.
     fn read_back(&self) -> Result<Option<Vec<u8>>> {
         let rect = Box2D::new(

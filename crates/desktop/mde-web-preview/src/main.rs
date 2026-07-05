@@ -24,16 +24,29 @@
 //! no analytics — only the page the user navigates to is fetched.
 
 use std::io::Write;
-use std::time::Duration;
+use std::os::fd::FromRawFd;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use mde_web_preview::engine::Engine;
 use mde_web_preview::sandbox::{self, SandboxPolicy};
 use mde_web_preview::shm::FrameChannel;
+use mde_web_preview::sock::{self, RecvOutcome};
+use mde_web_preview::wire::{self, ControlMsg, EventMsg};
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the `tab` serve loop waits for a natural first paint before the
+/// first-frame watchdog force-emits a frame anyway (so a slow/heavy page cannot
+/// leave the shell stuck on "Loading the page…").
+const FIRST_FRAME_WATCHDOG: Duration = Duration::from_millis(750);
+
+/// The session socket the shell hands the `tab` child as its stdin (fd 0) — see
+/// `mde-web-preview-client`'s `WebSession::spawn`.
+const SESSION_SOCKET_FD: std::os::fd::RawFd = 0;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -73,33 +86,192 @@ fn render_once(args: &[String]) -> Result<()> {
     let frame = channel
         .read_latest()
         .context("no frame on the shm channel after render")?;
+    // Render-once is the headless DoD path AND the eyes-on render aid: alongside
+    // the geometry, report cheap content stats (distinct byte values + mean luma)
+    // so a caller can tell a real render from a blank/white frame without a PNG
+    // decoder — useful when deciding whether a Servo-compat follow-up is needed.
+    let (distinct, mean_luma) = frame_stats(&frame.pixels);
     println!(
-        "FRAME_OK {}x{} seq={} bytes={}",
+        "FRAME_OK {}x{} seq={} bytes={} distinct={distinct} mean_luma={mean_luma:.1}",
         frame.width,
         frame.height,
         channel.sequence(),
-        frame.pixels.len()
+        frame.pixels.len(),
     );
+
+    // Exercise the watchdog path in the real binary (the crate's engine-exercise
+    // idiom is the separate-process self-test, since Servo is one-instance-per-
+    // process): force a frame with no fresh frame-ready and confirm the shm
+    // sequence advances. `FORCE_OK` is the force_emit acceptance signal.
+    if engine.force_emit(&channel).context("force emit")? {
+        println!("FORCE_OK seq={}", channel.sequence());
+    }
     Ok(())
 }
 
-/// The production per-tab process: sandbox, then serve frames continuously.
+/// Cheap content stats over an RGBA frame: how many distinct byte values appear,
+/// and the mean luma (Rec. 601). A blank/white frame reads as `distinct` ~1–2 and
+/// `mean_luma` ~255; a real render spreads both.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "a pixel count fits an f64 mantissa exactly at these frame sizes, and the \
+              readable weighted-sum form is fine for a diagnostic luma stat (no mul_add)"
+)]
+fn frame_stats(pixels: &[u8]) -> (usize, f64) {
+    let mut seen = [false; 256];
+    for &b in pixels {
+        seen[b as usize] = true;
+    }
+    let distinct = seen.iter().filter(|&&s| s).count();
+    let mut luma_sum = 0.0f64;
+    let pixel_count = pixels.len() / 4;
+    for px in pixels.chunks_exact(4) {
+        luma_sum += 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
+    }
+    let mean_luma = if pixel_count == 0 {
+        0.0
+    } else {
+        luma_sum / pixel_count as f64
+    };
+    (distinct, mean_luma)
+}
+
+/// The production per-tab process: sandbox, then speak the BOOKMARKS-6 socket
+/// protocol — attach the shm fd, apply the shell's control frames, and signal each
+/// delivered frame with a `PaintReady` (the shell goes Live on the first one).
 fn run_tab(args: &[String]) -> Result<()> {
     let url = flag(args, "--url").context("tab mode requires --url")?;
     let (width, height) = dimensions(args)?;
 
-    // Confine BEFORE touching any web content.
+    // Confine BEFORE touching any web content. `apply` forks (CLONE_NEWPID): all
+    // socket + channel work below runs in the CONFINED CHILD, so the AttachFrame fd
+    // send targets the right process (a pre-fork send would ride the supervisor).
     sandbox::apply(SandboxPolicy::tab()).context("apply sandbox")?;
 
+    // The shell handed us the session socket as our stdin (fd 0). Take sole
+    // ownership of it — nothing else in `tab` mode reads stdin — and drive it
+    // non-blocking so the serve loop never stalls on a quiet shell.
+    // SAFETY: in `tab` mode fd 0 is the connected `AF_UNIX` session socket the
+    // shell passed via `Command::stdin`; we own it exclusively for this process.
+    let socket = unsafe { UnixStream::from_raw_fd(SESSION_SOCKET_FD) };
+    socket
+        .set_nonblocking(true)
+        .context("session socket non-blocking")?;
+
     let channel = FrameChannel::create(width, height).context("create shm channel")?;
-    // The fd BOOKMARKS-6 receives over the session socket (SCM_RIGHTS).
-    println!("SHM_FD {}", channel.as_raw_fd());
+    // Hand the shm frame-region fd to the shell ONCE via SCM_RIGHTS, so it maps the
+    // reader before any frame — the shell's Live gate needs the mapping in place.
+    sock::send_frame_with_fd(
+        &socket,
+        &EventMsg::AttachFrame.encode(),
+        channel.as_raw_fd(),
+    )
+    .context("attach frame fd")?;
 
     let engine = Engine::new_headless(width, height, &url).context("boot engine")?;
+    // Announce the committed URL so the chrome's address bar reflects it (the
+    // ad-filter first-party is (re)anchored on this too, BOOKMARKS-7).
+    announce_nav(&socket, &url, false);
+
+    let mut rbuf: Vec<u8> = Vec::new();
+    let started = Instant::now();
+    let mut first_frame_sent = false;
     loop {
-        let _painted = engine.pump_step(&channel).context("serve frame")?;
+        // (a) Apply every pending control frame the shell sent.
+        match sock::recv(&socket) {
+            Ok(RecvOutcome::Data { bytes, .. }) => {
+                rbuf.extend_from_slice(&bytes);
+                loop {
+                    match wire::take_frame(&mut rbuf) {
+                        Ok(Some(payload)) => {
+                            if let Ok(msg) = ControlMsg::decode(&payload) {
+                                apply_control(&engine, &socket, &msg);
+                            }
+                        }
+                        Ok(None) => break,
+                        // A corrupt length prefix from our own shell is not
+                        // recoverable — stop serving (the shell reads a crash).
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+            Ok(RecvOutcome::WouldBlock) => {}
+            // The shell closed the socket (tab closed) — exit cleanly.
+            Ok(RecvOutcome::Eof) | Err(_) => return Ok(()),
+        }
+
+        // (b) Spin one step; publish a frame if the engine painted one.
+        let painted = engine.pump_step(&channel).context("serve frame")?;
+
+        // (c) First-frame watchdog: if nothing has been delivered yet and the grace
+        //     window elapsed, force a frame so a slow/heavy page (which may never
+        //     fire a prompt frame-ready) cannot hang the shell on "Loading…". Keyed
+        //     on a delivered frame, NEVER on `load_complete()`.
+        let forced = if !first_frame_sent && !painted && started.elapsed() >= FIRST_FRAME_WATCHDOG {
+            engine.force_emit(&channel).context("watchdog force emit")?
+        } else {
+            false
+        };
+
+        // (d) Signal paint-ready on any delivered frame — the FIRST one makes the
+        //     shell go Live and stop showing "Loading the page…".
+        if painted || forced {
+            first_frame_sent = true;
+            // A send failure means the shell is gone; stop serving.
+            if sock::send_frame(
+                &socket,
+                &EventMsg::PaintReady {
+                    seq: channel.sequence(),
+                }
+                .encode(),
+            )
+            .is_err()
+            {
+                return Ok(());
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(8));
     }
+}
+
+/// Apply one control frame from the shell to the engine. Navigation is wired to the
+/// engine's existing methods; `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters`
+/// are decoded (so the framed stream stays in sync) but not yet acted on — the
+/// engine has no live-resize / input-injection hook yet, and the ad-filter runs
+/// shell-side. Wiring those is the BOOKMARKS interactive follow-up.
+fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
+    match msg {
+        ControlMsg::Load(url) => {
+            if engine.load(url).is_ok() {
+                announce_nav(socket, url, true);
+            }
+        }
+        ControlMsg::Reload => engine.reload(),
+        ControlMsg::Back => engine.go_back(1),
+        ControlMsg::Forward => engine.go_forward(1),
+        ControlMsg::Resize { .. }
+        | ControlMsg::Input(_)
+        | ControlMsg::ResourceVerdict { .. }
+        | ControlMsg::CosmeticFilters(_) => {}
+    }
+}
+
+/// Push a best-effort nav-state so the chrome's address bar shows the committed
+/// URL. History-edge flags are unknown to this minimal serve loop, so they are
+/// reported conservatively as `false`; `loading` toggles on navigation.
+fn announce_nav(socket: &UnixStream, url: &str, loading: bool) {
+    let _ = sock::send_frame(
+        socket,
+        &EventMsg::NavState {
+            can_back: false,
+            can_forward: false,
+            loading,
+            url: url.to_owned(),
+        }
+        .encode(),
+    );
 }
 
 /// The warm helper: pre-initialise the engine, then wait for the first URL.
