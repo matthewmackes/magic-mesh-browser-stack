@@ -170,8 +170,14 @@ impl Engine {
 
             if self.shared.frame_ready.replace(false) {
                 self.webview.paint();
+                // Read back BEFORE present(): read_to_image reads the context's
+                // BOUND (back) buffer, and present() swaps in an unpreserved one
+                // (PreserveBuffer::No) — a post-present read returns the empty /
+                // one-frame-stale buffer, never the frame paint() just rendered
+                // (the live "browser renders all-black" bug, 2026-07-05).
+                let pixels = self.read_back()?;
                 self.rendering_context.present();
-                if let Some(pixels) = self.read_back()? {
+                if let Some(pixels) = pixels {
                     channel
                         .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
                         .context("publish frame to shm")?;
@@ -196,8 +202,10 @@ impl Engine {
         self.servo.spin_event_loop();
         if self.shared.frame_ready.replace(false) {
             self.webview.paint();
+            // Read back BEFORE present() — see `pump_until_frame`.
+            let pixels = self.read_back()?;
             self.rendering_context.present();
-            if let Some(pixels) = self.read_back()? {
+            if let Some(pixels) = pixels {
                 channel
                     .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
                     .context("publish frame to shm")?;
@@ -227,8 +235,10 @@ impl Engine {
         // re-publish this same frame as a "new" paint.
         self.shared.frame_ready.set(false);
         self.webview.paint();
+        // Read back BEFORE present() — see `pump_until_frame`.
+        let pixels = self.read_back()?;
         self.rendering_context.present();
-        if let Some(pixels) = self.read_back()? {
+        if let Some(pixels) = pixels {
             channel
                 .emit(self.width, self.height, PixelFormat::Rgba8, &pixels)
                 .context("publish forced frame to shm")?;
@@ -238,6 +248,14 @@ impl Engine {
     }
 
     /// Read the whole framebuffer back into an RGBA byte buffer, if painted.
+    ///
+    /// MUST be called after `webview.paint()` and BEFORE
+    /// `rendering_context.present()`: `SoftwareRenderingContext::read_to_image`
+    /// reads the context's currently BOUND (back) surface, and `present()` is a
+    /// surfman swap-chain `swap_buffers(PreserveBuffer::No)` — after it, the bound
+    /// surface is an unpreserved recycled/new buffer (all zeros on the first swap,
+    /// one frame stale after), so a post-present read can never observe the frame
+    /// that was just painted.
     fn read_back(&self) -> Result<Option<Vec<u8>>> {
         let rect = Box2D::new(
             Point2D::new(0, 0),
