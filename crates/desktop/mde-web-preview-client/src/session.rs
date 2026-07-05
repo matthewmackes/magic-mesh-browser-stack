@@ -363,6 +363,26 @@ impl WebSession {
     }
 }
 
+impl Drop for WebSession {
+    /// Reap the live helper child on teardown so a dropped session never leaks an
+    /// orphaned `mde-web-preview` process. `std::process::Child`'s own drop
+    /// deliberately does **not** signal the child (it detaches it) — which is how
+    /// orphaned `tab` helper pairs accumulated live (BUG-BROWSER-4) across shell
+    /// restarts, closed tabs, and respawn-on-reload swaps that drop the old
+    /// session. So this KILLs then WAITs: `kill` stops a still-running helper and
+    /// `wait` reaps it (leaving no zombie either — an already-exited child was
+    /// reaped by [`Self::poll`]'s `try_wait`, so `wait` is then a cheap cached
+    /// read). Best-effort: an already-gone child makes `kill` error, which is the
+    /// goal state and is ignored, and `wait` never blocks on a reaped pid. A
+    /// test / fake-helper session carries no child and this is a no-op.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Everything the live spawn needs to launch the sandboxed helper (`live-helper`).
 #[cfg(feature = "live-helper")]
 #[derive(Debug, Clone)]
@@ -759,5 +779,61 @@ mod tests {
         session.send_input(&egui::Event::PointerMoved(egui::pos2(1.0, 2.0)), 2.0);
         session.reload();
         assert!(session.is_crashed());
+    }
+
+    // ── BUG-BROWSER-4: the Drop reaps the live helper child (no orphan/zombie) ──
+
+    /// Whether `pid` still has a process-table entry (Linux `/proc` — the platform
+    /// this shell runs on). A live orphan keeps its `/proc/<pid>`; so does a
+    /// killed-but-unwaited zombie — so a *missing* entry proves it was killed AND
+    /// reaped.
+    fn pid_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn drop_reaps_the_live_helper_child_leaving_no_orphan() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Servo (the real helper) isn't spawnable in-test, so a long-lived `sleep`
+        // stands in for the sandboxed helper child: its pid is unambiguously alive
+        // until something reaps it. Wired into the session exactly as the live
+        // spawn does — `from_stream(socket, Some(child))`.
+        let (shell, _helper) = UnixStream::pair().expect("socketpair");
+        let child = Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn a stand-in helper child");
+        let pid = child.id();
+        assert!(pid_alive(pid), "the stand-in helper should be running");
+
+        let session = WebSession::from_stream(shell, Some(child)).expect("session");
+        drop(session); // the Drop under test: kill + wait
+
+        // The child is gone from the process table: a leaked orphan would still be
+        // running `sleep 600`, and a killed-but-unwaited zombie would still hold
+        // its `/proc` entry — both keep the path present. `wait` in Drop is
+        // synchronous, so this settles at once; the short poll only guards against
+        // scheduler jitter.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut gone = !pid_alive(pid);
+        while !gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            gone = !pid_alive(pid);
+        }
+        assert!(
+            gone,
+            "the helper child leaked past the session drop (orphan or zombie)"
+        );
+    }
+
+    #[test]
+    fn dropping_a_childless_session_is_a_safe_no_op() {
+        // A test / fake-helper session carries `child: None`; its Drop must not
+        // panic or block — there is nothing to reap.
+        let (shell, _peer) = UnixStream::pair().expect("socketpair");
+        let session = WebSession::from_stream(shell, None).expect("session");
+        drop(session);
     }
 }
