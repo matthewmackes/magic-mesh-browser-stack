@@ -1,0 +1,15 @@
+[Unit]
+Description=MCNF - install the pinned Chromium/CEF browser runtime (BROWSER-DD-1)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/bin/mde-web-cef
+ConditionPathExists=!/opt/mde/cef/Release/libcef.so
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/install-cef-runtime
+
+[Install]
+WantedBy=multi-user.target

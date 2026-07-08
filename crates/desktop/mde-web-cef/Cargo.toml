@@ -1,0 +1,54 @@
+# mde-web-cef — the out-of-process Chromium/CEF browser helper (BROWSER-DD-1).
+#
+# This is a separate workspace root like `mde-web-preview`: the Chromium runtime
+# is a vendored native payload managed by the build farm, not a dependency of the
+# daemon workspace. The first slice establishes the binary, CLI, runtime gate, and
+# shared BOOKMARKS-6 wire protocol. Actual CEF offscreen rendering lands once the
+# farm has a pinned CEF bundle to link and package.
+[workspace]
+
+[package]
+name = "mde-web-cef"
+description = "BROWSER-DD-1 — Chromium/CEF helper scaffold for the first-class platform browser."
+version = "12.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+authors = ["Matthew Mackes <matthewmackes@gmail.com>"]
+repository = "https://github.com/matthewmackes/magic-mesh"
+
+[[bin]]
+name = "mde-web-cef"
+path = "src/main.rs"
+
+[[bin]]
+name = "mde-web-cef-renderer"
+path = "src/renderer.rs"
+
+[lib]
+name = "mde_web_cef"
+path = "src/lib.rs"
+
+[dependencies]
+# Direct dynamic-loader/CEF ABI calls (`dlopen`, `dlsym`, `dlclose`) for the
+# bridge. Kept explicit rather than relying on nix's transitive libc edge.
+libc = "0.2"
+# Native bridge plumbing for the BOOKMARKS-6 shm + SCM_RIGHTS seam. This is the
+# same syscall surface used by `mde-web-preview`; the CEF crate keeps its own
+# lock because it is workspace-excluded.
+nix = { version = "0.29", features = ["fs", "mman", "socket", "uio"] }
+
+[lints.rust]
+# The Chromium bridge needs small, named syscall modules for mmap/memfd and
+# SCM_RIGHTS fd ownership. Keep unsafe confined there and documented.
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "warn"
+todo = "deny"

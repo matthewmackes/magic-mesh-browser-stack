@@ -1,0 +1,16 @@
+[Unit]
+Description=MCNF - install the optional Widevine CDM for the CEF browser (BROWSER-DD-4)
+After=network-online.target mde-cef-runtime-setup.service
+Wants=network-online.target
+ConditionPathExists=/usr/bin/mde-web-cef
+ConditionPathExists=!/opt/mde/widevine/libwidevinecdm.so
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SuccessExitStatus=78
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/install-widevine-cdm
+
+[Install]
+WantedBy=multi-user.target
