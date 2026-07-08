@@ -219,10 +219,11 @@ fn run_tab(args: &[String]) -> Result<()> {
 }
 
 /// Apply one control frame from the shell to the engine. Navigation is wired to the
-/// engine's existing methods; `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters`
-/// are decoded (so the framed stream stays in sync) but not yet acted on — the
-/// engine has no live-resize / input-injection hook yet, and the ad-filter runs
-/// shell-side. Wiring those is the BOOKMARKS interactive follow-up.
+/// engine's existing methods; zoom/find/force-dark/audio-mute use the helper's
+/// DOM script seam. `Stop`/`Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters`
+/// are decoded (so the framed stream stays in sync) but not yet acted on — Servo
+/// currently exposes no real cancel-load, live-resize, input-injection, or
+/// helper-side ad-filter hook here.
 fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
     match msg {
         ControlMsg::Load(url) => {
@@ -233,10 +234,19 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::Reload => engine.reload(),
         ControlMsg::Back => engine.go_back(1),
         ControlMsg::Forward => engine.go_forward(1),
-        ControlMsg::Resize { .. }
+        ControlMsg::SetZoom { percent } => engine.set_zoom(*percent),
+        ControlMsg::FindInPage { query, backwards } => engine.find_in_page(query, *backwards),
+        ControlMsg::ClearFind => engine.clear_find(),
+        ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
+        ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
+        ControlMsg::SetReaderMode { enabled } => engine.set_reader_mode(*enabled),
+        ControlMsg::PrintPage => engine.print_page(),
+        ControlMsg::Stop
+        | ControlMsg::Resize { .. }
         | ControlMsg::Input(_)
         | ControlMsg::ResourceVerdict { .. }
-        | ControlMsg::CosmeticFilters(_) => {}
+        | ControlMsg::CosmeticFilters(_)
+        | ControlMsg::SavePdf { .. } => {}
     }
 }
 

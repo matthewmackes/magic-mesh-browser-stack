@@ -62,6 +62,15 @@ pub struct NavState {
     pub loading: bool,
 }
 
+/// Result of a helper save-as-PDF request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfSaveStatus {
+    /// The requested output path.
+    pub path: String,
+    /// Whether the helper reported success.
+    pub ok: bool,
+}
+
 /// One driven browser session.
 pub struct WebSession {
     stream: UnixStream,
@@ -76,6 +85,7 @@ pub struct WebSession {
     title: String,
     last_seq: u64,
     pending: Option<ColorImage>,
+    pdf_events: VecDeque<PdfSaveStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
     /// injects a compiled one from the mackesd `adfilter` blob via [`Self::set_filter`].
@@ -103,6 +113,7 @@ impl WebSession {
             title: String::new(),
             last_seq: 0,
             pending: None,
+            pdf_events: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
     }
@@ -271,6 +282,9 @@ impl WebSession {
                     allow: !decision.is_block(),
                 });
             }
+            EventMsg::PdfSaved { path, ok } => {
+                self.pdf_events.push_back(PdfSaveStatus { path, ok })
+            }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
         Ok(())
@@ -285,6 +299,11 @@ impl WebSession {
     /// texture is not re-uploaded every frame).
     pub const fn take_frame(&mut self) -> Option<ColorImage> {
         self.pending.take()
+    }
+
+    /// Drain save-as-PDF completion events reported by the helper.
+    pub fn drain_pdf_events(&mut self) -> Vec<PdfSaveStatus> {
+        self.pdf_events.drain(..).collect()
     }
 
     /// The session's live status.
@@ -322,6 +341,12 @@ impl WebSession {
         self.send(&ControlMsg::Reload);
     }
 
+    /// Stop the current page load.
+    pub fn stop(&mut self) {
+        self.nav.loading = false;
+        self.send(&ControlMsg::Stop);
+    }
+
     /// Go back one history entry.
     pub fn go_back(&mut self) {
         self.send(&ControlMsg::Back);
@@ -330,6 +355,49 @@ impl WebSession {
     /// Go forward one history entry.
     pub fn go_forward(&mut self) {
         self.send(&ControlMsg::Forward);
+    }
+
+    /// Set page zoom to a percentage. `100` is normal size.
+    pub fn set_zoom(&mut self, percent: u16) {
+        self.send(&ControlMsg::SetZoom { percent });
+    }
+
+    /// Find text on the current page.
+    pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool) {
+        self.send(&ControlMsg::FindInPage {
+            query: query.into(),
+            backwards,
+        });
+    }
+
+    /// Clear the page-find selection/highlight where the helper supports it.
+    pub fn clear_find(&mut self) {
+        self.send(&ControlMsg::ClearFind);
+    }
+
+    /// Set whether tab audio is muted.
+    pub fn set_audio_muted(&mut self, muted: bool) {
+        self.send(&ControlMsg::SetAudioMuted { muted });
+    }
+
+    /// Set whether forced-dark styling is enabled for this tab.
+    pub fn set_force_dark(&mut self, enabled: bool) {
+        self.send(&ControlMsg::SetForceDark { enabled });
+    }
+
+    /// Set whether reader-mode styling is enabled for this tab.
+    pub fn set_reader_mode(&mut self, enabled: bool) {
+        self.send(&ControlMsg::SetReaderMode { enabled });
+    }
+
+    /// Ask the helper to print the current page.
+    pub fn print_page(&mut self) {
+        self.send(&ControlMsg::PrintPage);
+    }
+
+    /// Ask the helper to save the current page as a PDF at `path`.
+    pub fn save_pdf(&mut self, path: impl Into<String>) {
+        self.send(&ControlMsg::SavePdf { path: path.into() });
     }
 
     /// Tell the helper the view resized to `width` x `height` device pixels.
@@ -383,11 +451,12 @@ impl Drop for WebSession {
     }
 }
 
-/// Everything the live spawn needs to launch the sandboxed helper (`live-helper`).
+/// Everything the live spawn needs to launch a sandboxed browser helper
+/// (`live-helper`).
 #[cfg(feature = "live-helper")]
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
-    /// Path to the `mde-web-preview` binary.
+    /// Path to the browser helper binary (`mde-web-preview` or `mde-web-cef`).
     pub helper_bin: std::path::PathBuf,
     /// The first URL to load.
     pub url: String,
@@ -399,12 +468,12 @@ pub struct SpawnSpec {
 
 #[cfg(feature = "live-helper")]
 impl WebSession {
-    /// Spawn the real `mde-web-preview` helper and wire it the session socket.
+    /// Spawn the real browser helper and wire it the session socket.
     ///
     /// The helper end is passed as the child's stdin — a connected `AF_UNIX`
     /// socket over which it reads control frames and `SCM_RIGHTS` its shm frame fd
-    /// back. Honest-gated: it needs a GPU seat and the helper's `tab` mode taught
-    /// to speak this socket (the BOOKMARKS-5 follow-up).
+    /// back. Honest-gated by the caller: it needs a GPU seat plus a helper whose
+    /// `tab` mode speaks this socket contract.
     ///
     /// # Errors
     /// Fails if the socketpair or the child process cannot be created.
@@ -609,6 +678,108 @@ mod tests {
         assert_eq!(session.blocked_count(), 0);
     }
 
+    #[test]
+    fn pdf_completion_events_are_queued_for_the_shell() {
+        let (mut session, peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::PdfSaved {
+                path: "/tmp/mde-page.pdf".to_owned(),
+                ok: true,
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(
+            session.drain_pdf_events(),
+            vec![PdfSaveStatus {
+                path: "/tmp/mde-page.pdf".to_owned(),
+                ok: true,
+            }]
+        );
+        assert!(
+            session.drain_pdf_events().is_empty(),
+            "events are drained exactly once"
+        );
+    }
+
+    #[test]
+    fn page_zoom_and_find_controls_are_framed_for_the_helper() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+
+        session.set_zoom(125);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetZoom { percent: 125 }
+        );
+
+        session.find_in_page("mesh", false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::FindInPage {
+                query: "mesh".to_owned(),
+                backwards: false,
+            }
+        );
+
+        session.find_in_page("mesh", true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::FindInPage {
+                query: "mesh".to_owned(),
+                backwards: true,
+            }
+        );
+
+        session.clear_find();
+        assert_eq!(read_control(&mut peer), ControlMsg::ClearFind);
+
+        session.set_audio_muted(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAudioMuted { muted: true }
+        );
+        session.set_audio_muted(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAudioMuted { muted: false }
+        );
+
+        session.set_force_dark(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetForceDark { enabled: true }
+        );
+        session.set_force_dark(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetForceDark { enabled: false }
+        );
+
+        session.set_reader_mode(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetReaderMode { enabled: true }
+        );
+        session.set_reader_mode(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetReaderMode { enabled: false }
+        );
+
+        session.print_page();
+        assert_eq!(read_control(&mut peer), ControlMsg::PrintPage);
+        session.save_pdf("/tmp/mde-page.pdf");
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SavePdf {
+                path: "/tmp/mde-page.pdf".to_owned()
+            }
+        );
+    }
+
     /// Poll until a frame lands (the fake helper's initial burst is already in the
     /// socket buffer, so one poll is enough — the loop just guards scheduling).
     fn poll_for_frame(session: &mut WebSession) -> Option<ColorImage> {
@@ -620,6 +791,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         None
+    }
+
+    fn poll_until_crashed(session: &mut WebSession) -> bool {
+        for _ in 0..50 {
+            session.poll();
+            if session.is_crashed() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
     }
 
     #[test]
@@ -734,8 +916,10 @@ mod tests {
         assert!(!session.is_crashed());
 
         helper.crash(); // closes the helper socket end
-        session.poll();
-        assert!(session.is_crashed(), "a dead helper must surface honestly");
+        assert!(
+            poll_until_crashed(&mut session),
+            "a dead helper must surface honestly"
+        );
         assert!(matches!(session.state(), SessionState::Crashed { .. }));
     }
 
@@ -747,9 +931,8 @@ mod tests {
         poll_for_frame(&mut b).expect("b frame");
 
         helper_a.crash();
-        a.poll();
+        assert!(poll_until_crashed(&mut a), "tab A crashed");
         b.poll();
-        assert!(a.is_crashed(), "tab A crashed");
         assert!(!b.is_crashed(), "tab B is unaffected by A's crash");
         assert_eq!(b.state(), &SessionState::Live);
     }
@@ -768,12 +951,36 @@ mod tests {
     }
 
     #[test]
+    fn stop_drives_a_real_control_frame_over_the_seam() {
+        let (shell, mut helper) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: true,
+                url: "https://example.test/".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.nav().loading, "helper reported an in-flight load");
+
+        session.stop();
+
+        assert_eq!(read_control(&mut helper), ControlMsg::Stop);
+        assert!(
+            !session.nav().loading,
+            "toolbar leaves loading state locally"
+        );
+    }
+
+    #[test]
     fn input_after_a_crash_is_a_silent_no_op() {
         let (mut session, helper) = testkit::connect().expect("connect");
         poll_for_frame(&mut session).expect("frame");
         helper.crash();
-        session.poll();
-        assert!(session.is_crashed());
+        assert!(poll_until_crashed(&mut session));
         // Forwarding input / nav on a crashed session must not panic and stays a
         // no-op (the socket is gone).
         session.send_input(&egui::Event::PointerMoved(egui::pos2(1.0, 2.0)), 2.0);

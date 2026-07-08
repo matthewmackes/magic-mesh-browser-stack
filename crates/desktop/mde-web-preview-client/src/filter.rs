@@ -19,7 +19,62 @@
 //! worker's replicated `state/adfilter` blob); the default filter blocks nothing,
 //! so a session with no filter behaves exactly as before this unit.
 
-use mde_adblock::{host_of, Decision, Engine, FilterListStore, ResourceType};
+use std::collections::BTreeSet;
+
+use mde_adblock::{host_of, AllowReason, Decision, Engine, FilterListStore, ResourceType};
+
+/// A mesh-synced safe-browsing host blocklist.
+///
+/// Hosts match exactly or by subdomain suffix, so listing `malware.test` blocks
+/// both `https://malware.test/` and `https://cdn.malware.test/`. Mesh/overlay
+/// exemptions still win in [`RequestFilter::decide`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SafeBrowsingBlocklist {
+    hosts: BTreeSet<String>,
+}
+
+impl SafeBrowsingBlocklist {
+    /// Build an empty blocklist.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            hosts: BTreeSet::new(),
+        }
+    }
+
+    /// Build a blocklist from mesh-hosted host entries.
+    #[must_use]
+    pub fn from_hosts(hosts: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut list = Self::default();
+        for host in hosts {
+            list.insert(host.as_ref());
+        }
+        list
+    }
+
+    fn insert(&mut self, host: &str) {
+        let host = host
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if !host.is_empty() {
+            self.hosts.insert(host);
+        }
+    }
+
+    /// Does this URL or host match the unsafe-host set?
+    #[must_use]
+    pub fn matches(&self, url_or_host: &str) -> Option<&str> {
+        let host = host_of(url_or_host)
+            .unwrap_or_else(|| url_or_host.trim().to_ascii_lowercase())
+            .trim_end_matches('.')
+            .to_owned();
+        self.hosts.iter().find_map(|blocked| {
+            (host == *blocked || host.ends_with(&format!(".{blocked}"))).then_some(blocked.as_str())
+        })
+    }
+}
 
 /// Map a compact wire discriminant back to a [`ResourceType`].
 ///
@@ -57,6 +112,8 @@ pub const fn resource_to_wire(ty: ResourceType) -> u8 {
 pub struct RequestFilter {
     /// The compiled matcher (empty = blocks nothing; the default).
     engine: Engine,
+    /// Mesh-hosted unsafe host blocklist.
+    safe_browsing: SafeBrowsingBlocklist,
     /// The host of the top-level page every subresource is judged against.
     first_party: String,
     /// Requests blocked on the current page (reset when the page host changes).
@@ -76,6 +133,7 @@ impl RequestFilter {
     pub fn empty() -> Self {
         Self {
             engine: Engine::new(),
+            safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
             blocked: 0,
         }
@@ -86,9 +144,17 @@ impl RequestFilter {
     pub fn new(engine: Engine) -> Self {
         Self {
             engine,
+            safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
             blocked: 0,
         }
+    }
+
+    /// Attach a mesh safe-browsing blocklist to this filter.
+    #[must_use]
+    pub fn with_safe_browsing(mut self, safe_browsing: SafeBrowsingBlocklist) -> Self {
+        self.safe_browsing = safe_browsing;
+        self
     }
 
     /// Compile a filter from a [`FilterListStore`] (the primary glue point — the
@@ -135,6 +201,21 @@ impl RequestFilter {
     /// drops the request. Mesh/overlay + allowlisted hosts are allowed by the
     /// engine (honored, not re-derived here).
     pub fn decide(&mut self, url: &str, resource_type: ResourceType) -> Decision {
+        if let Some(host) = host_of(url) {
+            if matches!(
+                self.engine
+                    .match_request(url, resource_type, &self.first_party),
+                Decision::Allow(AllowReason::Exempt)
+            ) {
+                return Decision::Allow(AllowReason::Exempt);
+            }
+            if let Some(blocked) = self.safe_browsing.matches(&host) {
+                self.blocked = self.blocked.saturating_add(1);
+                return Decision::Block {
+                    filter: format!("safe-browsing:{blocked}"),
+                };
+            }
+        }
         let decision = self
             .engine
             .match_request(url, resource_type, &self.first_party);
@@ -284,5 +365,37 @@ mod tests {
             .is_block());
         // A malformed blob is a typed error, never a panic.
         assert!(RequestFilter::from_store_json("{not json").is_err());
+    }
+
+    #[test]
+    fn safe_browsing_blocks_exact_and_subdomain_hosts_before_network() {
+        let mut f = RequestFilter::empty()
+            .with_safe_browsing(SafeBrowsingBlocklist::from_hosts(["malware.test"]));
+        f.set_page("https://news.example.com/");
+
+        let exact = f.decide("https://malware.test/payload", ResourceType::Document);
+        assert_eq!(exact.blocked_by(), Some("safe-browsing:malware.test"));
+        let subdomain = f.decide("https://cdn.malware.test/pixel", ResourceType::Image);
+        assert_eq!(subdomain.blocked_by(), Some("safe-browsing:malware.test"));
+        assert_eq!(f.blocked_count(), 2);
+    }
+
+    #[test]
+    fn safe_browsing_keeps_mesh_overlay_exempt() {
+        let mut f = RequestFilter::empty().with_safe_browsing(SafeBrowsingBlocklist::from_hosts([
+            "media.mesh",
+            "10.42.0.9",
+        ]));
+        f.set_page("https://news.example.com/");
+
+        assert!(matches!(
+            f.decide("https://media.mesh/malware", ResourceType::Script),
+            Decision::Allow(mde_adblock::AllowReason::Exempt)
+        ));
+        assert!(matches!(
+            f.decide("https://10.42.0.9/malware", ResourceType::Script),
+            Decision::Allow(mde_adblock::AllowReason::Exempt)
+        ));
+        assert_eq!(f.blocked_count(), 0);
     }
 }

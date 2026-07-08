@@ -523,9 +523,270 @@ impl Engine {
         let _ = self.webview.go_forward(amount);
     }
 
+    /// Set page zoom through Servo's page script seam. This is intentionally the
+    /// same bounded DOM transform CEF uses until Servo exposes a native zoom API.
+    pub fn set_zoom(&self, percent: u16) {
+        self.evaluate_page_script(&page_zoom_script(percent));
+    }
+
+    /// Find text on the current page through Servo's page script seam.
+    pub fn find_in_page(&self, query: &str, backwards: bool) {
+        if query.trim().is_empty() {
+            self.clear_find();
+        } else {
+            self.evaluate_page_script(&find_in_page_script(query, backwards));
+        }
+    }
+
+    /// Clear the current page selection/highlight where the DOM supports it.
+    pub fn clear_find(&self) {
+        self.evaluate_page_script(clear_find_script());
+    }
+
+    /// Apply or remove Quasar forced-dark styling in the Servo tab.
+    pub fn set_force_dark(&self, enabled: bool) {
+        self.evaluate_page_script(&force_dark_script(enabled));
+    }
+
+    /// Apply or remove reader-mode styling in the Servo tab.
+    pub fn set_reader_mode(&self, enabled: bool) {
+        self.evaluate_page_script(&reader_mode_script(enabled));
+    }
+
+    /// Apply or remove tab audio mute in the Servo tab. Servo does not expose the
+    /// CEF-style browser-host mute slot, so this uses the page seam to mute every
+    /// HTML media element already present and any media element inserted later.
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.evaluate_page_script(audio_mute_script(muted));
+    }
+
+    /// Ask the page to invoke its print flow. Servo does not expose a native
+    /// print/PDF backend here yet, so the helper uses the browser-standard DOM
+    /// print hook and leaves save-as-PDF to CEF.
+    pub fn print_page(&self) {
+        self.evaluate_page_script(print_page_script());
+    }
+
+    fn evaluate_page_script(&self, script: &str) {
+        self.webview.evaluate_javascript(script, |_| {});
+    }
+
     /// Whether the initial load has reported completion.
     #[must_use]
     pub fn load_complete(&self) -> bool {
         self.shared.load_complete.get()
+    }
+}
+
+fn page_zoom_script(percent: u16) -> String {
+    let percent = percent.clamp(25, 500);
+    format!("(function(){{document.documentElement.style.zoom='{percent}%';}})();")
+}
+
+fn find_in_page_script(query: &str, backwards: bool) -> String {
+    let query = js_string_literal(query);
+    let backwards = if backwards { "true" } else { "false" };
+    format!("(function(){{window.find({query},false,{backwards},true,false,false,false);}})();")
+}
+
+const fn clear_find_script() -> &'static str {
+    "(function(){var s=window.getSelection&&window.getSelection();if(s)s.removeAllRanges();})();"
+}
+
+fn force_dark_script(enabled: bool) -> String {
+    if !enabled {
+        return "(function(){var id='mde-servo-force-dark-style';var el=document.getElementById(id);if(el)el.remove();document.documentElement.style.colorScheme='';})();".to_owned();
+    }
+    let css = r#"
+:root { color-scheme: dark !important; background: #0f1419 !important; }
+html, body { background: #0f1419 !important; color: #f2f4f8 !important; }
+body, main, article, section, nav, aside, header, footer, div {
+  background-color: color-mix(in srgb, currentColor 0%, #0f1419 100%) !important;
+}
+p, span, li, td, th, label, input, textarea, select, button, a, h1, h2, h3, h4, h5, h6 {
+  color: #f2f4f8 !important;
+}
+a { color: #78a9ff !important; }
+img, video, canvas, picture, svg, iframe { filter: none !important; }
+input, textarea, select, button { background: #202830 !important; border-color: #525c66 !important; }
+"#;
+    let css = js_string_literal(css);
+    format!(
+        "(function(){{var id='mde-servo-force-dark-style';var root=document.head||document.documentElement;if(!root)return;var el=document.getElementById(id);if(!el){{el=document.createElement('style');el.id=id;root.appendChild(el);}}document.documentElement.style.colorScheme='dark';el.textContent={css};}})();"
+    )
+}
+
+fn reader_mode_script(enabled: bool) -> String {
+    if !enabled {
+        return "(function(){var id='mde-servo-reader-style';var el=document.getElementById(id);if(el)el.remove();document.documentElement.classList.remove('mde-reader-mode');})();".to_owned();
+    }
+    let css = r#"
+html.mde-reader-mode body {
+  max-width: 76ch !important;
+  margin: 0 auto !important;
+  padding: 3rem 2rem !important;
+  line-height: 1.65 !important;
+  font-size: 18px !important;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+}
+html.mde-reader-mode article, html.mde-reader-mode main {
+  max-width: 76ch !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+html.mde-reader-mode nav, html.mde-reader-mode aside, html.mde-reader-mode footer,
+html.mde-reader-mode [role="navigation"], html.mde-reader-mode [aria-label*="advert"],
+html.mde-reader-mode iframe, html.mde-reader-mode embed {
+  display: none !important;
+}
+html.mde-reader-mode p, html.mde-reader-mode li {
+  margin-block: 0.85em !important;
+}
+html.mde-reader-mode img, html.mde-reader-mode video {
+  max-width: 100% !important;
+  height: auto !important;
+}
+"#;
+    let css = js_string_literal(css);
+    format!(
+        "(function(){{var id='mde-servo-reader-style';var root=document.head||document.documentElement;if(!root)return;var el=document.getElementById(id);if(!el){{el=document.createElement('style');el.id=id;root.appendChild(el);}}el.textContent={css};document.documentElement.classList.add('mde-reader-mode');}})();"
+    )
+}
+
+const fn print_page_script() -> &'static str {
+    "(function(){if(window.print)window.print();})();"
+}
+
+const fn audio_mute_script(muted: bool) -> &'static str {
+    if muted {
+        "(function(){var key='mdeServoAudioMuted';var apply=function(root){var list=(root||document).querySelectorAll? (root||document).querySelectorAll('audio,video') : [];for(var i=0;i<list.length;i++){list[i].muted=true;list[i].defaultMuted=true;}};document.documentElement.dataset[key]='true';apply(document);if(window.__mdeServoAudioMuteObserver)window.__mdeServoAudioMuteObserver.disconnect();window.__mdeServoAudioMuteObserver=new MutationObserver(function(records){for(var r=0;r<records.length;r++){for(var n=0;n<records[r].addedNodes.length;n++){var node=records[r].addedNodes[n];if(node&&node.matches&&node.matches('audio,video')){node.muted=true;node.defaultMuted=true;}apply(node);}}});window.__mdeServoAudioMuteObserver.observe(document.documentElement,{childList:true,subtree:true});})();"
+    } else {
+        "(function(){var key='mdeServoAudioMuted';delete document.documentElement.dataset[key];if(window.__mdeServoAudioMuteObserver){window.__mdeServoAudioMuteObserver.disconnect();window.__mdeServoAudioMuteObserver=null;}var list=document.querySelectorAll?document.querySelectorAll('audio,video'):[];for(var i=0;i<list.length;i++){list[i].muted=false;list[i].defaultMuted=false;}})();"
+    }
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        audio_mute_script, clear_find_script, find_in_page_script, force_dark_script,
+        page_zoom_script, print_page_script, reader_mode_script, secure_preferences,
+        GENERIC_USER_AGENT,
+    };
+
+    #[test]
+    fn secure_preferences_disable_cookie_storage_and_disk_cache() {
+        let prefs = secure_preferences();
+        assert_eq!(prefs.user_agent, GENERIC_USER_AGENT);
+        assert!(
+            !prefs.dom_cookiestore_enabled,
+            "cookie store is disabled, so third-party cookies have no persistence surface"
+        );
+        assert!(
+            !prefs.dom_indexeddb_enabled,
+            "IndexedDB persistence is disabled"
+        );
+        assert!(
+            !prefs.dom_storage_manager_api_enabled,
+            "StorageManager persistence is disabled"
+        );
+        assert!(
+            prefs.network_http_cache_disabled,
+            "HTTP disk cache is disabled"
+        );
+        assert!(
+            !prefs.dom_webrtc_enabled,
+            "WebRTC local-IP leaks are disabled"
+        );
+        assert!(!prefs.dom_webgpu_enabled, "WebGPU is disabled");
+    }
+
+    #[test]
+    fn servo_page_tool_scripts_are_bounded_and_escaped() {
+        assert!(page_zoom_script(125).contains("zoom='125%'"));
+        assert!(page_zoom_script(5).contains("zoom='25%'"));
+        assert!(page_zoom_script(900).contains("zoom='500%'"));
+
+        let forward = find_in_page_script("mesh \"ops\"", false);
+        assert!(forward.contains(r#"window.find("mesh \"ops\"",false,false"#));
+        let backward = find_in_page_script("mesh", true);
+        assert!(backward.contains(r#"window.find("mesh",false,true"#));
+        assert!(clear_find_script().contains("removeAllRanges"));
+    }
+
+    #[test]
+    fn servo_force_dark_script_installs_and_clears_bounded_style() {
+        let enable = force_dark_script(true);
+        assert!(enable.contains("mde-servo-force-dark-style"));
+        assert!(enable.contains("color-scheme: dark"));
+        assert!(
+            !enable.contains("</style>"),
+            "force-dark is injected as style text only"
+        );
+
+        let disable = force_dark_script(false);
+        assert!(disable.contains("remove()"));
+        assert!(disable.contains("colorScheme=''"));
+    }
+
+    #[test]
+    fn servo_reader_mode_script_installs_and_clears_bounded_style() {
+        let enable = reader_mode_script(true);
+        assert!(enable.contains("mde-servo-reader-style"));
+        assert!(enable.contains("mde-reader-mode"));
+        assert!(enable.contains("max-width: 76ch"));
+        assert!(
+            !enable.contains("<script"),
+            "reader mode is injected as style text only"
+        );
+
+        let disable = reader_mode_script(false);
+        assert!(disable.contains("if(el)el.remove()"));
+        assert!(disable.contains("classList.remove"));
+    }
+
+    #[test]
+    fn servo_audio_mute_script_mutes_existing_and_future_media() {
+        let enable = audio_mute_script(true);
+        assert!(enable.contains("querySelectorAll('audio,video')"));
+        assert!(enable.contains("muted=true"));
+        assert!(enable.contains("defaultMuted=true"));
+        assert!(enable.contains("MutationObserver"));
+        assert!(enable.contains("__mdeServoAudioMuteObserver.observe"));
+
+        let disable = audio_mute_script(false);
+        assert!(disable.contains("__mdeServoAudioMuteObserver.disconnect"));
+        assert!(disable.contains("muted=false"));
+        assert!(disable.contains("defaultMuted=false"));
+        assert!(disable.contains("delete document.documentElement.dataset"));
+    }
+
+    #[test]
+    fn servo_print_script_uses_the_page_print_hook() {
+        assert_eq!(
+            print_page_script(),
+            "(function(){if(window.print)window.print();})();"
+        );
     }
 }
