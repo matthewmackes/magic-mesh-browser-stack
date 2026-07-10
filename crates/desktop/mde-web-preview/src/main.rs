@@ -235,10 +235,26 @@ fn run_tab(args: &[String]) -> Result<()> {
 
 /// Apply one control frame from the shell to the engine. Navigation is wired to the
 /// engine's existing methods; zoom/find/force-dark/audio-mute use the helper's
-/// DOM script seam. `Stop`/`Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters`
-/// are decoded (so the framed stream stays in sync) but not yet acted on — Servo
-/// currently exposes no real cancel-load, live-resize, input-injection, or
-/// helper-side ad-filter hook here.
+/// DOM script seam. `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters` are
+/// decoded (so the framed stream stays in sync) but not yet acted on — Servo
+/// currently exposes no live-resize, input-injection, or helper-side ad-filter
+/// hook here; these remain future work, not investigated limitations.
+///
+/// `Stop` is decoded-and-intentionally-ignored for a DIFFERENT reason (DD-2,
+/// investigated 2026-07-10, not "not yet"): the pinned `servo` 0.3.0 crate's
+/// `WebView`/`Servo` public methods carry no stop/cancel-navigation method at
+/// all (confirmed by reading `webview.rs`'s and `servo.rs`'s complete `impl`
+/// blocks in the crates.io-published source); the `WebDriverCommandMsg` relay
+/// `Servo::execute_webdriver_command` accepts (from `servo-embedder-traits`
+/// 0.3.0) has no stop/cancel variant either — only `LoadUrl`/`Refresh`/
+/// `GoBack`/`GoForward` touch navigation; and the lower-level
+/// `EmbedderToConstellationMessage` channel `WebView::load`/`reload` send on
+/// internally (from `servo-constellation-traits` 0.3.0) has no such variant
+/// either, and is unreachable from outside the crate regardless (`WebView`'s
+/// `inner()`/`inner_mut()` accessors are private). So there is no real
+/// mechanism anywhere in this pinned version to wire up — see
+/// `mde-shell-egui::web::can_show_stop_control` for the shell-side gate this
+/// keeps honest (CEF-only Stop; Servo keeps the honest Reload while loading).
 fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
     match msg {
         ControlMsg::Load(url) => {
@@ -310,8 +326,10 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         }
         ControlMsg::CompletePasskey { body } => engine.complete_passkey(body),
         ControlMsg::PrintPage => engine.print_page(),
-        ControlMsg::Stop
-        | ControlMsg::Resize { .. }
+        // Confirmed upstream limitation, not "not yet" — see this function's doc
+        // comment for the full source-level investigation (DD-2, 2026-07-10).
+        ControlMsg::Stop => {}
+        ControlMsg::Resize { .. }
         | ControlMsg::Input(_)
         | ControlMsg::ResourceVerdict { .. }
         | ControlMsg::CosmeticFilters(_)
