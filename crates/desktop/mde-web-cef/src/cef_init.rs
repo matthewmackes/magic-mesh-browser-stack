@@ -296,6 +296,39 @@ impl CefInitPaths {
     }
 }
 
+/// Chromium command-line switches used for privacy/telemetry hardening.
+///
+/// `--disable-webrtc` was removed here 2026-07-10 after verifying it is not a
+/// real Chromium switch: it is absent from the live upstream switch
+/// registries (`content/public/common/content_switches.cc`,
+/// `chrome/common/chrome_switches.cc`, fetched directly from
+/// `chromium.googlesource.com` against this pinned CEF's Chromium
+/// `149.0.7827.201` base — no `kDisableWebRtc`/`"disable-webrtc"` constant
+/// anywhere in either file). Chromium's `base::CommandLine` never validates
+/// switches against a registry — an unrecognized `--` switch is silently
+/// never read by any consuming code, not errored or warned — so this line
+/// shipped as inert "hardening" that did nothing. Corroborated by a live
+/// Google Chrome Enterprise support-forum administrator report of this exact
+/// flag being ignored in production
+/// (<https://support.google.com/chrome/a/thread/5939360>), and by a
+/// chromium-dev mailing-list thread confirming the only real way to disable
+/// WebRTC is the build-time GN flag `enable_webrtc=false` (used by e.g.
+/// Chromecast-audio builds) — not available here since this crate links a
+/// prebuilt vendored CEF binary, not a from-source build.
+///
+/// `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` stays: it *is*
+/// real (`kForceWebRtcIPHandlingPolicy` = `"force-webrtc-ip-handling-policy"`
+/// in `content_switches.cc`, backing the genuine Chrome enterprise policy
+/// `WebRtcIPHandling`) and constrains ICE candidate gathering to
+/// proxied/relayed transport, which is the correct mechanism for the
+/// local-IP-leak concern this bundle is defending against.
+///
+/// The actual JS-reachable WebRTC surface (`RTCPeerConnection`,
+/// `getUserMedia`) has no real command-line or `cef_settings_t` kill switch
+/// on a prebuilt CEF binary, so it is now removed at the renderer level
+/// instead — see `cef_browser::webrtc_block_script`/`poll_webrtc_block`,
+/// applied on every `run_windowless_tab` session the same way the passkey
+/// bridge shim is.
 fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
     [
         "--disable-background-networking",
@@ -310,7 +343,6 @@ fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
         "--disable-notifications",
         "--disable-speech-api",
         "--disable-sync",
-        "--disable-webrtc",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-features=AutofillServerCommunication,DevicePosture,InterestCohort,MediaRouter,PaymentRequest,PrivacySandboxAdsAPIs,Translate,WebBluetooth,WebGPU,WebUSB",
     ]
@@ -580,7 +612,6 @@ mod tests {
         assert!(switches.contains(&"--disable-sync".to_owned()));
         assert!(switches.contains(&"--disable-extensions".to_owned()));
         assert!(switches.contains(&"--disable-metrics-reporting".to_owned()));
-        assert!(switches.contains(&"--disable-webrtc".to_owned()));
         assert!(switches
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned()));
         assert!(switches.iter().any(|s| {
@@ -589,6 +620,24 @@ mod tests {
                 && s.contains("WebGPU")
                 && s.contains("WebUSB")
         }));
+    }
+
+    #[test]
+    fn init_paths_never_emit_the_inert_disable_webrtc_switch() {
+        // `--disable-webrtc` is not a real Chromium switch: verified absent
+        // from the live `content_switches.cc`/`chrome_switches.cc` upstream
+        // registries, and Chromium silently no-ops unrecognized `--` switches
+        // rather than erroring — so shipping it here was a false sense of
+        // privacy hardening (WebRTC stayed fully reachable). Regression guard
+        // against reintroducing it; the real mitigations are
+        // `--force-webrtc-ip-handling-policy` (kept above) plus renderer-level
+        // API removal (`cef_browser::webrtc_block_script`).
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(!switches.iter().any(|s| s == "--disable-webrtc"));
     }
 
     #[test]

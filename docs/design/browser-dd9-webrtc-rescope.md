@@ -19,6 +19,20 @@ mesh feature riding the Bus), the shipped VOIP-GW epic (the mesh's existing,
 unrelated-protocol calling stack — see §"Two deliverables hiding under one line"
 below).
 
+**Update 2026-07-10 (later same day):** the open verification question this
+doc flags below — whether `--disable-webrtc` is functionally real — has been
+resolved, independent of DD-9 itself. It is confirmed **not real** (verified
+against the live Chromium source, not just the community switches reference
+this doc cites — see `docs/THREAT_MODEL.md` §8 and the doc comment on
+`chromium_privacy_switches()` in `cef_init.rs` for the full evidence trail)
+and has been fixed: the dead switch is removed, `--force-webrtc-ip-handling-
+policy` is confirmed-real and kept, and a renderer-level JS shim
+(`cef_browser::webrtc_block_script`) now actually removes the WebRTC surface
+pending DD-9. This does **not** change DD-9's own scope or recommendation
+below (CEF WebRTC is still off by design, not yet a shipped feature) — it
+only means the engine-choice table's "may not even be real" framing and the
+Rollup's "unverified... worth checking" line are now historical, not current.
+
 ## What DD-9 actually asks for
 
 The full, unexpanded WORKLIST line (`docs/WORKLIST.md`, BROWSER-DD-9):
