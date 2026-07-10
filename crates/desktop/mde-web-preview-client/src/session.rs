@@ -34,6 +34,7 @@ use crate::{input, wire};
 /// How many `recvmsg` batches one [`WebSession::poll`] drains before yielding
 /// (a bound so a flooding helper can't spin the UI thread).
 const MAX_RECV_PER_POLL: usize = 64;
+const MAX_RECENT_RESOURCE_REQUESTS: usize = 128;
 
 /// A session's live status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,42 @@ pub struct PdfSaveStatus {
     pub ok: bool,
 }
 
+/// One page-text extraction result from the helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageTextStatus {
+    /// Request id originally supplied by the shell.
+    pub id: u64,
+    /// Bounded visible text extracted by the helper.
+    pub text: String,
+}
+
+/// One structured active-page scrape result from the helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageScrapeStatus {
+    /// Request id originally supplied by the shell.
+    pub id: u64,
+    /// Bounded helper JSON body with visible text plus DOM links/headings.
+    pub body: String,
+}
+
+/// One helper-observed passkey/WebAuthn ceremony request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyRequestStatus {
+    /// Bounded helper JSON body with public ceremony metadata.
+    pub body: String,
+}
+
+/// One subresource request observed by the shell-side request filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRequestStatus {
+    /// Requested subresource URL.
+    pub url: String,
+    /// Compact resource-type discriminant from [`crate::resource_to_wire`].
+    pub resource: u8,
+    /// Whether the shell allowed the request to continue.
+    pub allowed: bool,
+}
+
 /// One driven browser session.
 pub struct WebSession {
     stream: UnixStream,
@@ -86,6 +123,10 @@ pub struct WebSession {
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
+    page_text_events: VecDeque<PageTextStatus>,
+    page_scrape_events: VecDeque<PageScrapeStatus>,
+    passkey_events: VecDeque<PasskeyRequestStatus>,
+    recent_resource_requests: VecDeque<ResourceRequestStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
     /// injects a compiled one from the mackesd `adfilter` blob via [`Self::set_filter`].
@@ -114,6 +155,10 @@ impl WebSession {
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
+            page_text_events: VecDeque::new(),
+            page_scrape_events: VecDeque::new(),
+            passkey_events: VecDeque::new(),
+            recent_resource_requests: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
     }
@@ -259,6 +304,7 @@ impl WebSession {
                 // cosmetic user-stylesheet (BOOKMARKS-7). Same-page nav-state churn
                 // (loading true→false) leaves both untouched.
                 if self.filter.set_page(&url) {
+                    self.recent_resource_requests.clear();
                     let css = self.filter.cosmetic_stylesheet();
                     if !css.is_empty() {
                         self.send(&ControlMsg::CosmeticFilters(css));
@@ -277,13 +323,30 @@ impl WebSession {
                 let decision = self
                     .filter
                     .decide(&url, filter::resource_from_wire(resource));
-                self.send(&ControlMsg::ResourceVerdict {
-                    id,
-                    allow: !decision.is_block(),
-                });
+                let allowed = !decision.is_block();
+                if self.recent_resource_requests.len() >= MAX_RECENT_RESOURCE_REQUESTS {
+                    self.recent_resource_requests.pop_front();
+                }
+                self.recent_resource_requests
+                    .push_back(ResourceRequestStatus {
+                        url,
+                        resource,
+                        allowed,
+                    });
+                self.send(&ControlMsg::ResourceVerdict { id, allow: allowed });
             }
             EventMsg::PdfSaved { path, ok } => {
                 self.pdf_events.push_back(PdfSaveStatus { path, ok })
+            }
+            EventMsg::PageText { id, text } => {
+                self.page_text_events.push_back(PageTextStatus { id, text });
+            }
+            EventMsg::PageScrape { id, body } => {
+                self.page_scrape_events
+                    .push_back(PageScrapeStatus { id, body });
+            }
+            EventMsg::PasskeyRequest { body } => {
+                self.passkey_events.push_back(PasskeyRequestStatus { body });
             }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
@@ -304,6 +367,27 @@ impl WebSession {
     /// Drain save-as-PDF completion events reported by the helper.
     pub fn drain_pdf_events(&mut self) -> Vec<PdfSaveStatus> {
         self.pdf_events.drain(..).collect()
+    }
+
+    /// Drain visible page-text extraction results reported by the helper.
+    pub fn drain_page_text_events(&mut self) -> Vec<PageTextStatus> {
+        self.page_text_events.drain(..).collect()
+    }
+
+    /// Drain structured active-page scrape results reported by the helper.
+    pub fn drain_page_scrape_events(&mut self) -> Vec<PageScrapeStatus> {
+        self.page_scrape_events.drain(..).collect()
+    }
+
+    /// Drain passkey/WebAuthn ceremony requests reported by the helper.
+    pub fn drain_passkey_events(&mut self) -> Vec<PasskeyRequestStatus> {
+        self.passkey_events.drain(..).collect()
+    }
+
+    /// Recent subresource requests observed for the current page.
+    #[must_use]
+    pub fn recent_resource_requests(&self) -> Vec<ResourceRequestStatus> {
+        self.recent_resource_requests.iter().cloned().collect()
     }
 
     /// The session's live status.
@@ -390,6 +474,40 @@ impl WebSession {
         self.send(&ControlMsg::SetReaderMode { enabled });
     }
 
+    /// Set whether the shell-curated userscript bundle is enabled for this tab.
+    pub fn set_user_scripts(&mut self, enabled: bool, bundle: impl Into<String>) {
+        self.send(&ControlMsg::SetUserScripts {
+            enabled,
+            bundle: bundle.into(),
+        });
+    }
+
+    /// Override page-visible User-Agent metadata for this tab. Empty restores the
+    /// helper's engine default.
+    pub fn set_user_agent(&mut self, user_agent: impl Into<String>) {
+        self.send(&ControlMsg::SetUserAgent {
+            user_agent: user_agent.into(),
+        });
+    }
+
+    /// Override page-visible device metadata for this tab.
+    pub fn set_device_profile(
+        &mut self,
+        profile: impl Into<String>,
+        width: u16,
+        height: u16,
+        scale_percent: u16,
+        touch: bool,
+    ) {
+        self.send(&ControlMsg::SetDeviceProfile {
+            profile: profile.into(),
+            width,
+            height,
+            scale_percent,
+            touch,
+        });
+    }
+
     /// Ask the helper to print the current page.
     pub fn print_page(&mut self) {
         self.send(&ControlMsg::PrintPage);
@@ -398,6 +516,78 @@ impl WebSession {
     /// Ask the helper to save the current page as a PDF at `path`.
     pub fn save_pdf(&mut self, path: impl Into<String>) {
         self.send(&ControlMsg::SavePdf { path: path.into() });
+    }
+
+    /// Ask the helper to extract bounded visible page text.
+    pub fn request_page_text(&mut self, id: u64, max_bytes: u32) {
+        self.send(&ControlMsg::RequestPageText { id, max_bytes });
+    }
+
+    /// Ask the helper to extract bounded active-page scrape data.
+    pub fn request_page_scrape(
+        &mut self,
+        id: u64,
+        max_bytes: u32,
+        max_links: u16,
+        max_headings: u16,
+    ) {
+        self.send(&ControlMsg::RequestPageScrape {
+            id,
+            max_bytes,
+            max_links,
+            max_headings,
+        });
+    }
+
+    /// Resolve or reject one pending page WebAuthn/passkey request.
+    pub fn complete_passkey(&mut self, body: impl Into<String>) {
+        self.send(&ControlMsg::CompletePasskey { body: body.into() });
+    }
+
+    /// Apply shell-owned spellcheck highlights to the current page. An empty
+    /// word list clears any prior helper-side highlights.
+    pub fn set_spellcheck_highlights(&mut self, words: Vec<String>) {
+        self.send(&ControlMsg::SetSpellcheckHighlights { words });
+    }
+
+    /// Ask the helper to replace one spelling miss with the selected suggestion.
+    pub fn apply_spellcheck_correction(
+        &mut self,
+        word: impl Into<String>,
+        replacement: impl Into<String>,
+    ) {
+        self.send(&ControlMsg::ApplySpellcheckCorrection {
+            word: word.into(),
+            replacement: replacement.into(),
+        });
+    }
+
+    /// Ask the helper to replace all visible matches for one spelling miss with
+    /// the selected suggestion.
+    pub fn apply_spellcheck_correction_all(
+        &mut self,
+        word: impl Into<String>,
+        replacement: impl Into<String>,
+    ) {
+        self.send(&ControlMsg::ApplySpellcheckCorrectionAll {
+            word: word.into(),
+            replacement: replacement.into(),
+        });
+    }
+
+    /// Ask the helper to replace one indexed visible spelling miss with the
+    /// selected suggestion.
+    pub fn apply_spellcheck_correction_at(
+        &mut self,
+        word: impl Into<String>,
+        replacement: impl Into<String>,
+        occurrence: u16,
+    ) {
+        self.send(&ControlMsg::ApplySpellcheckCorrectionAt {
+            word: word.into(),
+            replacement: replacement.into(),
+            occurrence,
+        });
     }
 
     /// Tell the helper the view resized to `width` x `height` device pixels.
@@ -572,6 +762,14 @@ mod tests {
             }
         );
         assert_eq!(session.blocked_count(), 1, "the blocked request is counted");
+        assert_eq!(
+            session.recent_resource_requests(),
+            vec![ResourceRequestStatus {
+                url: "https://www.google-analytics.com/collect".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                allowed: false,
+            }]
+        );
     }
 
     #[test]
@@ -705,6 +903,118 @@ mod tests {
     }
 
     #[test]
+    fn page_text_events_are_queued_for_the_shell() {
+        let (mut session, peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::PageText {
+                id: 7,
+                text: "visible page words".to_owned(),
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(
+            session.drain_page_text_events(),
+            vec![PageTextStatus {
+                id: 7,
+                text: "visible page words".to_owned(),
+            }]
+        );
+        assert!(
+            session.drain_page_text_events().is_empty(),
+            "page-text events are drained exactly once"
+        );
+    }
+
+    #[test]
+    fn passkey_requests_are_queued_for_the_shell() {
+        let (mut session, peer) = filtered_session();
+        let body = r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz"}"#;
+        send_event(
+            &peer,
+            &EventMsg::PasskeyRequest {
+                body: body.to_owned(),
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(
+            session.drain_passkey_events(),
+            vec![PasskeyRequestStatus {
+                body: body.to_owned(),
+            }]
+        );
+        assert!(
+            session.drain_passkey_events().is_empty(),
+            "passkey events are drained exactly once"
+        );
+    }
+
+    #[test]
+    fn passkey_completion_is_sent_to_the_helper() {
+        let (mut session, mut peer) = filtered_session();
+        let body = r#"{"client_request_id":"pk-1","op":"browser_passkey_assertion"}"#;
+
+        session.complete_passkey(body);
+
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::CompletePasskey {
+                body: body.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn resource_manifest_is_bounded_and_resets_on_page_host_change() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        let _cosmetic = read_control_after_poll(&mut session, &mut peer);
+        for id in 1..=140 {
+            send_event(
+                &peer,
+                &EventMsg::ResourceRequest {
+                    id,
+                    url: format!("https://cdn.example.com/{id}.js"),
+                    resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                },
+            );
+            let _verdict = read_control_after_poll(&mut session, &mut peer);
+        }
+
+        let resources = session.recent_resource_requests();
+        assert_eq!(resources.len(), MAX_RECENT_RESOURCE_REQUESTS);
+        assert_eq!(resources[0].url, "https://cdn.example.com/13.js");
+        assert_eq!(
+            resources.last().expect("last resource").url,
+            "https://cdn.example.com/140.js"
+        );
+
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://other.example.com/".to_owned(),
+            },
+        );
+        let _cosmetic = read_control_after_poll(&mut session, &mut peer);
+        assert!(session.recent_resource_requests().is_empty());
+    }
+
+    #[test]
     fn page_zoom_and_find_controls_are_framed_for_the_helper() {
         let (shell, mut peer) = UnixStream::pair().expect("socketpair");
         let mut session = WebSession::from_stream(shell, None).expect("session");
@@ -769,6 +1079,59 @@ mod tests {
             ControlMsg::SetReaderMode { enabled: false }
         );
 
+        session.set_user_scripts(true, "console.log('mde');");
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetUserScripts {
+                enabled: true,
+                bundle: "console.log('mde');".to_owned(),
+            }
+        );
+        session.set_user_scripts(false, "");
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetUserScripts {
+                enabled: false,
+                bundle: String::new(),
+            }
+        );
+        session.set_user_agent("Mozilla/5.0 MDE-Test");
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetUserAgent {
+                user_agent: "Mozilla/5.0 MDE-Test".to_owned(),
+            }
+        );
+        session.set_user_agent("");
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetUserAgent {
+                user_agent: String::new(),
+            }
+        );
+        session.set_device_profile("phone", 390, 844, 300, true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetDeviceProfile {
+                profile: "phone".to_owned(),
+                width: 390,
+                height: 844,
+                scale_percent: 300,
+                touch: true,
+            }
+        );
+        session.set_device_profile("default", 0, 0, 100, false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetDeviceProfile {
+                profile: "default".to_owned(),
+                width: 0,
+                height: 0,
+                scale_percent: 100,
+                touch: false,
+            }
+        );
+
         session.print_page();
         assert_eq!(read_control(&mut peer), ControlMsg::PrintPage);
         session.save_pdf("/tmp/mde-page.pdf");
@@ -776,6 +1139,15 @@ mod tests {
             read_control(&mut peer),
             ControlMsg::SavePdf {
                 path: "/tmp/mde-page.pdf".to_owned()
+            }
+        );
+
+        session.request_page_text(11, 4096);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::RequestPageText {
+                id: 11,
+                max_bytes: 4096,
             }
         );
     }

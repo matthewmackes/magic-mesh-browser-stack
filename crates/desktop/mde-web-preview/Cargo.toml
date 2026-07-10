@@ -66,6 +66,7 @@ path = "src/lib.rs"
 # stays OFF, so Servo selects the dummy media backend (honest degrade, "media
 # best-effort") and the airgapped farm build needs no gstreamer system libs.
 servo = { version = "0.3", default-features = false, features = ["baked-in-resources", "js_jit"] }
+embedder_traits = { package = "servo-embedder-traits", version = "0.3" }
 
 # --- OS sandbox (Linux syscalls; unsafe confined to sandbox.rs) ---
 # Safe wrappers for unshare/mount/pivot_root/prctl/sethostname/uid-gid-maps.

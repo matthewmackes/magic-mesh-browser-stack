@@ -10,11 +10,29 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
     let runtime = root.join("cef");
     let bridge = root.join("bridge.sh");
     let log = root.join("bridge.log");
+    let registry = root.join("allowlist.env");
+    let extension_dir = root.join("lastpass");
     fs::create_dir_all(runtime.join("Release")).expect("release dir");
     fs::create_dir_all(runtime.join("Resources")).expect("resources dir");
+    fs::create_dir_all(&extension_dir).expect("extension dir");
+    fs::write(
+        extension_dir.join("manifest.json"),
+        b"{\"manifest_version\":3,\"name\":\"LastPass\",\"version\":\"4.130.0\",\"permissions\":[\"storage\",\"tabs\"]}",
+    )
+    .expect("extension manifest");
     fs::write(runtime.join("Release/libcef.so"), b"fake libcef").expect("libcef");
     fs::write(runtime.join("Resources/icudtl.dat"), b"icu").expect("icu");
     fs::write(runtime.join("Resources/resources.pak"), b"pak").expect("pak");
+    fs::write(
+        &registry,
+        "            [extension.hdokiejnpimakedhajhdlcegeplioahd]\n\
+             name = \"LastPass\"\n\
+             version = \"4.130.0\"\n\
+             path = \"lastpass\"\n\
+             permissions = storage,tabs\n\
+             power_sideload = true\n",
+    )
+    .expect("extension registry");
     fs::write(
         &bridge,
         format!(
@@ -24,6 +42,9 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
              printf 'lib=%s\\n' \"$MDE_CEF_BRIDGE_LIBCEF\" >> {log}\n\
              printf 'release=%s\\n' \"$MDE_CEF_BRIDGE_RELEASE_DIR\" >> {log}\n\
              printf 'resources=%s\\n' \"$MDE_CEF_BRIDGE_RESOURCES_DIR\" >> {log}\n\
+             printf 'extensions=%s\\n' \"$MDE_CEF_BRIDGE_EXTENSIONS\" >> {log}\n\
+             printf 'extension_registry=%s\\n' \"$MDE_CEF_BRIDGE_EXTENSION_REGISTRY\" >> {log}\n\
+             printf 'extension_power=%s\\n' \"$MDE_CEF_EXTENSION_POWER_MODE\" >> {log}\n\
              printf 'ld=%s\\n' \"$LD_LIBRARY_PATH\" >> {log}\n\
              exit 77\n",
             log = log.display()
@@ -38,6 +59,8 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
         .arg("https://example.com/")
         .env("MDE_CEF_ROOT", &runtime)
         .env("MDE_CEF_BRIDGE_BIN", &bridge)
+        .env("MDE_CEF_EXTENSION_REGISTRY", &registry)
+        .env("MDE_CEF_EXTENSION_POWER_MODE", "true")
         .env("LD_LIBRARY_PATH", "/usr/lib64")
         .output()
         .expect("run helper");
@@ -46,6 +69,8 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.contains("CEF_OK"), "{stdout}");
     assert!(stdout.contains("CEF_LAUNCH"), "{stdout}");
+    assert!(stdout.contains("CEF_EXTENSIONS_READY"), "{stdout}");
+    assert!(stdout.contains("extensions=1"), "{stdout}");
     let log = fs::read_to_string(&log).expect("bridge log");
     assert!(log.contains("argv=render-once --url https://example.com/"));
     assert!(log.contains(&format!("root={}", runtime.display())));
@@ -58,8 +83,64 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
         "resources={}",
         runtime.join("Resources").display()
     )));
+    assert!(log.contains(&format!("extensions={}", extension_dir.display())));
+    assert!(log.contains(&format!("extension_registry={}", registry.display())));
+    assert!(log.contains("extension_power=true"));
     assert!(log.contains(&format!("ld={}", runtime.join("Release").display())));
     assert!(log.contains("/usr/lib64"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn packaged_smoke_extension_registry_reaches_the_bridge() {
+    let root = temp_root("mde-web-cef-smoke-handoff");
+    let runtime = root.join("cef");
+    let bridge = root.join("bridge.sh");
+    let log = root.join("bridge.log");
+    fs::create_dir_all(runtime.join("Release")).expect("release dir");
+    fs::create_dir_all(runtime.join("Resources")).expect("resources dir");
+    fs::write(runtime.join("Release/libcef.so"), b"fake libcef").expect("libcef");
+    fs::write(runtime.join("Resources/icudtl.dat"), b"icu").expect("icu");
+    fs::write(runtime.join("Resources/resources.pak"), b"pak").expect("pak");
+    fs::write(
+        &bridge,
+        format!(
+            "#!/bin/sh\n\
+             printf 'extensions=%s\\n' \"$MDE_CEF_BRIDGE_EXTENSIONS\" > {log}\n\
+             printf 'extension_registry=%s\\n' \"$MDE_CEF_BRIDGE_EXTENSION_REGISTRY\" >> {log}\n\
+             printf 'extension_power=%s\\n' \"$MDE_CEF_EXTENSION_POWER_MODE\" >> {log}\n\
+             exit 77\n",
+            log = log.display()
+        ),
+    )
+    .expect("bridge script");
+    fs::set_permissions(&bridge, fs::Permissions::from_mode(0o755)).expect("chmod bridge");
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()
+        .expect("repo root");
+    let registry = repo_root.join("packaging/browser/webextensions-smoke.env");
+    let smoke_extension = repo_root.join("packaging/browser/smoke-extension");
+    let output = Command::new(env!("CARGO_BIN_EXE_mde-web-cef"))
+        .arg("render-once")
+        .arg("--url")
+        .arg("https://example.com/")
+        .env("MDE_CEF_ROOT", &runtime)
+        .env("MDE_CEF_BRIDGE_BIN", &bridge)
+        .env("MDE_CEF_EXTENSION_REGISTRY", &registry)
+        .env("MDE_CEF_EXTENSION_POWER_MODE", "true")
+        .output()
+        .expect("run helper");
+
+    assert_eq!(output.status.code(), Some(77));
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains("CEF_EXTENSIONS_READY"), "{stdout}");
+    assert!(stdout.contains("extensions=1"), "{stdout}");
+    let log = fs::read_to_string(&log).expect("bridge log");
+    assert!(log.contains(&format!("extensions={}", smoke_extension.display())));
+    assert!(log.contains(&format!("extension_registry={}", registry.display())));
+    assert!(log.contains("extension_power=true"));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -3330,6 +3330,7 @@ dependencies = [
  "nix",
  "seccompiler",
  "servo",
+ "servo-embedder-traits",
  "url",
 ]
 

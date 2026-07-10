@@ -1,0 +1,16 @@
+[Unit]
+Description=MCNF - install the optional Browser translation model (BROWSER-DD-12)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/libexec/mackesd/browser-translate
+ConditionPathExists=!/usr/share/magic-mesh/translate/browser-translate.model
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SuccessExitStatus=78
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/install-browser-translate-model
+
+[Install]
+WantedBy=multi-user.target

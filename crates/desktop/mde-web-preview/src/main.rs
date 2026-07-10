@@ -47,6 +47,9 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// leave the shell stuck on "Loading the page…").
 const FIRST_FRAME_WATCHDOG: Duration = Duration::from_millis(750);
 
+/// Cadence for draining the in-page WebAuthn/passkey bridge.
+const PASSKEY_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// The session socket the shell hands the `tab` child as its stdin (fd 0) — see
 /// `mde-web-preview-client`'s `WebSession::spawn`.
 const SESSION_SOCKET_FD: std::os::fd::RawFd = 0;
@@ -159,6 +162,9 @@ fn run_tab(args: &[String]) -> Result<()> {
     let mut rbuf: Vec<u8> = Vec::new();
     let started = Instant::now();
     let mut first_frame_sent = false;
+    let mut last_passkey_poll = Instant::now()
+        .checked_sub(PASSKEY_BRIDGE_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         // (a) Apply every pending control frame the shell sent.
         match sock::recv(&socket) {
@@ -185,6 +191,15 @@ fn run_tab(args: &[String]) -> Result<()> {
 
         // (b) Spin one step; publish a frame if the engine painted one.
         let painted = engine.pump_step(&channel).context("serve frame")?;
+
+        if last_passkey_poll.elapsed() >= PASSKEY_BRIDGE_POLL_INTERVAL {
+            if let Ok(socket) = socket.try_clone() {
+                engine.poll_passkey_request(move |body| {
+                    let _ = sock::send_frame(&socket, &EventMsg::PasskeyRequest { body }.encode());
+                });
+            }
+            last_passkey_poll = Instant::now();
+        }
 
         // (c) First-frame watchdog: if nothing has been delivered yet and the grace
         //     window elapsed, force a frame so a slow/heavy page (which may never
@@ -240,6 +255,60 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
         ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
         ControlMsg::SetReaderMode { enabled } => engine.set_reader_mode(*enabled),
+        ControlMsg::SetUserScripts { enabled, bundle } => {
+            engine.set_user_scripts(*enabled, bundle);
+        }
+        ControlMsg::SetUserAgent { user_agent } => engine.set_user_agent(user_agent),
+        ControlMsg::SetDeviceProfile {
+            profile,
+            width,
+            height,
+            scale_percent,
+            touch,
+        } => engine.set_device_profile(profile, *width, *height, *scale_percent, *touch),
+        ControlMsg::SetSpellcheckHighlights { words } => {
+            engine.set_spellcheck_highlights(words);
+        }
+        ControlMsg::ApplySpellcheckCorrection { word, replacement } => {
+            engine.apply_spellcheck_correction(word, replacement);
+        }
+        ControlMsg::ApplySpellcheckCorrectionAll { word, replacement } => {
+            engine.apply_spellcheck_correction_all(word, replacement);
+        }
+        ControlMsg::ApplySpellcheckCorrectionAt {
+            word,
+            replacement,
+            occurrence,
+        } => {
+            engine.apply_spellcheck_correction_at(word, replacement, *occurrence);
+        }
+        ControlMsg::RequestPageText { id, max_bytes } => {
+            if let Ok(socket) = socket.try_clone() {
+                engine.request_page_text(*id, *max_bytes, move |id, text| {
+                    let _ = sock::send_frame(&socket, &EventMsg::PageText { id, text }.encode());
+                });
+            }
+        }
+        ControlMsg::RequestPageScrape {
+            id,
+            max_bytes,
+            max_links,
+            max_headings,
+        } => {
+            if let Ok(socket) = socket.try_clone() {
+                engine.request_page_scrape(
+                    *id,
+                    *max_bytes,
+                    *max_links,
+                    *max_headings,
+                    move |id, body| {
+                        let _ =
+                            sock::send_frame(&socket, &EventMsg::PageScrape { id, body }.encode());
+                    },
+                );
+            }
+        }
+        ControlMsg::CompletePasskey { body } => engine.complete_passkey(body),
         ControlMsg::PrintPage => engine.print_page(),
         ControlMsg::Stop
         | ControlMsg::Resize { .. }

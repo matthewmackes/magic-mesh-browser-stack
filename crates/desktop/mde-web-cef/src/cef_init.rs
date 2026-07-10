@@ -77,6 +77,9 @@ pub const CEF_GENERIC_LOCALE: &str = "en-US";
 /// Stable Accept-Language list exposed to web content by the Chromium helper.
 pub const CEF_GENERIC_ACCEPT_LANGUAGE: &str = "en-US,en";
 
+/// Loopback Chromium DevTools discovery port for the CEF helper.
+pub const CEF_REMOTE_DEBUGGING_PORT: i32 = 9222;
+
 /// `cef_main_args_t` on Linux.
 #[repr(C)]
 pub struct CefMainArgs {
@@ -160,6 +163,10 @@ impl CefSettings {
         settings.put_i32(CEF_SETTINGS_EXTERNAL_MESSAGE_PUMP_OFFSET, 1);
         settings.put_i32(CEF_SETTINGS_WINDOWLESS_RENDERING_ENABLED_OFFSET, 1);
         settings.put_i32(CEF_SETTINGS_COMMAND_LINE_ARGS_DISABLED_OFFSET, 0);
+        settings.put_i32(
+            CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET,
+            CEF_REMOTE_DEBUGGING_PORT,
+        );
         settings
     }
 
@@ -179,12 +186,13 @@ impl CefSettings {
     #[must_use]
     pub fn status_line(&self) -> String {
         format!(
-            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={}",
+            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={} remote_debugging_port={}",
             self.get_usize(CEF_SETTINGS_SIZE_OFFSET),
             self.get_i32(CEF_SETTINGS_NO_SANDBOX_OFFSET),
             self.get_i32(CEF_SETTINGS_WINDOWLESS_RENDERING_ENABLED_OFFSET),
             self.get_i32(CEF_SETTINGS_EXTERNAL_MESSAGE_PUMP_OFFSET),
-            self.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET)
+            self.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET),
+            self.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET)
         )
     }
 
@@ -222,6 +230,8 @@ pub struct CefInitPaths {
     pub locales_dir_path: PathBuf,
     /// CEF log file path.
     pub log_file: PathBuf,
+    /// Vetted unpacked extension directories to load, when extension support is enabled.
+    pub extension_dirs: Vec<PathBuf>,
 }
 
 impl CefInitPaths {
@@ -234,7 +244,15 @@ impl CefInitPaths {
             locales_dir_path: resources_dir.join("locales"),
             resources_dir_path: resources_dir,
             log_file: std::env::temp_dir().join("mde-web-cef-renderer.log"),
+            extension_dirs: Vec::new(),
         }
+    }
+
+    /// Return a copy that loads exactly these vetted unpacked extension dirs.
+    #[must_use]
+    pub fn with_extension_dirs(mut self, extension_dirs: Vec<PathBuf>) -> Self {
+        self.extension_dirs = extension_dirs;
+        self
     }
 
     /// CEF/Chromium switches that mirror the pinned settings paths.
@@ -245,6 +263,7 @@ impl CefInitPaths {
             "--disable-gpu".to_owned(),
             "--disable-gpu-compositing".to_owned(),
             "--ozone-platform=headless".to_owned(),
+            format!("--remote-debugging-port={CEF_REMOTE_DEBUGGING_PORT}"),
             format!("--lang={CEF_GENERIC_LOCALE}"),
             format!("--user-agent={CEF_GENERIC_USER_AGENT}"),
             format!("--accept-lang={CEF_GENERIC_ACCEPT_LANGUAGE}"),
@@ -259,6 +278,19 @@ impl CefInitPaths {
                 self.resources_dir_path.join("icudtl.dat").display()
             ),
         ];
+        if self.extension_dirs.is_empty() {
+            switches.push("--disable-extensions".to_owned());
+        } else {
+            let dirs = self
+                .extension_dirs
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(",");
+            switches.push("--enable-extensions".to_owned());
+            switches.push(format!("--load-extension={dirs}"));
+            switches.push("--disable-component-extensions-with-background-pages".to_owned());
+        }
         switches.extend(chromium_privacy_switches().map(str::to_owned));
         switches
     }
@@ -273,7 +305,6 @@ fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
         "--disable-default-apps",
         "--disable-device-discovery-notifications",
         "--disable-domain-reliability",
-        "--disable-extensions",
         "--disable-metrics",
         "--disable-metrics-reporting",
         "--disable-notifications",
@@ -458,9 +489,14 @@ mod tests {
             settings.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET),
             0
         );
+        assert_eq!(
+            settings.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET),
+            CEF_REMOTE_DEBUGGING_PORT
+        );
         let line = settings.status_line();
         assert!(line.contains("CEF_INIT_PLAN"));
         assert!(line.contains("windowless=1"));
+        assert!(line.contains("remote_debugging_port=9222"));
     }
 
     #[test]
@@ -483,6 +519,7 @@ mod tests {
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
         assert_ne!(
@@ -512,6 +549,9 @@ mod tests {
         assert!(switches.contains(&"--no-sandbox".to_owned()));
         assert!(switches.contains(&"--disable-gpu".to_owned()));
         assert!(switches.contains(&"--ozone-platform=headless".to_owned()));
+        assert!(switches.contains(&format!(
+            "--remote-debugging-port={CEF_REMOTE_DEBUGGING_PORT}"
+        )));
         assert!(switches
             .iter()
             .any(|s| s == "--resources-dir-path=/opt/mde/cef/Resources"));
@@ -538,6 +578,7 @@ mod tests {
         assert!(switches.contains(&format!("--lang={CEF_GENERIC_LOCALE}")));
         assert!(switches.contains(&"--disable-background-networking".to_owned()));
         assert!(switches.contains(&"--disable-sync".to_owned()));
+        assert!(switches.contains(&"--disable-extensions".to_owned()));
         assert!(switches.contains(&"--disable-metrics-reporting".to_owned()));
         assert!(switches.contains(&"--disable-webrtc".to_owned()));
         assert!(switches
@@ -551,12 +592,33 @@ mod tests {
     }
 
     #[test]
+    fn init_paths_load_only_vetted_extensions_when_present() {
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        )
+        .with_extension_dirs(vec![
+            PathBuf::from("/mnt/mesh-storage/browser/extensions/lastpass"),
+            PathBuf::from("/mnt/mesh-storage/browser/extensions/ublock-origin"),
+        ]);
+        let switches = paths.command_line_switches();
+        assert!(!switches.contains(&"--disable-extensions".to_owned()));
+        assert!(switches.contains(&"--enable-extensions".to_owned()));
+        assert!(
+            switches.contains(&"--disable-component-extensions-with-background-pages".to_owned())
+        );
+        assert!(switches.iter().any(|switch| switch
+            == "--load-extension=/mnt/mesh-storage/browser/extensions/lastpass,/mnt/mesh-storage/browser/extensions/ublock-origin"));
+    }
+
+    #[test]
     fn owned_settings_pin_generic_browser_identity() {
         let paths = CefInitPaths {
             browser_subprocess_path: PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer"),
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
         let encoded = |text: &str| text.encode_utf16().collect::<Vec<_>>();

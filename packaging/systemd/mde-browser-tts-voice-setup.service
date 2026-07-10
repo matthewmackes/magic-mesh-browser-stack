@@ -1,0 +1,16 @@
+[Unit]
+Description=MCNF - install the optional Browser read-aloud Piper voice (BROWSER-DD-11)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/libexec/mackesd/browser-read-aloud-tts
+ConditionPathExists=!/usr/share/magic-mesh/tts/browser-read-aloud.onnx
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SuccessExitStatus=78
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/install-browser-tts-voice
+
+[Install]
+WantedBy=multi-user.target

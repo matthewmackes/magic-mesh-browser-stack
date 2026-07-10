@@ -1,0 +1,16 @@
+[Unit]
+Description=MCNF - install the optional Browser voice-command STT model (BROWSER-DD-11)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/libexec/mackesd/browser-voice-command-stt
+ConditionPathExists=!/usr/share/magic-mesh/stt/browser-voice-command.model
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+SuccessExitStatus=78
+ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
+ExecStart=/usr/libexec/mackesd/install-browser-stt-model
+
+[Install]
+WantedBy=multi-user.target

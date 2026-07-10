@@ -15,15 +15,21 @@ use std::time::Duration;
 
 use mde_web_cef::{
     cef_abi::{CefAbi, CefInitializeProbe},
-    cef_browser::{run_windowless_browser_probe_with_stream, run_windowless_tab},
+    cef_browser::{
+        run_windowless_browser_probe_with_stream, run_windowless_tab, run_windowless_text_probe,
+    },
     cef_init::{CefInitPaths, CefMainArgs, CefSettingsOwned},
-    CEF_BRIDGE_LIBCEF_ENV, CEF_BRIDGE_RELEASE_ENV, CEF_BRIDGE_RESOURCES_ENV, CEF_BRIDGE_ROOT_ENV,
-    CEF_ICU_DATA, CEF_RESOURCES_PAK,
+    detect_extension_registry, extension_power_mode_enabled, CefExtensionRegistry,
+    CEF_BRIDGE_EXTENSIONS_ENV, CEF_BRIDGE_EXTENSION_REGISTRY_ENV, CEF_BRIDGE_LIBCEF_ENV,
+    CEF_BRIDGE_RELEASE_ENV, CEF_BRIDGE_RESOURCES_ENV, CEF_BRIDGE_ROOT_ENV, CEF_ICU_DATA,
+    CEF_RESOURCES_PAK,
 };
 
 const CEF_INITIALIZE_PROBE_ENV: &str = "MDE_CEF_INITIALIZE_PROBE";
 const CEF_BROWSER_PROBE_ENV: &str = "MDE_CEF_BROWSER_PROBE";
+const CEF_TEXT_PROBE_EXPECT_ENV: &str = "MDE_CEF_TEXT_PROBE_EXPECT";
 const CEF_ATTACH_STDIN_ENV: &str = "MDE_CEF_ATTACH_STDIN";
+const CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV: &str = "MDE_CEF_ALLOW_ALLOY_EXTENSION_SMOKE";
 const SESSION_SOCKET_FD: i32 = 0;
 
 fn main() -> ExitCode {
@@ -41,11 +47,12 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "CEF_BRIDGE_READY mode={mode} root={} lib={} release={} resources={}",
+        "CEF_BRIDGE_READY mode={mode} root={} lib={} release={} resources={} extensions={}",
         contract.root.display(),
         contract.libcef.display(),
         contract.release_dir.display(),
-        contract.resources_dir.display()
+        contract.resources_dir.display(),
+        contract.extensions.len()
     );
 
     let abi = match CefAbi::load(&contract.libcef).and_then(|abi| {
@@ -63,7 +70,8 @@ fn main() -> ExitCode {
     };
     let bridge_exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mde-web-cef-renderer"));
-    let paths = CefInitPaths::new(bridge_exe, &contract.resources_dir);
+    let paths = CefInitPaths::new(bridge_exe, &contract.resources_dir)
+        .with_extension_dirs(contract.extensions.clone());
     let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
     println!("{}", settings.status_line());
 
@@ -103,6 +111,41 @@ fn main() -> ExitCode {
                     }
                 } else if std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some() {
                     let url = url_arg(&args).unwrap_or("https://example.com/");
+                    if let Some(expected) = std::env::var_os(CEF_TEXT_PROBE_EXPECT_ENV) {
+                        if let Some(line) = windowless_extension_runtime_gate(
+                            contract.extensions.len(),
+                            allow_alloy_extension_smoke_enabled(),
+                        ) {
+                            eprintln!("{line}");
+                            return ExitCode::from(78);
+                        }
+                        let expected = expected.to_string_lossy().into_owned();
+                        match run_windowless_text_probe(
+                            &abi,
+                            url,
+                            1024,
+                            768,
+                            Duration::from_secs(15),
+                            &expected,
+                        ) {
+                            Ok(probe) => {
+                                println!("{}", probe.status_line());
+                                if !contract.extensions.is_empty() {
+                                    println!(
+                                        "CEF_EXTENSION_SMOKE_READY extensions={} marker_bytes={} text_bytes={}",
+                                        contract.extensions.len(),
+                                        expected.len(),
+                                        probe.text_bytes
+                                    );
+                                }
+                                return ExitCode::SUCCESS;
+                            }
+                            Err(err) => {
+                                eprintln!("CEF_TEXT_PROBE_FAILED reason={err}");
+                                return ExitCode::from(78);
+                            }
+                        }
+                    }
                     let session_socket = if std::env::var_os(CEF_ATTACH_STDIN_ENV).is_some() {
                         Some(session_socket_from_stdin())
                     } else {
@@ -149,6 +192,9 @@ struct BridgeContract {
     libcef: PathBuf,
     release_dir: PathBuf,
     resources_dir: PathBuf,
+    extensions: Vec<PathBuf>,
+    extension_registry: Option<PathBuf>,
+    extension_power_mode: bool,
 }
 
 impl BridgeContract {
@@ -158,6 +204,9 @@ impl BridgeContract {
             libcef: env_path(CEF_BRIDGE_LIBCEF_ENV)?,
             release_dir: env_path(CEF_BRIDGE_RELEASE_ENV)?,
             resources_dir: env_path(CEF_BRIDGE_RESOURCES_ENV)?,
+            extensions: env_paths(CEF_BRIDGE_EXTENSIONS_ENV),
+            extension_registry: env_path(CEF_BRIDGE_EXTENSION_REGISTRY_ENV),
+            extension_power_mode: extension_power_mode_enabled(),
         })
     }
 
@@ -183,12 +232,68 @@ impl BridgeContract {
                 self.resources_dir.join(CEF_RESOURCES_PAK).display()
             ));
         }
+        for path in &self.extensions {
+            if !path.is_dir() {
+                return Err(format!("extension directory {} missing", path.display()));
+            }
+        }
+        self.validate_extension_registry()
+    }
+
+    fn validate_extension_registry(&self) -> Result<(), String> {
+        if self.extensions.is_empty() {
+            return Ok(());
+        }
+        let registry = self.extension_registry.as_ref().ok_or_else(|| {
+            format!("{CEF_BRIDGE_EXTENSION_REGISTRY_ENV} missing for extension handoff")
+        })?;
+        let detected = detect_extension_registry(registry);
+        let expected = match detected {
+            CefExtensionRegistry::Available { extensions, .. } => extensions
+                .into_iter()
+                .filter(|entry| self.extension_power_mode || !entry.power_sideload)
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            CefExtensionRegistry::Missing { .. } | CefExtensionRegistry::Invalid { .. } => {
+                return Err(format!(
+                    "extension registry did not validate: {}",
+                    detected.status_line()
+                ));
+            }
+        };
+        if expected != self.extensions {
+            return Err(format!(
+                "extension handoff does not match registry {} expected={} got={}",
+                registry.display(),
+                join_paths_for_status(&expected),
+                join_paths_for_status(&self.extensions)
+            ));
+        }
         Ok(())
     }
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).filter(non_empty).map(PathBuf::from)
+}
+
+fn env_paths(key: &str) -> Vec<PathBuf> {
+    std::env::var_os(key).map_or_else(Vec::new, |value| {
+        value
+            .to_string_lossy()
+            .split(',')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
+fn join_paths_for_status(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn non_empty(value: &OsString) -> bool {
@@ -216,8 +321,167 @@ fn u32_flag(args: &[String], flag: &str) -> Option<u32> {
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].parse().ok()).flatten())
 }
 
+fn allow_alloy_extension_smoke_enabled() -> bool {
+    std::env::var(CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn windowless_extension_runtime_gate(
+    extension_count: usize,
+    allow_alloy_extension_smoke: bool,
+) -> Option<String> {
+    if extension_count == 0 || allow_alloy_extension_smoke {
+        return None;
+    }
+    Some(format!(
+        "CEF_EXTENSIONS_WINDOWLESS_ALLOY_GATED extensions={extension_count} reason=cef_149_windowless_forces_alloy_runtime chrome_runtime_required_for_webextensions override_env={CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV}"
+    ))
+}
+
 fn session_socket_from_stdin() -> UnixStream {
     // SAFETY: this opt-in probe mode follows `mde-web-preview`'s live-helper
     // convention: fd 0 is a connected AF_UNIX session socket owned by the child.
     unsafe { UnixStream::from_raw_fd(SESSION_SOCKET_FD) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn bridge_contract_revalidates_extension_dirs_against_registry() {
+        let root = temp_root("mde-cef-bridge-registry");
+        let release = root.join("Release");
+        let resources = root.join("Resources");
+        let lastpass = root.join("lastpass");
+        let forged = root.join("forged");
+        let registry = root.join("allowlist.env");
+        fs::create_dir_all(&release).expect("release dir");
+        fs::create_dir_all(&resources).expect("resources dir");
+        fs::create_dir_all(&lastpass).expect("lastpass dir");
+        fs::create_dir_all(&forged).expect("forged dir");
+        fs::write(release.join("libcef.so"), b"fake cef").expect("libcef");
+        fs::write(resources.join(CEF_ICU_DATA), b"icu").expect("icu");
+        fs::write(resources.join(CEF_RESOURCES_PAK), b"pak").expect("pak");
+        write_manifest(&lastpass, "LastPass", "4.130.0", &["storage", "tabs"]);
+        write_manifest(&forged, "Forged", "1.0.0", &["storage"]);
+        fs::write(
+            &registry,
+            r#"
+            [extension.hdokiejnpimakedhajhdlcegeplioahd]
+            name = "LastPass"
+            version = "4.130.0"
+            path = "lastpass"
+            permissions = storage,tabs
+            power_sideload = true
+            "#,
+        )
+        .expect("registry");
+
+        let valid = contract(
+            &root,
+            &release,
+            &resources,
+            Some(registry.clone()),
+            true,
+            vec![lastpass.clone()],
+        );
+        valid.validate().expect("vetted extension handoff");
+
+        let power_gated = contract(
+            &root,
+            &release,
+            &resources,
+            Some(registry.clone()),
+            false,
+            vec![lastpass],
+        );
+        let err = power_gated
+            .validate()
+            .expect_err("sideload handoff requires power mode");
+        assert!(err.contains("does not match registry"), "{err}");
+
+        let missing_registry = contract(
+            &root,
+            &release,
+            &resources,
+            None,
+            true,
+            vec![forged.clone()],
+        );
+        let err = missing_registry
+            .validate()
+            .expect_err("registry pointer required");
+        assert!(err.contains(CEF_BRIDGE_EXTENSION_REGISTRY_ENV), "{err}");
+
+        let forged = contract(
+            &root,
+            &release,
+            &resources,
+            Some(registry),
+            true,
+            vec![forged],
+        );
+        let err = forged
+            .validate()
+            .expect_err("forged extension dir rejected");
+        assert!(err.contains("does not match registry"), "{err}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windowless_extension_runtime_gate_names_chrome_runtime_requirement() {
+        let line = windowless_extension_runtime_gate(1, false).expect("extension smoke gated");
+        assert!(line.contains("CEF_EXTENSIONS_WINDOWLESS_ALLOY_GATED"));
+        assert!(line.contains("cef_149_windowless_forces_alloy_runtime"));
+        assert!(line.contains(CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV));
+        assert!(windowless_extension_runtime_gate(0, false).is_none());
+        assert!(windowless_extension_runtime_gate(1, true).is_none());
+    }
+
+    fn contract(
+        root: &PathBuf,
+        release: &PathBuf,
+        resources: &PathBuf,
+        extension_registry: Option<PathBuf>,
+        extension_power_mode: bool,
+        extensions: Vec<PathBuf>,
+    ) -> BridgeContract {
+        BridgeContract {
+            root: root.clone(),
+            libcef: release.join("libcef.so"),
+            release_dir: release.clone(),
+            resources_dir: resources.clone(),
+            extensions,
+            extension_registry,
+            extension_power_mode,
+        }
+    }
+
+    fn write_manifest(path: &PathBuf, name: &str, version: &str, permissions: &[&str]) {
+        let permissions = permissions
+            .iter()
+            .map(|permission| format!("\"{permission}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            path.join("manifest.json"),
+            format!(
+                "{{\"manifest_version\":3,\"name\":\"{name}\",\"version\":\"{version}\",\"permissions\":[{permissions}]}}"
+            ),
+        )
+        .expect("manifest");
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
 }

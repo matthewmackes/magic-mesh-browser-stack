@@ -4,8 +4,9 @@ use std::process::Command;
 use std::process::ExitCode;
 
 use mde_web_cef::{
-    configured_bridge_bin, configured_cef_root, configured_widevine_root, detect_runtime,
-    detect_widevine, parse_mode, CefLaunchPlan, Mode,
+    configured_bridge_bin, configured_cef_root, configured_extension_registry,
+    configured_widevine_root, detect_extension_registry, detect_runtime, detect_widevine,
+    extension_power_mode_enabled, parse_mode, CefLaunchPlan, Mode,
 };
 
 fn main() -> ExitCode {
@@ -22,8 +23,17 @@ fn main() -> ExitCode {
 
     let runtime = detect_runtime(configured_cef_root());
     let widevine = detect_widevine(configured_widevine_root());
+    let extensions = detect_extension_registry(configured_extension_registry());
+    let extension_power_mode = extension_power_mode_enabled();
     println!("{}", runtime.status_line());
     println!("{}", widevine.status_line());
+    println!("{}", extensions.status_line());
+    if let Some(line) = extensions.power_mode_gate_line(extension_power_mode) {
+        println!("{line}");
+    }
+    if let Some(line) = extensions.runtime_gate_line() {
+        println!("{line}");
+    }
     match mode {
         Mode::Probe => {
             if runtime.is_available() {
@@ -32,9 +42,13 @@ fn main() -> ExitCode {
                 ExitCode::from(78)
             }
         }
-        Mode::Tab | Mode::RenderOnce | Mode::Warm => {
-            run_renderer_mode(&runtime, &widevine, mode, args.iter().skip(2))
-        }
+        Mode::Tab | Mode::RenderOnce | Mode::Warm => run_renderer_mode(
+            &runtime,
+            &widevine,
+            extension_power_mode,
+            mode,
+            args.iter().skip(2),
+        ),
         Mode::Help => ExitCode::SUCCESS,
     }
 }
@@ -42,6 +56,7 @@ fn main() -> ExitCode {
 fn run_renderer_mode<'a>(
     runtime: &mde_web_cef::CefRuntime,
     widevine: &mde_web_cef::WidevineCdm,
+    extension_power_mode: bool,
     mode: Mode,
     passthrough_args: impl Iterator<Item = &'a String>,
 ) -> ExitCode {
@@ -50,8 +65,14 @@ fn run_renderer_mode<'a>(
         return ExitCode::from(78);
     }
 
-    let Some(plan) = CefLaunchPlan::new_with_widevine(runtime, widevine, configured_bridge_bin())
-    else {
+    let extensions = detect_extension_registry(configured_extension_registry());
+    let Some(plan) = CefLaunchPlan::new_with_widevine_extensions_and_power_mode(
+        runtime,
+        widevine,
+        &extensions,
+        extension_power_mode,
+        configured_bridge_bin(),
+    ) else {
         eprintln!("Chromium/CEF runtime is present but its launch plan is incomplete");
         return ExitCode::from(78);
     };
