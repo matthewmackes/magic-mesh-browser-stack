@@ -1273,37 +1273,6 @@ impl WebState {
         }
     }
 
-    fn poll_offline_cache_results(&mut self) {
-        if self
-            .offline_cache_result_last_poll
-            .is_some_and(|last| last.elapsed() < OFFLINE_CACHE_RESULT_POLL_INTERVAL)
-        {
-            return;
-        }
-        self.offline_cache_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
-            return;
-        };
-        let topic = browser_offline_cache_result_topic(&local_hostname());
-        let Ok(msgs) = persist.list_since(&topic, self.offline_cache_result_cursor.as_deref())
-        else {
-            return;
-        };
-        for msg in msgs {
-            self.offline_cache_result_cursor = Some(msg.ulid.clone());
-            let Some(body) = msg.body.as_deref() else {
-                continue;
-            };
-            let Ok(result) = parse_offline_cache_result(body) else {
-                continue;
-            };
-            self.apply_offline_cache_result(result);
-        }
-    }
-
     fn poll_security_update_status(&mut self) {
         if self
             .security_update_last_poll
@@ -1359,38 +1328,6 @@ impl WebState {
             Err(err) => {
                 self.capture_notice = Some(format!("QR share unavailable: {err}"));
             }
-        }
-    }
-
-    fn apply_offline_cache_result(&mut self, result: BrowserOfflineCacheResult) {
-        if result.host != local_hostname() {
-            return;
-        }
-        let chars = result.text.chars().count();
-        self.capture_notice = Some(format!(
-            "Offline cache ready: {} character{}",
-            chars,
-            plural(chars)
-        ));
-        for key in cache_url_keys(&result.url) {
-            self.offline_cache_by_url.insert(key, result.clone());
-        }
-        self.latest_offline_cache = Some(result);
-    }
-
-    fn cached_snapshot_for_url(&self, url: &str) -> Option<&BrowserOfflineCacheResult> {
-        cache_url_keys(url)
-            .into_iter()
-            .find_map(|key| self.offline_cache_by_url.get(&key))
-    }
-
-    fn offline_cache_fallback_for_unavailable(&self) -> Option<&BrowserOfflineCacheResult> {
-        match self.tabs.get(self.active) {
-            Some(tab) if tab.session.is_crashed() => {
-                self.cached_snapshot_for_url(tab.session.nav().url.trim())
-            }
-            None => self.cached_snapshot_for_url(self.address.trim()),
-            _ => None,
         }
     }
 
@@ -2396,77 +2333,6 @@ impl WebState {
         Ok(path)
     }
 
-    fn open_latest_offline_cache_pdf(&mut self) {
-        match self.save_latest_offline_cache_pdf_to_dir(browser_pdf_dir()) {
-            Ok(path) => {
-                if let Some(result) = &self.latest_offline_cache {
-                    self.last_saved_pdf = Some(SavedPdf {
-                        path,
-                        url: result.url.clone(),
-                        title: result.title.clone(),
-                    });
-                }
-                self.open_last_saved_pdf();
-            }
-            Err(err) => {
-                self.capture_notice = Some(format!("Offline PDF failed: {err}"));
-            }
-        }
-    }
-
-    fn save_latest_offline_cache_pdf_to_dir(
-        &self,
-        dir: impl AsRef<Path>,
-    ) -> Result<PathBuf, String> {
-        let result = self
-            .latest_offline_cache
-            .as_ref()
-            .ok_or_else(|| "no offline copy".to_owned())?;
-        let pdf = result
-            .pdf_snapshot
-            .as_ref()
-            .ok_or_else(|| "offline copy has no PDF snapshot".to_owned())?;
-        let bytes = offline_cache_pdf_bytes(pdf)?;
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-        let path = dir.join(&pdf.filename);
-        std::fs::write(&path, bytes)
-            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
-        Ok(path)
-    }
-
-    fn save_latest_offline_cache_archive(&mut self) {
-        match self.save_latest_offline_cache_archive_to_dir(browser_capture_dir()) {
-            Ok(path) => self.record_capture_success("Saved offline archive", &path),
-            Err(err) => {
-                self.capture_notice = Some(format!("Offline archive failed: {err}"));
-            }
-        }
-    }
-
-    fn save_latest_offline_cache_archive_to_dir(
-        &self,
-        dir: impl AsRef<Path>,
-    ) -> Result<PathBuf, String> {
-        let result = self
-            .latest_offline_cache
-            .as_ref()
-            .ok_or_else(|| "no offline copy".to_owned())?;
-        let archive = result
-            .archive_mhtml
-            .as_ref()
-            .ok_or_else(|| "offline copy has no MHTML archive".to_owned())?;
-        let bytes = offline_cache_archive_bytes(archive)?;
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-        let path = dir.join(&archive.filename);
-        std::fs::write(&path, bytes)
-            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
-        Ok(path)
-    }
-
     fn can_drive_page_tools(&self) -> bool {
         self.tabs
             .get(self.active)
@@ -2625,49 +2491,6 @@ impl WebState {
             .map_or(DeviceProfile::Default, |tab| tab.device_profile)
             .next();
         self.set_active_tab_device_profile(device_profile);
-    }
-
-    fn request_active_offline_cache(&mut self) {
-        if !self.can_drive_page_tools() {
-            self.capture_notice = Some("Offline cache unavailable: no live page".to_owned());
-            return;
-        }
-        let (engine, url, title, viewport, resources) = {
-            let Some(tab) = self.tabs.get(self.active) else {
-                self.capture_notice = Some("Offline cache unavailable: no live page".to_owned());
-                return;
-            };
-            (
-                tab.engine,
-                tab.session.nav().url.clone(),
-                tab.session.title().to_owned(),
-                tab.last_frame
-                    .as_ref()
-                    .and_then(offline_cache_viewport_image),
-                offline_cache_resource_manifest(&tab.session.recent_resource_requests()),
-            )
-        };
-        let pdf_snapshot = self
-            .last_saved_pdf
-            .as_ref()
-            .filter(|saved| saved.url == url)
-            .and_then(offline_cache_pdf_snapshot);
-        let request = OfflineCacheRequest {
-            tab_index: self.active,
-            engine,
-            url,
-            title,
-            viewport,
-            resources,
-            pdf_snapshot,
-        };
-        let id = self.next_page_text_request_id;
-        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
-        if let Some(tab) = self.active_tab() {
-            tab.session.request_page_text(id, 64 * 1024);
-            self.pending_offline_cache_requests.insert(id, request);
-            self.capture_notice = Some("Offline cache: reading page text".to_owned());
-        }
     }
 
     fn request_active_voice_command(&mut self, mode: VoiceCommandMode) {
