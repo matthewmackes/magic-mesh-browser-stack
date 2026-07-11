@@ -2627,95 +2627,6 @@ impl WebState {
         self.set_active_tab_device_profile(device_profile);
     }
 
-    fn apply_spellcheck_correction(&mut self, tab_index: usize, word: &str, replacement: &str) {
-        self.apply_spellcheck_correction_inner(tab_index, word, replacement, false);
-    }
-
-    fn apply_spellcheck_correction_all(&mut self, tab_index: usize, word: &str, replacement: &str) {
-        self.apply_spellcheck_correction_inner(tab_index, word, replacement, true);
-    }
-
-    fn apply_spellcheck_correction_at(
-        &mut self,
-        tab_index: usize,
-        word: &str,
-        replacement: &str,
-        occurrence: u16,
-    ) {
-        let word = word.trim();
-        let replacement = replacement.trim();
-        if word.is_empty() || replacement.is_empty() {
-            return;
-        }
-        let Some(tab) = self.tabs.get_mut(tab_index) else {
-            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
-            return;
-        };
-        if tab.session.is_crashed() {
-            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
-            return;
-        }
-        tab.session.apply_spellcheck_correction_at(
-            word.to_owned(),
-            replacement.to_owned(),
-            occurrence,
-        );
-        self.capture_notice = Some(format!(
-            "Spelling: replaced occurrence {} of {word} with {replacement}",
-            u32::from(occurrence) + 1
-        ));
-    }
-
-    fn apply_spellcheck_correction_inner(
-        &mut self,
-        tab_index: usize,
-        word: &str,
-        replacement: &str,
-        replace_all: bool,
-    ) {
-        let word = word.trim();
-        let replacement = replacement.trim();
-        if word.is_empty() || replacement.is_empty() {
-            return;
-        }
-        let Some(tab) = self.tabs.get_mut(tab_index) else {
-            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
-            return;
-        };
-        if tab.session.is_crashed() {
-            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
-            return;
-        }
-        if replace_all {
-            tab.session
-                .apply_spellcheck_correction_all(word.to_owned(), replacement.to_owned());
-            self.capture_notice = Some(format!("Spelling: replaced all {word} with {replacement}"));
-        } else {
-            tab.session
-                .apply_spellcheck_correction(word.to_owned(), replacement.to_owned());
-            self.capture_notice = Some(format!("Spelling: replaced {word} with {replacement}"));
-        }
-    }
-
-    fn request_active_spellcheck(&mut self) {
-        if !self.can_drive_page_tools() {
-            self.capture_notice = Some("Spelling unavailable: no live page".to_owned());
-            return;
-        }
-        if self.spellcheck.in_flight.is_some() {
-            self.capture_notice = Some("Spelling: check already running".to_owned());
-            return;
-        }
-        let id = self.next_page_text_request_id;
-        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
-        let active = self.active;
-        if let Some(tab) = self.active_tab() {
-            tab.session.request_page_text(id, 64 * 1024);
-            self.pending_spell_requests.insert(id, active);
-            self.capture_notice = Some("Spelling: reading page text".to_owned());
-        }
-    }
-
     fn request_active_read_aloud(&mut self) {
         if !self.can_drive_page_tools() {
             self.capture_notice = Some("Read aloud unavailable: no live page".to_owned());
@@ -2918,29 +2829,6 @@ impl WebState {
                 self.capture_notice = Some(format!("Passkey: ignored helper event ({err})"));
             }
         }
-    }
-
-    fn poll_spellcheck(&mut self) {
-        let Some((id, tab_index, result)) = self.spellcheck.poll() else {
-            return;
-        };
-        if self.pending_spell_requests.contains_key(&id) {
-            return;
-        }
-        let highlight_words = match &result {
-            Ok(misses) => spellcheck_highlight_words(misses),
-            Err(_) => Vec::new(),
-        };
-        if let Some(tab) = self.tabs.get_mut(tab_index) {
-            if !tab.session.is_crashed() {
-                tab.session.set_spellcheck_highlights(highlight_words);
-            }
-        }
-        self.latest_spellcheck = Some(BrowserSpellcheckResult::from_result(
-            tab_index,
-            result.clone(),
-        ));
-        self.capture_notice = Some(spellcheck_notice(result));
     }
 
     fn set_active_tab_container(&mut self, container: ContainerProfile) {

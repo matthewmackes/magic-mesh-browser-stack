@@ -127,3 +127,132 @@ pub(super) struct OfflineCacheViewportTexture {
     pub(super) data_sig: u64,
     pub(super) texture: Option<TextureHandle>,
 }
+
+/// Spellcheck actions on the Browser surface state — requesting a page-text check,
+/// draining the async result onto the tab, and applying a suggested correction —
+/// kept beside the [`BrowserSpellcheckResult`] carrier they populate. `use super::*`
+/// pulls in the parent's `spellcheck_highlight_words` / `spellcheck_notice` helpers
+/// and `WebState`'s private fields. A pure relocation from the `web` god-module.
+impl WebState {
+    pub(super) fn apply_spellcheck_correction(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+    ) {
+        self.apply_spellcheck_correction_inner(tab_index, word, replacement, false);
+    }
+
+    pub(super) fn apply_spellcheck_correction_all(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+    ) {
+        self.apply_spellcheck_correction_inner(tab_index, word, replacement, true);
+    }
+
+    pub(super) fn apply_spellcheck_correction_at(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+        occurrence: u16,
+    ) {
+        let word = word.trim();
+        let replacement = replacement.trim();
+        if word.is_empty() || replacement.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
+            return;
+        };
+        if tab.session.is_crashed() {
+            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
+            return;
+        }
+        tab.session.apply_spellcheck_correction_at(
+            word.to_owned(),
+            replacement.to_owned(),
+            occurrence,
+        );
+        self.capture_notice = Some(format!(
+            "Spelling: replaced occurrence {} of {word} with {replacement}",
+            u32::from(occurrence) + 1
+        ));
+    }
+
+    fn apply_spellcheck_correction_inner(
+        &mut self,
+        tab_index: usize,
+        word: &str,
+        replacement: &str,
+        replace_all: bool,
+    ) {
+        let word = word.trim();
+        let replacement = replacement.trim();
+        if word.is_empty() || replacement.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            self.capture_notice = Some("Spelling correction unavailable: tab closed".to_owned());
+            return;
+        };
+        if tab.session.is_crashed() {
+            self.capture_notice = Some("Spelling correction unavailable: page crashed".to_owned());
+            return;
+        }
+        if replace_all {
+            tab.session
+                .apply_spellcheck_correction_all(word.to_owned(), replacement.to_owned());
+            self.capture_notice = Some(format!("Spelling: replaced all {word} with {replacement}"));
+        } else {
+            tab.session
+                .apply_spellcheck_correction(word.to_owned(), replacement.to_owned());
+            self.capture_notice = Some(format!("Spelling: replaced {word} with {replacement}"));
+        }
+    }
+
+    pub(super) fn request_active_spellcheck(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Spelling unavailable: no live page".to_owned());
+            return;
+        }
+        if self.spellcheck.in_flight.is_some() {
+            self.capture_notice = Some("Spelling: check already running".to_owned());
+            return;
+        }
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        let active = self.active;
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_spell_requests.insert(id, active);
+            self.capture_notice = Some("Spelling: reading page text".to_owned());
+        }
+    }
+
+    pub(super) fn poll_spellcheck(&mut self) {
+        let Some((id, tab_index, result)) = self.spellcheck.poll() else {
+            return;
+        };
+        if self.pending_spell_requests.contains_key(&id) {
+            return;
+        }
+        let highlight_words = match &result {
+            Ok(misses) => spellcheck_highlight_words(misses),
+            Err(_) => Vec::new(),
+        };
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            if !tab.session.is_crashed() {
+                tab.session.set_spellcheck_highlights(highlight_words);
+            }
+        }
+        self.latest_spellcheck = Some(BrowserSpellcheckResult::from_result(
+            tab_index,
+            result.clone(),
+        ));
+        self.capture_notice = Some(spellcheck_notice(result));
+    }
+}
