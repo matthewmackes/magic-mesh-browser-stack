@@ -29,6 +29,10 @@ mackes-mesh-types = { path = "../mackes-mesh-types" }
 # browser_policy (BOOKMARKS-8) folds the fleet ad-block/browser policy against
 # the pure mde-adblock engine model (`mde_adblock::host_of`).
 mde-adblock = { path = "../../services/mde-adblock" }
+# arch-7 — browser_passkeys seals platform passkey private keys with the shared
+# Argon2id + XChaCha20-Poly1305 primitives (+ the mesh age identity path) that
+# also back CA disaster-recovery and the VPN secret store.
+mde-seal = { path = "../mde-seal" }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +42,10 @@ tracing = "0.1"
 # durable records.
 base64 = "0.22"
 sha2 = "0.10"
+# browser_passkeys mints/signs P-256 platform-authenticator credentials (ES256)
+# and draws credential-id / seal randomness.
+p256 = "0.14.0-rc.9"
+rand = "0.8"
 # resolve_local_root() falls back to the XDG data dir (offline_cache +
 # session_sync) when no explicit local root is configured.
 dirs = "5"

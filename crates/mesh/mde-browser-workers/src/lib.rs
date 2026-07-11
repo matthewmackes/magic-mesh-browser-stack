@@ -14,6 +14,16 @@
 
 #![forbid(unsafe_code)]
 
+// BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
+// action/browser/passkey handoffs, persists pending challenges locally, mirrors
+// them into the Syncthing-backed workgroup root, owns the software platform-
+// authenticator key store (sealing platform passkey private keys via the shared
+// `mde_seal::{seal_bytes, unseal_bytes}` primitives), and publishes honest
+// pending/created/asserted/error state without minting fake credentials.
+// arch-7 (2026-07-11): the 11th and final browser worker to leave the mackesd
+// control-plane crate — unblocked by extracting the seal primitives into
+// `mde-seal`, so it no longer depends back on the daemon.
+pub mod browser_passkeys;
 // BROWSER-DD-12 — Browser external-protocol owner. Drains
 // action/browser/protocol handoffs for external schemes Browser refused to
 // navigate, validates mailto/email and magnet/transfers routes, and publishes
