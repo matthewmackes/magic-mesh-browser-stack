@@ -40,6 +40,12 @@ path = "src/lib.rs"
 cef-devtools = []
 
 [dependencies]
+# The shared BOOKMARKS-6 socket wire contract (`ControlMsg`/`EventMsg` + framing),
+# re-exported as this crate's `wire` module. A pure-std workspace member the shell
+# client and the Servo helper also depend on, so all three ends share ONE type
+# identity instead of `#[path]`-including one `wire.rs` source into three crates.
+mde-web-wire = { path = "../mde-web-wire" }
+
 # Direct dynamic-loader/CEF ABI calls (`dlopen`, `dlsym`, `dlclose`) for the
 # bridge. Kept explicit rather than relying on nix's transitive libc edge.
 libc = "0.2"

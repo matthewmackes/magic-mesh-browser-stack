@@ -53,6 +53,12 @@ name = "mde_web_preview"
 path = "src/lib.rs"
 
 [dependencies]
+# The shared BOOKMARKS-6 socket wire contract (`ControlMsg`/`EventMsg` + framing),
+# re-exported as this crate's `wire` module. A pure-std workspace member the shell
+# client and the Chromium helper also depend on, so all three ends share ONE type
+# identity instead of `#[path]`-including one `wire.rs` source into three crates.
+mde-web-wire = { path = "../mde-web-wire" }
+
 # The interactive Servo web engine — the OFFICIAL servo-project publication on
 # crates.io (owners SimonSapin/larsbergstrom/jdm + the servo cargo-publish team;
 # repository github.com/servo/servo). Real libservo: WebView/WebViewBuilder,

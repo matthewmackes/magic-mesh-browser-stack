@@ -50,7 +50,13 @@ pub mod frame;
 pub mod input;
 pub mod scm;
 pub mod session;
-pub mod wire;
+
+// The socket wire contract now lives in its own crate (`mde-web-wire`) so the
+// shell client and BOTH out-of-process helpers (`mde-web-preview` / Servo and
+// `mde-web-cef` / Chromium) share ONE type identity, not three `#[path]`-included
+// copies of one source file. Re-exported as `wire` so callers' `wire::…` paths
+// (and this crate's own `crate::wire::…`) are unchanged.
+pub use mde_web_wire as wire;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

@@ -60,6 +60,12 @@ testkit = []
 live-helper = []
 
 [dependencies]
+# The shared BOOKMARKS-6 socket wire contract (`ControlMsg`/`EventMsg` + framing),
+# re-exported as this crate's `wire` module. Extracted from this crate's former
+# `src/wire.rs` into its own crate so the shell client and both engine helpers
+# share ONE type identity instead of `#[path]`-including the same source thrice.
+mde-web-wire = { path = "../mde-web-wire" }
+
 # The §4/§5 egui harness — the ONE toolkit resolution. This crate uses only the
 # egui types (ColorImage / TextureHandle / Event / Key / Color32); eframe/wgpu are
 # pulled transitively by the harness but unused here, exactly as the VDI decoder

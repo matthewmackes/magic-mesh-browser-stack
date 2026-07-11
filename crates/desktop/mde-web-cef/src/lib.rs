@@ -59,10 +59,12 @@ pub const CEF_EXTENSION_POWER_MODE_ENV: &str = "MDE_CEF_EXTENSION_POWER_MODE";
 pub const DEFAULT_CEF_EXTENSION_REGISTRY: &str =
     "/mnt/mesh-storage/browser/extensions/allowlist.env";
 
-/// The socket wire contract is the same one used by `mde-web-preview` and the
-/// shell client. Include the one source file so golden tests catch drift.
-#[path = "../../mde-web-preview-client/src/wire.rs"]
-pub mod wire;
+// The socket wire contract is the same one used by `mde-web-preview` and the
+// shell client — now the dedicated `mde-web-wire` crate, re-exported here as this
+// crate's `wire` module so every `wire::…` / `crate::wire::…` path is unchanged.
+// One crate, one type identity (it used to `#[path]`-include the client's
+// `wire.rs`); the golden `tests/protocol_golden.rs` still pins the bytes.
+pub use mde_web_wire as wire;
 
 /// Helper-side shared-memory frame writer for Chromium/CEF offscreen pixels.
 pub mod shm;

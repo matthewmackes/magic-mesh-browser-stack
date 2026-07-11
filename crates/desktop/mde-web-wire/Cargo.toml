@@ -1,0 +1,32 @@
+# mde-web-wire — the shared BOOKMARKS-6 socket wire contract.
+#
+# The typed, length-prefixed control/event message set (`ControlMsg`/`EventMsg` +
+# the `[u32 LE len][payload]` framing) that the shell client and both browser
+# helpers speak over the per-session Unix socket. It is the SINGLE source of that
+# contract: `mde-web-preview-client` (the shell-side bridge, a workspace member)
+# and the two workspace-EXCLUDED engine helpers — `mde-web-preview` (Servo) and
+# `mde-web-cef` (Chromium/CEF) — all depend on THIS crate by path and `use
+# mde_web_wire::...`, replacing the old `#[path]`-include of one sibling's
+# `wire.rs` into three crates. One crate now means one type identity and no drift;
+# the exact bytes stay pinned by this crate's round-trip + golden tests (mirrored
+# by each helper's `tests/protocol_golden.rs`).
+#
+# Pure `std` — no serde, no native links, no `unsafe` — so unlike the helper
+# crates it is a normal workspace MEMBER under the workspace `forbid`-unsafe lints,
+# and the excluded helpers pull it as an ordinary cross-workspace path dependency.
+[package]
+name        = "mde-web-wire"
+description = "BOOKMARKS-6 — the shared, typed length-prefixed browser socket wire contract (ControlMsg/EventMsg + framing) spoken by the shell client and both out-of-process engine helpers (Servo mde-web-preview + Chromium mde-web-cef). Pure std, no serde; every field is bounds-checked on decode so a malformed frame is a typed WireError, never a panic."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_web_wire"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
