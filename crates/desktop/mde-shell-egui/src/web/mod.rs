@@ -2627,32 +2627,6 @@ impl WebState {
         self.set_active_tab_device_profile(device_profile);
     }
 
-    fn request_active_translate_page(&mut self) {
-        if !self.can_drive_page_tools() {
-            self.capture_notice = Some("Translate unavailable: no live page".to_owned());
-            return;
-        }
-        let Some(tab) = self.tabs.get(self.active) else {
-            self.capture_notice = Some("Translate unavailable: no live page".to_owned());
-            return;
-        };
-        let request = TranslateRequest {
-            tab_index: self.active,
-            engine: tab.engine,
-            url: tab.session.nav().url.clone(),
-            title: tab.session.title().to_owned(),
-            source_lang: "auto".to_owned(),
-            target_lang: browser_translate_target_lang(),
-        };
-        let id = self.next_page_text_request_id;
-        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
-        if let Some(tab) = self.active_tab() {
-            tab.session.request_page_text(id, 64 * 1024);
-            self.pending_translate_requests.insert(id, request);
-            self.capture_notice = Some("Translate: reading page text".to_owned());
-        }
-    }
-
     fn request_active_offline_cache(&mut self) {
         if !self.can_drive_page_tools() {
             self.capture_notice = Some("Offline cache unavailable: no live page".to_owned());
