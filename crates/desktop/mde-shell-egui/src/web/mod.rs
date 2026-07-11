@@ -2289,61 +2289,6 @@ impl WebState {
         }
     }
 
-    fn refresh_cups_printers(&mut self) {
-        match discover_cups_printers() {
-            Ok(printers) => {
-                if self.cups_settings.destination.is_none() {
-                    self.cups_settings.destination = printers
-                        .iter()
-                        .find(|printer| printer.is_default)
-                        .or_else(|| printers.first())
-                        .map(|printer| printer.name.clone());
-                }
-                self.cups_printers = printers;
-                self.cups_notice = None;
-            }
-            Err(err) => {
-                self.cups_printers.clear();
-                self.cups_notice = Some(err);
-            }
-        }
-    }
-
-    fn queue_active_page_cups_print_to_dir(
-        &mut self,
-        dir: impl AsRef<Path>,
-    ) -> Result<PathBuf, String> {
-        if !self.can_drive_page_tools() {
-            return Err("no live page".to_owned());
-        }
-        let (url, title) = {
-            let Some(tab) = self.tabs.get(self.active) else {
-                return Err("no active tab".to_owned());
-            };
-            (
-                tab.session.nav().url.clone(),
-                tab.session.title().to_owned(),
-            )
-        };
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-        let now_ms = unix_ms();
-        let name = print_pdf_filename_for(&url, &title, now_ms);
-        let path = dir.join(name);
-        let key = path.to_string_lossy().into_owned();
-        let request = CupsPrintRequest {
-            path: key.clone(),
-            title: cups_job_title(&url, &title, now_ms),
-            settings: self.cups_settings.clone(),
-        };
-        self.pending_cups_prints.insert(key.clone(), request);
-        if let Some(tab) = self.active_tab() {
-            tab.session.save_pdf(key);
-        }
-        Ok(path)
-    }
-
     fn handle_pdf_event(&mut self, path: String, ok: bool) -> String {
         if let Some(request) = self.pending_cups_prints.remove(&path) {
             if !ok {
