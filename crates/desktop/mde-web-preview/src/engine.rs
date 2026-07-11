@@ -84,6 +84,28 @@ pub fn frame_stats(pixels: &[u8]) -> (usize, f64) {
 ///
 /// JavaScript stays ON (the `js_jit` feature + Servo defaults). Everything that
 /// persists to disk, fingerprints, or leaks the network path is turned OFF.
+///
+/// Cross-engine posture (browser-5): the shell runs two interchangeable browser
+/// engines on the same seat — CEF is the preferred default when its runtime is
+/// present and this Servo helper is the fallback (see
+/// `mde-shell-egui::web::engine_runtime::preferred_default_engine`) — so the
+/// same user may render a page under either, and their security guarantees must
+/// be reasoned about together:
+/// * WebRTC / local-IP leak: Servo turns it off at the *engine* level here
+///   (`dom_webrtc_enabled = false` — `RTCPeerConnection` never exists, no bypass).
+///   CEF has no equivalent hard off switch on its prebuilt binary, so it pairs an
+///   engine-level `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`
+///   switch (blocks the actual raw-local-IP leak — parity with Servo for the
+///   *harm*) with a best-effort JS shim that removes the API surface. The one
+///   residual gap is CEF-only: a page's own inline script can touch the WebRTC
+///   *API surface* in the sub-tick before the shim's first injection lands
+///   (documented in `mde-web-cef::cef_browser::webrtc_block_script`); the IP
+///   leak itself stays engine-blocked on both. Do not weaken this Servo hard-off
+///   to "match" CEF — CEF is meant to reach up to Servo, not the reverse.
+/// * Passkeys / WebAuthn: at parity — this Servo helper bridges ceremonies to
+///   the daemon-owned passkey worker via `poll_passkey_request` /
+///   `complete_passkey` exactly as CEF's `passkey_bridge_script` does. (An
+///   earlier "passkeys are CEF-only" belief is stale as of this landing.)
 #[must_use]
 pub fn secure_preferences() -> Preferences {
     Preferences {

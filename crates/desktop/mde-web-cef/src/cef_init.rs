@@ -717,6 +717,11 @@ mod tests {
         assert!(switches.contains(&"--disable-sync".to_owned()));
         assert!(switches.contains(&"--disable-extensions".to_owned()));
         assert!(switches.contains(&"--disable-metrics-reporting".to_owned()));
+        // browser-5 cross-engine parity: this engine-level switch is CEF's
+        // counterpart to Servo's `dom_webrtc_enabled = false` hard-off. Pinning
+        // the strongest policy value (`disable_non_proxied_udp`) guards against a
+        // silent downgrade that would drop CEF's raw-local-IP-leak guarantee
+        // below Servo's. See `cef_browser::webrtc_block_script` for the layering.
         assert!(switches
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned()));
         assert!(switches.iter().any(|s| {
