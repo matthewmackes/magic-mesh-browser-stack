@@ -2,8 +2,11 @@
 //! tab carries and mirrors to the helper: which isolation container it runs in,
 //! which display it should land on, the page-visible User-Agent / device-profile
 //! overrides, and the device-permission kinds plus a per-site permission-prompt
-//! record. Self-contained value types (no `WebState` coupling); `use super::*`
-//! only pulls in std for the derives. A pure relocation from the `web` god-module.
+//! record — plus the site-permission [`WebState`] actions that read and mutate that
+//! record (summarize the active site's prompts, forget them, and deny a device
+//! prompt to the bus). `use super::*` pulls in the parent's `host_of` /
+//! `browser_permission_prompt_body` / `publish_to_bus` helpers and `WebState`'s
+//! private fields. A pure relocation from the `web` god-module.
 
 use super::*;
 
@@ -296,5 +299,88 @@ impl DeviceProfile {
             Self::Phone => Self::Tablet,
             Self::Tablet => Self::Default,
         }
+    }
+}
+
+/// Site-permission actions on the Browser surface state — summarizing the active
+/// first-party site's sensitive-prompt decisions, forgetting them, and denying a
+/// device-permission prompt (mirrored to the daemon over the bus) — kept beside the
+/// [`SitePermissionPrompt`] / [`DevicePermissionKind`] value types they operate on.
+/// A pure relocation from the `web` god-module.
+impl WebState {
+    pub(super) fn active_site_permission_summary(&self) -> Option<String> {
+        let host = self.active_first_party()?;
+        if self
+            .forgotten_permission_sites
+            .iter()
+            .any(|site| site == &host)
+        {
+            return Some(format!("{host}: forgotten; default deny remains active"));
+        }
+        let prompts = self
+            .site_permission_prompts
+            .iter()
+            .filter(|prompt| prompt.host == host)
+            .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
+            .collect::<Vec<_>>();
+        if prompts.is_empty() {
+            Some(format!("{host}: all sensitive prompts denied by default"))
+        } else {
+            Some(format!(
+                "{host}: {}; helper default deny remains active",
+                prompts.join(", ")
+            ))
+        }
+    }
+
+    pub(super) fn forget_active_site_permissions(&mut self) {
+        let Some(host) = self.active_first_party() else {
+            return;
+        };
+        self.forgotten_permission_sites.retain(|site| site != &host);
+        self.site_permission_prompts
+            .retain(|prompt| prompt.host != host);
+        self.forgotten_permission_sites.push(host);
+    }
+
+    pub(super) fn prompt_active_device_permission(&mut self, kind: DevicePermissionKind) {
+        let Some((url, title, engine, host)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            if url.is_empty() || tab.session.is_crashed() {
+                None
+            } else {
+                host_of(&url).map(|host| (url, tab.session.title().to_owned(), tab.engine, host))
+            }
+        }) else {
+            self.capture_notice = Some(format!("{} prompt requires a live site", kind.label()));
+            return;
+        };
+        let now = unix_ms();
+        if let Some(prompt) = self
+            .site_permission_prompts
+            .iter_mut()
+            .find(|prompt| prompt.host == host && prompt.kind == kind)
+        {
+            prompt.decision = "denied";
+            prompt.updated_ms = now;
+        } else {
+            self.site_permission_prompts.push(SitePermissionPrompt {
+                host: host.clone(),
+                kind,
+                decision: "denied",
+                updated_ms: now,
+            });
+        }
+        self.forgotten_permission_sites.retain(|site| site != &host);
+        let body = browser_permission_prompt_body(kind, engine, &url, &title, &host, now);
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            ACTION_BROWSER_PERMISSION_PROMPT,
+            &body,
+        );
+        self.capture_notice = Some(format!(
+            "{} prompt denied for {host}; helper default deny remains active",
+            kind.label()
+        ));
     }
 }
