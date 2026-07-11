@@ -256,3 +256,33 @@ impl WebState {
         self.capture_notice = Some(spellcheck_notice(result));
     }
 }
+
+/// Read-aloud action on the Browser surface state — snapshots the active tab into
+/// a [`ReadAloudRequest`] and asks the helper for the page text (the TTS handoff
+/// happens later in the parent's shared page-text handler). A pure relocation from
+/// the `web` god-module.
+impl WebState {
+    pub(super) fn request_active_read_aloud(&mut self) {
+        if !self.can_drive_page_tools() {
+            self.capture_notice = Some("Read aloud unavailable: no live page".to_owned());
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.capture_notice = Some("Read aloud unavailable: no live page".to_owned());
+            return;
+        };
+        let request = ReadAloudRequest {
+            tab_index: self.active,
+            engine: tab.engine,
+            url: tab.session.nav().url.clone(),
+            title: tab.session.title().to_owned(),
+        };
+        let id = self.next_page_text_request_id;
+        self.next_page_text_request_id = self.next_page_text_request_id.saturating_add(1).max(1);
+        if let Some(tab) = self.active_tab() {
+            tab.session.request_page_text(id, 64 * 1024);
+            self.pending_read_aloud_requests.insert(id, request);
+            self.capture_notice = Some("Read aloud: reading page text".to_owned());
+        }
+    }
+}
