@@ -29,6 +29,16 @@ path = "src/renderer.rs"
 name = "mde_web_cef"
 path = "src/lib.rs"
 
+[features]
+# SECURITY (security-4): the Chromium DevTools Protocol (CDP) remote-debugging
+# endpoint is an unauthenticated control channel that can drive the browser,
+# read cookies/DOM, and run arbitrary JS in any tab — on a node that also holds
+# the Nebula CA + SSH keys. It is DISABLED by default and MUST NOT be compiled
+# into shipped builds. This opt-in feature (or the `MDE_CEF_REMOTE_DEBUG` env
+# var at launch) is the only way to turn it on, for local debugging on a
+# trusted host. Never enable it in a release/RPM build.
+cef-devtools = []
+
 [dependencies]
 # Direct dynamic-loader/CEF ABI calls (`dlopen`, `dlsym`, `dlclose`) for the
 # bridge. Kept explicit rather than relying on nix's transitive libc edge.

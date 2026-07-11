@@ -77,8 +77,83 @@ pub const CEF_GENERIC_LOCALE: &str = "en-US";
 /// Stable Accept-Language list exposed to web content by the Chromium helper.
 pub const CEF_GENERIC_ACCEPT_LANGUAGE: &str = "en-US,en";
 
-/// Loopback Chromium DevTools discovery port for the CEF helper.
+/// Default loopback Chromium DevTools discovery port for the CEF helper, used
+/// **only** when the operator has explicitly opted the debug endpoint in (see
+/// [`remote_debugging_port`]).
 pub const CEF_REMOTE_DEBUGGING_PORT: i32 = 9222;
+
+/// Environment variable that opts the Chromium DevTools Protocol (CDP)
+/// remote-debugging endpoint in at launch. Absent/off by default.
+pub const CEF_REMOTE_DEBUG_ENV: &str = "MDE_CEF_REMOTE_DEBUG";
+
+/// Resolved opt-in state for the CDP remote-debugging endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoteDebug {
+    /// Explicitly disabled.
+    Off,
+    /// Enabled on the given loopback port.
+    Port(i32),
+}
+
+/// Parse the `MDE_CEF_REMOTE_DEBUG` env value into an explicit opt-in decision.
+///
+/// `None` means "no explicit env decision" (fall back to the build feature).
+/// A falsey value (`0`/`false`/`no`/`off`) is an explicit disable. A port in
+/// the usable `1024..=65535` range enables on that port; any other truthy value
+/// enables on the default [`CEF_REMOTE_DEBUGGING_PORT`].
+fn parse_remote_debug_flag(raw: Option<&str>) -> Option<RemoteDebug> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    ) {
+        return Some(RemoteDebug::Off);
+    }
+    if let Ok(port) = trimmed.parse::<u16>() {
+        if (1024..=65535).contains(&port) {
+            return Some(RemoteDebug::Port(i32::from(port)));
+        }
+    }
+    Some(RemoteDebug::Port(CEF_REMOTE_DEBUGGING_PORT))
+}
+
+/// Combine the compile-time `cef-devtools` feature default with an optional
+/// env override into a concrete `remote_debugging_port` value (`0` = disabled).
+const fn resolve_remote_debug(feature_default_on: bool, env: Option<RemoteDebug>) -> i32 {
+    match env {
+        Some(RemoteDebug::Off) => 0,
+        Some(RemoteDebug::Port(port)) => port,
+        None => {
+            if feature_default_on {
+                CEF_REMOTE_DEBUGGING_PORT
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// The `remote_debugging_port` value to hand CEF (`0` = disabled).
+///
+/// SECURITY (security-4): the Chromium DevTools Protocol (CDP) endpoint this
+/// port exposes is an unauthenticated control channel — a peer that reaches it
+/// can drive the browser, read cookies/DOM, and execute arbitrary JS in any
+/// tab, on a node that also holds the Nebula CA + SSH keys. It is therefore
+/// **disabled by default** and never emitted on the shipped/default launch
+/// path. It only turns on behind an explicit opt-in: the `cef-devtools` build
+/// feature, or the `MDE_CEF_REMOTE_DEBUG` env var at launch (which also lets an
+/// operator pin a specific loopback port). The env decision, when present,
+/// overrides the feature default in both directions.
+#[must_use]
+pub fn remote_debugging_port() -> i32 {
+    resolve_remote_debug(
+        cfg!(feature = "cef-devtools"),
+        parse_remote_debug_flag(std::env::var(CEF_REMOTE_DEBUG_ENV).ok().as_deref()),
+    )
+}
 
 /// `cef_main_args_t` on Linux.
 #[repr(C)]
@@ -163,9 +238,12 @@ impl CefSettings {
         settings.put_i32(CEF_SETTINGS_EXTERNAL_MESSAGE_PUMP_OFFSET, 1);
         settings.put_i32(CEF_SETTINGS_WINDOWLESS_RENDERING_ENABLED_OFFSET, 1);
         settings.put_i32(CEF_SETTINGS_COMMAND_LINE_ARGS_DISABLED_OFFSET, 0);
+        // SECURITY (security-4): `0` disables CDP remote debugging in CEF. Only
+        // an explicit opt-in (`cef-devtools` feature / `MDE_CEF_REMOTE_DEBUG`)
+        // ever sets a live port here.
         settings.put_i32(
             CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET,
-            CEF_REMOTE_DEBUGGING_PORT,
+            remote_debugging_port(),
         );
         settings
     }
@@ -263,7 +341,6 @@ impl CefInitPaths {
             "--disable-gpu".to_owned(),
             "--disable-gpu-compositing".to_owned(),
             "--ozone-platform=headless".to_owned(),
-            format!("--remote-debugging-port={CEF_REMOTE_DEBUGGING_PORT}"),
             format!("--lang={CEF_GENERIC_LOCALE}"),
             format!("--user-agent={CEF_GENERIC_USER_AGENT}"),
             format!("--accept-lang={CEF_GENERIC_ACCEPT_LANGUAGE}"),
@@ -278,6 +355,13 @@ impl CefInitPaths {
                 self.resources_dir_path.join("icudtl.dat").display()
             ),
         ];
+        // SECURITY (security-4): only expose the unauthenticated CDP
+        // remote-debugging endpoint when explicitly opted in — never on the
+        // default/shipped launch path. See [`remote_debugging_port`].
+        let debug_port = remote_debugging_port();
+        if debug_port != 0 {
+            switches.push(format!("--remote-debugging-port={debug_port}"));
+        }
         if self.extension_dirs.is_empty() {
             switches.push("--disable-extensions".to_owned());
         } else {
@@ -521,14 +605,19 @@ mod tests {
             settings.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET),
             0
         );
+        // security-4: the CDP port reflects the opt-in gate — `0` (disabled) on
+        // the default/shipped path, not a hardcoded live 9222.
         assert_eq!(
             settings.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET),
-            CEF_REMOTE_DEBUGGING_PORT
+            remote_debugging_port()
         );
         let line = settings.status_line();
         assert!(line.contains("CEF_INIT_PLAN"));
         assert!(line.contains("windowless=1"));
-        assert!(line.contains("remote_debugging_port=9222"));
+        assert!(line.contains(&format!(
+            "remote_debugging_port={}",
+            remote_debugging_port()
+        )));
     }
 
     #[test]
@@ -581,9 +670,6 @@ mod tests {
         assert!(switches.contains(&"--no-sandbox".to_owned()));
         assert!(switches.contains(&"--disable-gpu".to_owned()));
         assert!(switches.contains(&"--ozone-platform=headless".to_owned()));
-        assert!(switches.contains(&format!(
-            "--remote-debugging-port={CEF_REMOTE_DEBUGGING_PORT}"
-        )));
         assert!(switches
             .iter()
             .any(|s| s == "--resources-dir-path=/opt/mde/cef/Resources"));
@@ -638,6 +724,95 @@ mod tests {
         );
         let switches = paths.command_line_switches();
         assert!(!switches.iter().any(|s| s == "--disable-webrtc"));
+    }
+
+    #[test]
+    fn default_launch_never_exposes_the_cdp_debug_port() {
+        // security-4: the Chromium DevTools Protocol endpoint is an
+        // unauthenticated control channel (drive the browser, read cookies/DOM,
+        // run arbitrary JS). On the default/shipped path — no `cef-devtools`
+        // feature, no `MDE_CEF_REMOTE_DEBUG` — neither the command line nor the
+        // `cef_settings_t` block may carry a live remote-debugging port.
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(
+            !switches
+                .iter()
+                .any(|s| s.starts_with("--remote-debugging-port")),
+            "shipped launch must not open the CDP debug port"
+        );
+        let settings = CefSettings::windowless_no_sandbox();
+        let expected = if cfg!(feature = "cef-devtools") {
+            CEF_REMOTE_DEBUGGING_PORT
+        } else {
+            0
+        };
+        assert_eq!(remote_debugging_port(), expected);
+        assert_eq!(
+            settings.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET),
+            expected
+        );
+    }
+
+    #[test]
+    fn remote_debug_env_flag_parses_the_opt_in_shapes() {
+        // Absent / blank => no env decision (fall back to the build feature).
+        assert_eq!(parse_remote_debug_flag(None), None);
+        assert_eq!(parse_remote_debug_flag(Some("   ")), None);
+        // Explicit disable, case-insensitive.
+        assert_eq!(parse_remote_debug_flag(Some("0")), Some(RemoteDebug::Off));
+        assert_eq!(parse_remote_debug_flag(Some("off")), Some(RemoteDebug::Off));
+        assert_eq!(
+            parse_remote_debug_flag(Some("False")),
+            Some(RemoteDebug::Off)
+        );
+        // A usable explicit port wins.
+        assert_eq!(
+            parse_remote_debug_flag(Some("9333")),
+            Some(RemoteDebug::Port(9333))
+        );
+        // Truthy flag / out-of-range port => default loopback port.
+        assert_eq!(
+            parse_remote_debug_flag(Some("1")),
+            Some(RemoteDebug::Port(CEF_REMOTE_DEBUGGING_PORT))
+        );
+        assert_eq!(
+            parse_remote_debug_flag(Some("on")),
+            Some(RemoteDebug::Port(CEF_REMOTE_DEBUGGING_PORT))
+        );
+        assert_eq!(
+            parse_remote_debug_flag(Some("80")),
+            Some(RemoteDebug::Port(CEF_REMOTE_DEBUGGING_PORT))
+        );
+    }
+
+    #[test]
+    fn remote_debug_resolution_defaults_off_and_honors_overrides() {
+        // Feature off + no env => disabled (the shipped default).
+        assert_eq!(resolve_remote_debug(false, None), 0);
+        // Feature on + no env => default port (dev/debug build).
+        assert_eq!(resolve_remote_debug(true, None), CEF_REMOTE_DEBUGGING_PORT);
+        // Env overrides the feature default in both directions.
+        assert_eq!(resolve_remote_debug(true, Some(RemoteDebug::Off)), 0);
+        assert_eq!(
+            resolve_remote_debug(false, Some(RemoteDebug::Port(9345))),
+            9345
+        );
+    }
+
+    #[test]
+    fn opting_in_reopens_the_cdp_debug_port() {
+        // security-4: prove the opt-in path still works — when resolved on, both
+        // the switch and the settings field carry the port. Exercised via the
+        // pure resolver so the test does not mutate process-global env.
+        assert_eq!(
+            resolve_remote_debug(false, Some(RemoteDebug::Port(CEF_REMOTE_DEBUGGING_PORT))),
+            CEF_REMOTE_DEBUGGING_PORT
+        );
+        assert_eq!(resolve_remote_debug(true, None), CEF_REMOTE_DEBUGGING_PORT);
     }
 
     #[test]
