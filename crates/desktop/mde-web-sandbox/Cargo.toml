@@ -1,0 +1,70 @@
+# mde-web-sandbox — the shared OS confinement for MCNF's out-of-process web
+# engine helpers (security-1).
+#
+# This crate is the SINGLE SOURCE of the layered Linux kernel sandbox that a
+# browser helper installs on itself before it touches any web content: user +
+# mount + IPC + UTS + cgroup + PID namespaces, uid/gid maps to a throwaway
+# identity, a pivot_root'd read-only rootfs with NO $HOME / SSH keys / Nebula
+# certs / mesh data, no_new_privs, a fully-dropped capability set, seccomp-bpf
+# escape-syscall denial, and cgroup v2 memory/CPU caps.
+#
+# It was factored out of `mde-web-preview`'s proven `sandbox.rs` (BOOKMARKS-5)
+# so the Chromium/CEF helper (`mde-web-cef`, security-1) can reuse the SAME
+# confinement rather than re-implement or copy-paste it. The one generalisation
+# over the original is `apply_with_binds`: a caller may name EXTRA read-only bind
+# paths to expose in the rootfs (CEF needs its vendored `/opt/mde/cef` runtime
+# bundle bound in so the multi-process browser can dlopen `libcef.so` and
+# re-exec its subprocess helpers — the Servo helper, single-process with
+# baked-in resources, passes none and behaves exactly as before).
+#
+# WORKSPACE ISOLATION: like `mde-web-preview` and `mde-web-cef`, this is its own
+# workspace root (empty `[workspace]` below) and is `exclude`d from the parent
+# workspace. It links the same native-syscall crates those helpers already lock
+# (nix / seccompiler / caps), and needs `unsafe` (the FFI/sandbox syscalls),
+# which the parent workspace forbids — so it carries its own lints table.
+[workspace]
+
+[package]
+name = "mde-web-sandbox"
+description = "security-1 — the shared OS sandbox (userns + seccomp-bpf + dropped caps + no-new-privs + pivot_root RO rootfs with NO home/keys + cgroup v2 caps) for MCNF's out-of-process web engine helpers (Servo `mde-web-preview` + Chromium/CEF `mde-web-cef`)."
+version = "12.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+authors = ["Matthew Mackes <matthewmackes@gmail.com>"]
+repository = "https://github.com/matthewmackes/magic-mesh"
+
+[lib]
+name = "mde_web_sandbox"
+path = "src/lib.rs"
+
+[dependencies]
+# Safe wrappers for unshare/mount/pivot_root/prctl/sethostname/fork/uid-gid-maps.
+# `user` gates `Uid`/`Gid` (the real-id capture before the userns unshare).
+nix = { version = "0.29", features = ["sched", "mount", "process", "hostname", "fs", "user"] }
+# Raw constants + the couple of syscalls nix doesn't wrap (seccomp install path).
+libc = "0.2"
+# seccomp-bpf: assemble + install the escape-syscall denylist BPF program
+# (Firecracker's pure-Rust assembler — no libseccomp system dep, airgap-friendly).
+seccompiler = "0.4"
+# Capability bounding-set drop: clear every capability from the bounding +
+# ambient + inheritable + permitted + effective sets.
+caps = "0.5"
+# Typed error plumbing (no raw unwrap/panic — lints deny unwrap_used).
+anyhow = "1"
+
+[lints.rust]
+# UNSAFE is ALLOWED here (and only in the named FFI/sandbox syscall paths) — the
+# whole crate exists to perform the privileged namespace/mount/seccomp setup.
+# Every `unsafe` block carries a `// SAFETY:` note.
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "warn"
+todo = "deny"

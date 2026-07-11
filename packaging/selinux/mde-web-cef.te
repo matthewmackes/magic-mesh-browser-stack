@@ -1,0 +1,139 @@
+policy_module(mde_web_cef, 1.0.0)
+
+########################################
+#
+# security-1 — a confined, ENFORCING SELinux domain for the Chromium/CEF browser
+# helper (`/usr/bin/mde-web-cef` launcher + `/usr/libexec/mackesd/
+# mde-web-cef-renderer` bridge, BROWSER-DD-1).
+#
+# This is defense-in-depth. The helper's PRIMARY confinement is the in-process
+# OS sandbox the RENDERER installs on itself before it calls `cef_initialize` /
+# touches the network — a user namespace + seccomp-bpf escape denylist + a
+# fully-dropped capability bounding set + no-new-privs + cgroup v2 memory/CPU
+# caps + a pivot_root'd read-only rootfs with NO access to $HOME, SSH keys,
+# Nebula certs or mesh data (the SHARED `mde-web-sandbox` crate; see
+# docs/THREAT_MODEL.md §10). That sandbox wraps the WHOLE multi-process Chromium
+# tree (the browser process forks + re-execs its renderer/GPU/utility
+# subprocesses, which inherit the confinement across exec) and does not depend on
+# SELinux.
+#
+# This module adds a SECOND, orthogonal MAC layer so that, wherever the node
+# runs SELinux Enforcing, the browser process tree is a distinct labelled domain
+# with an explicit least-privilege access set — and everything NOT listed below
+# (the operator's home, `~/.ssh`, `/etc/nebula`, `/etc/mackesd`, `/var/lib/*`)
+# is denied by the SELinux default-deny, which IS the confinement. There are no
+# blanket `unconfined_*` grants: this is a real confined domain, not a
+# permissive stub.
+#
+# NOTE (platform standard): the operator sets SELinux DISABLED platform-wide
+# (2026-06-20); Quasar-cloud nodes target Enforcing (QC-22). Where SELinux is
+# disabled the kernel never enforces this module and the loader
+# (setup-selinux-web-cef.sh) self-skips — the OS sandbox above remains the
+# operative confinement. This module ships + loads so that any node running
+# SELinux Enforcing gets the confined domain with zero extra work.
+#
+# HONESTY NOTE: a prebuilt Chromium is a large, syscall- and mmap-heavy program;
+# a byte-perfect Enforcing policy for it is an audit2allow exercise on a live
+# Enforcing seat, not something provable headlessly. The grants below are the
+# known-necessary least-privilege set (sandbox bring-up, self multi-process
+# fork+exec, read+execute of the vendored CEF runtime, GPU, client networking);
+# any residual AVC on a live Enforcing node is tuned there. The OS sandbox is the
+# primary boundary regardless.
+#
+########################################
+
+########################################
+#
+# Declarations
+#
+
+type mde_web_cef_t;
+type mde_web_cef_exec_t;
+application_domain(mde_web_cef_t, mde_web_cef_exec_t)
+role system_r types mde_web_cef_t;
+
+gen_require(`
+	type unconfined_t;
+	role unconfined_r;
+')
+
+# The desktop shell (mde-shell-egui) spawns the launcher, which execs the
+# renderer bridge; both binaries carry mde_web_cef_exec_t, so entering either
+# auto-transitions the child into this confined domain and drops it into the
+# operator's role set.
+role unconfined_r types mde_web_cef_t;
+domain_auto_trans(unconfined_t, mde_web_cef_exec_t, mde_web_cef_t)
+allow mde_web_cef_t unconfined_t:fd use;
+allow mde_web_cef_t unconfined_t:process sigchld;
+allow mde_web_cef_t unconfined_t:unix_stream_socket { connectto read write };
+
+########################################
+#
+# mde_web_cef_t local policy
+#
+
+# --- Self / sandbox bring-up + multi-process browser tree ---------------------
+# The renderer builds its OWN OS sandbox before locking itself with seccomp: it
+# unshares a user+mount+pid namespace, sets uid/gid maps, pivot_root's into a
+# tmpfs read-only rootfs, drops the capability bounding set, and sets rlimits.
+# Chromium is multi-process: the browser process forks + re-execs the SAME
+# mde_web_cef_exec_t binary as its renderer/GPU/utility subprocesses (staying
+# in-domain via can_exec below), and V8's JIT needs writable+executable memory.
+allow mde_web_cef_t self:capability { setuid setgid sys_chroot sys_admin };
+allow mde_web_cef_t self:cap_userns { setuid setgid sys_admin sys_chroot };
+allow mde_web_cef_t self:user_namespace create;
+allow mde_web_cef_t self:process { fork setsched setrlimit setpgid getsched signal signull setcap execmem execstack getcap };
+allow mde_web_cef_t self:fifo_file rw_fifo_file_perms;
+allow mde_web_cef_t self:unix_stream_socket create_stream_socket_perms;
+allow mde_web_cef_t self:unix_dgram_socket create_socket_perms;
+# The shared-memory frame region (the shm seam BOOKMARKS-6 maps read-only) +
+# Chromium's own shm/futex IPC between its subprocesses, and the anonymous tmpfs
+# backing the sandbox rootfs.
+allow mde_web_cef_t self:shm create_shm_perms;
+fs_manage_tmpfs_files(mde_web_cef_t)
+fs_manage_tmpfs_dirs(mde_web_cef_t)
+fs_getattr_tmpfs(mde_web_cef_t)
+
+# --- Read-only program + resources + vendored CEF runtime ---------------------
+# The domain reads (and executes) only its own binaries/libs, the vendored CEF
+# runtime under /opt/mde/cef (usr_t on Fedora — covered by files_read_usr_files;
+# libcef.so is mmapped PROT_EXEC, hence the exec grants), the system CA bundle
+# (honest TLS), fontconfig/font caches, and locale — never the operator's data.
+can_exec(mde_web_cef_t, mde_web_cef_exec_t)
+libs_exec_ld_so(mde_web_cef_t)
+libs_read_lib_files(mde_web_cef_t)
+libs_exec_lib_files(mde_web_cef_t)
+files_read_etc_files(mde_web_cef_t)
+files_read_usr_files(mde_web_cef_t)
+files_exec_usr_files(mde_web_cef_t)
+miscfiles_read_localization(mde_web_cef_t)
+miscfiles_read_fonts(mde_web_cef_t)
+miscfiles_read_generic_certs(mde_web_cef_t)
+
+# --- GPU (offscreen render; GPU-capable helper) ------------------------------
+# CEF renders windowless/offscreen; where a render node is present it uses the
+# DRI render node. No /dev/fb, no seat/input devices.
+dev_rw_dri(mde_web_cef_t)
+dev_read_sysfs(mde_web_cef_t)
+
+# --- Network (the browser's job) --------------------------------------------
+# Outbound web fetch + DNS. The app-layer ad-filter blocks trackers before fetch
+# and the sandbox denies the mesh/overlay ranges; SELinux scopes this domain to
+# ordinary client networking (no listen/bind of privileged ports).
+corenet_tcp_connect_all_ports(mde_web_cef_t)
+corenet_tcp_sendrecv_all_ports(mde_web_cef_t)
+corenet_all_recvfrom_unlabeled(mde_web_cef_t)
+sysnet_dns_name_resolve(mde_web_cef_t)
+allow mde_web_cef_t self:tcp_socket create_stream_socket_perms;
+allow mde_web_cef_t self:udp_socket create_socket_perms;
+
+# --- Diagnostics -------------------------------------------------------------
+# stderr diagnostics only; no persistent history/log of browsed content.
+logging_send_syslog_msg(mde_web_cef_t)
+kernel_read_system_state(mde_web_cef_t)
+
+#
+# Everything else — the operator's home, ~/.ssh, /etc/nebula, /etc/mackesd,
+# /var/lib/mackesd, the mesh-storage tree — is DENIED by omission (SELinux
+# default-deny). That omission is the confinement; do not add blanket grants.
+#

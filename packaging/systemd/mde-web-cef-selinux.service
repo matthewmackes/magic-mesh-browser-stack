@@ -1,0 +1,14 @@
+[Unit]
+Description=MCNF Chromium/CEF browser helper SELinux policy setup (non-blocking postinstall)
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=magic-mesh-selinux-policy.service
+Wants=magic-mesh-selinux-policy.service
+ConditionPathExists=/usr/libexec/mackesd/setup-selinux-web-cef
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+ExecStart=/usr/libexec/mackesd/setup-selinux-web-cef
+
+[Install]
+WantedBy=multi-user.target

@@ -47,6 +47,13 @@ libc = "0.2"
 # same syscall surface used by `mde-web-preview`; the CEF crate keeps its own
 # lock because it is workspace-excluded.
 nix = { version = "0.29", features = ["fs", "mman", "socket", "uio"] }
+# security-1: the SHARED OS sandbox (userns + seccomp-bpf + dropped caps +
+# no-new-privs + pivot_root RO rootfs with NO home/keys + cgroup caps) the
+# renderer installs on the CEF browser process before `cef_initialize`. Same
+# confinement class the Servo helper (`mde-web-preview`) already gets; factored
+# into a shared crate rather than copy-pasted. See `renderer.rs`'s
+# `apply_os_sandbox` + `docs/THREAT_MODEL.md` §10.
+mde-web-sandbox = { path = "../mde-web-sandbox" }
 
 [lints.rust]
 # The Chromium bridge needs small, named syscall modules for mmap/memfd and

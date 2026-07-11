@@ -9,9 +9,11 @@
 use std::ffi::OsString;
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+
+use mde_web_sandbox::SandboxPolicy;
 
 use mde_web_cef::{
     cef_abi::{CefAbi, CefInitializeProbe},
@@ -55,6 +57,32 @@ fn main() -> ExitCode {
         contract.extensions.len()
     );
 
+    // security-1: confine THIS (top-level CEF browser) process BEFORE it dlopens
+    // libcef.so or touches a single line of web content. The OS sandbox
+    // (mde-web-sandbox) is the same confinement class the Servo helper already
+    // gets — a user namespace + seccomp-bpf escape denylist + a fully-dropped
+    // capability set + no-new-privs + a pivot_root'd read-only rootfs with NO
+    // $HOME / SSH keys / Nebula CA / mesh data — and it wraps the WHOLE
+    // multi-process Chromium tree: CEF forks + re-execs its renderer/GPU/utility
+    // subprocesses, which inherit this confinement across `exec` (no-new-privs
+    // preserves the seccomp filter; the namespaces + rootfs are inherited). A CEF
+    // subprocess (`--type=…`) is ALREADY inside the parent's sandbox and must NOT
+    // re-apply it (re-`unshare`/`pivot_root` would EPERM under our own denylist),
+    // so gate on `!is_cef_subprocess`. Chromium's own internal sandbox stays off
+    // (`--no-sandbox`) — see `cef_init.rs` + `docs/THREAT_MODEL.md` §10 for why
+    // it cannot be re-enabled nested inside this one, and why the OS sandbox is
+    // the honest confinement instead.
+    let is_cef_subprocess = args.iter().any(|arg| arg.starts_with("--type="));
+    let will_run_cef = mode == "tab"
+        || std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some()
+        || std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some();
+    if will_run_cef && !is_cef_subprocess {
+        if let Err(reason) = apply_os_sandbox(&contract) {
+            eprintln!("CEF_OS_SANDBOX_FAILED reason={reason}");
+            return ExitCode::from(78);
+        }
+    }
+
     let abi = match CefAbi::load(&contract.libcef).and_then(|abi| {
         let metadata = abi.metadata()?;
         Ok((abi, metadata))
@@ -76,7 +104,8 @@ fn main() -> ExitCode {
     println!("{}", settings.status_line());
 
     let is_tab = mode == "tab";
-    let is_cef_subprocess = args.iter().any(|arg| arg.starts_with("--type="));
+    // `is_cef_subprocess` + the CEF-init env gates were resolved above (where the
+    // OS sandbox is applied for the top-level browser process).
     if is_tab
         || is_cef_subprocess
         || std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some()
@@ -185,6 +214,49 @@ fn main() -> ExitCode {
 
     eprintln!("CEF_OFFSCREEN_PENDING mode={mode}");
     ExitCode::from(78)
+}
+
+/// Install the shared OS sandbox on THIS (top-level CEF browser) process.
+///
+/// Exposes the vendored CEF runtime bundle + any vetted extension dirs read-only
+/// inside the confined rootfs (so the browser can `dlopen` `libcef.so` and
+/// re-`exec` its subprocess bridge) and NOTHING of the operator's. On success
+/// the call forks: the confined child returns and proceeds; the pre-fork process
+/// becomes a signal-forwarding supervisor that never returns. A failure is fatal
+/// — the caller must never run web content unconfined.
+fn apply_os_sandbox(contract: &BridgeContract) -> Result<(), String> {
+    let binds = cef_extra_readonly_binds(&contract.root, &contract.extensions);
+    let policy = SandboxPolicy::web_cef();
+    mde_web_sandbox::apply_with_binds(policy, &binds).map_err(|err| format!("{err:#}"))?;
+    // Observable on the seat (stdout/journal) for live confinement verification.
+    // `chromium_internal_sandbox=off` is honest: `--no-sandbox` stays because the
+    // OS sandbox's seccomp denylist blocks the mount/pivot_root/unshare syscalls
+    // Chromium's own nested sandbox would need (see `cef_init.rs` + THREAT_MODEL
+    // §10). The OS sandbox — inherited by every Chromium subprocess — is the
+    // operative confinement instead.
+    println!(
+        "CEF_OS_SANDBOX applied=1 host={} mem_max={} extra_binds={} home_visible=0 seccomp=1 caps_dropped=1 chromium_internal_sandbox=off",
+        policy.hostname,
+        policy.cgroup_memory_max(),
+        binds.len(),
+    );
+    Ok(())
+}
+
+/// The extra read-only paths the CEF browser tree needs visible after
+/// `pivot_root`: the vendored CEF runtime root (`/opt/mde/cef` — its `Release/`
+/// libcef.so + `Resources/`) plus any vetted unpacked extension dirs. The
+/// subprocess bridge binary itself lives under `/usr/libexec`, already covered by
+/// the sandbox's `/usr` bind.
+///
+/// SECURITY INVARIANT: this list is ENGINE RUNTIME + vetted extensions only —
+/// never a `$HOME`/SSH/Nebula/mesh path. Enforced by the unit tests below; the
+/// shared sandbox binds each entry read-only.
+fn cef_extra_readonly_binds(root: &Path, extensions: &[PathBuf]) -> Vec<PathBuf> {
+    let mut binds = Vec::with_capacity(1 + extensions.len());
+    binds.push(root.to_path_buf());
+    binds.extend(extensions.iter().cloned());
+    binds
 }
 
 struct BridgeContract {
@@ -431,6 +503,41 @@ mod tests {
         assert!(err.contains("does not match registry"), "{err}");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cef_extra_binds_expose_the_runtime_and_extensions_never_keys() {
+        // security-1: the extra RO binds the CEF browser gets inside its confined
+        // rootfs are the vendored runtime + vetted extensions ONLY — the sandbox
+        // must expose no home/keys/mesh path even here.
+        let root = PathBuf::from("/opt/mde/cef");
+        let exts = vec![
+            PathBuf::from("/mnt/mesh-storage/browser/extensions/ublock-origin"),
+            PathBuf::from("/mnt/mesh-storage/browser/extensions/lastpass"),
+        ];
+        let binds = cef_extra_readonly_binds(&root, &exts);
+        assert!(
+            binds.contains(&PathBuf::from("/opt/mde/cef")),
+            "runtime root"
+        );
+        assert!(binds.contains(&exts[0]));
+        assert!(binds.contains(&exts[1]));
+        for bind in &binds {
+            let s = bind.to_string_lossy();
+            assert!(!s.starts_with("/home"), "home leaked: {s}");
+            assert!(!s.starts_with("/root"), "root home leaked: {s}");
+            assert!(!s.contains("ssh"), "ssh keys leaked: {s}");
+            assert!(!s.contains("nebula"), "nebula keys leaked: {s}");
+            assert!(!s.contains("mackesd"), "mackesd state leaked: {s}");
+            assert!(!s.contains("syncthing"), "syncthing data leaked: {s}");
+            assert!(!s.starts_with("/var"), "var (mesh data) leaked: {s}");
+        }
+    }
+
+    #[test]
+    fn cef_extra_binds_default_to_just_the_runtime_root() {
+        let binds = cef_extra_readonly_binds(&PathBuf::from("/opt/mde/cef"), &[]);
+        assert_eq!(binds, vec![PathBuf::from("/opt/mde/cef")]);
     }
 
     #[test]

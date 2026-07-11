@@ -334,9 +334,28 @@ impl CefInitPaths {
     }
 
     /// CEF/Chromium switches that mirror the pinned settings paths.
+    ///
+    /// SECURITY (security-1): `--no-sandbox` disables **Chromium's own** internal
+    /// (unprivileged-userns / setuid) sandbox. It stays because the browser
+    /// process is instead confined by MCNF's **OS sandbox** (`mde-web-sandbox`,
+    /// applied in `renderer.rs` before `cef_initialize`): a user namespace +
+    /// seccomp-bpf escape denylist + fully-dropped capabilities + no-new-privs +
+    /// a `pivot_root`'d read-only rootfs with NO `$HOME`/SSH/Nebula/mesh data,
+    /// which wraps the whole multi-process tree (every Chromium subprocess
+    /// inherits it across `exec`). Chromium's own nested sandbox CANNOT be
+    /// re-enabled here: its zygote must `unshare`/`mount`/`pivot_root` to build a
+    /// renderer view, and those syscalls are exactly what our seccomp denylist
+    /// `EPERM`s (nor is a setuid `chrome-sandbox` helper installed, nor would it
+    /// work under our throwaway uid map). Re-enabling it would mean gutting the
+    /// OS sandbox's seccomp layer — a strictly worse trade. This is documented in
+    /// full in `docs/THREAT_MODEL.md` §10; do NOT drop `--no-sandbox` on the
+    /// assumption Chromium then self-sandboxes — it would fail to start under the
+    /// OS sandbox, or (without it) run entirely unconfined.
     #[must_use]
     pub fn command_line_switches(&self) -> Vec<String> {
         let mut switches = vec![
+            // See the function doc: Chromium's internal sandbox is off ON PURPOSE
+            // — the OS sandbox (mde-web-sandbox) is the operative confinement.
             "--no-sandbox".to_owned(),
             "--disable-gpu".to_owned(),
             "--disable-gpu-compositing".to_owned(),

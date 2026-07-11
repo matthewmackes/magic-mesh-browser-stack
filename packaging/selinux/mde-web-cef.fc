@@ -1,0 +1,9 @@
+# security-1 — file contexts for the confined Chromium/CEF browser helper.
+# Labels BOTH the launcher (/usr/bin/mde-web-cef) and the renderer bridge
+# (/usr/libexec/mackesd/mde-web-cef-renderer — also CEF's own subprocess re-exec
+# target) with mde_web_cef_exec_t, so spawning (or re-exec'ing) either
+# auto-transitions the child into the confined mde_web_cef_t domain (see
+# mde-web-cef.te). The loader runs `restorecon` on both after `semodule -i` so
+# the labels take on the already-installed binaries.
+/usr/bin/mde-web-cef				--	gen_context(system_u:object_r:mde_web_cef_exec_t,s0)
+/usr/libexec/mackesd/mde-web-cef-renderer	--	gen_context(system_u:object_r:mde_web_cef_exec_t,s0)
