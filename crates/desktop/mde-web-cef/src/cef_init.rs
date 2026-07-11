@@ -429,9 +429,9 @@ impl CefInitPaths {
 /// The actual JS-reachable WebRTC surface (`RTCPeerConnection`,
 /// `getUserMedia`) has no real command-line or `cef_settings_t` kill switch
 /// on a prebuilt CEF binary, so it is now removed at the renderer level
-/// instead — see `cef_browser::webrtc_block_script`/`poll_webrtc_block`,
-/// applied on every `run_windowless_tab` session the same way the passkey
-/// bridge shim is.
+/// instead — see `cef_browser::webrtc_block_script`/`inject_context_shims`,
+/// injected per navigation on every `run_windowless_tab` session the same way
+/// the passkey bridge shim is.
 fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
     [
         "--disable-background-networking",
