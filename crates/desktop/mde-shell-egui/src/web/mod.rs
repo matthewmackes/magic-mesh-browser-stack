@@ -188,7 +188,10 @@ struct Tab {
     texture: Option<TextureHandle>,
     /// Last helper frame retained on the CPU side for viewport capture. The GPU
     /// texture is not readable, so capture uses this exact pre-upload image.
-    last_frame: Option<egui::ColorImage>,
+    /// Held behind an `Arc` so retaining it costs a refcount bump, not a
+    /// full-resolution pixel deep copy, on every decoded frame (the same `Arc`
+    /// is handed to the texture upload — `egui::ImageData` stores `Arc<ColorImage>`).
+    last_frame: Option<std::sync::Arc<egui::ColorImage>>,
     /// Debounces panel-size changes into a single settled `session.resize` so a
     /// drag-resize drives the helper's CSS viewport once, not every frame
     /// (browser-1).
@@ -2960,6 +2963,11 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     //    idle page never triggers a re-upload.
     if let Some(tab) = state.active_tab() {
         if let Some(img) = tab.session.take_frame() {
+            // Share one `Arc<ColorImage>` between the retained CPU frame and the
+            // GPU upload instead of deep-copying the full-resolution pixels on
+            // every decoded frame: the retain is a refcount bump, and the upload
+            // moves the same `Arc` (`egui::ImageData` already stores it as one).
+            let img = std::sync::Arc::new(img);
             tab.last_frame = Some(img.clone());
             match tab.texture.as_mut() {
                 Some(handle) => handle.set(img, BROWSER_TEX),

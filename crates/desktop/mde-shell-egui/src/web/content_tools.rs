@@ -479,7 +479,7 @@ impl WebState {
                 tab.session.title().to_owned(),
                 tab.last_frame
                     .as_ref()
-                    .and_then(offline_cache_viewport_image),
+                    .and_then(|frame| offline_cache_viewport_image(frame)),
                 offline_cache_resource_manifest(&tab.session.recent_resource_requests()),
             )
         };
