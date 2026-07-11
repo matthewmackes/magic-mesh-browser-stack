@@ -3327,12 +3327,17 @@ dependencies = [
  "dpi",
  "euclid",
  "libc",
+ "mde-web-wire",
  "nix",
  "seccompiler",
  "servo",
  "servo-embedder-traits",
  "url",
 ]
+
+[[package]]
+name = "mde-web-wire"
+version = "12.0.0"
 
 [[package]]
 name = "memchr"
