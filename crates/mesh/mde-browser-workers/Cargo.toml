@@ -26,6 +26,9 @@ mde-bus = { path = "../../platform/mde-bus" }
 # arch-7 — the shared `shared_root_writable` guard + CANONICAL_QNM_MOUNT for the
 # offline-cache / session-sync / policy share seam (AUDIT-MESH-15).
 mackes-mesh-types = { path = "../mackes-mesh-types" }
+# browser_policy (BOOKMARKS-8) folds the fleet ad-block/browser policy against
+# the pure mde-adblock engine model (`mde_adblock::host_of`).
+mde-adblock = { path = "../../services/mde-adblock" }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

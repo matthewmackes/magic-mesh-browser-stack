@@ -56,3 +56,9 @@ pub mod browser_offline_cache;
 // shape, persists the latest local copy, and mirrors it to the Syncthing-backed
 // workgroup root as browser-session-sync/<host>/latest.json.
 pub mod browser_session_sync;
+// BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker. Replicates the
+// operator-authored fleet policy doc over the encrypted share, folds it for
+// THIS node's role (the role NAME is passed into the worker by the daemon),
+// and enforces at the browser launch/spawn seam. Uses the shared
+// `mackes_mesh_types::shared_root_writable` guard for the share seam.
+pub mod browser_policy;
