@@ -1,0 +1,39 @@
+# arch-7 (2026-07-11) — the per-seat browser workers, extracted out of the
+# `mackesd` fleet control-plane bin crate. These ~10.7k lines are a per-SEAT
+# concern (passkeys, offline cache, read-aloud/voice/translate, external-
+# protocol/share, tab-suspend, session-sync, browser policy) that had been
+# mixed into the control-plane daemon — a layering violation + a large
+# compile-coupling. Each worker implements the `mde-worker-core` `Worker`
+# trait; `mackesd` depends on this crate and re-exports the modules under
+# `workers::` so its supervisor spawn sites reach them unchanged.
+
+[package]
+name         = "mde-browser-workers"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Per-seat browser workers for the mackesd supervisor (passkeys, offline cache, read-aloud/voice/translate, share/protocol, tab-suspend, session-sync, policy)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mde-worker-core = { path = "../mde-worker-core" }
+mde-bus = { path = "../../platform/mde-bus" }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# select! (macros) + spawn_blocking (rt) + interval (time). The workers shell
+# out via std::process/std::fs, so no tokio net/fs/process features are needed.
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
