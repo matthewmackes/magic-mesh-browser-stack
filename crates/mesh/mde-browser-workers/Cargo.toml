@@ -23,11 +23,21 @@ path = "src/lib.rs"
 [dependencies]
 mde-worker-core = { path = "../mde-worker-core" }
 mde-bus = { path = "../../platform/mde-bus" }
+# arch-7 — the shared `shared_root_writable` guard + CANONICAL_QNM_MOUNT for the
+# offline-cache / session-sync / policy share seam (AUDIT-MESH-15).
+mackes-mesh-types = { path = "../mackes-mesh-types" }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# browser_offline_cache content-addresses cache blobs (sha2) + base64-encodes
+# durable records.
+base64 = "0.22"
+sha2 = "0.10"
+# resolve_local_root() falls back to the XDG data dir (offline_cache +
+# session_sync) when no explicit local root is configured.
+dirs = "5"
 # select! (macros) + spawn_blocking (rt) + interval (time). The workers shell
 # out via std::process/std::fs, so no tokio net/fs/process features are needed.
 tokio = { version = "1", features = ["macros", "rt", "time"] }

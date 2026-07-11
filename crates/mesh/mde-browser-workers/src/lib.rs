@@ -46,3 +46,13 @@ pub mod browser_translate;
 // command when present, emits bounded transcript events, and publishes honest
 // unavailable/error/transcribed state for the shell.
 pub mod browser_voice_command;
+// BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
+// cache snapshots, validates private offline/mesh payloads, writes local durable
+// records, and mirrors them into the Syncthing-backed workgroup root. Uses the
+// shared `mackes_mesh_types::shared_root_writable` guard for the share seam.
+pub mod browser_offline_cache;
+// BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
+// action/browser/session-sync snapshots, validates the restore-compatible JSON
+// shape, persists the latest local copy, and mirrors it to the Syncthing-backed
+// workgroup root as browser-session-sync/<host>/latest.json.
+pub mod browser_session_sync;
