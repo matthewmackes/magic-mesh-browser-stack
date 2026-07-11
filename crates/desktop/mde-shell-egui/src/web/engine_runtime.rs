@@ -9,6 +9,8 @@
 
 use super::*;
 
+/// Resolve the selected sandboxed-helper binary path.
+#[cfg(feature = "live-helper")]
 pub(super) fn helper_bin_path(engine: BrowserEngine) -> std::path::PathBuf {
     let (env, default) = match engine {
         BrowserEngine::Servo => (SERVO_HELPER_BIN_ENV, DEFAULT_SERVO_HELPER_BIN),

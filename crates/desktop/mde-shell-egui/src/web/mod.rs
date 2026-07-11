@@ -143,8 +143,6 @@ const PAGE_ZOOM_MAX: u16 = 200;
 const PAGE_ZOOM_STEP: u16 = 10;
 const CUPS_PRINT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Resolve the selected sandboxed-helper binary path.
-#[cfg(feature = "live-helper")]
 mod engine_runtime;
 use engine_runtime::*;
 
