@@ -12,8 +12,9 @@
 //! 2. [`take_frame`](WebSession::take_frame)s the pending [`egui::ColorImage`] on a
 //!    paint-ready and uploads it to its `TextureHandle` (the panel does this only
 //!    when a frame is actually present — never a per-frame re-upload).
-//! 3. Forwards input with [`send_input`](WebSession::send_input) (scaled by
-//!    `pixels_per_point`) and drives navigation.
+//! 3. Forwards input with [`send_input`](WebSession::send_input) (pointer
+//!    positions pre-mapped by the shell into frame device pixels; `pixels_per_point`
+//!    scales only wheel scroll) and drives navigation.
 //!
 //! Sessions are independent: one session's crash never touches another's socket,
 //! mapping, or state (per-tab isolation).
@@ -595,8 +596,9 @@ impl WebSession {
         self.send(&ControlMsg::Resize { width, height });
     }
 
-    /// Forward one egui input event, scaling pointer geometry by
-    /// `pixels_per_point`. A no-op once crashed, or for an event that does not map.
+    /// Forward one egui input event. Pointer positions must already be in frame
+    /// device pixels (the shell maps them); `pixels_per_point` scales only wheel
+    /// scroll. A no-op once crashed, or for an event that does not map.
     pub fn send_input(&mut self, event: &egui::Event, pixels_per_point: f32) {
         if self.is_crashed() {
             return;

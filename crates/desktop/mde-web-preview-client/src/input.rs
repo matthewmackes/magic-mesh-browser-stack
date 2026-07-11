@@ -1,11 +1,17 @@
-//! Map an egui input event onto the engine-neutral [`wire::InputEvent`], scaling
-//! pointer geometry by `pixels_per_point`.
+//! Map an egui input event onto the engine-neutral [`wire::InputEvent`].
 //!
-//! egui reports pointer positions and scroll in **logical points**; the sandboxed
-//! engine renders (and the shm frame is sized) in **device pixels**. So every
-//! coordinate that crosses the socket is multiplied by the frame's
-//! `pixels_per_point` here — a `HiDPI` seat at ppp = 2.0 turns a click at logical
-//! (100, 50) into a device click at (200, 100), landing on the right element.
+//! Pointer positions arrive here **already in frame device pixels** — the shell
+//! maps every panel-space pointer coordinate through the frame transform
+//! (`rel * frame_size / image_rect.size`, DPI-independent) BEFORE it reaches this
+//! layer, so a click always lands on the pixel under the cursor whatever the seat's
+//! resolution or the panel's aspect (browser-1). This layer therefore forwards
+//! pointer positions verbatim and never re-scales them (double-scaling them by
+//! `pixels_per_point` against a fixed frame was the coordinate bug).
+//!
+//! `pixels_per_point` is still needed for **wheel** scroll: egui reports scroll in
+//! logical points and the engine scrolls in device pixels, so a wheel delta is
+//! multiplied by the frame's `pixels_per_point` here (a `HiDPI` seat at ppp = 2.0
+//! turns a two-point scroll into a device scroll of the right magnitude).
 //!
 //! Events the sandboxed browser has no use for (or keys with no neutral mapping)
 //! return `None` — printable characters ride [`wire::InputEvent::Text`] regardless,
@@ -19,23 +25,24 @@ use crate::wire::{InputEvent, KeyCode, Modifiers, PointerButton};
 const LINE_PX: f32 = 14.0;
 
 /// Map one egui event to a forwarded [`InputEvent`], or `None` if it does not
-/// forward. `pixels_per_point` is the frame's scale (device px per logical point).
+/// forward. Pointer positions are forwarded **verbatim** — the shell has already
+/// mapped them into frame device pixels. `pixels_per_point` is the frame's scale
+/// (device px per logical point) and is applied ONLY to wheel-scroll magnitude.
 #[must_use]
 pub fn map_event(event: &Event, pixels_per_point: f32) -> Option<InputEvent> {
     let ppp = pixels_per_point;
     match event {
-        Event::PointerMoved(pos) => Some(InputEvent::PointerMoved {
-            x: pos.x * ppp,
-            y: pos.y * ppp,
-        }),
+        // Pointer positions are already in frame device pixels (mapped by the
+        // shell's `map_pointer_to_frame`); forward them unchanged.
+        Event::PointerMoved(pos) => Some(InputEvent::PointerMoved { x: pos.x, y: pos.y }),
         Event::PointerButton {
             pos,
             button,
             pressed,
             ..
         } => Some(InputEvent::PointerButton {
-            x: pos.x * ppp,
-            y: pos.y * ppp,
+            x: pos.x,
+            y: pos.y,
             button: map_button(*button)?,
             pressed: *pressed,
         }),
@@ -171,13 +178,16 @@ mod tests {
     use crate::egui::{pos2, vec2, Modifiers as EMods, PointerButton as EButton};
 
     #[test]
-    fn pointer_position_scales_by_pixels_per_point() {
+    fn pointer_position_forwards_verbatim_in_device_pixels() {
+        // The shell already mapped the pointer into frame device pixels, so this
+        // layer must NOT re-scale it by `pixels_per_point` (that double-scale
+        // against a fixed frame was the coordinate bug). The position rides through
+        // unchanged whatever ppp the wheel path would use.
         let ev = Event::PointerMoved(pos2(100.0, 50.0));
         assert_eq!(
             map_event(&ev, 2.0),
-            Some(InputEvent::PointerMoved { x: 200.0, y: 100.0 })
+            Some(InputEvent::PointerMoved { x: 100.0, y: 50.0 })
         );
-        // At ppp = 1.0 the coordinate is unchanged.
         assert_eq!(
             map_event(&ev, 1.0),
             Some(InputEvent::PointerMoved { x: 100.0, y: 50.0 })
@@ -185,7 +195,9 @@ mod tests {
     }
 
     #[test]
-    fn a_click_scales_and_maps_the_button() {
+    fn a_click_forwards_its_device_position_and_maps_the_button() {
+        // The device-pixel position passes through untouched (ppp ignored for
+        // pointers); only the button enum is translated.
         let ev = Event::PointerButton {
             pos: pos2(10.0, 20.0),
             button: EButton::Secondary,
@@ -195,8 +207,8 @@ mod tests {
         assert_eq!(
             map_event(&ev, 1.5),
             Some(InputEvent::PointerButton {
-                x: 15.0,
-                y: 30.0,
+                x: 10.0,
+                y: 20.0,
                 button: PointerButton::Secondary,
                 pressed: true,
             })
