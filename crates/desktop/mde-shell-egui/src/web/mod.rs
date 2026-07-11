@@ -259,43 +259,14 @@ use device_profile::*;
 mod site_data;
 use site_data::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CupsPrintRequest {
-    path: String,
-    title: String,
-    settings: CupsPrintSettings,
-}
+mod printing;
+use printing::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SavedPdf {
     path: PathBuf,
     url: String,
     title: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CupsPrinter {
-    name: String,
-    is_default: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CupsPrintSettings {
-    destination: Option<String>,
-    copies: u16,
-    duplex: bool,
-    grayscale: bool,
-}
-
-impl Default for CupsPrintSettings {
-    fn default() -> Self {
-        Self {
-            destination: None,
-            copies: 1,
-            duplex: false,
-            grayscale: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8266,156 +8237,6 @@ fn mhtml_header_value(text: &str) -> String {
     text.chars()
         .map(|ch| if ch == '\r' || ch == '\n' { ' ' } else { ch })
         .collect()
-}
-
-fn cups_job_title(url: &str, title: &str, unix_ms: u64) -> String {
-    let seed = {
-        let title = title.trim();
-        if title.is_empty() {
-            host_of(url).unwrap_or_else(|| "Browser page".to_owned())
-        } else {
-            title.to_owned()
-        }
-    };
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in seed.chars() {
-        let next = if ch.is_ascii_graphic() {
-            last_space = false;
-            Some(ch)
-        } else if ch.is_whitespace() && !last_space {
-            last_space = true;
-            Some(' ')
-        } else {
-            None
-        };
-        if let Some(ch) = next {
-            out.push(ch);
-        }
-        if out.len() >= 80 {
-            break;
-        }
-    }
-    let out = out.trim();
-    if out.is_empty() {
-        format!("Magic Mesh Browser {unix_ms}")
-    } else {
-        format!("Magic Mesh Browser - {out}")
-    }
-}
-
-fn discover_cups_printers() -> Result<Vec<CupsPrinter>, String> {
-    discover_cups_printers_with_runner(run_process_with_timeout)
-}
-
-fn discover_cups_printers_with_runner(
-    runner: impl Fn(&str, &[String], Duration) -> Result<ProcessOutput, String>,
-) -> Result<Vec<CupsPrinter>, String> {
-    let names = runner("lpstat", &["-e".to_owned()], CUPS_PRINT_TIMEOUT)?;
-    if !names.success {
-        return Err(process_error("lpstat -e", &names));
-    }
-    let default = runner("lpstat", &["-d".to_owned()], CUPS_PRINT_TIMEOUT).ok();
-    let default_name = default
-        .as_ref()
-        .filter(|output| output.success)
-        .and_then(|output| parse_cups_default_destination(&output.stdout));
-    let mut printers = parse_cups_printer_names(&names.stdout)
-        .into_iter()
-        .map(|name| CupsPrinter {
-            is_default: default_name.as_deref() == Some(name.as_str()),
-            name,
-        })
-        .collect::<Vec<_>>();
-    printers.sort_by(|a, b| {
-        b.is_default
-            .cmp(&a.is_default)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    Ok(printers)
-}
-
-fn parse_cups_printer_names(stdout: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    stdout
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .filter(|name| seen.insert((*name).to_owned()))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn parse_cups_default_destination(stdout: &str) -> Option<String> {
-    stdout
-        .lines()
-        .find_map(|line| {
-            line.rsplit_once(':')
-                .map(|(_, name)| name.trim().to_owned())
-        })
-        .filter(|name| !name.is_empty())
-}
-
-fn submit_pdf_to_cups(
-    path: &Path,
-    title: &str,
-    settings: &CupsPrintSettings,
-) -> Result<String, String> {
-    submit_pdf_to_cups_with_runner(path, title, settings, run_process_with_timeout)
-}
-
-fn submit_pdf_to_cups_with_runner(
-    path: &Path,
-    title: &str,
-    settings: &CupsPrintSettings,
-    runner: impl FnOnce(&str, &[String], Duration) -> Result<ProcessOutput, String>,
-) -> Result<String, String> {
-    if !path.is_file() {
-        return Err(format!("{} is not a file", path.display()));
-    }
-    let path_arg = path.to_string_lossy().into_owned();
-    let mut args = Vec::new();
-    if let Some(destination) = settings
-        .destination
-        .as_deref()
-        .map(str::trim)
-        .filter(|destination| !destination.is_empty())
-    {
-        args.push("-d".to_owned());
-        args.push(destination.to_owned());
-    }
-    if settings.copies > 1 {
-        args.push("-n".to_owned());
-        args.push(settings.copies.min(99).to_string());
-    }
-    if settings.duplex {
-        args.push("-o".to_owned());
-        args.push("sides=two-sided-long-edge".to_owned());
-    }
-    if settings.grayscale {
-        args.push("-o".to_owned());
-        args.push("ColorModel=Gray".to_owned());
-    }
-    args.push("-t".to_owned());
-    args.push(title.to_owned());
-    args.push(path_arg.clone());
-    let output = runner("lp", &args, CUPS_PRINT_TIMEOUT)?;
-    if output.success {
-        let job = output.stdout.trim();
-        if job.is_empty() {
-            Ok(path_arg)
-        } else {
-            Ok(job.to_owned())
-        }
-    } else {
-        let err = output.stderr.trim();
-        if err.is_empty() {
-            Err("lp failed without an error message".to_owned())
-        } else {
-            Err(err.to_owned())
-        }
-    }
 }
 
 fn process_error(command: &str, output: &ProcessOutput) -> String {
