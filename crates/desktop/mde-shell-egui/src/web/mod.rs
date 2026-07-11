@@ -302,6 +302,7 @@ const SPEECH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PASSKEY_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PASSKEY_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SECURITY_UPDATE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_TAB_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
 const CURATED_USERSCRIPT_COUNT: usize = 100;
 
@@ -515,6 +516,11 @@ pub(crate) struct WebState {
     downloads_open: bool,
     /// Last time the browser refreshed its ledger view.
     downloads_last_poll: Option<Instant>,
+    /// Last time the per-frame catch-all rebuilt + published the session
+    /// snapshot. Genuine mutations publish immediately via their own
+    /// `publish_session_snapshot()` calls; this gate only throttles the
+    /// unconditional per-paint rebuild in `web_panel`.
+    session_snapshot_last_poll: Option<Instant>,
     /// Last lifecycle dispatch failure, shown inline instead of being swallowed.
     download_notice: Option<String>,
     /// Last viewport-capture result, shown inline instead of being swallowed.
@@ -627,6 +633,7 @@ impl Default for WebState {
             security_update_last_poll: None,
             downloads_open: false,
             downloads_last_poll: None,
+            session_snapshot_last_poll: None,
             download_notice: None,
             capture_notice: None,
             last_saved_pdf: None,
@@ -716,6 +723,27 @@ impl WebState {
         }
         publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_SESSION_SYNC, &body);
         self.last_session_sync_body = Some(body);
+    }
+
+    /// Rebuild + publish the session snapshot at a UI-safe cadence. Genuine
+    /// mutations (new tab, navigation, download completion, …) still publish
+    /// immediately through their own `publish_session_snapshot()` calls; this
+    /// per-frame catch-all only needs to pick up async tab-poll changes, so it
+    /// runs ~1×/s instead of every vblank to avoid rebuilding the full
+    /// serde_json body (and reallocating the open-tab host Vec) on every paint.
+    /// The first frame still publishes immediately (last_poll is None), and the
+    /// string-compare dedup in `publish_session_snapshot` prevents redundant
+    /// bus traffic.
+    fn poll_session_snapshot(&mut self) {
+        if self
+            .session_snapshot_last_poll
+            .is_some_and(|last| last.elapsed() < SESSION_SNAPSHOT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.update_site_data_from_tabs();
+        self.publish_session_snapshot();
+        self.session_snapshot_last_poll = Some(Instant::now());
     }
 
     fn publish_download_notification(&mut self, job: &TransferJob) {
@@ -2926,8 +2954,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         state.handle_passkey_event(tab_index, engine, &body);
     }
     state.poll_spellcheck();
-    state.update_site_data_from_tabs();
-    state.publish_session_snapshot();
+    state.poll_session_snapshot();
 
     // 2. Upload the active tab's pending frame — ONLY when one is present, so an
     //    idle page never triggers a re-upload.
