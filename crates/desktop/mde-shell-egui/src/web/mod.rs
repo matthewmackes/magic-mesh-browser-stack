@@ -7709,14 +7709,14 @@ fn annotate_capture_image(
             img.pixels.len()
         ));
     }
-    let mut out = egui::ColorImage::new([w, out_h], egui::Color32::from_rgb(15, 20, 25));
+    let mut out = egui::ColorImage::new([w, out_h], Style::BG);
     out.pixels[..expected].copy_from_slice(&img.pixels);
     for y in h..out_h {
         for x in 0..w {
             out.pixels[y * w + x] = if y == h {
                 Style::ACCENT
             } else {
-                egui::Color32::from_rgb(21, 27, 34)
+                Style::SURFACE
             };
         }
     }
@@ -7737,13 +7737,7 @@ fn annotate_callout_capture_image(
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
     if w < 16 || h < 12 {
-        draw_tiny_text(
-            &mut out,
-            6,
-            h + 6,
-            "CALLOUT",
-            egui::Color32::from_rgb(255, 255, 255),
-        );
+        draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
         return Ok(out);
     }
 
@@ -7779,15 +7773,9 @@ fn annotate_callout_capture_image(
         leader_end_x.saturating_sub(8),
         leader_end_y.saturating_add(1),
         "1",
-        egui::Color32::from_rgb(255, 255, 255),
+        Style::TEXT_STRONG,
     );
-    draw_tiny_text(
-        &mut out,
-        6,
-        h + 6,
-        "CALLOUT",
-        egui::Color32::from_rgb(255, 255, 255),
-    );
+    draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
     Ok(out)
 }
 
@@ -7797,7 +7785,7 @@ fn annotate_freehand_capture_image(
 ) -> Result<egui::ColorImage, String> {
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
-    let stroke = egui::Color32::from_rgb(255, 255, 255);
+    let stroke = Style::TEXT_STRONG;
     if w < 16 || h < 12 {
         draw_tiny_text(&mut out, 6, h + 6, "FREEHAND", stroke);
         return Ok(out);
@@ -9119,11 +9107,8 @@ fn handle_region_capture_drag(
     {
         if let Some(region) = PixelRegion::from_points(start, current, frame_size) {
             let overlay = region.rect_on_image(image_rect, frame_size);
-            ui.painter().rect_filled(
-                overlay,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(15, 98, 254, 42),
-            );
+            ui.painter()
+                .rect_filled(overlay, 0.0, Style::selection_wash());
             ui.painter().rect_stroke(
                 overlay,
                 0.0,
@@ -12939,7 +12924,7 @@ mod tests {
         assert!(
             image.pixels[frame_pixels..]
                 .iter()
-                .any(|pixel| *pixel == egui::Color32::from_rgb(255, 255, 255)),
+                .any(|pixel| *pixel == Style::TEXT_STRONG),
             "callout capture should render a callout label into the caption band"
         );
     }
@@ -12979,15 +12964,15 @@ mod tests {
         assert!(
             image.pixels[frame_pixels..]
                 .iter()
-                .any(|pixel| *pixel == egui::Color32::from_rgb(255, 255, 255)),
+                .any(|pixel| *pixel == Style::TEXT_STRONG),
             "freehand capture should render a freehand label into the caption band"
         );
     }
 
     #[test]
     fn annotated_capture_preserves_frame_and_adds_caption_band() {
-        let mut img = egui::ColorImage::new([32, 4], egui::Color32::from_rgb(1, 2, 3));
-        img.pixels[3] = egui::Color32::from_rgb(9, 8, 7);
+        let mut img = egui::ColorImage::new([32, 4], egui::Color32::RED);
+        img.pixels[3] = egui::Color32::BLUE;
 
         let annotated = annotate_capture_image(&img, "Example | https://example.test | 123")
             .expect("valid annotation");
@@ -13004,7 +12989,7 @@ mod tests {
 
     #[test]
     fn callout_capture_draws_overlay_and_preserves_frame_area() {
-        let img = egui::ColorImage::new([64, 48], egui::Color32::from_rgb(1, 2, 3));
+        let img = egui::ColorImage::new([64, 48], egui::Color32::RED);
 
         let annotated =
             annotate_callout_capture_image(&img, "Example | https://example.test | 123")
@@ -13024,14 +13009,14 @@ mod tests {
         assert!(
             annotated.pixels[(64 * 48)..]
                 .iter()
-                .any(|pixel| *pixel == egui::Color32::from_rgb(255, 255, 255)),
+                .any(|pixel| *pixel == Style::TEXT_STRONG),
             "callout label should be painted into the appended band"
         );
     }
 
     #[test]
     fn freehand_capture_draws_stroke_and_preserves_frame_area() {
-        let img = egui::ColorImage::new([64, 48], egui::Color32::from_rgb(1, 2, 3));
+        let img = egui::ColorImage::new([64, 48], egui::Color32::RED);
 
         let annotated =
             annotate_freehand_capture_image(&img, "Example | https://example.test | 123")
@@ -13045,13 +13030,13 @@ mod tests {
         assert!(
             annotated.pixels[..(64 * 48)]
                 .iter()
-                .any(|pixel| *pixel == egui::Color32::from_rgb(255, 255, 255)),
+                .any(|pixel| *pixel == Style::TEXT_STRONG),
             "freehand overlay should paint a visible white stroke"
         );
         assert!(
             annotated.pixels[(64 * 48)..]
                 .iter()
-                .any(|pixel| *pixel == egui::Color32::from_rgb(255, 255, 255)),
+                .any(|pixel| *pixel == Style::TEXT_STRONG),
             "freehand label should be painted into the appended band"
         );
     }
@@ -13095,8 +13080,10 @@ mod tests {
         let mut img = egui::ColorImage::new([4, 3], egui::Color32::TRANSPARENT);
         for y in 0..3 {
             for x in 0..4 {
+                // Twelve distinct sentinel pixels (a WHITE ramp) so the crop's
+                // positional preservation is provable without minting a colour.
                 img.pixels[y * 4 + x] =
-                    egui::Color32::from_rgba_unmultiplied(x as u8, y as u8, (x + y) as u8, 255);
+                    egui::Color32::WHITE.gamma_multiply((y * 4 + x + 1) as f32 / 12.0);
             }
         }
 
@@ -16340,7 +16327,7 @@ mod tests {
     fn browser_offline_cache_result_parser_is_private_and_bounded() {
         let viewport = offline_cache_viewport_image(&egui::ColorImage {
             size: [1, 1],
-            pixels: vec![egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255)],
+            pixels: vec![egui::Color32::RED],
         })
         .expect("small viewport encodes");
         let archive_request = OfflineCacheRequest {
@@ -16461,7 +16448,7 @@ mod tests {
         for y in 0..3 {
             for x in 0..4 {
                 image.pixels[y * 4 + x] =
-                    egui::Color32::from_rgba_unmultiplied(x as u8, y as u8, 40, 255);
+                    egui::Color32::WHITE.gamma_multiply((y * 4 + x + 1) as f32 / 12.0);
             }
         }
         let viewport = offline_cache_viewport_image(&image).expect("small viewport encodes");
