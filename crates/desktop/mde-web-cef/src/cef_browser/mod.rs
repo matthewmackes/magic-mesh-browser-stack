@@ -64,6 +64,12 @@ pub const CEF_CLIENT_GET_RENDER_HANDLER_OFFSET: usize = 168;
 pub const CEF_CLIENT_GET_REQUEST_HANDLER_OFFSET: usize = 176;
 /// `offsetof(cef_client_t, get_display_handler)` — carries nav/title state (B1).
 pub const CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET: usize = 72;
+/// `offsetof(cef_client_t, get_find_handler)` — find-in-page match results (field 7).
+pub const CEF_CLIENT_GET_FIND_HANDLER_OFFSET: usize = 96;
+/// `sizeof(cef_find_handler_t)` (1 fn ptr + 40 base).
+pub const CEF_FIND_HANDLER_SIZE: usize = 48;
+/// `offsetof(cef_find_handler_t, on_find_result)`.
+pub const CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET: usize = 40;
 /// `offsetof(cef_client_t, get_load_handler)` — carries loading/back/forward (B1).
 pub const CEF_CLIENT_GET_LOAD_HANDLER_OFFSET: usize = 152;
 /// `sizeof(cef_display_handler_t)` for pinned Linux CEF 149 (13 fn ptrs + 40-byte base).
@@ -150,6 +156,10 @@ pub const CEF_BROWSER_HOST_SET_FOCUS_OFFSET: usize = 72;
 /// `offsetof(cef_browser_host_t, set_zoom_level)` — native page zoom (field 15,
 /// reconciled against close_browser=48 and set_focus=72).
 pub const CEF_BROWSER_HOST_SET_ZOOM_LEVEL_OFFSET: usize = 160;
+/// `offsetof(cef_browser_host_t, find)` — native find-in-page (field 21).
+pub const CEF_BROWSER_HOST_FIND_OFFSET: usize = 208;
+/// `offsetof(cef_browser_host_t, stop_finding)` (field 22).
+pub const CEF_BROWSER_HOST_STOP_FINDING_OFFSET: usize = 216;
 /// `offsetof(cef_browser_host_t, was_resized)`.
 pub const CEF_BROWSER_HOST_WAS_RESIZED_OFFSET: usize = 304;
 /// `offsetof(cef_browser_host_t, invalidate)`.
@@ -878,9 +888,11 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::Input(event) => apply_input_event(browser, callbacks, event),
         ControlMsg::CosmeticFilters(css) => apply_cosmetic_filters(browser, css),
         ControlMsg::SetZoom { percent } => apply_page_zoom(browser, *percent),
-        ControlMsg::FindInPage { query, backwards } => {
-            apply_find_in_page(browser, query, *backwards)
-        }
+        ControlMsg::FindInPage {
+            query,
+            backwards,
+            find_next,
+        } => apply_find_in_page(browser, query, *backwards, *find_next),
         ControlMsg::ClearFind => clear_find_in_page(browser),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
         ControlMsg::SetForceDark { enabled } => apply_force_dark(browser, *enabled),
@@ -1122,6 +1134,7 @@ struct CefBrowserCallbacks {
     print: Box<CefCallbackBlock<CEF_PRINT_HANDLER_SIZE>>,
     display: Box<CefCallbackBlock<CEF_DISPLAY_HANDLER_SIZE>>,
     load: Box<CefCallbackBlock<CEF_LOAD_HANDLER_SIZE>>,
+    find: Box<CefCallbackBlock<CEF_FIND_HANDLER_SIZE>>,
 }
 
 impl CefBrowserCallbacks {
@@ -1147,6 +1160,7 @@ impl CefBrowserCallbacks {
             print: Box::new(CefCallbackBlock::new(CEF_PRINT_HANDLER_SIZE)),
             display: Box::new(CefCallbackBlock::new(CEF_DISPLAY_HANDLER_SIZE)),
             load: Box::new(CefCallbackBlock::new(CEF_LOAD_HANDLER_SIZE)),
+            find: Box::new(CefCallbackBlock::new(CEF_FIND_HANDLER_SIZE)),
         };
         callbacks.install();
         Ok(callbacks)
@@ -1247,6 +1261,15 @@ impl CefBrowserCallbacks {
             CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET,
             fn_ptr(on_loading_state_change as *const ()),
         );
+        // Find-in-page match tally (native find via the browser host).
+        self.client.put_fn(
+            CEF_CLIENT_GET_FIND_HANDLER_OFFSET,
+            fn_ptr(get_find_handler as *const ()),
+        );
+        self.find.put_fn(
+            CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET,
+            fn_ptr(on_find_result as *const ()),
+        );
 
         let state = self.state.as_ref() as *const CefBrowserState as usize;
         self.state
@@ -1261,6 +1284,7 @@ impl CefBrowserCallbacks {
         registry.insert(self.print.as_usize(), state);
         registry.insert(self.display.as_usize(), state);
         registry.insert(self.load.as_usize(), state);
+        registry.insert(self.find.as_usize(), state);
     }
 
     fn client_ptr(&self) -> *mut c_void {
@@ -1332,6 +1356,7 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.print.as_usize());
         registry.remove(&self.display.as_usize());
         registry.remove(&self.load.as_usize());
+        registry.remove(&self.find.as_usize());
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
@@ -1812,6 +1837,20 @@ impl CefBrowserState {
         });
     }
 
+    /// A native find-in-page result — the shell shows the "active/count" tally.
+    fn publish_find_result(&self, count: u32, active: u32, final_update: bool) {
+        let event = EventMsg::FindResult {
+            count,
+            active,
+            final_update,
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
     /// The renderer process died — tell the shell so the tab shows its crashed
     /// (sad-tab) state instead of a frozen last frame.
     fn publish_crashed(&self, reason: String) {
@@ -2250,6 +2289,28 @@ unsafe extern "C" fn get_load_handler(self_: *mut c_void) -> *mut c_void {
     with_state(self_, |state| state.load_ptr()).unwrap_or(ptr::null_mut())
 }
 
+unsafe extern "C" fn get_find_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.find_ptr()).unwrap_or(ptr::null_mut())
+}
+
+/// CEF `on_find_result(self, browser, identifier, count, rect, active_ordinal,
+/// final_update)` — the native find reported its match tally.
+unsafe extern "C" fn on_find_result(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    _identifier: c_int,
+    count: c_int,
+    _selection_rect: *const CefRect,
+    active_match_ordinal: c_int,
+    final_update: c_int,
+) {
+    let count = u32::try_from(count).unwrap_or(0);
+    let active = u32::try_from(active_match_ordinal).unwrap_or(0);
+    let _ = with_state(self_, |state| {
+        state.publish_find_result(count, active, final_update != 0);
+    });
+}
+
 /// CEF `on_address_change(self, browser, frame, url)` — the committed URL changed.
 unsafe extern "C" fn on_address_change(
     self_: *mut c_void,
@@ -2444,6 +2505,10 @@ impl CefBrowserState {
 
     fn load_ptr(&self) -> *mut c_void {
         lookup_peer(self, CEF_LOAD_HANDLER_SIZE)
+    }
+
+    fn find_ptr(&self) -> *mut c_void {
+        lookup_peer(self, CEF_FIND_HANDLER_SIZE)
     }
 }
 
@@ -3048,22 +3113,53 @@ fn apply_page_zoom(browser: *mut c_void, percent: u16) {
     unsafe { callback(host, zoom_level_for_percent(percent)) };
 }
 
-fn apply_find_in_page(browser: *mut c_void, query: &str, backwards: bool) {
-    let Some(frame) = main_frame(browser) else {
-        return;
-    };
+fn apply_find_in_page(browser: *mut c_void, query: &str, backwards: bool, find_next: bool) {
     if query.trim().is_empty() {
         clear_find_in_page(browser);
         return;
     }
-    execute_java_script(frame, &find_in_page_script(query, backwards));
+    // Native host->find: highlights ALL matches, cycles with find_next, and fires
+    // on_find_result with the match tally (unlike the old window.find script,
+    // which had no count). forward = !backwards; case-insensitive.
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_FIND_OFFSET) else {
+        return;
+    };
+    let Ok(search) = CefStringOwned::new(query) else {
+        return;
+    };
+    // SAFETY: `callback` is `cef_browser_host_t::find`, signature
+    // `(host*, const cef_string_t*, int forward, int match_case, int find_next)`.
+    let callback: unsafe extern "C" fn(*mut c_void, *const c_void, c_int, c_int, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: host + the owned search string live for the duration of the call.
+    unsafe {
+        callback(
+            host,
+            search.as_ptr(),
+            c_int::from(!backwards),
+            0,
+            c_int::from(find_next),
+        );
+    }
 }
 
 fn clear_find_in_page(browser: *mut c_void) {
-    let Some(frame) = main_frame(browser) else {
+    // Native stop_finding(clear_selection=1) — ends the search + drops highlights.
+    let Some(host) = browser_host(browser) else {
         return;
     };
-    execute_java_script(frame, clear_find_script());
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_STOP_FINDING_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is `cef_browser_host_t::stop_finding`, signature
+    // `(host*, int clear_selection)`.
+    let callback: unsafe extern "C" fn(*mut c_void, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: host came from CEF and remains valid for the call.
+    unsafe { callback(host, 1) };
 }
 
 fn execute_java_script(frame: *mut c_void, script: &str) {

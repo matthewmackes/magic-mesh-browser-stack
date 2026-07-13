@@ -103,16 +103,6 @@ pub(super) fn device_profile_script(
     )
 }
 
-pub(super) fn find_in_page_script(query: &str, backwards: bool) -> String {
-    let query = js_string_literal(query);
-    let backwards = if backwards { "true" } else { "false" };
-    format!("(function(){{window.find({query},false,{backwards},true,false,false,false);}})();")
-}
-
-pub(super) const fn clear_find_script() -> &'static str {
-    "(function(){var s=window.getSelection&&window.getSelection();if(s)s.removeAllRanges();})();"
-}
-
 pub(super) fn userscript_library_script(enabled: bool, bundle: &str) -> String {
     if !enabled {
         return "(function(){var style=document.getElementById('mde-browser-userscript-style');if(style)style.remove();if(window.__mdeBrowserUserScriptsObserver){window.__mdeBrowserUserScriptsObserver.disconnect();window.__mdeBrowserUserScriptsObserver=null;}delete document.documentElement.dataset.mdeBrowserUserscripts;})();".to_owned();

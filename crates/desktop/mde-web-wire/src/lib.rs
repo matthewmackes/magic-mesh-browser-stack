@@ -509,6 +509,9 @@ pub enum ControlMsg {
         query: String,
         /// Search backwards instead of forwards.
         backwards: bool,
+        /// Continue from the current match (next/prev) rather than starting a
+        /// fresh search from the top — native find needs this distinction.
+        find_next: bool,
     },
     /// Clear the current page-find highlight/selection where the helper supports it.
     ClearFind,
@@ -658,10 +661,15 @@ impl ControlMsg {
                 out.push(9);
                 put_u16(&mut out, *percent);
             }
-            Self::FindInPage { query, backwards } => {
+            Self::FindInPage {
+                query,
+                backwards,
+                find_next,
+            } => {
                 out.push(10);
                 put_str(&mut out, query);
                 out.push(u8::from(*backwards));
+                out.push(u8::from(*find_next));
             }
             Self::ClearFind => out.push(11),
             Self::SetAudioMuted { muted } => {
@@ -780,6 +788,7 @@ impl ControlMsg {
             10 => Self::FindInPage {
                 query: c.string()?,
                 backwards: c.bool()?,
+                find_next: c.bool()?,
             },
             11 => Self::ClearFind,
             12 => Self::SetAudioMuted { muted: c.bool()? },
@@ -940,6 +949,16 @@ pub enum EventMsg {
         /// The engine-neutral cursor shape.
         kind: CursorKind,
     },
+    /// A find-in-page search reported its match tally (native find), driving the
+    /// "N/M" counter in the find bar.
+    FindResult {
+        /// Total matches on the page.
+        count: u32,
+        /// The 1-based ordinal of the currently-highlighted match (0 = none).
+        active: u32,
+        /// This is the final result for the search (counts have settled).
+        final_update: bool,
+    },
 }
 
 impl EventMsg {
@@ -1024,6 +1043,16 @@ impl EventMsg {
                 out.push(12);
                 out.push(*kind as u8);
             }
+            Self::FindResult {
+                count,
+                active,
+                final_update,
+            } => {
+                out.push(13);
+                put_u32(&mut out, *count);
+                put_u32(&mut out, *active);
+                out.push(u8::from(*final_update));
+            }
         }
         out
     }
@@ -1078,6 +1107,11 @@ impl EventMsg {
             11 => Self::PopupRequested { url: c.string()? },
             12 => Self::CursorChanged {
                 kind: CursorKind::from_u8(c.u8()?),
+            },
+            13 => Self::FindResult {
+                count: c.u32()?,
+                active: c.u32()?,
+                final_update: c.bool()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1286,10 +1320,12 @@ mod tests {
         round_control(&ControlMsg::FindInPage {
             query: "mesh".to_owned(),
             backwards: false,
+            find_next: false,
         });
         round_control(&ControlMsg::FindInPage {
             query: "mesh".to_owned(),
             backwards: true,
+            find_next: true,
         });
         round_control(&ControlMsg::ClearFind);
         round_control(&ControlMsg::SetAudioMuted { muted: true });
@@ -1426,6 +1462,11 @@ mod tests {
         });
         round_event(&EventMsg::CursorChanged {
             kind: CursorKind::ResizeNwSe,
+        });
+        round_event(&EventMsg::FindResult {
+            count: 12,
+            active: 3,
+            final_update: true,
         });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);

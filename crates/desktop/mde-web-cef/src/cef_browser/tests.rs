@@ -641,12 +641,26 @@ fn native_zoom_level_follows_chromium_convention_and_clamps() {
 }
 
 #[test]
-fn find_scripts_are_bounded_and_escaped() {
-    let forward = find_in_page_script("mesh \"ops\"", false);
-    assert!(forward.contains(r#"window.find("mesh \"ops\"",false,false"#));
-    let backward = find_in_page_script("mesh", true);
-    assert!(backward.contains(r#"window.find("mesh",false,true"#));
-    assert!(clear_find_script().contains("removeAllRanges"));
+fn find_handler_offsets_reconcile_with_the_client_and_host_layout() {
+    // get_find_handler is client field 7 (get_display=72/field4 + get_download=80
+    // /field5 pin the run); the 48-byte 1-field handler holds on_find_result at 40.
+    assert_eq!(CEF_CLIENT_GET_FIND_HANDLER_OFFSET, 40 + 7 * 8);
+    assert_eq!(CEF_FIND_HANDLER_SIZE, 40 + 1 * 8);
+    assert_eq!(CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET, 40);
+    // host find/stop_finding are fields 21/22 (set_zoom_level=160/field15 anchors).
+    assert_eq!(CEF_BROWSER_HOST_FIND_OFFSET, 40 + 21 * 8);
+    assert_eq!(CEF_BROWSER_HOST_STOP_FINDING_OFFSET, 40 + 22 * 8);
+    // Find-handler size 48 must stay unique for lookup_peer resolution.
+    for other in [
+        CEF_LIFE_SPAN_HANDLER_SIZE,
+        CEF_RENDER_HANDLER_SIZE,
+        CEF_REQUEST_HANDLER_SIZE,
+        CEF_RESOURCE_REQUEST_HANDLER_SIZE,
+        CEF_DISPLAY_HANDLER_SIZE,
+        CEF_LOAD_HANDLER_SIZE,
+    ] {
+        assert_ne!(CEF_FIND_HANDLER_SIZE, other);
+    }
 }
 
 #[test]

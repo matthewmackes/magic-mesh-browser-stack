@@ -438,6 +438,9 @@ pub(crate) struct WebState {
     speed_dial: Vec<SpeedDialEntry>,
     /// Page find draft shown in the compact find bar.
     find_query: String,
+    /// The query of the last find submitted — a repeat means "next/prev match"
+    /// (native find's `find_next`), a change means a fresh search from the top.
+    last_find_query: Option<String>,
     /// Whether the compact find bar is open.
     find_open: bool,
     /// Current page zoom percentage sent to the active helper.
@@ -632,6 +635,7 @@ impl Default for WebState {
             dashboard_query: String::new(),
             speed_dial: default_speed_dial(),
             find_query: String::new(),
+            last_find_query: None,
             find_open: false,
             page_zoom_percent: 100,
             suggestions: SuggestionState::default(),
@@ -2621,6 +2625,7 @@ impl WebState {
 
     fn close_find_bar(&mut self) {
         self.find_open = false;
+        self.last_find_query = None;
         if let Some(tab) = self.active_tab() {
             tab.session.clear_find();
         }
@@ -2630,14 +2635,24 @@ impl WebState {
     fn submit_find(&mut self, backwards: bool) {
         let query = self.find_query.trim().to_owned();
         if query.is_empty() {
+            self.last_find_query = None;
             if let Some(tab) = self.active_tab() {
                 tab.session.clear_find();
             }
             return;
         }
+        // Same query as last time → cycle to the next/prev match; a changed query
+        // starts a fresh search from the top.
+        let find_next = self.last_find_query.as_deref() == Some(query.as_str());
+        self.last_find_query = Some(query.clone());
         if let Some(tab) = self.active_tab() {
-            tab.session.find_in_page(query, backwards);
+            tab.session.find_in_page(query, backwards, find_next);
         }
+    }
+
+    /// The active tab's find tally `(active_ordinal, total_count)` for the counter.
+    fn active_find_result(&self) -> Option<(u32, u32)> {
+        self.tabs.get(self.active)?.session.find_result()
     }
 
     fn sync_address_from_active(&mut self) {
@@ -5047,6 +5062,11 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     }
     let enabled = state.can_drive_page_tools();
+    // The engine's match tally, shown as "active/count" (or "No results"). Read
+    // before the mutable-borrow closure below.
+    let find_tally = (!state.find_query.trim().is_empty())
+        .then(|| state.active_find_result())
+        .flatten();
     let mut submit_forward = false;
     let mut submit_backward = false;
     egui::Frame::NONE
@@ -5069,6 +5089,18 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                         .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
                 );
                 state.chrome_edit_focus |= resp.has_focus();
+                if let Some((active, count)) = find_tally {
+                    let label = if count == 0 {
+                        "No results".to_owned()
+                    } else {
+                        format!("{active}/{count}")
+                    };
+                    ui.label(
+                        RichText::new(label)
+                            .size(CHROME_FONT)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if enter && ui.input(|i| i.modifiers.shift) {
                     submit_backward = true;
@@ -7152,6 +7184,7 @@ mod tests {
                 mde_web_preview_client::ControlMsg::FindInPage {
                     query,
                     backwards: false,
+                    ..
                 } if query == "mesh"
             )),
             "forward find must reach the helper: {controls:?}"
@@ -7162,6 +7195,7 @@ mod tests {
                 mde_web_preview_client::ControlMsg::FindInPage {
                     query,
                     backwards: true,
+                    ..
                 } if query == "mesh"
             )),
             "backward find must reach the helper: {controls:?}"

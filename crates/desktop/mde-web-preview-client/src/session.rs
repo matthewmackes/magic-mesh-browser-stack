@@ -150,6 +150,8 @@ pub struct WebSession {
     nav: NavState,
     title: String,
     cursor: CursorKind,
+    /// Latest find-in-page tally `(active_ordinal, total_count)`.
+    find_result: Option<(u32, u32)>,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -185,6 +187,7 @@ impl WebSession {
             nav: NavState::default(),
             title: String::new(),
             cursor: CursorKind::default(),
+            find_result: None,
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -406,6 +409,9 @@ impl WebSession {
                 self.popup_requests.push_back(PopupRequestStatus { url });
             }
             EventMsg::CursorChanged { kind } => self.cursor = kind,
+            EventMsg::FindResult { count, active, .. } => {
+                self.find_result = Some((active, count));
+            }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
         Ok(())
@@ -524,11 +530,20 @@ impl WebSession {
     }
 
     /// Find text on the current page.
-    pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool) {
+    pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool, find_next: bool) {
         self.send(&ControlMsg::FindInPage {
             query: query.into(),
             backwards,
+            find_next,
         });
+    }
+
+    /// The latest find-in-page match tally `(active, count)` reported by the
+    /// engine (1-based active ordinal, 0 = no active match), or `None` before any
+    /// search this session.
+    #[must_use]
+    pub const fn find_result(&self) -> Option<(u32, u32)> {
+        self.find_result
     }
 
     /// Clear the page-find selection/highlight where the helper supports it.
@@ -1103,21 +1118,23 @@ mod tests {
             ControlMsg::SetZoom { percent: 125 }
         );
 
-        session.find_in_page("mesh", false);
+        session.find_in_page("mesh", false, false);
         assert_eq!(
             read_control(&mut peer),
             ControlMsg::FindInPage {
                 query: "mesh".to_owned(),
                 backwards: false,
+                find_next: false,
             }
         );
 
-        session.find_in_page("mesh", true);
+        session.find_in_page("mesh", true, true);
         assert_eq!(
             read_control(&mut peer),
             ControlMsg::FindInPage {
                 query: "mesh".to_owned(),
                 backwards: true,
+                find_next: true,
             }
         );
 
