@@ -265,6 +265,8 @@ use device_profile::*;
 
 mod site_data;
 use site_data::*;
+mod history;
+use history::*;
 
 mod printing;
 use printing::*;
@@ -587,6 +589,10 @@ pub(crate) struct WebState {
     /// BROWSER-DD-3 per-site data manager. Tracks committed first-party hosts,
     /// live tab counts, last-seen timestamps, and explicit clear actions.
     site_data: SiteDataManager,
+    /// Session-only in-memory browsing history (B3, Q74/Q80 — never persisted).
+    history: HistoryStore,
+    /// Whether the History drawer is open.
+    history_open: bool,
     /// Shared Transfers client. Browser downloads are just `browser_download`
     /// rows in the daemon-owned ledger, so Files and Browser show one queue.
     transfers: Box<dyn TransfersClient>,
@@ -765,6 +771,8 @@ impl Default for WebState {
             forgotten_permission_sites: Vec::new(),
             site_permission_prompts: Vec::new(),
             site_data: SiteDataManager::default(),
+            history: HistoryStore::default(),
+            history_open: false,
             transfers: Box::new(FileTransfers::from_env()),
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
@@ -910,6 +918,7 @@ impl WebState {
             return;
         }
         self.update_site_data_from_tabs();
+        self.record_history_from_active_tab();
         self.publish_session_snapshot();
         self.session_snapshot_last_poll = Some(Instant::now());
     }
@@ -2997,6 +3006,21 @@ impl WebState {
             .observe_open_tabs(hosts.iter().map(String::as_str), unix_ms());
     }
 
+    /// Record the ACTIVE tab's committed navigation into the session-only history
+    /// (B3). `record` dedupes the NavState `loading:true→false` churn and reloads,
+    /// and back-fills the title as it arrives; new-tab/blank pages are skipped.
+    fn record_history_from_active_tab(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let url = tab.session.nav().url.trim().to_owned();
+        let title = tab.session.title().to_owned();
+        if url.is_empty() || url == NEW_TAB_URL {
+            return;
+        }
+        self.history.record(&url, &title, unix_ms());
+    }
+
     fn set_active_site_blocking(&mut self, enabled: bool) {
         let Some(host) = self.active_first_party() else {
             return;
@@ -3427,6 +3451,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 offline_cache_drawer(ui, state);
                 print_settings_drawer(ui, state);
                 downloads_drawer(ui, state);
+                history_drawer(ui, state);
                 ui.add_space(CHROME_GAP);
                 active_body(ui, state);
             });
@@ -3452,6 +3477,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         offline_cache_drawer(ui, state);
         print_settings_drawer(ui, state);
         downloads_drawer(ui, state);
+        history_drawer(ui, state);
         ui.add_space(CHROME_GAP);
         active_body(ui, state);
     }

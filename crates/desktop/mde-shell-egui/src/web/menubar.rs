@@ -63,6 +63,7 @@ pub(super) enum MenuAction {
     ToggleVerticalTabs,
     /// Toggle the browser download manager drawer.
     ToggleDownloads,
+    ToggleHistory,
     /// Toggle the BOOKMARKS-BAR horizontal bookmarks bar below the nav chrome.
     ToggleBookmarksBar,
     /// Toggle BROWSER-DD-8 power mode.
@@ -212,6 +213,7 @@ struct Snapshot {
     find_open: bool,
     /// Download manager drawer is open.
     downloads_open: bool,
+    history_open: bool,
     /// The BOOKMARKS-BAR bookmarks bar is shown.
     bookmarks_bar_visible: bool,
     /// Active browser-originated transfer count.
@@ -311,6 +313,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 page_zoom_percent: state.page_zoom_percent,
                 find_open: state.find_open,
                 downloads_open: state.downloads_open,
+                history_open: state.history_open,
                 bookmarks_bar_visible: state.bookmarks_bar_visible,
                 active_downloads,
                 total_downloads,
@@ -432,6 +435,14 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         "Hide Downloads"
                     } else {
                         "Show Downloads"
+                    },
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ToggleHistory,
+                    if s.history_open {
+                        "Hide History"
+                    } else {
+                        "Show History"
                     },
                 )),
                 Entry::Item(Item::new(
@@ -1047,6 +1058,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
                 state.refresh_downloads();
             }
         }
+        MenuAction::ToggleHistory => state.history_open = !state.history_open,
         MenuAction::ToggleBookmarksBar => state.toggle_bookmarks_bar(),
         MenuAction::TogglePowerMode => state.toggle_power_mode(),
         MenuAction::CycleContainer => state.cycle_active_tab_container(),
@@ -1250,6 +1262,7 @@ mod tests {
             page_zoom_percent: 100,
             find_open: false,
             downloads_open: false,
+            history_open: false,
             bookmarks_bar_visible: false,
             active_downloads: 0,
             total_downloads: 0,
@@ -1554,6 +1567,7 @@ mod tests {
             page_zoom_percent: 150,
             find_open: true,
             downloads_open: true,
+            history_open: false,
             active_downloads: 2,
             total_downloads: 3,
             audio_muted: true,
@@ -1940,6 +1954,7 @@ mod tests {
                             item.label.as_str(),
                             "Vertical Tabs"
                                 | "Show Downloads"
+                                | "Show History"
                                 | "Show Bookmarks Bar"
                                 | "Open Bookmarks Manager"
                         ),
