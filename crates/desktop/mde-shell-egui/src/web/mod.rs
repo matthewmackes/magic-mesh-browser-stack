@@ -13801,4 +13801,227 @@ mod tests {
             }
         }
     }
+
+    // ── BOOKMARKS-BAR ─────────────────────────────────────────────────────────
+    /// Build a converged daemon [`mde_bookmarks::Collection`] fixture by minting
+    /// real `AddBookmark` ops (top-level, in the given order) — the exact op the
+    /// mackesd bookmarks worker replays, so the fold + serialize round-trip mirrors
+    /// production, not a hand-forged JSON blob.
+    fn fake_bookmark_collection(entries: &[(&str, &str)]) -> mde_bookmarks::Collection {
+        let author = mde_bookmarks::Author::new("tester".into(), "test-node".into());
+        let mut collection = mde_bookmarks::Collection::new();
+        for (i, (title, url)) in entries.iter().enumerate() {
+            collection.apply(&mde_bookmarks::Op::new(
+                mde_bookmarks::Hlc::new(100 + i as u64, 0, "test-node".into()),
+                author.clone(),
+                mde_bookmarks::OpKind::AddBookmark {
+                    id: uuid::Uuid::from_u128(0x1000 + i as u128),
+                    parent: None,
+                    order_key: format!("a{i}"),
+                    url: (*url).to_string(),
+                    title: (*title).to_string(),
+                    favicon_ref: None,
+                    tags: Vec::new(),
+                    notes: String::new(),
+                    added: 100,
+                    source: mde_bookmarks::Source::Manual,
+                },
+            ));
+        }
+        collection
+    }
+
+    #[test]
+    fn bookmark_bar_links_fold_top_level_bookmarks_in_render_order() {
+        let mut collection = fake_bookmark_collection(&[
+            ("Beta", "https://beta.example/"),
+            ("", "https://blank-title.example/"),
+        ]);
+        // A top-level folder is NOT a bar button — the bar is a flat link strip.
+        collection.apply(&mde_bookmarks::Op::new(
+            mde_bookmarks::Hlc::new(200, 0, "test-node".into()),
+            mde_bookmarks::Author::new("tester".into(), "test-node".into()),
+            mde_bookmarks::OpKind::AddFolder {
+                id: uuid::Uuid::from_u128(0x2000),
+                name: "Work".to_string(),
+                parent: None,
+                order_key: "a9".to_string(),
+            },
+        ));
+
+        let links = bookmark_bar_links_from(&collection);
+        assert_eq!(links.len(), 2, "the folder is omitted from the bar");
+        assert_eq!(links[0].title, "Beta");
+        assert_eq!(links[0].url, "https://beta.example/");
+        // A blank stored title falls back to the URL so the button stays legible.
+        assert_eq!(links[1].title, "https://blank-title.example/");
+    }
+
+    #[test]
+    fn bookmark_bar_visible_count_reserves_an_overflow_slot() {
+        let (btn, gap, over) = (100.0, 2.0, 26.0);
+        // Everything fits → no overflow slot, all shown.
+        assert_eq!(bookmark_bar_visible_count(3, 400.0, btn, gap, over), 3);
+        // Exactly the full-row width still shows them all.
+        let exact = 3.0 * btn + 2.0 * gap;
+        assert_eq!(bookmark_bar_visible_count(3, exact, btn, gap, over), 3);
+        // Too narrow for all 4 → reserve the ">>" slot and show fewer (< total).
+        let v = bookmark_bar_visible_count(4, exact, btn, gap, over);
+        assert!(v < 4, "an overflow split shows fewer than the total");
+        assert!(v >= 1, "a comfortable width still shows some buttons");
+        // A sliver of width shows none — the whole set lives in the overflow menu.
+        assert_eq!(bookmark_bar_visible_count(4, 20.0, btn, gap, over), 0);
+        // Empty collection → nothing.
+        assert_eq!(bookmark_bar_visible_count(0, 400.0, btn, gap, over), 0);
+    }
+
+    #[test]
+    fn browser_bookmarks_bar_mirrors_the_collection_from_the_bus() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        let collection = fake_bookmark_collection(&[
+            ("Example News", "https://news.example/"),
+            ("Docs", "https://docs.example/"),
+        ]);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        persist
+            .write(
+                STATE_BOOKMARKS_COLLECTION,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&collection).expect("serialize collection")),
+            )
+            .expect("write collection");
+
+        state.poll_bookmarks_collection();
+        assert_eq!(
+            state
+                .bookmark_bar_links
+                .iter()
+                .map(|l| (l.title.as_str(), l.url.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Example News", "https://news.example/"),
+                ("Docs", "https://docs.example/"),
+            ]
+        );
+
+        // The cursor prevents re-folding the same retained snapshot.
+        state.bookmarks_collection_last_poll = None;
+        state.poll_bookmarks_collection();
+        assert_eq!(state.bookmark_bar_links.len(), 2, "no duplicate fold");
+
+        // A newer converged snapshot replaces the row.
+        let updated = fake_bookmark_collection(&[("Only One", "https://one.example/")]);
+        persist
+            .write(
+                STATE_BOOKMARKS_COLLECTION,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&updated).expect("serialize updated")),
+            )
+            .expect("write updated collection");
+        state.bookmarks_collection_last_poll = None;
+        state.poll_bookmarks_collection();
+        assert_eq!(state.bookmark_bar_links.len(), 1);
+        assert_eq!(state.bookmark_bar_links[0].url, "https://one.example/");
+    }
+
+    #[test]
+    fn browser_bookmarks_bar_toggle_shows_and_hides_the_row() {
+        let mut state = WebState::default();
+        state.bookmark_bar_links = vec![BookmarkBarLink {
+            title: "Example".to_owned(),
+            url: "https://example.test/".to_owned(),
+        }];
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+
+        // Hidden by default (matching the other chrome toggles): no bar button.
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        assert!(!state.bookmarks_bar_visible);
+        assert!(
+            !accesskit_nodes(&out)
+                .iter()
+                .any(|(_, n)| n.label() == Some("Example")),
+            "a hidden bar renders no bookmark button"
+        );
+
+        // View → Show Bookmarks Bar reveals the button.
+        state.toggle_bookmarks_bar();
+        assert!(state.bookmarks_bar_visible);
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        assert!(
+            accesskit_nodes(&out)
+                .iter()
+                .any(|(_, n)| n.label() == Some("Example")),
+            "a shown bar renders the bookmark button"
+        );
+
+        // Toggling again hides it.
+        state.toggle_bookmarks_bar();
+        assert!(!state.bookmarks_bar_visible);
+    }
+
+    #[test]
+    fn browser_bookmarks_bar_overflow_menu_holds_the_extras() {
+        // A narrow bar with more bookmarks than fit: the leading run shows on the
+        // row and the rest live behind the ">>" menu. Assert the split via the pure
+        // fit fn on the same fixed geometry the renderer uses.
+        let total = 40usize;
+        let narrow = 3.0 * BOOKMARK_BTN_W; // room for only a couple buttons
+        let visible = bookmark_bar_visible_count(
+            total,
+            narrow,
+            BOOKMARK_BTN_W,
+            CHROME_GAP,
+            BOOKMARK_OVERFLOW_W,
+        );
+        assert!(visible < total, "not all bookmarks fit the narrow row");
+        assert!(visible >= 1, "at least one bookmark shows before the menu");
+        assert!(
+            total - visible >= 1,
+            "the overflow menu holds the remaining bookmarks"
+        );
+    }
+
+    #[test]
+    fn browser_bookmark_click_navigates_active_tab_and_middle_click_opens_a_new_tab() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        // Plain click → navigate the active tab and sync the omnibox.
+        state.open_bookmark("https://news.example/".to_owned(), false);
+        assert_eq!(state.address, "https://news.example/");
+        assert!(
+            state.take_open_request().is_none(),
+            "a plain click reuses the active tab, no new-tab intent"
+        );
+
+        // Middle click → open a new foreground tab on the preferred engine.
+        state.open_bookmark("https://docs.example/".to_owned(), true);
+        assert!(
+            matches!(
+                state.take_open_request(),
+                Some(TabOpenIntent::NewForegroundUrl { url, .. }) if url == "https://docs.example/"
+            ),
+            "a middle click enqueues a new foreground tab for the bookmark"
+        );
+    }
+
+    #[test]
+    fn browser_bookmark_click_with_no_open_tab_opens_a_new_tab() {
+        let mut state = WebState::default();
+        assert!(state.tabs.is_empty());
+        state.open_bookmark("https://news.example/".to_owned(), false);
+        assert!(
+            matches!(
+                state.take_open_request(),
+                Some(TabOpenIntent::NewForegroundUrl { url, .. }) if url == "https://news.example/"
+            ),
+            "with no active tab a click opens the bookmark in a new tab"
+        );
+    }
 }

@@ -2213,6 +2213,7 @@ mod tests {
             MenuAction::Forward,
             MenuAction::Reload,
             MenuAction::OpenAddress,
+            MenuAction::ToggleBookmarksBar,
             MenuAction::TogglePowerMode,
             MenuAction::CycleContainer,
             MenuAction::CycleDisplayTarget,
