@@ -74,4 +74,7 @@ pub use store::{
     Allowlist, AllowlistEntry, FilterListSource, FilterListStore, ListKind, Staleness,
 };
 pub use tally::BlockTally;
-pub use url::{host_of, is_third_party, registrable_domain};
+pub use url::{
+    confusable_reason, host_of, is_confusable_host, is_third_party, registrable_domain,
+    ConfusableReason,
+};
