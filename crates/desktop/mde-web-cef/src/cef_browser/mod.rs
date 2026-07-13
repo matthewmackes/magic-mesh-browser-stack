@@ -84,6 +84,11 @@ pub const CEF_RENDER_HANDLER_SIZE: usize = 176;
 pub const CEF_RENDER_HANDLER_GET_VIEW_RECT_OFFSET: usize = 56;
 /// `offsetof(cef_render_handler_t, on_paint)`.
 pub const CEF_RENDER_HANDLER_ON_PAINT_OFFSET: usize = 96;
+/// `offsetof(cef_render_handler_t, on_popup_show)` — the engine's popup widget
+/// (`<select>` dropdown / autocomplete list) toggled visible.
+pub const CEF_RENDER_HANDLER_ON_POPUP_SHOW_OFFSET: usize = 80;
+/// `offsetof(cef_render_handler_t, on_popup_size)` — the popup widget's view rect.
+pub const CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET: usize = 88;
 /// `sizeof(cef_request_handler_t)` for pinned Linux CEF 149.
 pub const CEF_REQUEST_HANDLER_SIZE: usize = 128;
 /// `offsetof(cef_request_handler_t, get_resource_request_handler)`.
@@ -206,6 +211,8 @@ const BASE_HAS_AT_LEAST_ONE_REF_OFFSET: usize = 32;
 /// `sizeof(cef_rect_t)` for pinned Linux CEF 149.
 pub const CEF_RECT_SIZE: usize = 16;
 const PET_VIEW: c_int = 0;
+/// The engine's popup widget paint (`<select>` dropdown / autocomplete list).
+const PET_POPUP: c_int = 1;
 const MBT_LEFT: c_int = 0;
 const MBT_MIDDLE: c_int = 1;
 const MBT_RIGHT: c_int = 2;
@@ -1140,6 +1147,15 @@ impl CefBrowserCallbacks {
             CEF_RENDER_HANDLER_ON_PAINT_OFFSET,
             fn_ptr(on_paint as *const ()),
         );
+        // The `<select>`/autocomplete popup surface (composited over the view).
+        self.render.put_fn(
+            CEF_RENDER_HANDLER_ON_POPUP_SHOW_OFFSET,
+            fn_ptr(on_popup_show as *const ()),
+        );
+        self.render.put_fn(
+            CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET,
+            fn_ptr(on_popup_size as *const ()),
+        );
         self.request.put_fn(
             CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET,
             fn_ptr(get_resource_request_handler as *const ()),
@@ -1340,6 +1356,75 @@ impl ClickTracker {
     }
 }
 
+/// The engine's popup widget overlay (a `<select>` dropdown or autocomplete
+/// list). A windowless CEF browser paints the popup as a SEPARATE `PET_POPUP`
+/// surface — never into the view frame — so unless the bridge composites it,
+/// dropdowns are invisible. While visible, the latest clean view frame is
+/// retained so a popup repaint (or hide) can republish without a fresh view paint.
+#[derive(Default)]
+struct PopupOverlay {
+    visible: bool,
+    /// Popup rect in view device px: `(x, y, width, height)` from `on_popup_size`.
+    rect: (i32, i32, i32, i32),
+    /// Latest `PET_POPUP` BGRA paint (rect-sized).
+    pixels: Option<Vec<u8>>,
+    /// Retained clean view frame `(width, height, bgra)` while the popup shows.
+    view: Option<(u32, u32, Vec<u8>)>,
+}
+
+impl PopupOverlay {
+    /// The retained view frame with the popup blended in, if both are present.
+    fn compose(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let (view_w, view_h, view) = self.view.as_ref()?;
+        let pixels = self.pixels.as_ref()?;
+        let (x, y, w, h) = self.rect;
+        let mut merged = view.clone();
+        blend_popup_over_view(&mut merged, *view_w, *view_h, pixels, w, h, x, y);
+        Some((*view_w, *view_h, merged))
+    }
+}
+
+/// Copy an opaque BGRA popup rect over a BGRA view frame at `(at_x, at_y)` view
+/// coordinates, clipping to the view bounds (a dropdown near the window edge
+/// may extend past it). Row-wise `copy_from_slice`; both buffers are tightly
+/// packed `width * height * 4`.
+fn blend_popup_over_view(
+    view: &mut [u8],
+    view_w: u32,
+    view_h: u32,
+    popup: &[u8],
+    popup_w: i32,
+    popup_h: i32,
+    at_x: i32,
+    at_y: i32,
+) {
+    let (view_w, view_h) = (i64::from(view_w), i64::from(view_h));
+    let (popup_w, popup_h) = (i64::from(popup_w), i64::from(popup_h));
+    if popup_w <= 0 || popup_h <= 0 {
+        return;
+    }
+    for row in 0..popup_h {
+        let view_y = i64::from(at_y) + row;
+        if view_y < 0 || view_y >= view_h {
+            continue;
+        }
+        let src_col = (-i64::from(at_x)).max(0);
+        let dst_col = i64::from(at_x).max(0);
+        let cols = (popup_w - src_col).min(view_w - dst_col);
+        if cols <= 0 {
+            continue;
+        }
+        let src = usize::try_from((row * popup_w + src_col) * 4).unwrap_or(usize::MAX);
+        let dst = usize::try_from((view_y * view_w + dst_col) * 4).unwrap_or(usize::MAX);
+        let len = usize::try_from(cols * 4).unwrap_or(0);
+        if let (Some(src_end), Some(dst_end)) = (src.checked_add(len), dst.checked_add(len)) {
+            if src_end <= popup.len() && dst_end <= view.len() {
+                view[dst..dst_end].copy_from_slice(&popup[src..src_end]);
+            }
+        }
+    }
+}
+
 struct CefBrowserState {
     width: AtomicI32,
     height: AtomicI32,
@@ -1372,6 +1457,8 @@ struct CefBrowserState {
     held_buttons: AtomicI32,
     /// Multi-click chaining state (double/triple-click detection).
     click_tracker: Mutex<ClickTracker>,
+    /// The `<select>`/autocomplete popup overlay composited over the view frame.
+    popup: Mutex<PopupOverlay>,
 }
 
 impl CefBrowserState {
@@ -1413,7 +1500,19 @@ impl CefBrowserState {
             nav_can_forward: AtomicBool::new(false),
             held_buttons: AtomicI32::new(0),
             click_tracker: Mutex::new(ClickTracker::new()),
+            popup: Mutex::new(PopupOverlay::default()),
         })
+    }
+
+    /// Publish a BGRA frame to the shell over the shm frame channel.
+    fn publish_frame(&self, width: u32, height: u32, pixels: &[u8]) {
+        if let Ok(mut guard) = self.frame_sink.lock() {
+            if let Some(frame_sink) = guard.as_mut() {
+                let _ = frame_sink
+                    .sink
+                    .publish_bgra(&frame_sink.stream, width, height, pixels);
+            }
+        }
     }
 
     /// Record a button press: mark it held (for drag mouse-moves) and chain the
@@ -1871,7 +1970,40 @@ unsafe extern "C" fn on_paint(
     width: c_int,
     height: c_int,
 ) {
-    if paint_type != PET_VIEW || buffer.is_null() || width <= 0 || height <= 0 {
+    if buffer.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    let len = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    // SAFETY: CEF documents `buffer` as `width * height * 4` bytes of BGRA for
+    // both `PET_VIEW` and `PET_POPUP` paints, and the pointer was checked non-null.
+    let pixels = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
+    if paint_type == PET_POPUP {
+        // A `<select>`/autocomplete popup painted: stash its pixels and, when a
+        // clean view frame is retained, republish the composite so the dropdown
+        // is visible without waiting for the next view paint.
+        let _ = with_state(self_, |state| {
+            let merged = state
+                .popup
+                .lock()
+                .ok()
+                .map(|mut popup| {
+                    // Trust the paint's own dimensions over the last on_popup_size
+                    // rect (CEF may repaint after a resize); keep the rect origin.
+                    popup.rect.2 = width;
+                    popup.rect.3 = height;
+                    popup.pixels = Some(pixels.to_vec());
+                    popup.compose()
+                })
+                .unwrap_or(None);
+            if let Some((view_w, view_h, frame)) = merged {
+                state.publish_frame(view_w, view_h, &frame);
+            }
+        });
+        return;
+    }
+    if paint_type != PET_VIEW {
         return;
     }
     let _ = with_state(self_, |state| {
@@ -1882,21 +2014,61 @@ unsafe extern "C" fn on_paint(
         state
             .last_paint_height
             .store(usize::try_from(height).unwrap_or(0), Ordering::SeqCst);
-        if let Ok(mut guard) = state.frame_sink.lock() {
-            if let Some(frame_sink) = guard.as_mut() {
-                let len = (width as usize)
-                    .saturating_mul(height as usize)
-                    .saturating_mul(4);
-                // SAFETY: CEF documents `buffer` as `width * height * 4` bytes for
-                // `PET_VIEW` BGRA paints and the pointer was checked non-null.
-                let pixels = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), len) };
-                let _ = frame_sink.sink.publish_bgra(
-                    &frame_sink.stream,
-                    u32::try_from(width).unwrap_or(0),
-                    u32::try_from(height).unwrap_or(0),
-                    pixels,
-                );
+        let width = u32::try_from(width).unwrap_or(0);
+        let height = u32::try_from(height).unwrap_or(0);
+        // While a popup is visible, retain the clean view frame (so popup
+        // repaints/hide can republish) and publish the composited frame instead.
+        let composite = state.popup.lock().ok().and_then(|mut popup| {
+            if popup.visible {
+                popup.view = Some((width, height, pixels.to_vec()));
+                popup.compose()
+            } else {
+                None
             }
+        });
+        match composite {
+            Some((view_w, view_h, frame)) => state.publish_frame(view_w, view_h, &frame),
+            None => state.publish_frame(width, height, pixels),
+        }
+    });
+}
+
+/// CEF `on_popup_show(self, browser, show)` — the popup widget toggled. On hide,
+/// republish the retained clean view frame so the dropdown pixels are erased.
+unsafe extern "C" fn on_popup_show(self_: *mut c_void, _browser: *mut c_void, show: c_int) {
+    let _ = with_state(self_, |state| {
+        let Ok(mut popup) = state.popup.lock() else {
+            return;
+        };
+        if show == 0 {
+            popup.visible = false;
+            popup.pixels = None;
+            let view = popup.view.take();
+            drop(popup);
+            if let Some((width, height, frame)) = view {
+                state.publish_frame(width, height, &frame);
+            }
+        } else {
+            popup.visible = true;
+        }
+    });
+}
+
+/// CEF `on_popup_size(self, browser, rect)` — where the popup sits in view
+/// coordinates (and its size, which the next `PET_POPUP` paint confirms).
+unsafe extern "C" fn on_popup_size(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    rect: *const CefRect,
+) {
+    if rect.is_null() {
+        return;
+    }
+    // SAFETY: CEF supplies a valid rect for the duration of the callback.
+    let (x, y, width, height) = unsafe { ((*rect).x, (*rect).y, (*rect).width, (*rect).height) };
+    let _ = with_state(self_, |state| {
+        if let Ok(mut popup) = state.popup.lock() {
+            popup.rect = (x, y, width, height);
         }
     });
 }

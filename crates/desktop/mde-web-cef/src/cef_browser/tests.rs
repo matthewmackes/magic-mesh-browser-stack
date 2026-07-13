@@ -5,6 +5,73 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A `w × h` BGRA buffer filled with `value` in every byte.
+fn bgra(w: i64, h: i64, value: u8) -> Vec<u8> {
+    vec![value; usize::try_from(w * h * 4).expect("test dims")]
+}
+
+#[test]
+fn popup_blend_copies_the_rect_and_clips_at_every_edge() {
+    // A 2x2 popup at (1, 1) inside a 4x4 view: exactly those 4 pixels change.
+    let mut view = bgra(4, 4, 0x00);
+    blend_popup_over_view(&mut view, 4, 4, &bgra(2, 2, 0xFF), 2, 2, 1, 1);
+    let px = |x: usize, y: usize| view[(y * 4 + x) * 4];
+    assert_eq!(px(0, 0), 0x00);
+    assert_eq!(px(1, 1), 0xFF);
+    assert_eq!(px(2, 2), 0xFF);
+    assert_eq!(px(3, 3), 0x00);
+    assert_eq!(px(1, 0), 0x00, "row above the popup untouched");
+
+    // Negative origin clips top/left instead of panicking or wrapping.
+    let mut view = bgra(4, 4, 0x00);
+    blend_popup_over_view(&mut view, 4, 4, &bgra(2, 2, 0xFF), 2, 2, -1, -1);
+    let px = |x: usize, y: usize| view[(y * 4 + x) * 4];
+    assert_eq!(px(0, 0), 0xFF, "the surviving popup corner lands at 0,0");
+    assert_eq!(px(1, 1), 0x00);
+
+    // Overhanging the bottom-right edge clips there too.
+    let mut view = bgra(4, 4, 0x00);
+    blend_popup_over_view(&mut view, 4, 4, &bgra(3, 3, 0xFF), 3, 3, 3, 3);
+    let px = |x: usize, y: usize| view[(y * 4 + x) * 4];
+    assert_eq!(px(3, 3), 0xFF);
+    assert_eq!(px(2, 2), 0x00);
+
+    // A popup entirely off-view is a no-op.
+    let mut view = bgra(2, 2, 0x11);
+    blend_popup_over_view(&mut view, 2, 2, &bgra(2, 2, 0xFF), 2, 2, 10, 10);
+    assert!(view.iter().all(|&b| b == 0x11));
+}
+
+#[test]
+fn popup_compose_needs_both_a_view_and_popup_pixels() {
+    // No retained view → nothing to composite (the PET_POPUP paint waits for
+    // the next view frame).
+    let mut overlay = PopupOverlay {
+        visible: true,
+        rect: (1, 1, 2, 2),
+        pixels: Some(bgra(2, 2, 0xFF)),
+        view: None,
+    };
+    assert!(overlay.compose().is_none());
+    // With a view retained, the composite is the view with the rect blended.
+    overlay.view = Some((4, 4, bgra(4, 4, 0x00)));
+    let (w, h, merged) = overlay.compose().expect("composite");
+    assert_eq!((w, h), (4, 4));
+    assert_eq!(merged[(4 + 1) * 4], 0xFF, "popup pixel at (1,1)");
+    assert_eq!(merged[0], 0x00, "view pixel at (0,0) untouched");
+}
+
+#[test]
+fn popup_render_handler_offsets_sit_between_view_rect_and_paint() {
+    // cef_render_handler_t field order pins on_popup_show/on_popup_size between
+    // the two offsets this bridge has already proven live (get_view_rect=56,
+    // on_paint=96): screen_point(64), screen_info(72), popup_show(80), popup_size(88).
+    assert_eq!(CEF_RENDER_HANDLER_ON_POPUP_SHOW_OFFSET, 80);
+    assert_eq!(CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET, 88);
+    assert!(CEF_RENDER_HANDLER_GET_VIEW_RECT_OFFSET < CEF_RENDER_HANDLER_ON_POPUP_SHOW_OFFSET);
+    assert!(CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET < CEF_RENDER_HANDLER_ON_PAINT_OFFSET);
+}
+
 #[test]
 fn multi_click_chains_within_the_window_and_radius_and_caps_at_triple() {
     let base = std::time::Instant::now();
