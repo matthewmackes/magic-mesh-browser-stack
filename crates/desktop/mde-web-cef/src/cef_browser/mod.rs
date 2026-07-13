@@ -93,6 +93,9 @@ pub const CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET: usize = 88;
 pub const CEF_REQUEST_HANDLER_SIZE: usize = 128;
 /// `offsetof(cef_request_handler_t, get_resource_request_handler)`.
 pub const CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET: usize = 56;
+/// `offsetof(cef_request_handler_t, on_render_process_terminated)` — the
+/// renderer process died (crash/OOM/killed); drives the shell's sad-tab state.
+pub const CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET: usize = 112;
 /// `sizeof(cef_resource_request_handler_t)` for pinned Linux CEF 149.
 pub const CEF_RESOURCE_REQUEST_HANDLER_SIZE: usize = 104;
 /// `offsetof(cef_resource_request_handler_t, on_before_resource_load)`.
@@ -1160,6 +1163,11 @@ impl CefBrowserCallbacks {
             CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET,
             fn_ptr(get_resource_request_handler as *const ()),
         );
+        // Renderer-process death → the shell's sad-tab (EventMsg::Crashed).
+        self.request.put_fn(
+            CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET,
+            fn_ptr(on_render_process_terminated as *const ()),
+        );
         self.resource_request.put_fn(
             CEF_RESOURCE_REQUEST_HANDLER_ON_BEFORE_RESOURCE_LOAD_OFFSET,
             fn_ptr(on_before_resource_load as *const ()),
@@ -1733,6 +1741,17 @@ impl CefBrowserState {
         });
     }
 
+    /// The renderer process died — tell the shell so the tab shows its crashed
+    /// (sad-tab) state instead of a frozen last frame.
+    fn publish_crashed(&self, reason: String) {
+        let event = EventMsg::Crashed { reason };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
     fn cancel_pending_resource_requests(&self) {
         let callbacks = self
             .pending_resource_requests
@@ -2071,6 +2090,38 @@ unsafe extern "C" fn on_popup_size(
             popup.rect = (x, y, width, height);
         }
     });
+}
+
+/// CEF `on_render_process_terminated(self, browser, status, error_code,
+/// error_string)` — the tab's renderer process died. Forward a human-readable
+/// reason so the shell swaps the frozen frame for its crashed (sad-tab) state.
+unsafe extern "C" fn on_render_process_terminated(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    status: c_int,
+    error_code: c_int,
+    error_string: *const CefString,
+) {
+    // cef_termination_status_t (CEF 149).
+    let what = match status {
+        1 => "renderer was killed",
+        2 => "renderer crashed",
+        3 => "renderer ran out of memory",
+        4 => "renderer failed to launch",
+        5 => "renderer integrity failure",
+        _ => "renderer terminated abnormally",
+    };
+    let detail = if error_string.is_null() {
+        String::new()
+    } else {
+        cef_string_to_string(error_string)
+    };
+    let reason = if detail.is_empty() {
+        format!("{what} (code {error_code})")
+    } else {
+        format!("{what} (code {error_code}): {detail}")
+    };
+    let _ = with_state(self_, |state| state.publish_crashed(reason.clone()));
 }
 
 unsafe extern "C" fn on_before_resource_load(

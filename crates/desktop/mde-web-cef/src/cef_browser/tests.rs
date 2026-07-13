@@ -62,6 +62,23 @@ fn popup_compose_needs_both_a_view_and_popup_pixels() {
 }
 
 #[test]
+fn render_process_terminated_offset_reconciles_with_the_request_handler_layout() {
+    // cef_request_handler_t (CEF 149) is 11 fn ptrs after the 40-byte base; the
+    // proven get_resource_request_handler=56 pins index 2, and the struct size
+    // 128 = 40 + 11*8 pins the field count. on_render_process_terminated is
+    // index 9 (before on_document_available_in_main_frame at index 10).
+    assert_eq!(
+        CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET,
+        40 + 9 * 8
+    );
+    assert_eq!(CEF_REQUEST_HANDLER_SIZE, 40 + 11 * 8);
+    assert!(
+        CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET < CEF_REQUEST_HANDLER_SIZE - 8,
+        "terminated slot must leave room for the final field"
+    );
+}
+
+#[test]
 fn popup_render_handler_offsets_sit_between_view_rect_and_paint() {
     // cef_render_handler_t field order pins on_popup_show/on_popup_size between
     // the two offsets this bridge has already proven live (get_view_rect=56,
