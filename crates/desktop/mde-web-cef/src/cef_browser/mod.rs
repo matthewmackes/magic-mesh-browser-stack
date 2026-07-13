@@ -67,6 +67,18 @@ pub const CEF_CLIENT_GET_REQUEST_HANDLER_OFFSET: usize = 176;
 pub const CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET: usize = 72;
 /// `offsetof(cef_client_t, get_find_handler)` — find-in-page match results (field 7).
 pub const CEF_CLIENT_GET_FIND_HANDLER_OFFSET: usize = 96;
+/// `offsetof(cef_client_t, get_download_handler)` — download interception (field 5).
+pub const CEF_CLIENT_GET_DOWNLOAD_HANDLER_OFFSET: usize = 80;
+/// `sizeof(cef_download_handler_t)` (3 fn ptrs + 40 base).
+pub const CEF_DOWNLOAD_HANDLER_SIZE: usize = 64;
+/// `offsetof(cef_download_handler_t, can_download)`.
+pub const CEF_DOWNLOAD_HANDLER_CAN_DOWNLOAD_OFFSET: usize = 40;
+/// `offsetof(cef_download_handler_t, on_before_download)`.
+pub const CEF_DOWNLOAD_HANDLER_ON_BEFORE_DOWNLOAD_OFFSET: usize = 48;
+/// `offsetof(cef_download_item_t, get_url)`.
+pub const CEF_DOWNLOAD_ITEM_GET_URL_OFFSET: usize = 152;
+/// `offsetof(cef_download_item_t, get_suggested_file_name)`.
+pub const CEF_DOWNLOAD_ITEM_GET_SUGGESTED_FILE_NAME_OFFSET: usize = 168;
 /// `sizeof(cef_find_handler_t)` (1 fn ptr + 40 base).
 pub const CEF_FIND_HANDLER_SIZE: usize = 48;
 /// `offsetof(cef_find_handler_t, on_find_result)`.
@@ -1152,6 +1164,7 @@ struct CefBrowserCallbacks {
     display: Box<CefCallbackBlock<CEF_DISPLAY_HANDLER_SIZE>>,
     load: Box<CefCallbackBlock<CEF_LOAD_HANDLER_SIZE>>,
     find: Box<CefCallbackBlock<CEF_FIND_HANDLER_SIZE>>,
+    download: Box<CefCallbackBlock<CEF_DOWNLOAD_HANDLER_SIZE>>,
 }
 
 impl CefBrowserCallbacks {
@@ -1178,6 +1191,7 @@ impl CefBrowserCallbacks {
             display: Box::new(CefCallbackBlock::new(CEF_DISPLAY_HANDLER_SIZE)),
             load: Box::new(CefCallbackBlock::new(CEF_LOAD_HANDLER_SIZE)),
             find: Box::new(CefCallbackBlock::new(CEF_FIND_HANDLER_SIZE)),
+            download: Box::new(CefCallbackBlock::new(CEF_DOWNLOAD_HANDLER_SIZE)),
         };
         callbacks.install();
         Ok(callbacks)
@@ -1287,6 +1301,20 @@ impl CefBrowserCallbacks {
             CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET,
             fn_ptr(on_find_result as *const ()),
         );
+        // Download interception → the mesh Transfers ledger (B2): cancel CEF's own
+        // write, forward the URL so the shell submits a daemon transfer.
+        self.client.put_fn(
+            CEF_CLIENT_GET_DOWNLOAD_HANDLER_OFFSET,
+            fn_ptr(get_download_handler as *const ()),
+        );
+        self.download.put_fn(
+            CEF_DOWNLOAD_HANDLER_CAN_DOWNLOAD_OFFSET,
+            fn_ptr(can_download as *const ()),
+        );
+        self.download.put_fn(
+            CEF_DOWNLOAD_HANDLER_ON_BEFORE_DOWNLOAD_OFFSET,
+            fn_ptr(on_before_download as *const ()),
+        );
 
         let state = self.state.as_ref() as *const CefBrowserState as usize;
         self.state
@@ -1302,6 +1330,7 @@ impl CefBrowserCallbacks {
         registry.insert(self.display.as_usize(), state);
         registry.insert(self.load.as_usize(), state);
         registry.insert(self.find.as_usize(), state);
+        registry.insert(self.download.as_usize(), state);
     }
 
     fn client_ptr(&self) -> *mut c_void {
@@ -1374,6 +1403,7 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.display.as_usize());
         registry.remove(&self.load.as_usize());
         registry.remove(&self.find.as_usize());
+        registry.remove(&self.download.as_usize());
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
@@ -1553,6 +1583,8 @@ struct CefBrowserState {
     /// Last cursor kind sent (as its wire byte), so identical repeats — CEF fires
     /// on_cursor_change on every mouse-move — are not re-published each frame.
     last_cursor: AtomicI32,
+    /// Monotonic id minted per intercepted download (B2), keying the shell row.
+    download_seq: AtomicU64,
 }
 
 impl CefBrowserState {
@@ -1596,7 +1628,28 @@ impl CefBrowserState {
             click_tracker: Mutex::new(ClickTracker::new()),
             popup: Mutex::new(PopupOverlay::default()),
             last_cursor: AtomicI32::new(-1),
+            download_seq: AtomicU64::new(1),
         })
+    }
+
+    /// B2 — a download was intercepted; forward its URL + name so the shell
+    /// submits a daemon Transfers job (CEF's own write is cancelled by the caller).
+    fn publish_download_intercepted(&self, url: String, filename: String) {
+        let id = self.download_seq.fetch_add(1, Ordering::SeqCst);
+        let event = EventMsg::Download {
+            id,
+            url,
+            filename,
+            received: 0,
+            total: 0,
+            done: false,
+            canceled: false,
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
     }
 
     /// Publish the engine's cursor shape to the shell, coalescing repeats (CEF
@@ -2310,6 +2363,81 @@ unsafe extern "C" fn get_find_handler(self_: *mut c_void) -> *mut c_void {
     with_state(self_, |state| state.find_ptr()).unwrap_or(ptr::null_mut())
 }
 
+unsafe extern "C" fn get_download_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.download_ptr()).unwrap_or(ptr::null_mut())
+}
+
+/// Read a `cef_string_userfree_t`-returning getter at `offset` off a CEF object,
+/// copying then freeing with the matching libcef symbol (mirrors `request_url`).
+fn download_item_string(
+    item: *mut c_void,
+    offset: usize,
+    string_userfree_free: CefStringUserfreeUtf16Free,
+) -> Option<String> {
+    let getter = read_fn(item, offset)?;
+    // SAFETY: each named getter's pinned C signature is
+    // `cef_string_userfree_t (*)(cef_download_item_t*)`.
+    let getter: unsafe extern "C" fn(*mut c_void) -> *mut CefString =
+        unsafe { std::mem::transmute(getter) };
+    // SAFETY: CEF supplied a live download item for the callback duration.
+    let raw = unsafe { getter(item) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: CEF returned a non-null userfree UTF-16 string; copy before freeing.
+    let text = unsafe {
+        let value = if (*raw).str_.is_null() || (*raw).length == 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(std::slice::from_raw_parts((*raw).str_, (*raw).length))
+        };
+        string_userfree_free(raw.cast());
+        value
+    };
+    Some(text)
+}
+
+/// CEF `can_download(self, browser, url, request_method)` — allow the flow to
+/// reach on_before_download (return 1). We intercept there, not here.
+unsafe extern "C" fn can_download(
+    _self: *mut c_void,
+    _browser: *mut c_void,
+    _url: *const CefString,
+    _request_method: *const CefString,
+) -> c_int {
+    1
+}
+
+/// CEF `on_before_download(self, browser, item, suggested_name, callback)` — a
+/// download is about to start. B2: forward the URL + name to the shell (which
+/// submits a daemon Transfers job) and do NOT call `callback.cont()`, so CEF
+/// cancels its own (sandbox-unwritable) write. Return 0 = handled.
+unsafe extern "C" fn on_before_download(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    download_item: *mut c_void,
+    suggested_name: *const CefString,
+    _callback: *mut c_void,
+) -> c_int {
+    let filename = if suggested_name.is_null() {
+        String::new()
+    } else {
+        cef_string_to_string(suggested_name)
+    };
+    let _ = with_state(self_, |state| {
+        let url = download_item_string(
+            download_item,
+            CEF_DOWNLOAD_ITEM_GET_URL_OFFSET,
+            state.string_userfree_free,
+        )
+        .unwrap_or_default();
+        if !url.is_empty() {
+            state.publish_download_intercepted(url, filename.clone());
+        }
+    });
+    0
+}
+
 /// CEF `on_find_result(self, browser, identifier, count, rect, active_ordinal,
 /// final_update)` — the native find reported its match tally.
 unsafe extern "C" fn on_find_result(
@@ -2526,6 +2654,10 @@ impl CefBrowserState {
 
     fn find_ptr(&self) -> *mut c_void {
         lookup_peer(self, CEF_FIND_HANDLER_SIZE)
+    }
+
+    fn download_ptr(&self) -> *mut c_void {
+        lookup_peer(self, CEF_DOWNLOAD_HANDLER_SIZE)
     }
 }
 

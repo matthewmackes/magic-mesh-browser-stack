@@ -641,6 +641,35 @@ fn native_zoom_level_follows_chromium_convention_and_clamps() {
 }
 
 #[test]
+fn download_handler_offsets_reconcile_and_size_is_unique() {
+    // get_download_handler is client field 5 (get_display=72/field4 anchors it).
+    assert_eq!(CEF_CLIENT_GET_DOWNLOAD_HANDLER_OFFSET, 40 + 5 * 8);
+    // cef_download_handler_t: can_download(40), on_before_download(48),
+    // on_download_updated(56) → 3 fields, size 64.
+    assert_eq!(CEF_DOWNLOAD_HANDLER_SIZE, 40 + 3 * 8);
+    assert_eq!(CEF_DOWNLOAD_HANDLER_CAN_DOWNLOAD_OFFSET, 40);
+    assert_eq!(CEF_DOWNLOAD_HANDLER_ON_BEFORE_DOWNLOAD_OFFSET, 48);
+    // Item getters (verified against cef_download_item_capi.h).
+    assert_eq!(CEF_DOWNLOAD_ITEM_GET_URL_OFFSET, 40 + 14 * 8);
+    assert_eq!(
+        CEF_DOWNLOAD_ITEM_GET_SUGGESTED_FILE_NAME_OFFSET,
+        40 + 16 * 8
+    );
+    // Size 64 must stay unique for lookup_peer resolution.
+    for other in [
+        CEF_LIFE_SPAN_HANDLER_SIZE,
+        CEF_RENDER_HANDLER_SIZE,
+        CEF_REQUEST_HANDLER_SIZE,
+        CEF_RESOURCE_REQUEST_HANDLER_SIZE,
+        CEF_DISPLAY_HANDLER_SIZE,
+        CEF_LOAD_HANDLER_SIZE,
+        CEF_FIND_HANDLER_SIZE,
+    ] {
+        assert_ne!(CEF_DOWNLOAD_HANDLER_SIZE, other);
+    }
+}
+
+#[test]
 fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     // cef_frame_t: 40-byte base then 8-byte fn ptrs. is_valid=0(40), undo=1(48),
     // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104).
