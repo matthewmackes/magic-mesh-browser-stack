@@ -5785,11 +5785,122 @@ fn omnibox_layout_job(url: &str, font_id: egui::FontId) -> egui::text::LayoutJob
     job
 }
 
+/// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`], shown
+/// at the top of the [`site_info_panel`]. Pure and paint-free so the copy is
+/// directly unit-testable without driving a frame.
+const fn security_headline(level: SecurityLevel) -> &'static str {
+    match level {
+        SecurityLevel::Secure => "Connection is secure",
+        SecurityLevel::NotSecure => "Your connection to this site is not secure",
+        SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
+        SecurityLevel::Neutral => "About this page",
+    }
+}
+
+/// SECURITY-INFO — the [`site_info_panel`]'s content, derived from the current
+/// page URL. Built on top of [`omnibox_display`] rather than re-parsing the
+/// URL, so the panel's host/eTLD+1 emphasis always matches the omnibox's own
+/// read-out. Pure and paint-free, unit-tested directly.
+struct SiteInfoSummary {
+    security: SecurityLevel,
+    headline: &'static str,
+    /// The host, already `www.`-stripped — empty when the URL carries no
+    /// `scheme://host` authority (e.g. `about:blank`).
+    host: String,
+    /// Byte range of the registrable domain within [`Self::host`] — see
+    /// [`OmniboxDisplay::host_emphasis`].
+    host_emphasis: Range<usize>,
+    /// Set only for `https://` pages: this browser blocks cert-error
+    /// navigations upstream (the TLS interstitial), so a live `https` page
+    /// reaching this panel has already been certificate-validated.
+    cert_line: Option<&'static str>,
+}
+
+fn site_info_summary(page_url: &str) -> SiteInfoSummary {
+    let display = omnibox_display(page_url);
+    let cert_line = matches!(display.security, SecurityLevel::Secure)
+        .then_some("Certificate: valid \u{2014} the connection is encrypted");
+    SiteInfoSummary {
+        security: display.security,
+        headline: security_headline(display.security),
+        host: display.host,
+        host_emphasis: display.host_emphasis,
+        cert_line,
+    }
+}
+
+/// A stable, ui-path-independent id for the [`site_info_panel`] popup — a
+/// single well-known key rather than [`egui::Ui::make_persistent_id`], so
+/// tests can open/close it without replaying the chrome bar's exact widget
+/// layout.
+fn security_chip_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_security_chip_popup")
+}
+
+/// SECURITY-INFO — the Chrome-style "site information" popup opened by
+/// clicking the omnibox's [`security_chip`]: the security headline, the
+/// page's host (registrable domain emphasized, matching the omnibox), an
+/// `https` cert-validity line, and the browser's session-only privacy note
+/// (B3/Q74 — cookies and site data are never persisted past the browser
+/// closing, so this stays a static fact rather than a live count).
+fn site_info_panel(ui: &mut egui::Ui, page_url: &str) {
+    let summary = site_info_summary(page_url);
+    ui.set_max_width(260.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(summary.security.glyph())
+                .size(CHROME_FONT)
+                .color(summary.security.tone().color()),
+        );
+        ui.label(
+            RichText::new(summary.headline)
+                .color(summary.security.tone().color())
+                .strong(),
+        );
+    });
+    if summary.host.is_empty() {
+        ui.label(RichText::new("No page is currently loaded").color(Style::TEXT_DIM));
+    } else {
+        let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+        let mut job = egui::text::LayoutJob::default();
+        let dim = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: Style::TEXT_DIM,
+            ..Default::default()
+        };
+        let strong = egui::TextFormat {
+            font_id,
+            color: Style::TEXT_STRONG,
+            ..Default::default()
+        };
+        let Range { start, end } = summary.host_emphasis;
+        if start > 0 {
+            job.append(&summary.host[..start], 0.0, dim.clone());
+        }
+        job.append(&summary.host[start..end], 0.0, strong);
+        if end < summary.host.len() {
+            job.append(&summary.host[end..], 0.0, dim);
+        }
+        ui.label(job);
+    }
+    if let Some(cert_line) = summary.cert_line {
+        ui.label(RichText::new(cert_line).small().color(Style::TEXT_DIM));
+    }
+    ui.separator();
+    ui.label(
+        RichText::new("Cookies & site data clear when you close the browser")
+            .small()
+            .color(Style::TEXT_DIM),
+    );
+}
+
 /// OMNIBOX-STYLE — the leading security chip, reflecting the CURRENT
-/// (committed) page URL's scheme, not the in-progress edit draft. A stub for
-/// now: the Browser surface has no site-info/permissions panel yet to open.
+/// (committed) page URL's scheme, not the in-progress edit draft. Clicking it
+/// opens the SECURITY-INFO [`site_info_panel`] below it, dismissed on
+/// click-away or Esc (egui's built-in popup close behavior).
 fn security_chip(ui: &mut egui::Ui, page_url: &str) {
     let security = omnibox_display(page_url).security;
+    let popup_id = security_chip_popup_id();
     let resp = ui
         .add(
             egui::Button::new(
@@ -5801,10 +5912,15 @@ fn security_chip(ui: &mut egui::Ui, page_url: &str) {
         )
         .on_hover_text(security.label());
     if resp.clicked() {
-        // TODO(security): site-info panel — wire this chip to a real
-        // site-info/permissions drawer once the Browser surface grows one.
-        // There is nothing to open yet, so the click is a deliberate no-op.
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| site_info_panel(ui, page_url),
+    );
 }
 
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
@@ -11607,6 +11723,64 @@ mod tests {
         assert_eq!(SecurityLevel::NotSecure.tone().color(), Style::WARN);
         assert_eq!(SecurityLevel::Mesh.tone().color(), Style::ACCENT);
         assert_eq!(SecurityLevel::Neutral.tone().color(), Style::TEXT_DIM);
+    }
+
+    // ── SECURITY-INFO — the site-info panel opened by the security chip ────────
+
+    #[test]
+    fn security_headline_maps_each_level_to_plain_language_copy() {
+        assert_eq!(
+            security_headline(SecurityLevel::Secure),
+            "Connection is secure"
+        );
+        assert_eq!(
+            security_headline(SecurityLevel::NotSecure),
+            "Your connection to this site is not secure"
+        );
+        assert_eq!(
+            security_headline(SecurityLevel::Mesh),
+            "Mesh service \u{2014} trusted overlay"
+        );
+        assert_eq!(security_headline(SecurityLevel::Neutral), "About this page");
+    }
+
+    #[test]
+    fn site_info_summary_host_matches_the_omnibox_displays_host_and_emphasis() {
+        let url = "https://foo.example.com/x";
+        let display = omnibox_display(url);
+        let summary = site_info_summary(url);
+        assert_eq!(summary.host, display.host);
+        assert_eq!(summary.host_emphasis, display.host_emphasis);
+        assert_eq!(summary.host, "foo.example.com");
+        assert_eq!(&summary.host[summary.host_emphasis.clone()], "example.com");
+    }
+
+    #[test]
+    fn site_info_summary_shows_a_cert_line_only_for_https() {
+        assert!(site_info_summary("https://example.com/")
+            .cert_line
+            .is_some());
+        assert!(site_info_summary("http://example.com/").cert_line.is_none());
+        assert!(site_info_summary("mesh://svc.mesh/").cert_line.is_none());
+        assert!(site_info_summary("about:blank").cert_line.is_none());
+    }
+
+    #[test]
+    fn site_info_panel_opens_from_the_security_chip_and_renders_without_panicking() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Establish the live page (https://example.test/) in the chrome bar.
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        // Force the popup open the same way the chip's click handler does —
+        // `security_chip_popup_id` is a fixed key, not a ui-path-derived one,
+        // so the test doesn't need to replay the chrome bar's exact layout.
+        ctx.memory_mut(|mem| mem.open_popup(security_chip_popup_id()));
+        // A second frame with the panel open must still paint, not panic.
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert!(ctx.memory(|mem| mem.is_popup_open(security_chip_popup_id())));
     }
 
     #[test]
