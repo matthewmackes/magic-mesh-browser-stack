@@ -36,8 +36,8 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    host_of, FilterListSource, FilterListStore, RequestFilter, SafeBrowsingBlocklist, SessionState,
-    WebSession,
+    host_of, EditCommand, FilterListSource, FilterListStore, RequestFilter, SafeBrowsingBlocklist,
+    SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -2634,6 +2634,19 @@ impl WebState {
             tab.session.clear_find();
         }
         self.publish_session_snapshot();
+    }
+
+    /// Apply an in-page context-menu action to the tab at `index`.
+    fn apply_page_context_action(&mut self, index: usize, action: PageContextAction) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        match action {
+            PageContextAction::Back => tab.session.go_back(),
+            PageContextAction::Forward => tab.session.go_forward(),
+            PageContextAction::Reload => tab.session.reload(),
+            PageContextAction::Edit(command) => tab.session.edit_command(command),
+        }
     }
 
     fn submit_find(&mut self, backwards: bool) {
@@ -5520,6 +5533,15 @@ fn cursor_icon_for(kind: mde_web_preview_client::CursorKind) -> egui::CursorIcon
     }
 }
 
+/// An action chosen from the in-page right-click context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageContextAction {
+    Back,
+    Forward,
+    Reload,
+    Edit(EditCommand),
+}
+
 fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
         let texture = tab.texture.as_ref()?;
@@ -5543,6 +5565,67 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     if !state.capture_region_mode && resp.hovered() {
         if let Some(kind) = state.tabs.get(active).map(|tab| tab.session.cursor()) {
             ui.output_mut(|o| o.cursor_icon = cursor_icon_for(kind));
+        }
+    }
+
+    // In-page right-click context menu: navigation + native clipboard/edit
+    // commands on the focused element (driven through the engine, not JS).
+    if !state.capture_region_mode {
+        let (can_back, can_forward, url) = state.tabs.get(active).map_or_else(
+            || (false, false, String::new()),
+            |tab| {
+                let nav = tab.session.nav();
+                (nav.can_back, nav.can_forward, nav.url.clone())
+            },
+        );
+        let mut action: Option<PageContextAction> = None;
+        resp.context_menu(|ui| {
+            if ui
+                .add_enabled(can_back, egui::Button::new("Back"))
+                .clicked()
+            {
+                action = Some(PageContextAction::Back);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(can_forward, egui::Button::new("Forward"))
+                .clicked()
+            {
+                action = Some(PageContextAction::Forward);
+                ui.close_menu();
+            }
+            if ui.button("Reload").clicked() {
+                action = Some(PageContextAction::Reload);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Cut").clicked() {
+                action = Some(PageContextAction::Edit(EditCommand::Cut));
+                ui.close_menu();
+            }
+            if ui.button("Copy").clicked() {
+                action = Some(PageContextAction::Edit(EditCommand::Copy));
+                ui.close_menu();
+            }
+            if ui.button("Paste").clicked() {
+                action = Some(PageContextAction::Edit(EditCommand::Paste));
+                ui.close_menu();
+            }
+            if ui.button("Select all").clicked() {
+                action = Some(PageContextAction::Edit(EditCommand::SelectAll));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!url.is_empty(), egui::Button::new("Copy page URL"))
+                .clicked()
+            {
+                ui.ctx().copy_text(url.clone());
+                ui.close_menu();
+            }
+        });
+        if let Some(action) = action {
+            state.apply_page_context_action(active, action);
         }
     }
 
@@ -7484,6 +7567,46 @@ mod tests {
                 mde_web_preview_client::ControlMsg::SavePdf { path } if path == &pdf_path_text
             )),
             "save-as-PDF must reach the helper with the chosen path: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn page_context_menu_actions_send_native_helper_controls() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        state.apply_page_context_action(state.active, PageContextAction::Reload);
+        state.apply_page_context_action(state.active, PageContextAction::Edit(EditCommand::Copy));
+        state.apply_page_context_action(
+            state.active,
+            PageContextAction::Edit(EditCommand::SelectAll),
+        );
+
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls
+                .iter()
+                .any(|msg| matches!(msg, mde_web_preview_client::ControlMsg::Reload)),
+            "context-menu Reload must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::EditCommand {
+                    command: EditCommand::Copy
+                }
+            )),
+            "context-menu Copy must send a native edit command: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::EditCommand {
+                    command: EditCommand::SelectAll
+                }
+            )),
+            "context-menu Select-all must send a native edit command: {controls:?}"
         );
     }
 
