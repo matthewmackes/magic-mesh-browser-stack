@@ -41,6 +41,10 @@
 //!   * [`bundled_sources`] — the compact **bundled seed** of common ad/tracker
 //!     filters that ships in the RPM as the offline fallback when a fresh sync
 //!     of the full upstream lists is unavailable (bundled.rs).
+//!   * [`BlockTally`] — a per-session, in-memory tally the browser chrome feeds
+//!     after each [`Engine::check`] to surface a "N trackers blocked"
+//!     breakdown by domain and by matched filter; no persistence, no Bus
+//!     (tally.rs).
 //!
 //! **Zero I/O**: no Servo, no Syncthing, no Bus, no wall clock, no network — the
 //! live filter-list replication is the mackesd `adfilter` worker (BOOKMARKS-7
@@ -57,6 +61,7 @@ mod pattern;
 mod resource;
 mod rule;
 mod store;
+mod tally;
 mod url;
 
 pub use bundled::{bundled_sources, EASYLIST_SEED, EASYPRIVACY_SEED, UBLOCK_BASE_SEED};
@@ -68,4 +73,5 @@ pub use rule::{parse_line, CosmeticRule, NetworkRule, ParsedLine, RuleOptions};
 pub use store::{
     Allowlist, AllowlistEntry, FilterListSource, FilterListStore, ListKind, Staleness,
 };
+pub use tally::BlockTally;
 pub use url::{host_of, is_third_party, registrable_domain};
