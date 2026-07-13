@@ -6,6 +6,70 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn multi_click_chains_within_the_window_and_radius_and_caps_at_triple() {
+    let base = std::time::Instant::now();
+    let mut tracker = ClickTracker::new();
+    assert_eq!(tracker.register(base, 100, 100, PointerButton::Primary), 1);
+    // A second press 200 ms later, 2 px away → a double-click.
+    let second = base + std::time::Duration::from_millis(200);
+    assert_eq!(
+        tracker.register(second, 102, 101, PointerButton::Primary),
+        2
+    );
+    // The matching release carries the press's count.
+    assert_eq!(tracker.release_count(PointerButton::Primary), 2);
+    // Third chained press → triple (paragraph select)…
+    let third = second + std::time::Duration::from_millis(200);
+    assert_eq!(tracker.register(third, 100, 100, PointerButton::Primary), 3);
+    // …and further rapid presses hold at 3 rather than cycling to a caret.
+    let fourth = third + std::time::Duration::from_millis(200);
+    assert_eq!(
+        tracker.register(fourth, 100, 100, PointerButton::Primary),
+        3
+    );
+}
+
+#[test]
+fn multi_click_resets_when_slow_far_or_another_button() {
+    let base = std::time::Instant::now();
+    let mut tracker = ClickTracker::new();
+    assert_eq!(tracker.register(base, 100, 100, PointerButton::Primary), 1);
+    // Slower than the double-click window → back to a single click.
+    let slow = base + std::time::Duration::from_millis(800);
+    assert_eq!(tracker.register(slow, 100, 100, PointerButton::Primary), 1);
+    // Farther than the chaining radius → single.
+    let far = slow + std::time::Duration::from_millis(100);
+    assert_eq!(tracker.register(far, 160, 100, PointerButton::Primary), 1);
+    // A different button never chains, and the primary's release count resets.
+    let other = far + std::time::Duration::from_millis(100);
+    assert_eq!(
+        tracker.register(other, 160, 100, PointerButton::Secondary),
+        1
+    );
+    assert_eq!(tracker.release_count(PointerButton::Primary), 1);
+}
+
+#[test]
+fn held_buttons_or_into_drag_move_flags_and_clear_on_release() {
+    // Pure flag math (the state machine drives real CEF mouse-moves): each
+    // button maps to its own EVENTFLAG bit so a drag-move carries exactly the
+    // held set.
+    let held = mouse_button_event_flag(PointerButton::Primary)
+        | mouse_button_event_flag(PointerButton::Middle);
+    assert_eq!(
+        held & EVENTFLAG_LEFT_MOUSE_BUTTON,
+        EVENTFLAG_LEFT_MOUSE_BUTTON
+    );
+    assert_eq!(
+        held & EVENTFLAG_MIDDLE_MOUSE_BUTTON,
+        EVENTFLAG_MIDDLE_MOUSE_BUTTON
+    );
+    assert_eq!(held & EVENTFLAG_RIGHT_MOUSE_BUTTON, 0);
+    let after_release = held & !mouse_button_event_flag(PointerButton::Primary);
+    assert_eq!(after_release, EVENTFLAG_MIDDLE_MOUSE_BUTTON);
+}
+
+#[test]
 fn lookup_peer_handler_sizes_are_unique() {
     // `lookup_peer` resolves a handler block for a state by its byte size, so every
     // handler resolved that way MUST have a distinct size — a collision would hand

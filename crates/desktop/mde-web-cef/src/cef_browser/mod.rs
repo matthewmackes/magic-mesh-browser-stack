@@ -896,7 +896,9 @@ fn apply_input_event(browser: *mut c_void, callbacks: &CefBrowserCallbacks, even
     match event {
         InputEvent::PointerMoved { x, y } => {
             let (x, y) = callbacks.update_pointer(*x, *y);
-            send_mouse_move(host, x, y, 0, false);
+            // Held-button flags make a press-drag a real drag (text selection,
+            // scrollbar-thumb drag) instead of a plain hover.
+            send_mouse_move(host, x, y, callbacks.held_button_flags(), false);
         }
         InputEvent::PointerButton {
             x,
@@ -906,14 +908,25 @@ fn apply_input_event(browser: *mut c_void, callbacks: &CefBrowserCallbacks, even
             modifiers,
         } => {
             let (x, y) = callbacks.update_pointer(*x, *y);
-            if *pressed {
+            let click_count = if *pressed {
                 set_host_focus(host, true);
-            }
-            send_mouse_click(host, x, y, *button, *pressed, cef_modifiers(*modifiers));
+                callbacks.register_press(*button, x, y)
+            } else {
+                callbacks.register_release(*button)
+            };
+            send_mouse_click(
+                host,
+                x,
+                y,
+                *button,
+                *pressed,
+                cef_modifiers(*modifiers) | callbacks.held_button_flags(),
+                click_count,
+            );
         }
         InputEvent::PointerGone => {
             let (x, y) = callbacks.pointer_position();
-            send_mouse_move(host, x, y, 0, true);
+            send_mouse_move(host, x, y, callbacks.held_button_flags(), true);
         }
         InputEvent::Scroll {
             delta_x,
@@ -1221,6 +1234,18 @@ impl CefBrowserCallbacks {
         self.state.pointer_position()
     }
 
+    fn register_press(&self, button: PointerButton, x: i32, y: i32) -> i32 {
+        self.state.register_press(button, x, y)
+    }
+
+    fn register_release(&self, button: PointerButton) -> i32 {
+        self.state.register_release(button)
+    }
+
+    fn held_button_flags(&self) -> c_int {
+        self.state.held_button_flags()
+    }
+
     fn apply_resource_verdict(&self, id: u64, allow: bool) {
         self.state.apply_resource_verdict(id, allow);
     }
@@ -1246,6 +1271,71 @@ impl Drop for CefBrowserCallbacks {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
             }
+        }
+    }
+}
+
+/// Double/triple-click chaining window (Chromium's default double-click time).
+const CLICK_COUNT_WINDOW: Duration = Duration::from_millis(500);
+/// Max pointer travel per axis (device px) between presses that still chains a
+/// multi-click — a slightly sloppy double-click still counts.
+const CLICK_COUNT_RADIUS_PX: i32 = 5;
+/// Web multi-click semantics top out at triple (paragraph select); further rapid
+/// clicks hold at 3 rather than cycling back to a caret.
+const CLICK_COUNT_MAX: i32 = 3;
+
+/// Chromium-style multi-click detection. The egui shell forwards plain
+/// press/release events with no count, so the bridge derives the `click_count`
+/// CEF expects (dblclick → word select → paragraph select) exactly like a native
+/// Chromium window: consecutive same-button presses within
+/// [`CLICK_COUNT_WINDOW`] and [`CLICK_COUNT_RADIUS_PX`] chain the count.
+struct ClickTracker {
+    last: Option<ClickRecord>,
+}
+
+struct ClickRecord {
+    at: Instant,
+    x: i32,
+    y: i32,
+    button: u8,
+    count: i32,
+}
+
+impl ClickTracker {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Register a press at `now`/`(x, y)` and return its click count.
+    fn register(&mut self, now: Instant, x: i32, y: i32, button: PointerButton) -> i32 {
+        let button = button as u8;
+        let count = match &self.last {
+            Some(last)
+                if last.button == button
+                    && now.saturating_duration_since(last.at) <= CLICK_COUNT_WINDOW
+                    && (last.x - x).abs() <= CLICK_COUNT_RADIUS_PX
+                    && (last.y - y).abs() <= CLICK_COUNT_RADIUS_PX =>
+            {
+                (last.count + 1).min(CLICK_COUNT_MAX)
+            }
+            _ => 1,
+        };
+        self.last = Some(ClickRecord {
+            at: now,
+            x,
+            y,
+            button,
+            count,
+        });
+        count
+    }
+
+    /// The count of the most recent press of `button` — its release must carry
+    /// the same count — or 1 if none is tracked.
+    fn release_count(&self, button: PointerButton) -> i32 {
+        match &self.last {
+            Some(last) if last.button == button as u8 => last.count,
+            _ => 1,
         }
     }
 }
@@ -1276,6 +1366,12 @@ struct CefBrowserState {
     nav_loading: AtomicBool,
     nav_can_back: AtomicBool,
     nav_can_forward: AtomicBool,
+    /// Currently-held pointer buttons as CEF `EVENTFLAG_*_MOUSE_BUTTON` bits —
+    /// ORed into mouse-move events so a press-drag reaches the page as a drag
+    /// (text selection, scrollbar-thumb drag) instead of a hover.
+    held_buttons: AtomicI32,
+    /// Multi-click chaining state (double/triple-click detection).
+    click_tracker: Mutex<ClickTracker>,
 }
 
 impl CefBrowserState {
@@ -1315,7 +1411,35 @@ impl CefBrowserState {
             nav_loading: AtomicBool::new(false),
             nav_can_back: AtomicBool::new(false),
             nav_can_forward: AtomicBool::new(false),
+            held_buttons: AtomicI32::new(0),
+            click_tracker: Mutex::new(ClickTracker::new()),
         })
+    }
+
+    /// Record a button press: mark it held (for drag mouse-moves) and chain the
+    /// multi-click count this press reports to CEF.
+    fn register_press(&self, button: PointerButton, x: i32, y: i32) -> i32 {
+        self.held_buttons
+            .fetch_or(mouse_button_event_flag(button), Ordering::SeqCst);
+        self.click_tracker
+            .lock()
+            .map(|mut tracker| tracker.register(Instant::now(), x, y, button))
+            .unwrap_or(1)
+    }
+
+    /// Record a button release; the release event carries its press's count.
+    fn register_release(&self, button: PointerButton) -> i32 {
+        self.held_buttons
+            .fetch_and(!mouse_button_event_flag(button), Ordering::SeqCst);
+        self.click_tracker
+            .lock()
+            .map(|tracker| tracker.release_count(button))
+            .unwrap_or(1)
+    }
+
+    /// The currently-held pointer buttons as CEF event flags.
+    fn held_button_flags(&self) -> c_int {
+        self.held_buttons.load(Ordering::SeqCst)
     }
 
     fn resize(&self, width: u32, height: u32) {
@@ -2147,6 +2271,7 @@ fn send_mouse_click(
     button: PointerButton,
     pressed: bool,
     modifiers: c_int,
+    click_count: c_int,
 ) {
     let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SEND_MOUSE_CLICK_EVENT_OFFSET) else {
         return;
@@ -2166,7 +2291,7 @@ fn send_mouse_click(
             event.as_ptr(),
             cef_mouse_button(button),
             if pressed { 0 } else { 1 },
-            1,
+            click_count.max(1),
         )
     };
 }
