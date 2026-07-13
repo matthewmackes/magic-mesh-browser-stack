@@ -42,6 +42,7 @@ use mde_web_preview_client::{
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -5299,6 +5300,218 @@ fn can_show_stop_control(
     has_tab && !crashed && loading && engine == Some(BrowserEngine::Cef)
 }
 
+/// Chrome/Edge-style **trust signal** for the omnibox's leading security chip
+/// (OMNIBOX-STYLE), derived purely from a URL's scheme. `Mesh` covers the
+/// airgapped `mesh://` scheme — trusted the same way HTTPS is, since mesh
+/// traffic never leaves the Nebula overlay and never touches the open web.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityLevel {
+    /// `https://` — a lock glyph, neutral tone. Modern browsers stopped
+    /// painting plain HTTPS green; it is simply the unremarkable default.
+    Secure,
+    /// `http://` — a "Not secure" glyph/tone; a deliberate downgrade signal,
+    /// so the scheme itself also stays visible in the omnibox text (never
+    /// elided the way `https://` is).
+    NotSecure,
+    /// `mesh://` and mesh-hosted services — a shield glyph, trusted.
+    Mesh,
+    /// `about:` / blank / new-tab / any other scheme — a neutral glyph.
+    Neutral,
+}
+
+impl SecurityLevel {
+    /// The chip's leading glyph.
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Secure => "\u{1F512}",   // lock
+            Self::NotSecure => "\u{26A0}", // warning triangle
+            Self::Mesh => "\u{1F6E1}",     // shield
+            Self::Neutral => "\u{1F50E}",  // magnifying glass
+        }
+    }
+
+    /// The chip's hover tooltip / accessible label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Secure => "Secure connection (HTTPS)",
+            Self::NotSecure => "Not secure — plain HTTP",
+            Self::Mesh => "Mesh — trusted overlay connection",
+            Self::Neutral => "No connection security to report",
+        }
+    }
+
+    /// The design-system tone the chip paints in (never a raw literal, §4).
+    const fn tone(self) -> ChipTone {
+        match self {
+            Self::Secure | Self::Neutral => ChipTone::Neutral,
+            Self::NotSecure => ChipTone::Warn,
+            Self::Mesh => ChipTone::Info,
+        }
+    }
+}
+
+/// A short-list of common two-level public suffixes for the omnibox's eTLD+1
+/// heuristic (OMNIBOX-STYLE). This is deliberately NOT a Public Suffix List (a
+/// large vendored blob) — just enough of the common ccTLD-style suffixes that
+/// the naive "last two dot-labels" rule would otherwise mis-emphasize
+/// (`foo.co.uk` must emphasize `foo.co.uk`, not `co.uk`).
+const OMNIBOX_TWO_LEVEL_SUFFIXES: &[&str] = &["co.uk", "com.au", "co.jp", "org.uk"];
+
+/// The Chrome-style **display breakdown** of a URL, built by [`omnibox_display`]
+/// for the unfocused omnibox (OMNIBOX-STYLE).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OmniboxDisplay {
+    /// The scheme prefix to render, if any. Always `None` for `https://` (the
+    /// scheme is elided, Chrome-style); always `Some` for every other scheme,
+    /// since keeping `http://` visible is a deliberate downgrade signal and
+    /// every other scheme (`mesh://`, `about:`, …) needs to stay legible.
+    scheme_shown: Option<String>,
+    /// The host, with a leading `www.` already stripped. Empty when the URL
+    /// carries no `scheme://host` authority (e.g. `about:blank`).
+    host: String,
+    /// Byte range into [`Self::host`] covering the registrable domain
+    /// (eTLD+1, see [`OMNIBOX_TWO_LEVEL_SUFFIXES`]) — rendered in the
+    /// strong/full-strength text token; the rest of `host` (a subdomain
+    /// prefix) renders dimmed.
+    host_emphasis: Range<usize>,
+    /// Path + query + fragment after the host, rendered dimmed.
+    rest: String,
+    /// The scheme's trust signal, for the leading security chip.
+    security: SecurityLevel,
+}
+
+/// Byte range of the eTLD+1 within `host` (dot-label heuristic, see
+/// [`OMNIBOX_TWO_LEVEL_SUFFIXES`]). Falls back to the whole host for a bare
+/// domain, `localhost`, or an IP literal (≤ 2 dot-labels) — a heuristic, not a
+/// full Public Suffix List lookup.
+fn omnibox_etld1_range(host: &str) -> Range<usize> {
+    if host.is_empty() {
+        return 0..0;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 2 {
+        return 0..host.len();
+    }
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    let take = if OMNIBOX_TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) {
+        3
+    } else {
+        2
+    }
+    .min(labels.len());
+    let start_label = labels.len() - take;
+    let start: usize = labels[..start_label].iter().map(|l| l.len() + 1).sum();
+    start..host.len()
+}
+
+/// Build the Chrome-style [`OmniboxDisplay`] breakdown for `url` — pure logic,
+/// unit-tested directly (OMNIBOX-STYLE). Elides the `https://` scheme, strips a
+/// leading `www.`, and emphasizes the registrable domain; `http://` and every
+/// other scheme stay fully visible as an honest identity/downgrade signal.
+fn omnibox_display(url: &str) -> OmniboxDisplay {
+    let trimmed = url.trim();
+    let (scheme_shown, security, after_scheme) =
+        if let Some(rest) = trimmed.strip_prefix("https://") {
+            (None, SecurityLevel::Secure, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("http://") {
+            (Some("http://"), SecurityLevel::NotSecure, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("mesh://") {
+            (Some("mesh://"), SecurityLevel::Mesh, rest)
+        } else {
+            // Any other scheme (`about:`, `data:`, `mailto:`, `ftp://`, …) — no
+            // elision, no host emphasis: an honest, unmodified read-out.
+            return OmniboxDisplay {
+                scheme_shown: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+                host: String::new(),
+                host_emphasis: 0..0,
+                rest: String::new(),
+                security: SecurityLevel::Neutral,
+            };
+        };
+
+    let split_at = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (host_part, rest) = after_scheme.split_at(split_at);
+    let host = host_part
+        .strip_prefix("www.")
+        .unwrap_or(host_part)
+        .to_owned();
+    let host_emphasis = omnibox_etld1_range(&host);
+
+    OmniboxDisplay {
+        scheme_shown: scheme_shown.map(str::to_owned),
+        host,
+        host_emphasis,
+        rest: rest.to_owned(),
+        security,
+    }
+}
+
+/// Build the layout job painted over the omnibox when it is NOT focused
+/// (OMNIBOX-STYLE): the scheme dimmed, the registrable domain in the strong
+/// text token, and everything else (subdomain prefix + path/query) dimmed.
+/// Returns an empty job for an empty `url` (the hint text shows through).
+fn omnibox_layout_job(url: &str, font_id: egui::FontId) -> egui::text::LayoutJob {
+    let display = omnibox_display(url);
+    let mut job = egui::text::LayoutJob::default();
+    let dim = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: Style::TEXT_DIM,
+        ..Default::default()
+    };
+    let strong = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: Style::TEXT_STRONG,
+        ..Default::default()
+    };
+    if display.host.is_empty() {
+        // No parsed `scheme://host` authority (`about:`, `data:`, …) — one
+        // neutral, unmodified run.
+        if let Some(scheme) = &display.scheme_shown {
+            job.append(scheme, 0.0, dim);
+        }
+        return job;
+    }
+    if let Some(scheme) = &display.scheme_shown {
+        job.append(scheme, 0.0, dim.clone());
+    }
+    let Range { start, end } = display.host_emphasis;
+    if start > 0 {
+        job.append(&display.host[..start], 0.0, dim.clone());
+    }
+    job.append(&display.host[start..end], 0.0, strong);
+    if end < display.host.len() {
+        job.append(&display.host[end..], 0.0, dim.clone());
+    }
+    if !display.rest.is_empty() {
+        job.append(&display.rest, 0.0, dim);
+    }
+    job
+}
+
+/// OMNIBOX-STYLE — the leading security chip, reflecting the CURRENT
+/// (committed) page URL's scheme, not the in-progress edit draft. A stub for
+/// now: the Browser surface has no site-info/permissions panel yet to open.
+fn security_chip(ui: &mut egui::Ui, page_url: &str) {
+    let security = omnibox_display(page_url).security;
+    let resp = ui
+        .add(
+            egui::Button::new(
+                RichText::new(security.glyph())
+                    .size(CHROME_FONT)
+                    .color(security.tone().color()),
+            )
+            .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+        )
+        .on_hover_text(security.label());
+    if resp.clicked() {
+        // TODO(security): site-info panel — wire this chip to a real
+        // site-info/permissions drawer once the Browser surface grows one.
+        // There is nothing to open yet, so the click is a deliberate no-op.
+    }
+}
+
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
 /// the active session; the address bar loads on submit. On a crashed tab, Reload
 /// becomes a respawn request. The page-actions menu (BOOKMARKS-10) hangs off both
@@ -5451,6 +5664,11 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
         ui.add_space(CHROME_GAP);
 
+        // OMNIBOX-STYLE — the leading security chip reflects the CURRENT
+        // (committed) page URL's scheme, never the in-progress edit draft.
+        security_chip(ui, &page_url);
+        ui.add_space(CHROME_GAP);
+
         // The address bar fills the rest of the row.
         let field = egui::TextEdit::singleline(&mut state.address)
             .id(omnibox_widget_id())
@@ -5464,6 +5682,26 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // guards (the same tracked-focus idiom as `Tab::page_focused`).
         state.omnibox_focused = resp.has_focus();
         state.chrome_edit_focus |= resp.has_focus();
+        // OMNIBOX-STYLE — when the omnibox is NOT being edited, paint the
+        // Chrome-style elided/emphasized read-out ON TOP of the TextEdit
+        // (never touching its own layouter/cursor logic, so click-to-edit
+        // cursor placement stays exactly as correct as it is today). Focused
+        // editing always shows the full, unmodified draft underneath.
+        if has_tab && !crashed && !resp.has_focus() && !state.address.trim().is_empty() {
+            let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+            let job = omnibox_layout_job(&state.address, font_id);
+            if !job.is_empty() {
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let bg = ui.visuals().extreme_bg_color;
+                let corner_radius = ui.visuals().widgets.inactive.corner_radius;
+                ui.painter().rect_filled(resp.rect, corner_radius, bg);
+                let text_pos = egui::pos2(
+                    resp.rect.left() + 4.0,
+                    resp.rect.center().y - galley.size().y / 2.0,
+                );
+                ui.painter().galley(text_pos, galley, Style::TEXT);
+            }
+        }
         if resp.changed() && has_tab && !crashed {
             state.update_suggestions_for_address();
         }
@@ -10653,6 +10891,87 @@ mod tests {
             Some("https://search.mesh/search?q=a%2Bb+%26+c".to_owned())
         );
         assert_eq!(omnibox_target("  "), None);
+    }
+
+    // ── OMNIBOX-STYLE — Chrome-style omnibox display + security chip ───────────
+
+    #[test]
+    fn omnibox_display_elides_https_and_strips_www() {
+        let display = omnibox_display("https://www.example.com/x");
+        assert_eq!(display.scheme_shown, None, "https:// is elided");
+        assert_eq!(display.host, "example.com");
+        assert_eq!(display.host_emphasis, 0..display.host.len());
+        assert_eq!(&display.host[display.host_emphasis.clone()], "example.com");
+        assert_eq!(display.rest, "/x");
+        assert_eq!(display.security, SecurityLevel::Secure);
+    }
+
+    #[test]
+    fn omnibox_display_keeps_http_scheme_as_a_downgrade_signal() {
+        let display = omnibox_display("http://example.com");
+        assert_eq!(display.scheme_shown, Some("http://".to_owned()));
+        assert_eq!(display.host, "example.com");
+        assert_eq!(display.rest, "");
+        assert_eq!(display.security, SecurityLevel::NotSecure);
+    }
+
+    #[test]
+    fn omnibox_display_treats_mesh_scheme_as_trusted() {
+        let display = omnibox_display("mesh://music.mesh");
+        assert_eq!(display.scheme_shown, Some("mesh://".to_owned()));
+        assert_eq!(display.host, "music.mesh");
+        assert_eq!(display.security, SecurityLevel::Mesh);
+    }
+
+    #[test]
+    fn omnibox_display_emphasizes_the_registrable_domain_under_a_subdomain() {
+        let display = omnibox_display("https://foo.bar.example.com/p");
+        assert_eq!(display.host, "foo.bar.example.com");
+        assert_eq!(&display.host[display.host_emphasis.clone()], "example.com");
+        assert_eq!(display.rest, "/p");
+    }
+
+    #[test]
+    fn omnibox_display_emphasizes_a_full_two_level_suffix_registrable_domain() {
+        let display = omnibox_display("https://foo.co.uk/p");
+        assert_eq!(display.host, "foo.co.uk");
+        assert_eq!(&display.host[display.host_emphasis.clone()], "foo.co.uk");
+        assert_eq!(display.rest, "/p");
+    }
+
+    #[test]
+    fn omnibox_display_neutral_scheme_stays_unmodified() {
+        let display = omnibox_display("about:blank");
+        assert_eq!(display.scheme_shown, Some("about:blank".to_owned()));
+        assert_eq!(display.host, "");
+        assert_eq!(display.security, SecurityLevel::Neutral);
+    }
+
+    #[test]
+    fn omnibox_display_empty_url_shown_as_neutral_with_no_scheme() {
+        let display = omnibox_display("   ");
+        assert_eq!(display.scheme_shown, None);
+        assert_eq!(display.host, "");
+        assert_eq!(display.security, SecurityLevel::Neutral);
+    }
+
+    #[test]
+    fn omnibox_layout_job_covers_the_full_text_for_an_elided_https_url() {
+        let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+        let job = omnibox_layout_job("https://www.example.com/x", font_id);
+        // The elided job's text is shorter than the raw address (no `https://`,
+        // no `www.`) — that mismatch is exactly why the styled read-out is
+        // painted as an overlay rather than fed into the TextEdit's own
+        // layouter (which must stay 1:1 with the buffer for cursor mapping).
+        assert_eq!(job.text, "example.com/x");
+    }
+
+    #[test]
+    fn security_level_tones_use_design_tokens_not_raw_literals() {
+        assert_eq!(SecurityLevel::Secure.tone().color(), Style::TEXT_DIM);
+        assert_eq!(SecurityLevel::NotSecure.tone().color(), Style::WARN);
+        assert_eq!(SecurityLevel::Mesh.tone().color(), Style::ACCENT);
+        assert_eq!(SecurityLevel::Neutral.tone().color(), Style::TEXT_DIM);
     }
 
     #[test]
