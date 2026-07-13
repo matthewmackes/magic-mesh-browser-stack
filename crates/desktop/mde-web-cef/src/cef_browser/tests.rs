@@ -107,6 +107,23 @@ fn render_process_terminated_offset_reconciles_with_the_request_handler_layout()
 }
 
 #[test]
+fn certificate_error_offset_sits_inside_the_request_handler_layout() {
+    // cef_request_handler_t (CEF 149): the proven get_resource_request_handler=56
+    // pins index 2, so on_certificate_error is index 4 (get_auth_credentials=64,
+    // on_certificate_error=72), before the proven on_render_process_terminated=112.
+    assert_eq!(CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET, 40 + 4 * 8);
+    assert!(
+        CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET
+            < CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET
+    );
+    assert!(
+        CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET
+            < CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET
+    );
+    assert!(CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET < CEF_REQUEST_HANDLER_SIZE - 8);
+}
+
+#[test]
 fn popup_render_handler_offsets_sit_between_view_rect_and_paint() {
     // cef_render_handler_t field order pins on_popup_show/on_popup_size between
     // the two offsets this bridge has already proven live (get_view_rect=56,

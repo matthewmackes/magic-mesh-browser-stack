@@ -126,6 +126,20 @@ pub struct DownloadStatus {
     pub canceled: bool,
 }
 
+/// A TLS/certificate error that blocked the top-level load. The engine cancelled
+/// the navigation (blocking-by-default); the shell paints a "Not secure —
+/// blocked" interstitial from this state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertError {
+    /// The URL whose certificate failed validation.
+    pub url: String,
+    /// The Chromium `net::Error` code (`cef_errorcode_t`, e.g. -202
+    /// CERT_AUTHORITY_INVALID).
+    pub code: i32,
+    /// A short human-readable description of the failure.
+    pub message: String,
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
@@ -155,6 +169,9 @@ pub struct WebSession {
     favicon: Option<Vec<u8>>,
     /// Latest find-in-page tally `(active_ordinal, total_count)`.
     find_result: Option<(u32, u32)>,
+    /// The latest TLS/certificate error that blocked a load (if any). Cleared on
+    /// a fresh navigation; drives the shell's "Not secure — blocked" interstitial.
+    cert_error: Option<CertError>,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -192,6 +209,7 @@ impl WebSession {
             cursor: CursorKind::default(),
             favicon: None,
             find_result: None,
+            cert_error: None,
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -414,6 +432,9 @@ impl WebSession {
             }
             EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Favicon { png } => self.favicon = Some(png),
+            EventMsg::CertError { url, code, message } => {
+                self.cert_error = Some(CertError { url, code, message });
+            }
             EventMsg::FindResult { count, active, .. } => {
                 self.find_result = Some((active, count));
             }
@@ -511,6 +532,8 @@ impl WebSession {
 
     /// Navigate to `url`.
     pub fn load(&mut self, url: impl Into<String>) {
+        // A fresh navigation clears any interstitial from the prior page.
+        self.cert_error = None;
         self.nav.loading = true;
         self.send(&ControlMsg::Load(url.into()));
     }
@@ -562,6 +585,14 @@ impl WebSession {
     #[must_use]
     pub const fn find_result(&self) -> Option<(u32, u32)> {
         self.find_result
+    }
+
+    /// The latest TLS/certificate error that blocked a load, if the current
+    /// navigation was cancelled by one. The shell paints its "Not secure —
+    /// blocked" interstitial from this; cleared on the next [`Self::load`].
+    #[must_use]
+    pub const fn cert_error(&self) -> Option<&CertError> {
+        self.cert_error.as_ref()
     }
 
     /// Clear the page-find selection/highlight where the helper supports it.
@@ -1027,6 +1058,41 @@ mod tests {
         session.poll();
 
         assert_eq!(session.favicon(), Some(&[0x89, b'P', b'N', b'G'][..]));
+    }
+
+    #[test]
+    fn cert_error_is_exposed_then_cleared_on_a_fresh_load() {
+        let (mut session, peer) = filtered_session();
+        assert!(
+            session.cert_error().is_none(),
+            "no cert error before any event"
+        );
+        send_event(
+            &peer,
+            &EventMsg::CertError {
+                url: "https://bad.example/".to_owned(),
+                code: -202,
+                message: "The certificate is not trusted (unknown authority)".to_owned(),
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(
+            session.cert_error(),
+            Some(&CertError {
+                url: "https://bad.example/".to_owned(),
+                code: -202,
+                message: "The certificate is not trusted (unknown authority)".to_owned(),
+            })
+        );
+
+        // A fresh navigation clears the interstitial state.
+        session.load("https://good.example/");
+        assert!(
+            session.cert_error().is_none(),
+            "cert error cleared on the next load"
+        );
     }
 
     #[test]

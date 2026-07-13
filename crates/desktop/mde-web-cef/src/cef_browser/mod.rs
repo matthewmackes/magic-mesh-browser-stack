@@ -124,6 +124,11 @@ pub const CEF_RENDER_HANDLER_ON_POPUP_SIZE_OFFSET: usize = 88;
 pub const CEF_REQUEST_HANDLER_SIZE: usize = 128;
 /// `offsetof(cef_request_handler_t, get_resource_request_handler)`.
 pub const CEF_REQUEST_HANDLER_GET_RESOURCE_REQUEST_HANDLER_OFFSET: usize = 56;
+/// `offsetof(cef_request_handler_t, on_certificate_error)` for pinned Linux CEF
+/// 149 — a TLS/certificate validation failure on the top-level load. The proven
+/// get_resource_request_handler=56 pins index 2, so on_certificate_error (index
+/// 4: get_auth_credentials@64, on_certificate_error@72) sits here.
+pub const CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET: usize = 72;
 /// `offsetof(cef_request_handler_t, on_render_process_terminated)` — the
 /// renderer process died (crash/OOM/killed); drives the shell's sad-tab state.
 pub const CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET: usize = 112;
@@ -1291,6 +1296,13 @@ impl CefBrowserCallbacks {
             CEF_REQUEST_HANDLER_ON_RENDER_PROCESS_TERMINATED_OFFSET,
             fn_ptr(on_render_process_terminated as *const ()),
         );
+        // TLS/certificate validation failure → the shell's "Not secure — blocked"
+        // interstitial (EventMsg::CertError). We return 0 (blocking-by-default),
+        // so CEF cancels the load; no "proceed anyway" this unit.
+        self.request.put_fn(
+            CEF_REQUEST_HANDLER_ON_CERTIFICATE_ERROR_OFFSET,
+            fn_ptr(on_certificate_error as *const ()),
+        );
         self.resource_request.put_fn(
             CEF_RESOURCE_REQUEST_HANDLER_ON_BEFORE_RESOURCE_LOAD_OFFSET,
             fn_ptr(on_before_resource_load as *const ()),
@@ -2091,6 +2103,21 @@ impl CefBrowserState {
         });
     }
 
+    /// A TLS/certificate error blocked the top-level load — tell the shell so it
+    /// paints the "Not secure — blocked" interstitial over the dead frame.
+    fn publish_cert_error(&self, url: String, code: i32, message: &str) {
+        let event = EventMsg::CertError {
+            url,
+            code,
+            message: message.to_owned(),
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
     fn cancel_pending_resource_requests(&self) {
         let callbacks = self
             .pending_resource_requests
@@ -2492,6 +2519,49 @@ unsafe extern "C" fn on_render_process_terminated(
         format!("{what} (code {error_code}): {detail}")
     };
     let _ = with_state(self_, |state| state.publish_crashed(reason.clone()));
+}
+
+/// Map a Chromium `net::Error` cert code (`cef_errorcode_t`) onto a short
+/// human message for the shell's "Not secure — blocked" interstitial.
+fn cert_error_message(code: i32) -> &'static str {
+    match code {
+        -200 => "The certificate does not match the site's name",
+        -201 => "The certificate is expired or not yet valid",
+        -202 => "The certificate is not trusted (unknown authority)",
+        -203 => "The certificate has no revocation mechanism",
+        -204 => "The certificate's revocation status could not be checked",
+        -205 => "The certificate has been revoked",
+        -206 => "The certificate is invalid",
+        -207 => "The certificate uses a weak signature algorithm",
+        -208 => "The certificate's name is non-unique",
+        -210 => "The certificate uses a weak key",
+        -211 => "The certificate violates a name constraint",
+        -212 => "The certificate's validity period is too long",
+        -213 => "The certificate is a distrusted Symantec legacy certificate",
+        _ => "Certificate error",
+    }
+}
+
+/// CEF `on_certificate_error(self, browser, cert_error, request_url, ssl_info,
+/// callback)` — TLS validation failed on the top-level load. We publish the
+/// error and return 0 (secure default): CEF cancels the load, the shell shows a
+/// blocking interstitial. The `callback` is intentionally dropped (no "proceed
+/// anyway" this unit) and `ssl_info` is left untouched.
+unsafe extern "C" fn on_certificate_error(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    cert_error: c_int,
+    request_url: *const CefString,
+    _ssl_info: *const c_void,
+    _callback: *const c_void,
+) -> c_int {
+    let url = cef_string_to_string(request_url);
+    // `c_int` is `i32` on the pinned Linux target; the wire carries an `i32`.
+    let code: i32 = cert_error;
+    let message = cert_error_message(code);
+    let _ = with_state(self_, |state| state.publish_cert_error(url, code, message));
+    // Return 0: do not proceed — CEF cancels the load (blocking-by-default).
+    0
 }
 
 unsafe extern "C" fn on_before_resource_load(

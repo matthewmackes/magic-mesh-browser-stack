@@ -1017,6 +1017,18 @@ pub enum EventMsg {
         /// The favicon image encoded as PNG (32px, engine-decoded).
         png: Vec<u8>,
     },
+    /// A TLS/certificate validation error blocked the top-level load. The engine
+    /// cancelled the navigation (blocking-by-default); the shell shows a "Not
+    /// secure — blocked" interstitial over the dead frame.
+    CertError {
+        /// The URL whose certificate failed validation.
+        url: String,
+        /// The Chromium `net::Error` code (`cef_errorcode_t`, e.g. -202
+        /// CERT_AUTHORITY_INVALID).
+        code: i32,
+        /// A short human-readable description of the failure.
+        message: String,
+    },
 }
 
 impl EventMsg {
@@ -1115,6 +1127,14 @@ impl EventMsg {
                 out.push(14);
                 put_bytes(&mut out, png);
             }
+            Self::CertError { url, code, message } => {
+                out.push(15);
+                put_str(&mut out, url);
+                // `code` is a negative net::Error id; the u32 codec preserves its
+                // bit pattern (decoded back with the inverse cast).
+                put_u32(&mut out, *code as u32);
+                put_str(&mut out, message);
+            }
         }
         out
     }
@@ -1177,6 +1197,11 @@ impl EventMsg {
             },
             14 => Self::Favicon {
                 png: c.bytes()?.to_vec(),
+            },
+            15 => Self::CertError {
+                url: c.string()?,
+                code: c.u32()? as i32,
+                message: c.string()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1557,6 +1582,11 @@ mod tests {
         });
         round_event(&EventMsg::Favicon { png: vec![1, 2, 3] });
         round_event(&EventMsg::Favicon { png: Vec::new() });
+        round_event(&EventMsg::CertError {
+            url: "https://bad.example".to_owned(),
+            code: -202,
+            message: "The certificate is not trusted (unknown authority)".to_owned(),
+        });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }
