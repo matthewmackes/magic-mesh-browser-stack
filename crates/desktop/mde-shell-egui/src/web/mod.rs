@@ -328,6 +328,27 @@ enum TabOpenIntent {
     NewForegroundUrl { engine: BrowserEngine, url: String },
 }
 
+/// One entry on the session-only reopen stack (Ctrl+Shift+T / History →
+/// Reopen Closed Tab).
+///
+/// Deliberately in-memory only: the stack is never written to disk, never part
+/// of the session-sync snapshot, and never published to the Bus — closing a tab
+/// must actually retire its trace (the Q74/Q80 privacy locks,
+/// `docs/THREAT_MODEL.md`). It lives and dies with this shell process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedTab {
+    /// The engine-committed URL the reopen loads.
+    url: String,
+    /// Last page title, used by the History menu's reopen item label.
+    title: String,
+    /// Engine that owned the closed session — the reopen keeps it.
+    engine: BrowserEngine,
+}
+
+/// Maximum retained reopenable closed tabs — a short, bounded stack (Chrome
+/// keeps a similarly short recently-closed list).
+const CLOSED_TAB_STACK_CAP: usize = 10;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum BrowserEngine {
     #[default]
@@ -375,6 +396,21 @@ pub(crate) struct WebState {
     engine: BrowserEngine,
     /// The address-bar edit buffer for the active tab.
     address: String,
+    /// Whether the omnibox TextEdit owned keyboard focus on the last painted
+    /// frame. Tracked as chrome state (the same idiom as [`Tab::page_focused`])
+    /// because the per-frame engine→address sync runs BEFORE the omnibox is
+    /// rebuilt each frame — an in-progress operator edit is never clobbered by
+    /// an engine redirect.
+    omnibox_focused: bool,
+    /// Whether ANY Browser chrome text field (omnibox, find bar, dashboard
+    /// search) owned keyboard focus on the last painted frame — the guard that
+    /// keeps the tab accelerators (Ctrl+T/W/Tab/1-9) from firing mid-edit.
+    chrome_edit_focus: bool,
+    /// The active tab's engine-committed URL as of the last per-frame sync, so
+    /// [`Self::sync_address_on_engine_nav`] rewrites the address bar only on a
+    /// real engine transition (redirect / page navigation), not every frame —
+    /// a blurred-but-unsubmitted draft survives until the engine really moves.
+    last_engine_url: Option<String>,
     /// Set when Reload is pressed on a *crashed* active tab — the shell (or a test)
     /// drains it and swaps in a fresh session (respawn-on-reload).
     respawn_requested: bool,
@@ -384,6 +420,10 @@ pub(crate) struct WebState {
     open_requested: VecDeque<TabOpenIntent>,
     /// Set when Browser chrome asks to open the rich Bookmarks manager surface.
     open_bookmarks_requested: bool,
+    /// Most-recently-closed tabs (newest LAST), bounded by
+    /// [`CLOSED_TAB_STACK_CAP`], feeding Ctrl+Shift+T / History → Reopen
+    /// Closed Tab. Session-only by design — see [`ClosedTab`] (Q74/Q80).
+    closed_tabs: Vec<ClosedTab>,
     /// BROWSER-DD-2 vertical-tabs preference. This is purely chrome layout: it
     /// reuses the same tab/session operations and never creates a second tab model.
     vertical_tabs: bool,
@@ -580,9 +620,13 @@ impl Default for WebState {
             active: 0,
             engine: preferred_default_engine(),
             address: String::new(),
+            omnibox_focused: false,
+            chrome_edit_focus: false,
+            last_engine_url: None,
             respawn_requested: false,
             open_requested: VecDeque::new(),
             open_bookmarks_requested: false,
+            closed_tabs: Vec::new(),
             vertical_tabs: false,
             insecure_prompt: None,
             dashboard_query: String::new(),
@@ -889,6 +933,52 @@ impl WebState {
     fn request_new_tab_with_url(&mut self, engine: BrowserEngine, url: String) {
         self.open_requested
             .push_back(TabOpenIntent::NewForegroundUrl { engine, url });
+    }
+
+    /// Retain a closing tab on the bounded, session-only reopen stack. Blank
+    /// sessions (no committed URL yet) are skipped — there is nothing to
+    /// restore. The stack never leaves this process (Q74/Q80): no persistence,
+    /// no snapshot, no Bus publish.
+    fn remember_closed_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let url = tab.session.nav().url.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        self.closed_tabs.push(ClosedTab {
+            url,
+            title: tab.session.title().trim().to_owned(),
+            engine: tab.engine,
+        });
+        if self.closed_tabs.len() > CLOSED_TAB_STACK_CAP {
+            self.closed_tabs.remove(0);
+        }
+    }
+
+    /// Reopen the most recently closed tab (Ctrl+Shift+T / History → Reopen
+    /// Closed Tab): pop the reopen stack and enqueue a foreground open of its
+    /// URL on its original engine — the exact open seam the tab strip's `+`
+    /// buttons use. A drained stack is a silent no-op.
+    fn restore_closed_tab(&mut self) {
+        if let Some(closed) = self.closed_tabs.pop() {
+            self.request_new_tab_with_url(closed.engine, closed.url);
+        }
+    }
+
+    /// Cycle to the next tab, wrapping past the end (Ctrl+Tab).
+    fn select_next_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.select_tab((self.active + 1) % self.tabs.len());
+        }
+    }
+
+    /// Cycle to the previous tab, wrapping past the start (Ctrl+Shift+Tab).
+    fn select_prev_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.select_tab((self.active + self.tabs.len() - 1) % self.tabs.len());
+        }
     }
 
     fn toggle_power_mode(&mut self) {
@@ -1478,11 +1568,15 @@ impl WebState {
     }
 
     /// Close a tab and keep a stable active index. The helper child is killed by
-    /// `WebSession`'s `Drop`, so this is the real process-teardown path.
+    /// `WebSession`'s `Drop`, so this is the real process-teardown path. The
+    /// closing tab's URL is retained on the in-memory reopen stack first, so
+    /// every close affordance (strip ×, context menu, middle-click, Ctrl+W,
+    /// voice) feeds Ctrl+Shift+T through this one seam.
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
+        self.remember_closed_tab(index);
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -2555,6 +2649,35 @@ impl WebState {
         }
     }
 
+    /// Per-frame omnibox ↔ engine sync: an engine-driven navigation (redirect,
+    /// page script, in-page link click) updates the address bar even though no
+    /// chrome action (tab select/close/move) ran. Guarded two ways so it can
+    /// run every frame from the pump: it only rewrites the address when the
+    /// active tab's engine URL actually CHANGED since the last frame, and never
+    /// while the omnibox itself owns keyboard focus — so it cannot clobber an
+    /// in-progress operator edit, and a blurred-but-unsubmitted draft survives
+    /// until the engine really moves.
+    fn sync_address_on_engine_nav(&mut self) {
+        let Some(url) = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.session.nav().url.trim().to_owned())
+        else {
+            self.last_engine_url = None;
+            return;
+        };
+        if self.last_engine_url.as_deref() == Some(url.as_str()) {
+            return;
+        }
+        if !self.omnibox_focused && !url.is_empty() {
+            self.address.clone_from(&url);
+        }
+        // Fold the transition even when focus suppressed the rewrite: lifting
+        // focus later must not retroactively apply a stale engine URL over
+        // whatever the operator left in the bar.
+        self.last_engine_url = Some(url);
+    }
+
     fn poll_suggestions(&mut self) {
         self.suggestions.poll();
     }
@@ -2899,10 +3022,83 @@ impl WebState {
     }
 }
 
+/// The browser-reserved tab accelerators (Chrome's tab-strip keyboard UX),
+/// live only while the Browser surface is painted — this runs from
+/// [`web_panel`].
+///
+/// Every match CONSUMES the key from this frame's input, so a reserved
+/// shortcut never leaks into chrome widgets or the page-canvas forwarding at
+/// the bottom of the frame (`paint_body` clones `i.events` after this ran) —
+/// the same reservation Chrome makes for Ctrl+T/W. Page-canvas keyboard focus
+/// deliberately does NOT pause these: tab management stays reachable while
+/// page typing is forwarded.
+///
+/// Tab-opening/closing accelerators (Ctrl+T / Ctrl+W / Ctrl+Shift+T) pause
+/// while a chrome text field (omnibox / find bar / dashboard search) owned
+/// keyboard focus on the last painted frame — closing the tab out of an
+/// in-progress edit would surprise, and egui's own TextEdit binds Ctrl+W as
+/// delete-previous-word, which the pause preserves. Tab CYCLING
+/// (Ctrl+Tab / Ctrl+digit) stays
+/// live during edits, exactly like desktop browsers — and deliberately so:
+/// egui's own focus traversal walks widget focus on Tab presses, so a cycling
+/// shortcut gated on text focus could dead-end itself once that walk reaches
+/// the omnibox.
+fn handle_tab_keyboard(ctx: &egui::Context, state: &mut WebState) {
+    const CTRL: egui::Modifiers = egui::Modifiers::CTRL;
+    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+    // ORDER MATTERS: `consume_key` matches modifiers logically (an EXTRA
+    // Shift is ignored — egui's documented behaviour), so the Ctrl+Shift
+    // variants must be consumed before their plain-Ctrl counterparts or
+    // Ctrl+Shift+T would trigger "new tab" instead of "reopen".
+    if !state.chrome_edit_focus {
+        if ctx.input_mut(|i| i.consume_key(CTRL_SHIFT, egui::Key::T)) {
+            state.restore_closed_tab();
+        }
+        if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::T)) {
+            state.request_new_tab(state.engine);
+        }
+        if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::W)) {
+            state.close_tab(state.active);
+        }
+    }
+    if ctx.input_mut(|i| i.consume_key(CTRL_SHIFT, egui::Key::Tab)) {
+        state.select_prev_tab();
+    }
+    if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::Tab)) {
+        state.select_next_tab();
+    }
+    // Ctrl+1..Ctrl+8 activate the Nth tab (out-of-range is ignored by
+    // `select_tab`); Ctrl+9 activates the LAST tab — the Chrome convention.
+    const DIGITS: [egui::Key; 8] = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+    ];
+    for (nth, key) in DIGITS.into_iter().enumerate() {
+        if ctx.input_mut(|i| i.consume_key(CTRL, key)) {
+            state.select_tab(nth);
+        }
+    }
+    if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::Num9)) {
+        if let Some(last) = state.tabs.len().checked_sub(1) {
+            state.select_tab(last);
+        }
+    }
+}
+
 /// Render the Browser surface into `ui`: poll every tab, upload any fresh frame on
 /// the active tab, draw the navigation chrome, and paint the body (or the honest
 /// crashed / loading / gated states).
 pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
+    // Tab-strip keyboard UX: consume the browser-reserved shortcuts FIRST so
+    // neither chrome widgets nor the page-canvas forwarding in `paint_body`
+    // ever see them.
+    handle_tab_keyboard(ui.ctx(), state);
     state.poll_suggestions();
     state.poll_downloads();
     state.poll_incoming_send_tabs();
@@ -2957,6 +3153,10 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         state.handle_passkey_event(tab_index, engine, &body);
     }
     state.poll_spellcheck();
+    // Engine-driven navigations (redirects, page scripts) land in the address
+    // bar here — the tab poll above has already drained this frame's nav
+    // events, and the focus guard keeps operator edits intact.
+    state.sync_address_on_engine_nav();
     state.poll_session_snapshot();
 
     // 2. Upload the active tab's pending frame — ONLY when one is present, so an
@@ -2985,6 +3185,11 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some(action) = menubar::show(state, ui) {
         menubar::apply(ui.ctx(), state, action);
     }
+    // The accelerator + omnibox-sync guards above read LAST frame's chrome
+    // text-field focus; re-collect it from the chrome widgets painted below
+    // (the omnibox, the find bar, and the dashboard search each OR into it).
+    state.chrome_edit_focus = false;
+    state.omnibox_focused = false;
     ui.add_space(CHROME_GAP);
 
     if state.vertical_tabs {
@@ -3106,6 +3311,11 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
             let tab_response = tab_pill(ui, &label, active);
             if tab_response.clicked() {
                 select = Some(idx);
+            }
+            // Middle-click closes the tab under the pointer (the ubiquitous
+            // desktop-browser gesture) — same seam as the inline × button.
+            if tab_response.middle_clicked() {
+                close = Some(idx);
             }
             tab_response
                 .on_hover_text(tab_hover(tab))
@@ -3251,6 +3461,11 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             let resp = tab_pill_sized(ui, &label, active, width);
                             if resp.clicked() {
                                 select = Some(idx);
+                            }
+                            // Middle-click closes this tab — same gesture as the
+                            // horizontal strip.
+                            if resp.middle_clicked() {
+                                close = Some(idx);
                             }
                             resp.on_hover_text(tab_hover(tab)).context_menu(|ui| {
                                 if ui
@@ -4757,12 +4972,17 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
         // The address bar fills the rest of the row.
         let field = egui::TextEdit::singleline(&mut state.address)
+            .id(omnibox_widget_id())
             .desired_width(ui.available_width() - Style::SP_XL * 2.0)
             .hint_text("Enter an address")
             .text_color(Style::TEXT)
             .font(egui::TextStyle::Small)
             .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H));
         let resp = ui.add_enabled(has_tab && !crashed, field);
+        // Latch omnibox focus for next frame's engine-sync + accelerator
+        // guards (the same tracked-focus idiom as `Tab::page_focused`).
+        state.omnibox_focused = resp.has_focus();
+        state.chrome_edit_focus |= resp.has_focus();
         if resp.changed() && has_tab && !crashed {
             state.update_suggestions_for_address();
         }
@@ -4807,6 +5027,12 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     }
 }
 
+/// Stable egui id for the omnibox TextEdit, so its keyboard focus can be
+/// tracked across frames (and driven by the tests).
+fn omnibox_widget_id() -> egui::Id {
+    egui::Id::new("browser-omnibox")
+}
+
 fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.find_open {
         return;
@@ -4833,6 +5059,7 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                         .font(egui::TextStyle::Small)
                         .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
                 );
+                state.chrome_edit_focus |= resp.has_focus();
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if enter && ui.input(|i| i.modifiers.shift) {
                     submit_backward = true;
@@ -4969,6 +5196,7 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
                     .hint_text("Search the mesh")
                     .text_color(Style::TEXT),
             );
+            state.chrome_edit_focus |= resp.has_focus();
             submit_search = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
                 .add(egui::Button::new(
@@ -5697,6 +5925,24 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
             ..Default::default()
         }
+    }
+
+    /// One Ctrl(+Shift) key press as a frame's input — drives the tab-strip
+    /// accelerators through the same event path a real seat produces.
+    fn ctrl_key_input(key: egui::Key, shift: bool) -> egui::RawInput {
+        let mut input = body_input();
+        input.events = vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift,
+                ..egui::Modifiers::default()
+            },
+        }];
+        input
     }
 
     /// Drive one headless frame of `web_panel` on the CPU tessellation path (the
@@ -7665,6 +7911,403 @@ mod tests {
         );
         assert_eq!(state.tabs.len(), 2);
         assert!(state.vertical_tabs);
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_tabs_and_ctrl_digits_jump_to_them() {
+        let (first, _h1) = testkit::connect().expect("connect 1");
+        let (second, _h2) = testkit::connect().expect("connect 2");
+        let (third, _h3) = testkit::connect().expect("connect 3");
+        let mut state = WebState::default();
+        state.push_session(first);
+        state.push_session(second);
+        state.push_session(third);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert_eq!(state.active, 2, "the newest pushed tab starts foreground");
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Tab, false)
+        ));
+        assert_eq!(state.active, 0, "Ctrl+Tab wraps forward to the first tab");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Tab, false)
+        ));
+        assert_eq!(state.active, 1, "Ctrl+Tab advances to the next tab");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Tab, true)
+        ));
+        assert_eq!(state.active, 0, "Ctrl+Shift+Tab cycles backwards");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Tab, true)
+        ));
+        assert_eq!(state.active, 2, "Ctrl+Shift+Tab wraps back to the last tab");
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Num1, false)
+        ));
+        assert_eq!(state.active, 0, "Ctrl+1 activates the first tab");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Num3, false)
+        ));
+        assert_eq!(state.active, 2, "Ctrl+3 activates the third tab");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Num1, false)
+        ));
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Num9, false)
+        ));
+        assert_eq!(state.active, 2, "Ctrl+9 activates the LAST tab");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Num5, false)
+        ));
+        assert_eq!(state.active, 2, "an out-of-range Ctrl+digit is ignored");
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_new_tab_intent_and_never_leaks_into_the_page() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let engine = state.engine;
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+
+        // Focus the page canvas first — the browser-reserved shortcut must
+        // still win over page keyboard forwarding.
+        let page_point = pos2(480.0, 420.0);
+        let mut click = body_input();
+        click.events = vec![
+            egui::Event::PointerMoved(page_point),
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        assert!(run_panel_on_ctx(&ctx, &mut state, click));
+        assert!(
+            state.tabs[0].page_focused,
+            "the click latches page keyboard focus"
+        );
+        let _ = drain_control_messages(&helper);
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::T, false)
+        ));
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForeground(engine)),
+            "Ctrl+T raises the tab strip's exact new-tab intent"
+        );
+        let leaked = drain_control_messages(&helper);
+        assert!(
+            !leaked.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::Input(
+                    mde_web_preview_client::InputEvent::Key { .. }
+                )
+            )),
+            "a consumed browser shortcut must not be forwarded to the page: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_closes_and_ctrl_shift_t_restores_the_closed_page() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let engine = state.tabs[0].engine;
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::W, false)
+        ));
+        assert!(state.tabs.is_empty(), "Ctrl+W closes the active tab");
+        assert_eq!(
+            state.closed_tabs.last(),
+            Some(&ClosedTab {
+                url: "https://example.test/".to_owned(),
+                title: "Example".to_owned(),
+                engine,
+            }),
+            "the closed page is retained in-memory for reopen"
+        );
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::T, true)
+        ));
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine,
+                url: "https://example.test/".to_owned(),
+            }),
+            "Ctrl+Shift+T reopens the closed page on its original engine"
+        );
+        // The stack drains — a second restore is an honest no-op.
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::T, true)
+        ));
+        assert_eq!(state.take_open_request(), None, "the reopen stack drains");
+    }
+
+    #[test]
+    fn the_reopen_stack_is_bounded_and_skips_blank_sessions() {
+        // A session that never committed a URL leaves nothing to restore.
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("nonblocking helper");
+        let blank = WebSession::from_stream(shell, None).expect("session");
+        let mut state = WebState::default();
+        state.push_session(blank);
+        state.close_tab(0);
+        assert!(
+            state.closed_tabs.is_empty(),
+            "a blank session is not reopenable"
+        );
+
+        // The stack stays bounded: a close past the cap evicts the OLDEST.
+        let (session, _helper2) = testkit::connect().expect("connect");
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        state.closed_tabs = (0..CLOSED_TAB_STACK_CAP)
+            .map(|n| ClosedTab {
+                url: format!("https://mesh{n}.test/"),
+                title: format!("Mesh {n}"),
+                engine: BrowserEngine::Servo,
+            })
+            .collect();
+        state.close_tab(0);
+        assert_eq!(
+            state.closed_tabs.len(),
+            CLOSED_TAB_STACK_CAP,
+            "the reopen stack stays bounded"
+        );
+        assert_eq!(
+            state.closed_tabs.first().map(|c| c.url.as_str()),
+            Some("https://mesh1.test/"),
+            "the oldest retained entry is evicted first"
+        );
+        assert_eq!(
+            state.closed_tabs.last().map(|c| c.url.as_str()),
+            Some("about:blank"),
+            "the newest close is retained"
+        );
+    }
+
+    #[test]
+    fn middle_clicking_a_tab_pill_closes_that_tab() {
+        use std::cell::Cell;
+        let (first, _h1) = testkit::connect().expect("connect 1");
+        let (second, _h2) = testkit::connect().expect("connect 2");
+        let mut state = WebState::default();
+        state.push_session(first);
+        state.push_session(second);
+        // Mark the FIRST tab so the assertion can tell which one closed.
+        state.tabs[0].force_dark = true;
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        // Probe frame: record where the first tab pill lands.
+        let origin = Cell::new(pos2(0.0, 0.0));
+        let _ = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                origin.set(ui.next_widget_position());
+                tab_strip(ui, &mut state);
+            });
+        });
+        let point = origin.get() + vec2(CHROME_TAB_W * 0.5, CHROME_TAB_H * 0.5);
+
+        let mut input = body_input();
+        input.events = vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| tab_strip(ui, &mut state));
+        });
+        assert_eq!(state.tabs.len(), 1, "middle-click closes the pill's tab");
+        assert!(
+            !state.tabs[0].force_dark,
+            "the SECOND tab survives — middle-click closed the first pill"
+        );
+    }
+
+    #[test]
+    fn engine_navigation_updates_the_address_bar_only_when_not_editing() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "https://example.test/",
+            "the pumped engine URL lands in the address bar with no chrome action"
+        );
+
+        // An engine-driven navigation (redirect / page script) rewrites the
+        // bar on the next pump — the seam tab select/close/move never covered.
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://example.test/redirected".to_owned(),
+            },
+        );
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(state.address, "https://example.test/redirected");
+
+        // Focus the omnibox and start a draft: an engine navigation must NOT
+        // clobber the in-progress edit.
+        ctx.memory_mut(|m| m.request_focus(omnibox_widget_id()));
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        state.address = "mesh draft".to_owned();
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://example.test/second".to_owned(),
+            },
+        );
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "mesh draft",
+            "an engine navigation never overwrites an in-progress edit"
+        );
+
+        // Blur without submitting: the missed engine URL is NOT retroactively
+        // applied over the draft, but the NEXT engine navigation syncs again.
+        ctx.memory_mut(|m| m.surrender_focus(omnibox_widget_id()));
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "mesh draft",
+            "blurring must not retroactively apply a stale engine URL"
+        );
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://example.test/third".to_owned(),
+            },
+        );
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "https://example.test/third",
+            "engine navigation resumes syncing once the edit ends"
+        );
+    }
+
+    #[test]
+    fn open_close_shortcuts_pause_while_a_chrome_text_field_is_editing() {
+        let (first, _h1) = testkit::connect().expect("connect 1");
+        let (second, _h2) = testkit::connect().expect("connect 2");
+        let mut state = WebState::default();
+        state.push_session(first);
+        state.push_session(second);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+
+        ctx.memory_mut(|m| m.request_focus(omnibox_widget_id()));
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert!(state.chrome_edit_focus, "omnibox focus latches the guard");
+
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::W, false)
+        ));
+        assert_eq!(state.tabs.len(), 2, "Ctrl+W must not close a tab mid-edit");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::T, false)
+        ));
+        assert_eq!(
+            state.take_open_request(),
+            None,
+            "Ctrl+T must not open a tab mid-edit"
+        );
+        // Tab CYCLING stays live during edits (the desktop-browser idiom).
+        let before = state.active;
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::Tab, false)
+        ));
+        assert_ne!(
+            state.active, before,
+            "Ctrl+Tab keeps cycling while the omnibox is focused"
+        );
+
+        // Blur → the open/close accelerators resume.
+        ctx.memory_mut(|m| m.surrender_focus(omnibox_widget_id()));
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert!(!state.chrome_edit_focus, "blurring releases the guard");
+        assert!(run_panel_on_ctx(
+            &ctx,
+            &mut state,
+            ctrl_key_input(egui::Key::W, false)
+        ));
+        assert_eq!(
+            state.tabs.len(),
+            1,
+            "Ctrl+W closes the tab once the edit ends"
+        );
     }
 
     #[test]
@@ -10583,8 +11226,11 @@ mod tests {
         state.push_session(session);
         state.tabs[state.active].engine = BrowserEngine::Cef;
         state.tabs[state.active].page_focused = true;
-        state.address = "https://example.test/current".to_owned();
         run_until_texture(&mut state);
+        // Draft an address AFTER the surface settled (the per-frame engine
+        // sync has folded the committed URL) — the handoff must carry the
+        // operator's draft distinctly from the engine URL.
+        state.address = "https://example.test/current".to_owned();
         let ctx = egui::Context::default();
 
         super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::VoiceCommand);

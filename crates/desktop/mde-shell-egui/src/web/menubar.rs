@@ -50,6 +50,9 @@ pub(super) enum MenuAction {
     Back,
     /// Navigate forward (`WebSession::go_forward`).
     Forward,
+    /// Reopen the most recently closed tab from the session-only reopen stack
+    /// (`WebState::restore_closed_tab` — the Ctrl+Shift+T seam).
+    ReopenClosedTab,
     /// Reload the page, or respawn a crashed tab (`WebSession::reload` /
     /// `respawn_requested` — the exact toolbar Reload behaviour).
     Reload,
@@ -259,6 +262,11 @@ struct Snapshot {
     passkey_status: Option<BrowserPasskeyStatus>,
     /// Daemon-owned CEF runtime updater status for this node.
     security_update: Option<BrowserSecurityUpdateStatus>,
+    /// The session-only reopen stack holds at least one closed tab.
+    can_reopen_closed: bool,
+    /// Title (or URL) of the most recently closed tab, naming the History →
+    /// reopen item.
+    last_closed: Option<String>,
 }
 
 impl Snapshot {
@@ -317,6 +325,9 @@ fn snapshot(state: &WebState) -> Snapshot {
                 voice_command_status: state.latest_voice_command_status.clone(),
                 passkey_status: state.latest_passkey_status.clone(),
                 security_update: state.latest_security_update.clone(),
+                // Overwritten below with the rest of the tab-independent state.
+                can_reopen_closed: false,
+                last_closed: None,
             }
         });
     let (active_downloads, total_downloads) = state.download_counts();
@@ -338,7 +349,26 @@ fn snapshot(state: &WebState) -> Snapshot {
     snap.voice_command_status = state.latest_voice_command_status.clone();
     snap.passkey_status = state.latest_passkey_status.clone();
     snap.security_update = state.latest_security_update.clone();
+    snap.can_reopen_closed = !state.closed_tabs.is_empty();
+    snap.last_closed = state.closed_tabs.last().map(|closed| {
+        if closed.title.is_empty() {
+            closed.url.clone()
+        } else {
+            closed.title.clone()
+        }
+    });
     snap
+}
+
+/// The History → reopen item names the tab it would restore ("Reopen
+/// “<title>”") when one is retained — the desktop-browser convention — and
+/// falls back to the plain verb with an empty stack (where it renders
+/// disabled).
+fn reopen_closed_label(s: &Snapshot) -> String {
+    s.last_closed.as_deref().map_or_else(
+        || "Reopen Closed Tab".to_owned(),
+        |last| format!("Reopen \u{201C}{}\u{201D}", super::ellipsize(last, 24)),
+    )
 }
 
 /// The Reload item's label — "Restart Page" on a crashed tab (it respawns),
@@ -574,6 +604,12 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Item(
                     Item::new(MenuAction::Forward, "Forward")
                         .enabled(s.has_tab && !s.crashed && s.can_forward),
+                ),
+                Entry::Separator,
+                Entry::Item(
+                    Item::new(MenuAction::ReopenClosedTab, reopen_closed_label(s))
+                        .shortcut("Ctrl+Shift+T")
+                        .enabled(s.can_reopen_closed),
                 ),
             ],
         ),
@@ -972,6 +1008,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
                 tab.session.go_forward();
             }
         }
+        MenuAction::ReopenClosedTab => state.restore_closed_tab(),
         MenuAction::Reload => {
             let crashed = state
                 .tabs
@@ -1227,6 +1264,8 @@ mod tests {
             voice_command_status: None,
             passkey_status: None,
             security_update: None,
+            can_reopen_closed: false,
+            last_closed: None,
         }
     }
 
@@ -1830,8 +1869,44 @@ mod tests {
             .collect();
         assert_eq!(
             items,
-            [("Back".to_owned(), true), ("Forward".to_owned(), false)]
+            [
+                ("Back".to_owned(), true),
+                ("Forward".to_owned(), false),
+                ("Reopen Closed Tab".to_owned(), false),
+            ]
         );
+    }
+
+    #[test]
+    fn history_menu_gates_reopen_closed_tab_on_the_session_stack() {
+        let reopen = |snap: &Snapshot| {
+            build_menus(snap)
+                .into_iter()
+                .find(|m| m.title == "History")
+                .expect("History menu present")
+                .entries
+                .into_iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == MenuAction::ReopenClosedTab => Some(i),
+                    _ => None,
+                })
+                .expect("Reopen Closed Tab item present")
+        };
+        // Empty stack → the honest §7 disable with the plain verb.
+        let item = reopen(&https_page());
+        assert!(!item.enabled, "an empty reopen stack disables the item");
+        assert_eq!(item.label, "Reopen Closed Tab");
+        assert_eq!(item.shortcut.as_deref(), Some("Ctrl+Shift+T"));
+
+        // A retained closed tab enables the item and names its title.
+        let with_stack = Snapshot {
+            can_reopen_closed: true,
+            last_closed: Some("Example".to_owned()),
+            ..https_page()
+        };
+        let item = reopen(&with_stack);
+        assert!(item.enabled, "a retained closed tab enables the reopen");
+        assert_eq!(item.label, "Reopen \u{201C}Example\u{201D}");
     }
 
     #[test]
