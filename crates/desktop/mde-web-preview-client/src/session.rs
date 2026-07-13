@@ -29,7 +29,7 @@ use crate::egui::{self, ColorImage};
 use crate::filter::{self, RequestFilter};
 use crate::frame::FrameReader;
 use crate::scm::{self, RecvOutcome};
-use crate::wire::{ControlMsg, EventMsg};
+use crate::wire::{ControlMsg, CursorKind, EventMsg};
 use crate::{input, wire};
 
 /// How many `recvmsg` batches one [`WebSession::poll`] drains before yielding
@@ -149,6 +149,7 @@ pub struct WebSession {
     state: SessionState,
     nav: NavState,
     title: String,
+    cursor: CursorKind,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -183,6 +184,7 @@ impl WebSession {
             state: SessionState::Loading,
             nav: NavState::default(),
             title: String::new(),
+            cursor: CursorKind::default(),
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -403,6 +405,7 @@ impl WebSession {
             EventMsg::PopupRequested { url } => {
                 self.popup_requests.push_back(PopupRequestStatus { url });
             }
+            EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
         Ok(())
@@ -479,6 +482,13 @@ impl WebSession {
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The engine's current cursor shape (hover over a link/text field/resize
+    /// edge). The shell reflects it while the pointer is over the page canvas.
+    #[must_use]
+    pub const fn cursor(&self) -> CursorKind {
+        self.cursor
     }
 
     /// Navigate to `url`.

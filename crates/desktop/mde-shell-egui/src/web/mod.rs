@@ -5318,6 +5318,30 @@ fn frame_target_device_px(rect: egui::Rect, ppp: f32) -> (u32, u32) {
 /// egui input to the session. Pointer geometry is mapped into frame device pixels
 /// via [`map_pointer_to_frame`], and the helper's viewport is re-sized (debounced)
 /// to track the real panel (browser-1).
+/// Map the engine-neutral [`CursorKind`] onto the shell's [`egui::CursorIcon`].
+fn cursor_icon_for(kind: mde_web_preview_client::CursorKind) -> egui::CursorIcon {
+    use mde_web_preview_client::CursorKind as K;
+    match kind {
+        K::Default => egui::CursorIcon::Default,
+        K::Pointer => egui::CursorIcon::PointingHand,
+        K::Text => egui::CursorIcon::Text,
+        K::Crosshair => egui::CursorIcon::Crosshair,
+        K::Wait => egui::CursorIcon::Wait,
+        K::Progress => egui::CursorIcon::Progress,
+        K::Help => egui::CursorIcon::Help,
+        K::Move => egui::CursorIcon::Move,
+        K::Grab => egui::CursorIcon::Grab,
+        K::Grabbing => egui::CursorIcon::Grabbing,
+        K::NotAllowed => egui::CursorIcon::NotAllowed,
+        K::ResizeHorizontal => egui::CursorIcon::ResizeHorizontal,
+        K::ResizeVertical => egui::CursorIcon::ResizeVertical,
+        K::ResizeNeSw => egui::CursorIcon::ResizeNeSw,
+        K::ResizeNwSe => egui::CursorIcon::ResizeNwSe,
+        K::ZoomIn => egui::CursorIcon::ZoomIn,
+        K::ZoomOut => egui::CursorIcon::ZoomOut,
+    }
+}
+
 fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
         let texture = tab.texture.as_ref()?;
@@ -5335,6 +5359,14 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     ui.painter().rect_filled(rect, 0.0, Style::SURFACE);
     egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
         .paint_at(ui, image_rect);
+
+    // Reflect the engine's cursor (hand over links, I-beam over text, resize
+    // edges, …) while the pointer is over the page canvas.
+    if !state.capture_region_mode && resp.hovered() {
+        if let Some(kind) = state.tabs.get(active).map(|tab| tab.session.cursor()) {
+            ui.output_mut(|o| o.cursor_icon = cursor_icon_for(kind));
+        }
+    }
 
     // Drive the helper's CSS viewport to the real panel size (device px), debounced
     // so a drag-resize sends ONE settled resize instead of one per frame — this

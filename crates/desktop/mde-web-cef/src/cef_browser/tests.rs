@@ -5,6 +5,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn cursor_change_offset_and_type_mapping() {
+    // on_cursor_change is field 9 of cef_display_handler_t; on_title_change=48
+    // pins field 1, and the 144-byte / 13-field handler bounds it.
+    assert_eq!(CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET, 40 + 9 * 8);
+    assert_eq!(CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET, 40 + 1 * 8);
+    // The load-bearing CT_* → CursorKind mappings (verified against the CEF 149
+    // cef_cursor_type_t enum).
+    assert_eq!(cursor_kind_for_cef_type(0), CursorKind::Default); // CT_POINTER
+    assert_eq!(cursor_kind_for_cef_type(2), CursorKind::Pointer); // CT_HAND
+    assert_eq!(cursor_kind_for_cef_type(3), CursorKind::Text); // CT_IBEAM
+    assert_eq!(cursor_kind_for_cef_type(6), CursorKind::ResizeHorizontal); // CT_EASTRESIZE
+    assert_eq!(cursor_kind_for_cef_type(7), CursorKind::ResizeVertical); // CT_NORTHRESIZE
+    assert_eq!(cursor_kind_for_cef_type(41), CursorKind::Grab); // CT_GRAB
+    assert_eq!(cursor_kind_for_cef_type(42), CursorKind::Grabbing); // CT_GRABBING
+    assert_eq!(cursor_kind_for_cef_type(38), CursorKind::NotAllowed); // CT_NOTALLOWED
+    assert_eq!(cursor_kind_for_cef_type(999), CursorKind::Default); // unmapped
+}
+
 /// A `w × h` BGRA buffer filled with `value` in every byte.
 fn bgra(w: i64, h: i64, value: u8) -> Vec<u8> {
     vec![value; usize::try_from(w * h * 4).expect("test dims")]

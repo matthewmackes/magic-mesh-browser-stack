@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 use crate::cef_abi::{CefAbi, CefStringUserfreeUtf16Free};
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
-use crate::wire::{self, ControlMsg, EventMsg, InputEvent, KeyCode, Modifiers, PointerButton};
+use crate::wire::{
+    self, ControlMsg, CursorKind, EventMsg, InputEvent, KeyCode, Modifiers, PointerButton,
+};
 
 mod scripts;
 use scripts::*;
@@ -70,6 +72,9 @@ pub const CEF_DISPLAY_HANDLER_SIZE: usize = 144;
 pub const CEF_DISPLAY_HANDLER_ON_ADDRESS_CHANGE_OFFSET: usize = 40;
 /// `offsetof(cef_display_handler_t, on_title_change)`.
 pub const CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET: usize = 48;
+/// `offsetof(cef_display_handler_t, on_cursor_change)` — engine cursor shape
+/// (field 9; on_address_change=40 pins field 0, on_title_change=48 field 1).
+pub const CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET: usize = 112;
 /// `sizeof(cef_load_handler_t)` for pinned Linux CEF 149 (4 fn ptrs + 40-byte base).
 pub const CEF_LOAD_HANDLER_SIZE: usize = 72;
 /// `offsetof(cef_load_handler_t, on_loading_state_change)`.
@@ -1234,6 +1239,10 @@ impl CefBrowserCallbacks {
             CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET,
             fn_ptr(on_title_change as *const ()),
         );
+        self.display.put_fn(
+            CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET,
+            fn_ptr(on_cursor_change as *const ()),
+        );
         self.load.put_fn(
             CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET,
             fn_ptr(on_loading_state_change as *const ()),
@@ -1499,6 +1508,9 @@ struct CefBrowserState {
     click_tracker: Mutex<ClickTracker>,
     /// The `<select>`/autocomplete popup overlay composited over the view frame.
     popup: Mutex<PopupOverlay>,
+    /// Last cursor kind sent (as its wire byte), so identical repeats — CEF fires
+    /// on_cursor_change on every mouse-move — are not re-published each frame.
+    last_cursor: AtomicI32,
 }
 
 impl CefBrowserState {
@@ -1541,7 +1553,23 @@ impl CefBrowserState {
             held_buttons: AtomicI32::new(0),
             click_tracker: Mutex::new(ClickTracker::new()),
             popup: Mutex::new(PopupOverlay::default()),
+            last_cursor: AtomicI32::new(-1),
         })
+    }
+
+    /// Publish the engine's cursor shape to the shell, coalescing repeats (CEF
+    /// re-reports the cursor on every mouse-move).
+    fn publish_cursor(&self, kind: CursorKind) {
+        let byte = i32::from(kind as u8);
+        if self.last_cursor.swap(byte, Ordering::SeqCst) == byte {
+            return;
+        }
+        let event = EventMsg::CursorChanged { kind };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
     }
 
     /// Publish a BGRA frame to the shell over the shm frame channel.
@@ -2246,6 +2274,51 @@ unsafe extern "C" fn on_title_change(
 ) {
     let title = cef_string_to_string(title);
     let _ = with_state(self_, |state| state.publish_title(title));
+}
+
+/// Map a `cef_cursor_type_t` (CEF 149) onto the engine-neutral [`CursorKind`].
+fn cursor_kind_for_cef_type(cef_type: c_int) -> CursorKind {
+    match cef_type {
+        2 => CursorKind::Pointer,   // CT_HAND
+        3 => CursorKind::Text,      // CT_IBEAM
+        1 => CursorKind::Crosshair, // CT_CROSS
+        4 => CursorKind::Wait,      // CT_WAIT
+        5 => CursorKind::Help,      // CT_HELP
+        // Resize family (CT_*RESIZE = 6..=17), column/row = 18/19.
+        6 | 13 | 24 | 26 => CursorKind::ResizeHorizontal, // E/W/EASTWEST
+        7 | 10 | 14 | 25 => CursorKind::ResizeVertical,   // N/S/NORTHSOUTH
+        8 | 12 | 16 => CursorKind::ResizeNeSw,            // NE/SW/NESW
+        9 | 11 | 17 => CursorKind::ResizeNwSe,            // NW/SE/NWSE
+        18 => CursorKind::ResizeHorizontal,               // CT_COLUMNRESIZE
+        19 => CursorKind::ResizeVertical,                 // CT_ROWRESIZE
+        20..=28 => CursorKind::Grabbing,                  // panning
+        29 => CursorKind::Move,                           // CT_MOVE
+        30 => CursorKind::Text,                           // CT_VERTICALTEXT
+        34 => CursorKind::Progress,                       // CT_PROGRESS
+        35 | 38 => CursorKind::NotAllowed,                // CT_NODROP / CT_NOTALLOWED
+        39 => CursorKind::ZoomIn,                         // CT_ZOOMIN
+        40 => CursorKind::ZoomOut,                        // CT_ZOOMOUT
+        41 => CursorKind::Grab,                           // CT_GRAB
+        42 => CursorKind::Grabbing,                       // CT_GRABBING
+        // CT_POINTER (0), and everything else CEF-neutral (cell, contextmenu,
+        // alias, copy, none, dnd, custom, …) map to the plain arrow.
+        _ => CursorKind::Default,
+    }
+}
+
+/// CEF `on_cursor_change(self, browser, cursor, type, custom_info)` — the engine
+/// changed the cursor (hover over a link, text field, resize edge, …). Forward
+/// the neutral shape so the shell reflects it. Return 1 = handled.
+unsafe extern "C" fn on_cursor_change(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    _cursor: *mut c_void,
+    cef_type: c_int,
+    _custom_cursor_info: *const c_void,
+) -> c_int {
+    let kind = cursor_kind_for_cef_type(cef_type);
+    let _ = with_state(self_, |state| state.publish_cursor(kind));
+    1
 }
 
 /// CEF `on_loading_state_change(self, browser, isLoading, canGoBack, canGoForward)`

@@ -85,6 +85,74 @@ impl PointerButton {
     }
 }
 
+/// Engine-neutral cursor shape the page requested — the helper maps the engine's
+/// native cursor type onto this small set, the shell maps it onto its UI cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CursorKind {
+    /// The default arrow.
+    #[default]
+    Default = 0,
+    /// A link / clickable (hand).
+    Pointer = 1,
+    /// Editable text (I-beam).
+    Text = 2,
+    /// A precise target (crosshair).
+    Crosshair = 3,
+    /// Busy / loading.
+    Wait = 4,
+    /// Progress (busy but interactive).
+    Progress = 5,
+    /// Contextual help.
+    Help = 6,
+    /// Move / all-scroll.
+    Move = 7,
+    /// Grab (draggable).
+    Grab = 8,
+    /// Grabbing (mid-drag).
+    Grabbing = 9,
+    /// Not allowed / no-drop.
+    NotAllowed = 10,
+    /// Horizontal resize (E/W, col).
+    ResizeHorizontal = 11,
+    /// Vertical resize (N/S, row).
+    ResizeVertical = 12,
+    /// Diagonal resize ↗↙ (NE/SW).
+    ResizeNeSw = 13,
+    /// Diagonal resize ↘↖ (NW/SE).
+    ResizeNwSe = 14,
+    /// Zoom in.
+    ZoomIn = 15,
+    /// Zoom out.
+    ZoomOut = 16,
+}
+
+impl CursorKind {
+    /// Decode from the wire byte, defaulting unknown values to [`Self::Default`].
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Pointer,
+            2 => Self::Text,
+            3 => Self::Crosshair,
+            4 => Self::Wait,
+            5 => Self::Progress,
+            6 => Self::Help,
+            7 => Self::Move,
+            8 => Self::Grab,
+            9 => Self::Grabbing,
+            10 => Self::NotAllowed,
+            11 => Self::ResizeHorizontal,
+            12 => Self::ResizeVertical,
+            13 => Self::ResizeNeSw,
+            14 => Self::ResizeNwSe,
+            15 => Self::ZoomIn,
+            16 => Self::ZoomOut,
+            _ => Self::Default,
+        }
+    }
+}
+
 /// Keyboard-modifier bitflags, engine-neutral (matches the common egui set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Modifiers(pub u8);
@@ -866,6 +934,12 @@ pub enum EventMsg {
         /// The popup's target URL.
         url: String,
     },
+    /// The engine changed the cursor shape (hover over a link, text field, resize
+    /// edge, …) so the shell can reflect it instead of a static arrow.
+    CursorChanged {
+        /// The engine-neutral cursor shape.
+        kind: CursorKind,
+    },
 }
 
 impl EventMsg {
@@ -946,6 +1020,10 @@ impl EventMsg {
                 out.push(11);
                 put_str(&mut out, url);
             }
+            Self::CursorChanged { kind } => {
+                out.push(12);
+                out.push(*kind as u8);
+            }
         }
         out
     }
@@ -998,6 +1076,9 @@ impl EventMsg {
                 canceled: c.bool()?,
             },
             11 => Self::PopupRequested { url: c.string()? },
+            12 => Self::CursorChanged {
+                kind: CursorKind::from_u8(c.u8()?),
+            },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1340,6 +1421,14 @@ mod tests {
         round_event(&EventMsg::PopupRequested {
             url: "https://example.com/window-open-target".to_owned(),
         });
+        round_event(&EventMsg::CursorChanged {
+            kind: CursorKind::Pointer,
+        });
+        round_event(&EventMsg::CursorChanged {
+            kind: CursorKind::ResizeNwSe,
+        });
+        // Unknown wire bytes decode to the default cursor, never an error.
+        assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }
 
     #[test]
