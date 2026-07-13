@@ -1250,6 +1250,7 @@ mod tests {
             page_zoom_percent: 100,
             find_open: false,
             downloads_open: false,
+            bookmarks_bar_visible: false,
             active_downloads: 0,
             total_downloads: 0,
             power_mode: false,
@@ -1928,7 +1929,7 @@ mod tests {
     fn the_page_family_items_disable_without_a_live_page() {
         // No tab → page/session items grey (Copy URL / Reload / Back / Forward /
         // Add Bookmark / Send in Chat / Share), while the pure chrome layout
-        // toggle remains usable.
+        // toggles remain usable.
         let menus = build_menus(&Snapshot::default());
         for menu in &menus {
             for entry in &menu.entries {
@@ -1937,7 +1938,10 @@ mod tests {
                         item.enabled,
                         matches!(
                             item.label.as_str(),
-                            "Vertical Tabs" | "Show Downloads" | "Open Bookmarks Manager"
+                            "Vertical Tabs"
+                                | "Show Downloads"
+                                | "Show Bookmarks Bar"
+                                | "Open Bookmarks Manager"
                         ),
                         "{} has the expected no-page gate",
                         item.label
