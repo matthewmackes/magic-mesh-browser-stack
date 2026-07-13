@@ -139,6 +139,9 @@ pub const CEF_BROWSER_HOST_SIZE: usize = 592;
 pub const CEF_BROWSER_HOST_CLOSE_BROWSER_OFFSET: usize = 48;
 /// `offsetof(cef_browser_host_t, set_focus)`.
 pub const CEF_BROWSER_HOST_SET_FOCUS_OFFSET: usize = 72;
+/// `offsetof(cef_browser_host_t, set_zoom_level)` — native page zoom (field 15,
+/// reconciled against close_browser=48 and set_focus=72).
+pub const CEF_BROWSER_HOST_SET_ZOOM_LEVEL_OFFSET: usize = 160;
 /// `offsetof(cef_browser_host_t, was_resized)`.
 pub const CEF_BROWSER_HOST_WAS_RESIZED_OFFSET: usize = 304;
 /// `offsetof(cef_browser_host_t, invalidate)`.
@@ -2878,11 +2881,27 @@ fn complete_passkey(browser: *mut c_void, body: &str) {
     execute_java_script(frame, &passkey_complete_script(body));
 }
 
+/// Chromium's zoom convention: `zoom_level = ln(factor) / ln(1.2)` (one level ≈
+/// one Ctrl+/- step). Clamped to the same 25–500% range the shell offers.
+fn zoom_level_for_percent(percent: u16) -> f64 {
+    let clamped = percent.clamp(25, 500);
+    (f64::from(clamped) / 100.0).ln() / 1.2f64.ln()
+}
+
 fn apply_page_zoom(browser: *mut c_void, percent: u16) {
-    let Some(frame) = main_frame(browser) else {
+    // Native browser zoom (layout + images + fixed elements), not a CSS `zoom`
+    // property injection — matches Ctrl+/- semantics in a desktop browser.
+    let Some(host) = browser_host(browser) else {
         return;
     };
-    execute_java_script(frame, &page_zoom_script(percent));
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SET_ZOOM_LEVEL_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is read from `cef_browser_host_t::set_zoom_level`, whose
+    // pinned C signature is `(cef_browser_host_t*, double)`.
+    let callback: unsafe extern "C" fn(*mut c_void, f64) = unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF and remains valid for the call.
+    unsafe { callback(host, zoom_level_for_percent(percent)) };
 }
 
 fn apply_find_in_page(browser: *mut c_void, query: &str, backwards: bool) {

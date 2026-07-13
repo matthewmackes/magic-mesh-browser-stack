@@ -103,11 +103,6 @@ pub(super) fn device_profile_script(
     )
 }
 
-pub(super) fn page_zoom_script(percent: u16) -> String {
-    let percent = percent.clamp(25, 500);
-    format!("(function(){{document.documentElement.style.zoom='{percent}%';}})();")
-}
-
 pub(super) fn find_in_page_script(query: &str, backwards: bool) -> String {
     let query = js_string_literal(query);
     let backwards = if backwards { "true" } else { "false" };

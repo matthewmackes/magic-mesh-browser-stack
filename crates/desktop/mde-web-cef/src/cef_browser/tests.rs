@@ -595,11 +595,25 @@ fn cosmetic_filter_script_installs_and_clears_the_style_element() {
 }
 
 #[test]
-fn page_zoom_and_find_scripts_are_bounded_and_escaped() {
-    assert!(page_zoom_script(125).contains("zoom='125%'"));
-    assert!(page_zoom_script(5).contains("zoom='25%'"));
-    assert!(page_zoom_script(900).contains("zoom='500%'"));
+fn native_zoom_level_follows_chromium_convention_and_clamps() {
+    // zoom_level = ln(factor)/ln(1.2): 100% → 0, 120% → 1 step, ~144% → 2 steps.
+    assert!(zoom_level_for_percent(100).abs() < 1e-9);
+    assert!((zoom_level_for_percent(120) - 1.0).abs() < 1e-9);
+    assert!((zoom_level_for_percent(144) - 2.0).abs() < 0.01);
+    // Below-100% zooms are negative levels.
+    assert!(zoom_level_for_percent(50) < 0.0);
+    // The shell's 25–500% bounds hold even for wild inputs (and ln(0) can never
+    // be reached — percent 0 clamps to 25%).
+    assert_eq!(zoom_level_for_percent(5), zoom_level_for_percent(25));
+    assert_eq!(zoom_level_for_percent(900), zoom_level_for_percent(500));
+    assert!(zoom_level_for_percent(0).is_finite());
+    // Offset reconciliation: set_zoom_level is field 15 of cef_browser_host_t,
+    // anchored by the proven close_browser=48 (field 1) and set_focus=72 (field 4).
+    assert_eq!(CEF_BROWSER_HOST_SET_ZOOM_LEVEL_OFFSET, 40 + 15 * 8);
+}
 
+#[test]
+fn find_scripts_are_bounded_and_escaped() {
     let forward = find_in_page_script("mesh \"ops\"", false);
     assert!(forward.contains(r#"window.find("mesh \"ops\"",false,false"#));
     let backward = find_in_page_script("mesh", true);
