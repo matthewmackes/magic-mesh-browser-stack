@@ -903,20 +903,25 @@ fn apply_input_event(browser: *mut c_void, callbacks: &CefBrowserCallbacks, even
             y,
             button,
             pressed,
+            modifiers,
         } => {
             let (x, y) = callbacks.update_pointer(*x, *y);
             if *pressed {
                 set_host_focus(host, true);
             }
-            send_mouse_click(host, x, y, *button, *pressed);
+            send_mouse_click(host, x, y, *button, *pressed, cef_modifiers(*modifiers));
         }
         InputEvent::PointerGone => {
             let (x, y) = callbacks.pointer_position();
             send_mouse_move(host, x, y, 0, true);
         }
-        InputEvent::Scroll { delta_x, delta_y } => {
+        InputEvent::Scroll {
+            delta_x,
+            delta_y,
+            modifiers,
+        } => {
             let (x, y) = callbacks.pointer_position();
-            send_mouse_wheel(host, x, y, *delta_x, *delta_y);
+            send_mouse_wheel(host, x, y, *delta_x, *delta_y, cef_modifiers(*modifiers));
         }
         InputEvent::Key {
             key,
@@ -2135,11 +2140,20 @@ fn send_mouse_move(host: *mut c_void, x: i32, y: i32, modifiers: c_int, mouse_le
     unsafe { callback(host, event.as_ptr(), if mouse_leave { 1 } else { 0 }) };
 }
 
-fn send_mouse_click(host: *mut c_void, x: i32, y: i32, button: PointerButton, pressed: bool) {
+fn send_mouse_click(
+    host: *mut c_void,
+    x: i32,
+    y: i32,
+    button: PointerButton,
+    pressed: bool,
+    modifiers: c_int,
+) {
     let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SEND_MOUSE_CLICK_EVENT_OFFSET) else {
         return;
     };
-    let event = CefMouseEvent::new(x, y, mouse_button_event_flag(button));
+    // The event modifiers carry both the pressed-button flag CEF tracks AND the
+    // held keyboard modifiers, so Ctrl/Shift/Cmd-click reach the page.
+    let event = CefMouseEvent::new(x, y, mouse_button_event_flag(button) | modifiers);
     // SAFETY: `callback` is read from `cef_browser_host_t::send_mouse_click_event`,
     // whose pinned C signature is `(cef_browser_host_t*, const cef_mouse_event_t*,
     // cef_mouse_button_type_t, int, int)`.
@@ -2157,11 +2171,19 @@ fn send_mouse_click(host: *mut c_void, x: i32, y: i32, button: PointerButton, pr
     };
 }
 
-fn send_mouse_wheel(host: *mut c_void, x: i32, y: i32, delta_x: f32, delta_y: f32) {
+fn send_mouse_wheel(
+    host: *mut c_void,
+    x: i32,
+    y: i32,
+    delta_x: f32,
+    delta_y: f32,
+    modifiers: c_int,
+) {
     let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SEND_MOUSE_WHEEL_EVENT_OFFSET) else {
         return;
     };
-    let event = CefMouseEvent::new(x, y, 0);
+    // Held modifiers reach the page: Ctrl-wheel zoom, Shift-wheel horizontal.
+    let event = CefMouseEvent::new(x, y, modifiers);
     // SAFETY: `callback` is read from `cef_browser_host_t::send_mouse_wheel_event`,
     // whose pinned C signature is `(cef_browser_host_t*, const cef_mouse_event_t*, int, int)`.
     let callback: unsafe extern "C" fn(*mut c_void, *const c_void, c_int, c_int) =

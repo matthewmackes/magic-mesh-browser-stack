@@ -283,6 +283,9 @@ pub enum InputEvent {
         button: PointerButton,
         /// `true` on press, `false` on release.
         pressed: bool,
+        /// Held keyboard modifiers at click time — carries Ctrl/Shift/Cmd-click
+        /// (open-in-tab, extend-selection) through to the engine.
+        modifiers: Modifiers,
     },
     /// The pointer left the view (so the helper can clear hover).
     PointerGone,
@@ -292,6 +295,9 @@ pub enum InputEvent {
         delta_x: f32,
         /// Vertical delta.
         delta_y: f32,
+        /// Held keyboard modifiers — carries ctrl-wheel zoom + shift-wheel
+        /// horizontal scroll through to the engine.
+        modifiers: Modifiers,
     },
     /// A key changed state.
     Key {
@@ -319,18 +325,25 @@ impl InputEvent {
                 y,
                 button,
                 pressed,
+                modifiers,
             } => {
                 out.push(1);
                 put_f32(out, *x);
                 put_f32(out, *y);
                 out.push(*button as u8);
                 out.push(u8::from(*pressed));
+                out.push(modifiers.0);
             }
             Self::PointerGone => out.push(2),
-            Self::Scroll { delta_x, delta_y } => {
+            Self::Scroll {
+                delta_x,
+                delta_y,
+                modifiers,
+            } => {
                 out.push(3);
                 put_f32(out, *delta_x);
                 put_f32(out, *delta_y);
+                out.push(modifiers.0);
             }
             Self::Key {
                 key,
@@ -360,11 +373,13 @@ impl InputEvent {
                 y: c.f32()?,
                 button: PointerButton::from_u8(c.u8()?).ok_or(WireError::BadTag(0))?,
                 pressed: c.bool()?,
+                modifiers: Modifiers(c.u8()?),
             },
             2 => Self::PointerGone,
             3 => Self::Scroll {
                 delta_x: c.f32()?,
                 delta_y: c.f32()?,
+                modifiers: Modifiers(c.u8()?),
             },
             4 => Self::Key {
                 key: KeyCode::from_u16(c.u16()?).ok_or(WireError::BadTag(4))?,
@@ -1150,11 +1165,13 @@ mod tests {
             y: 4.0,
             button: PointerButton::Secondary,
             pressed: true,
+            modifiers: Modifiers(Modifiers::CTRL | Modifiers::SHIFT),
         }));
         round_control(&ControlMsg::Input(InputEvent::PointerGone));
         round_control(&ControlMsg::Input(InputEvent::Scroll {
             delta_x: -2.0,
             delta_y: 40.0,
+            modifiers: Modifiers(Modifiers::CTRL),
         }));
         round_control(&ControlMsg::Input(InputEvent::Key {
             key: KeyCode::Enter,

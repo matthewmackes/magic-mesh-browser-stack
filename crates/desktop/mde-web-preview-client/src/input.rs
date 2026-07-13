@@ -39,15 +39,21 @@ pub fn map_event(event: &Event, pixels_per_point: f32) -> Option<InputEvent> {
             pos,
             button,
             pressed,
+            modifiers,
             ..
         } => Some(InputEvent::PointerButton {
             x: pos.x,
             y: pos.y,
             button: map_button(*button)?,
             pressed: *pressed,
+            modifiers: map_modifiers(*modifiers),
         }),
         Event::PointerGone => Some(InputEvent::PointerGone),
-        Event::MouseWheel { unit, delta, .. } => {
+        Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } => {
             let scale = match unit {
                 egui::MouseWheelUnit::Point => ppp,
                 egui::MouseWheelUnit::Line => LINE_PX * ppp,
@@ -56,6 +62,7 @@ pub fn map_event(event: &Event, pixels_per_point: f32) -> Option<InputEvent> {
             Some(InputEvent::Scroll {
                 delta_x: delta.x * scale,
                 delta_y: delta.y * scale,
+                modifiers: map_modifiers(*modifiers),
             })
         }
         Event::Key {
@@ -211,6 +218,7 @@ mod tests {
                 y: 20.0,
                 button: PointerButton::Secondary,
                 pressed: true,
+                modifiers: Modifiers(0),
             })
         );
     }
@@ -220,13 +228,18 @@ mod tests {
         let ev = Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: vec2(0.0, 3.0),
-            modifiers: EMods::default(),
+            modifiers: EMods {
+                ctrl: true,
+                ..EMods::default()
+            },
         };
         assert_eq!(
             map_event(&ev, 2.0),
             Some(InputEvent::Scroll {
                 delta_x: 0.0,
-                delta_y: 6.0
+                delta_y: 6.0,
+                // Ctrl-wheel forwards the modifier so the page zooms.
+                modifiers: Modifiers(Modifiers::CTRL),
             })
         );
     }
