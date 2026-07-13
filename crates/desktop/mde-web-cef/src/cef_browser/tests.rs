@@ -124,6 +124,22 @@ fn certificate_error_offset_sits_inside_the_request_handler_layout() {
 }
 
 #[test]
+fn jsdialog_offsets_reconcile_with_the_pinned_cef_layout() {
+    // cef_client_t: get_jsdialog_handler is index 11 (base 40 + 11*8 = 128),
+    // sitting between get_permission_handler(120) and get_keyboard_handler(136),
+    // and inside the proven CEF_CLIENT_SIZE=192.
+    assert_eq!(CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET, 40 + 11 * 8);
+    assert!(CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET < CEF_CLIENT_SIZE - 8);
+    // cef_jsdialog_handler_t: on_jsdialog is index 0 (base 40), and the struct is
+    // 4 methods (72 bytes); on_jsdialog fits inside it.
+    assert_eq!(CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET, 40);
+    assert_eq!(CEF_JSDIALOG_HANDLER_SIZE, 40 + 4 * 8);
+    assert!(CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET < CEF_JSDIALOG_HANDLER_SIZE);
+    // The jsdialog callback's cont slot reuses the shared cont offset (40).
+    assert_eq!(CEF_CALLBACK_CONT_OFFSET, 40);
+}
+
+#[test]
 fn popup_render_handler_offsets_sit_between_view_rect_and_paint() {
     // cef_render_handler_t field order pins on_popup_show/on_popup_size between
     // the two offsets this bridge has already proven live (get_view_rect=56,

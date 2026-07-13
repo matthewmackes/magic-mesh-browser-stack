@@ -1029,6 +1029,19 @@ pub enum EventMsg {
         /// A short human-readable description of the failure.
         message: String,
     },
+    /// A page opened a JavaScript dialog (`alert`/`confirm`/`prompt`). The engine
+    /// auto-resolves it synchronously (alert accepted, confirm/prompt cancelled)
+    /// so the page never blocks; this only carries a non-blocking notice the shell
+    /// may surface passively.
+    JsDialog {
+        /// The `cef_jsdialog_type_t` discriminant: `0` = alert, `1` = confirm,
+        /// `2` = prompt.
+        kind: u8,
+        /// The dialog's message text.
+        message: String,
+        /// The origin URL that raised the dialog.
+        origin: String,
+    },
 }
 
 impl EventMsg {
@@ -1135,6 +1148,16 @@ impl EventMsg {
                 put_u32(&mut out, *code as u32);
                 put_str(&mut out, message);
             }
+            Self::JsDialog {
+                kind,
+                message,
+                origin,
+            } => {
+                out.push(16);
+                out.push(*kind);
+                put_str(&mut out, message);
+                put_str(&mut out, origin);
+            }
         }
         out
     }
@@ -1202,6 +1225,11 @@ impl EventMsg {
                 url: c.string()?,
                 code: c.u32()? as i32,
                 message: c.string()?,
+            },
+            16 => Self::JsDialog {
+                kind: c.u8()?,
+                message: c.string()?,
+                origin: c.string()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1586,6 +1614,16 @@ mod tests {
             url: "https://bad.example".to_owned(),
             code: -202,
             message: "The certificate is not trusted (unknown authority)".to_owned(),
+        });
+        round_event(&EventMsg::JsDialog {
+            kind: 0,
+            message: "This page says: saved!".to_owned(),
+            origin: "https://app.example/".to_owned(),
+        });
+        round_event(&EventMsg::JsDialog {
+            kind: 2,
+            message: String::new(),
+            origin: "https://prompt.example/".to_owned(),
         });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);

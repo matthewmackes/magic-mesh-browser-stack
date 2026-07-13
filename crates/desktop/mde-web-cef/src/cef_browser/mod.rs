@@ -69,6 +69,16 @@ pub const CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET: usize = 72;
 pub const CEF_CLIENT_GET_FIND_HANDLER_OFFSET: usize = 96;
 /// `offsetof(cef_client_t, get_download_handler)` — download interception (field 5).
 pub const CEF_CLIENT_GET_DOWNLOAD_HANDLER_OFFSET: usize = 80;
+/// `offsetof(cef_client_t, get_jsdialog_handler)` — alert()/confirm()/prompt()
+/// handler (index 11 in the pinned CEF 149 client vtable: base 40 + 11*8 = 128,
+/// between get_permission_handler=120 and get_keyboard_handler=136).
+pub const CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET: usize = 128;
+/// `sizeof(cef_jsdialog_handler_t)` (4 fn ptrs + 40 base): on_jsdialog(40),
+/// on_before_unload_dialog(48), on_reset_dialog_state(56), on_dialog_closed(64).
+/// We register only on_jsdialog; the other three slots stay null.
+pub const CEF_JSDIALOG_HANDLER_SIZE: usize = 72;
+/// `offsetof(cef_jsdialog_handler_t, on_jsdialog)` — the only method we register.
+pub const CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET: usize = 40;
 /// `sizeof(cef_download_handler_t)` (3 fn ptrs + 40 base).
 pub const CEF_DOWNLOAD_HANDLER_SIZE: usize = 64;
 /// `offsetof(cef_download_handler_t, can_download)`.
@@ -1207,6 +1217,7 @@ struct CefBrowserCallbacks {
     load: Box<CefCallbackBlock<CEF_LOAD_HANDLER_SIZE>>,
     find: Box<CefCallbackBlock<CEF_FIND_HANDLER_SIZE>>,
     download: Box<CefCallbackBlock<CEF_DOWNLOAD_HANDLER_SIZE>>,
+    jsdialog: Box<CefCallbackBlock<CEF_JSDIALOG_HANDLER_SIZE>>,
 }
 
 impl CefBrowserCallbacks {
@@ -1238,6 +1249,7 @@ impl CefBrowserCallbacks {
             load: Box::new(CefCallbackBlock::new(CEF_LOAD_HANDLER_SIZE)),
             find: Box::new(CefCallbackBlock::new(CEF_FIND_HANDLER_SIZE)),
             download: Box::new(CefCallbackBlock::new(CEF_DOWNLOAD_HANDLER_SIZE)),
+            jsdialog: Box::new(CefCallbackBlock::new(CEF_JSDIALOG_HANDLER_SIZE)),
         };
         callbacks.install();
         Ok(callbacks)
@@ -1374,6 +1386,18 @@ impl CefBrowserCallbacks {
             CEF_DOWNLOAD_HANDLER_ON_BEFORE_DOWNLOAD_OFFSET,
             fn_ptr(on_before_download as *const ()),
         );
+        // JS dialogs (alert/confirm/prompt): emit a non-blocking notice to the
+        // shell and auto-resolve the dialog so the page never hangs. Kept off the
+        // size-keyed `lookup_peer` (its sizeof 72 collides with the load handler)
+        // by carrying a dedicated `jsdialog_handler_ptr`, mirroring the print path.
+        self.client.put_fn(
+            CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET,
+            fn_ptr(get_jsdialog_handler as *const ()),
+        );
+        self.jsdialog.put_fn(
+            CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET,
+            fn_ptr(on_jsdialog as *const ()),
+        );
 
         let state = self.state.as_ref() as *const CefBrowserState as usize;
         self.state
@@ -1391,6 +1415,9 @@ impl CefBrowserCallbacks {
         self.state
             .download_handler_ptr
             .store(self.download.as_usize(), Ordering::SeqCst);
+        self.state
+            .jsdialog_handler_ptr
+            .store(self.jsdialog.as_usize(), Ordering::SeqCst);
         let mut registry = registry().lock().expect("cef callback registry");
         registry.insert(self.client.as_usize(), state);
         registry.insert(self.life_span.as_usize(), state);
@@ -1402,6 +1429,7 @@ impl CefBrowserCallbacks {
         registry.insert(self.load.as_usize(), state);
         registry.insert(self.find.as_usize(), state);
         registry.insert(self.download.as_usize(), state);
+        registry.insert(self.jsdialog.as_usize(), state);
     }
 
     fn client_ptr(&self) -> *mut c_void {
@@ -1651,6 +1679,10 @@ struct CefBrowserState {
     load_handler_ptr: AtomicUsize,
     find_handler_ptr: AtomicUsize,
     download_handler_ptr: AtomicUsize,
+    /// The jsdialog handler block address (alert/confirm/prompt). Stored directly
+    /// like `print_handler_ptr` because its sizeof (72) collides with the load
+    /// handler under the size-keyed `lookup_peer`.
+    jsdialog_handler_ptr: AtomicUsize,
     string_userfree_free: CefStringUserfreeUtf16Free,
     /// `cef_string_list_size` / `cef_string_list_value` exports (dlsym'd via the
     /// ABI), used to read the favicon `icon_urls` list in `on_favicon_urlchange`.
@@ -1717,6 +1749,7 @@ impl CefBrowserState {
             load_handler_ptr: AtomicUsize::new(0),
             find_handler_ptr: AtomicUsize::new(0),
             download_handler_ptr: AtomicUsize::new(0),
+            jsdialog_handler_ptr: AtomicUsize::new(0),
             string_userfree_free,
             string_list_size,
             string_list_value,
@@ -2134,6 +2167,22 @@ impl CefBrowserState {
             url,
             code,
             message: message.to_owned(),
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// A page opened a JS dialog (alert/confirm/prompt). Forward a non-blocking
+    /// notice to the shell (which may later surface a passive notice); the engine
+    /// itself auto-resolves the dialog so the page never hangs.
+    fn publish_js_dialog(&self, kind: u8, message: String, origin: String) {
+        let event = EventMsg::JsDialog {
+            kind,
+            message,
+            origin,
         };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
@@ -2620,6 +2669,46 @@ unsafe extern "C" fn get_download_handler(self_: *mut c_void) -> *mut c_void {
     with_state(self_, |state| state.download_ptr()).unwrap_or(ptr::null_mut())
 }
 
+unsafe extern "C" fn get_jsdialog_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.jsdialog_ptr()).unwrap_or(ptr::null_mut())
+}
+
+/// CEF `on_jsdialog(self, browser, origin_url, dialog_type, message_text,
+/// default_prompt_text, callback, suppress_message)` — the page called
+/// `alert()`/`confirm()`/`prompt()`. v1: emit a non-blocking notice to the shell
+/// and resolve the dialog synchronously so the page never blocks. `alert`
+/// (type 0) is accepted (`cont(1, …)`); `confirm`/`prompt` are auto-cancelled
+/// (`cont(0, …)`, safe default). No callback retention, no shell round-trip. We
+/// set `*suppress_message = 0` (do not let CEF pop its own native dialog) and
+/// return 1 (handled).
+unsafe extern "C" fn on_jsdialog(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    origin_url: *const CefString,
+    dialog_type: c_int,
+    message_text: *const CefString,
+    _default_prompt_text: *const CefString,
+    callback: *mut c_void,
+    suppress_message: *mut c_int,
+) -> c_int {
+    let origin = cef_string_to_string(origin_url);
+    let message = cef_string_to_string(message_text);
+    let kind = u8::try_from(dialog_type).unwrap_or(0);
+    let _ = with_state(self_, |state| {
+        state.publish_js_dialog(kind, message, origin)
+    });
+    // Auto-resolve: accept an alert, cancel a confirm/prompt (never "OK" a
+    // confirm the user never saw). Null user_input == empty prompt text.
+    let success: c_int = c_int::from(dialog_type == 0);
+    continue_jsdialog_callback(callback, success);
+    if !suppress_message.is_null() {
+        // SAFETY: CEF passes a writable `int*` for the callback duration; 0 means
+        // "do not suppress our handling" — CEF must not raise its own dialog.
+        unsafe { *suppress_message = 0 };
+    }
+    1
+}
+
 /// Read a `cef_string_userfree_t`-returning getter at `offset` off a CEF object,
 /// copying then freeing with the matching libcef symbol (mirrors `request_url`).
 fn download_item_string(
@@ -2926,16 +3015,19 @@ impl CefBrowserState {
         self.print_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
-    // These four resolve their handler block DIRECTLY from the owned field
-    // (like `print_ptr`/`client_ptr`), NOT via the size-keyed `lookup_peer`.
-    // `lookup_peer` gates on `callback_size()`'s whitelist, which does NOT list
-    // the display(144)/load(72)/find(48)/download(64) sizes — so routing these
-    // through it returned NULL, silently disabling on_address_change/title/
-    // favicon/cursor, loading-state, find results, and download interception on
-    // live CEF (unit tests never exercise the real vtable). `as_mut_ptr()` is the
-    // exact pointer each block is registered under, so the callbacks still resolve
-    // their state. find(48) also aliases pdf_print_callback(48), so a whitelist
-    // fix would mis-resolve — direct access is the only collision-proof answer.
+    fn jsdialog_ptr(&self) -> *mut c_void {
+        self.jsdialog_handler_ptr.load(Ordering::SeqCst) as *mut c_void
+    }
+
+    // These four resolve their handler block DIRECTLY via a cached pointer set at
+    // install() time (like `print_ptr`/`jsdialog_ptr`), NOT via the size-keyed
+    // `lookup_peer`. `lookup_peer` gates on `callback_size()`'s whitelist, which
+    // does NOT list the display(144)/load(72)/find(48)/download(64) sizes — so
+    // routing these through it returned NULL, silently disabling on_address_change/
+    // title/favicon/cursor, loading-state, find results, and download interception
+    // on live CEF (unit tests never exercise the real vtable). find(48) also
+    // aliases pdf_print_callback(48), so a whitelist fix would mis-resolve — a
+    // dedicated cached pointer is the only collision-proof answer.
     fn display_ptr(&self) -> *mut c_void {
         self.display_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
@@ -3907,6 +3999,23 @@ fn continue_cef_callback(callback: *mut c_void) {
 
 fn cancel_cef_callback(callback: *mut c_void) {
     call_ref_counted_void(callback, CEF_CALLBACK_CANCEL_OFFSET);
+}
+
+/// Invoke `cef_jsdialog_callback_t::cont(self, success, user_input)`. Unlike the
+/// download/resource `cont` (which takes only `self`), the jsdialog callback
+/// carries `int success` + a `const cef_string_t* user_input`; we pass a null
+/// string (empty input). No-op if the slot is null.
+fn continue_jsdialog_callback(callback: *mut c_void, success: c_int) {
+    let Some(cont) = read_fn(callback, CEF_CALLBACK_CONT_OFFSET) else {
+        return;
+    };
+    // SAFETY: read from `cef_jsdialog_callback_t::cont`, whose pinned C signature
+    // is `void (*)(cef_jsdialog_callback_t*, int, const cef_string_t*)`.
+    let cont: unsafe extern "C" fn(*mut c_void, c_int, *const CefString) =
+        unsafe { std::mem::transmute(cont) };
+    // SAFETY: `callback` is the live CEF callback for this invocation; a null
+    // `cef_string_t*` means empty user input (accepted by CEF).
+    unsafe { cont(callback, success, ptr::null()) };
 }
 
 fn call_ref_counted_void(object: *mut c_void, offset: usize) {

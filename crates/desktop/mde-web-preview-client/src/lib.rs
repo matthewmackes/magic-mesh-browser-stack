@@ -65,7 +65,8 @@ pub use filter::{resource_from_wire, resource_to_wire, RequestFilter, SafeBrowsi
 pub use frame::{FrameReader, FrameSnapshot, PixelFormat, ReaderError};
 pub use input::map_event;
 pub use session::{
-    CertError, NavState, PasskeyRequestStatus, ResourceRequestStatus, SessionState, WebSession,
+    CertError, JsDialog, NavState, PasskeyRequestStatus, ResourceRequestStatus, SessionState,
+    WebSession,
 };
 pub use wire::{ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, WireError};
 

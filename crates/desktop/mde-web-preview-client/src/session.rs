@@ -140,6 +140,19 @@ pub struct CertError {
     pub message: String,
 }
 
+/// A JavaScript dialog (`alert`/`confirm`/`prompt`) a page raised. The engine
+/// auto-resolves it synchronously (alert accepted, confirm/prompt cancelled) so
+/// the page never blocks; the shell may surface this as a passive notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsDialog {
+    /// `0` = alert, `1` = confirm, `2` = prompt.
+    pub kind: u8,
+    /// The dialog's message text.
+    pub message: String,
+    /// The origin URL that raised the dialog.
+    pub origin: String,
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
@@ -172,6 +185,9 @@ pub struct WebSession {
     /// The latest TLS/certificate error that blocked a load (if any). Cleared on
     /// a fresh navigation; drives the shell's "Not secure — blocked" interstitial.
     cert_error: Option<CertError>,
+    /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
+    /// already auto-resolved it; this is a passive notice for the shell.
+    pending_js_dialog: Option<JsDialog>,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -210,6 +226,7 @@ impl WebSession {
             favicon: None,
             find_result: None,
             cert_error: None,
+            pending_js_dialog: None,
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -435,6 +452,17 @@ impl WebSession {
             EventMsg::CertError { url, code, message } => {
                 self.cert_error = Some(CertError { url, code, message });
             }
+            EventMsg::JsDialog {
+                kind,
+                message,
+                origin,
+            } => {
+                self.pending_js_dialog = Some(JsDialog {
+                    kind,
+                    message,
+                    origin,
+                });
+            }
             EventMsg::FindResult { count, active, .. } => {
                 self.find_result = Some((active, count));
             }
@@ -593,6 +621,14 @@ impl WebSession {
     #[must_use]
     pub const fn cert_error(&self) -> Option<&CertError> {
         self.cert_error.as_ref()
+    }
+
+    /// The latest JavaScript dialog (alert/confirm/prompt) a page raised. The
+    /// engine already auto-resolved it (the page did not block); the shell may
+    /// surface this as a passive, non-blocking notice.
+    #[must_use]
+    pub const fn pending_js_dialog(&self) -> Option<&JsDialog> {
+        self.pending_js_dialog.as_ref()
     }
 
     /// Clear the page-find selection/highlight where the helper supports it.
@@ -1092,6 +1128,34 @@ mod tests {
         assert!(
             session.cert_error().is_none(),
             "cert error cleared on the next load"
+        );
+    }
+
+    #[test]
+    fn js_dialog_notice_is_exposed_to_the_shell() {
+        let (mut session, peer) = filtered_session();
+        assert!(
+            session.pending_js_dialog().is_none(),
+            "no dialog before any event"
+        );
+        send_event(
+            &peer,
+            &EventMsg::JsDialog {
+                kind: 1,
+                message: "Delete this item?".to_owned(),
+                origin: "https://app.example/".to_owned(),
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(
+            session.pending_js_dialog(),
+            Some(&JsDialog {
+                kind: 1,
+                message: "Delete this item?".to_owned(),
+                origin: "https://app.example/".to_owned(),
+            })
         );
     }
 
