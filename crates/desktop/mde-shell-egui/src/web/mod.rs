@@ -133,6 +133,10 @@ const CHROME_FONT: f32 = 10.0;
 const CHROME_BUTTON: f32 = 20.0;
 const CHROME_TAB_H: f32 = 22.0;
 const CHROME_TAB_W: f32 = 132.0;
+/// The floor a horizontal tab pill shrinks to once the strip is crowded. Below
+/// this the strip stops shrinking and scrolls horizontally instead of wrapping
+/// onto a second row (the standard desktop-browser overflow behaviour).
+const CHROME_TAB_MIN_W: f32 = 54.0;
 const CHROME_TAB_CLOSE: f32 = 18.0;
 const CHROME_NEW_TAB_W: f32 = 58.0;
 const CHROME_OMNIBOX_H: f32 = 22.0;
@@ -3328,108 +3332,162 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
-    ui.horizontal_wrapped(|ui| {
-        for (idx, tab) in state.tabs.iter().enumerate() {
-            let active = idx == state.active;
-            let label = tab_label(tab);
-            let tab_response = tab_pill(ui, &label, active);
-            if tab_response.clicked() {
-                select = Some(idx);
-            }
-            // Middle-click closes the tab under the pointer (the ubiquitous
-            // desktop-browser gesture) — same seam as the inline × button.
-            if tab_response.middle_clicked() {
-                close = Some(idx);
-            }
-            tab_response
-                .on_hover_text(tab_hover(tab))
-                .context_menu(|ui| {
-                    if ui
-                        .add_enabled(idx > 0, compact_menu_item("Move tab left"))
-                        .clicked()
-                    {
-                        move_tab = Some((idx, idx - 1));
-                        ui.close_menu();
+
+    // Overflow (BROWSER tabstrip): pills shrink toward a floor as they multiply;
+    // once at the floor the strip scrolls horizontally in ONE row instead of
+    // wrapping onto stacked rows.
+    let pill_width = horizontal_tab_pill_width(ui.available_width(), state.tabs.len());
+
+    // Scroll the active pill into view only when the active tab actually CHANGED,
+    // so the operator can still scroll the strip freely while a tab stays selected.
+    let last_active_id = egui::Id::new("browser-horizontal-tabs-last-active");
+    let active_changed =
+        ui.ctx().data(|d| d.get_temp::<usize>(last_active_id)) != Some(state.active);
+
+    // Drag-reorder bookkeeping: every pill's laid-out rect (in tab order), plus the
+    // pill under a settled drag and where it was dropped.
+    let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut drag_from: Option<usize> = None;
+    let mut drop_pointer: Option<egui::Pos2> = None;
+
+    egui::ScrollArea::horizontal()
+        .id_salt("browser-horizontal-tabs")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (idx, tab) in state.tabs.iter().enumerate() {
+                    let active = idx == state.active;
+                    let label = tab_label(tab);
+                    let tab_response = tab_pill_sized(ui, &label, active, pill_width);
+                    pill_rects.push((idx, tab_response.rect));
+                    if tab_response.clicked() {
+                        select = Some(idx);
                     }
-                    if ui
-                        .add_enabled(
-                            idx + 1 < state.tabs.len(),
-                            compact_menu_item("Move tab right"),
-                        )
-                        .clicked()
-                    {
-                        move_tab = Some((idx, idx + 1));
-                        ui.close_menu();
-                    }
-                    let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                    if ui.add(compact_menu_item(mute_label)).clicked() {
-                        mute_tab = Some((idx, !tab.muted));
-                        ui.close_menu();
-                    }
-                    let dark_label = if tab.force_dark {
-                        "Disable force dark"
-                    } else {
-                        "Enable force dark"
-                    };
-                    if ui.add(compact_menu_item(dark_label)).clicked() {
-                        force_dark_tab = Some((idx, !tab.force_dark));
-                        ui.close_menu();
-                    }
-                    let reader_label = if tab.reader_mode {
-                        "Disable reader mode"
-                    } else {
-                        "Enable reader mode"
-                    };
-                    if ui.add(compact_menu_item(reader_label)).clicked() {
-                        reader_tab = Some((idx, !tab.reader_mode));
-                        ui.close_menu();
-                    }
-                    let scripts_label = if tab.user_scripts {
-                        "Disable userscripts"
-                    } else {
-                        "Enable userscripts"
-                    };
-                    if ui.add(compact_menu_item(scripts_label)).clicked() {
-                        user_scripts_tab = Some((idx, !tab.user_scripts));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    for container in ContainerProfile::ALL {
-                        if ui
-                            .add_enabled(
-                                tab.container != container,
-                                compact_menu_item(container.label()),
-                            )
-                            .clicked()
-                        {
-                            container_tab = Some((idx, container));
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    for display_target in DisplayTarget::ALL {
-                        if ui
-                            .add_enabled(
-                                tab.display_target != display_target,
-                                compact_menu_item(display_target.label()),
-                            )
-                            .clicked()
-                        {
-                            display_tab = Some((idx, display_target));
-                            ui.close_menu();
-                        }
-                    }
-                    if ui.add(compact_menu_item("Close tab")).clicked() {
+                    // Middle-click closes the tab under the pointer (the ubiquitous
+                    // desktop-browser gesture) — same seam as the inline × button.
+                    if tab_response.middle_clicked() {
                         close = Some(idx);
-                        ui.close_menu();
                     }
-                });
-            if inline_close_button(ui).clicked() {
-                close = Some(idx);
+                    // A settled horizontal drag reorders the tab to where it was
+                    // dropped; egui's own click/drag threshold keeps a plain click
+                    // (activate) and a middle-click (close) intact.
+                    if tab_response.drag_stopped() {
+                        drag_from = Some(idx);
+                        drop_pointer = tab_response.interact_pointer_pos();
+                    }
+                    if active && active_changed {
+                        tab_response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    tab_response
+                        .on_hover_text(tab_hover(tab))
+                        .context_menu(|ui| {
+                            if ui
+                                .add_enabled(idx > 0, compact_menu_item("Move tab left"))
+                                .clicked()
+                            {
+                                move_tab = Some((idx, idx - 1));
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    idx + 1 < state.tabs.len(),
+                                    compact_menu_item("Move tab right"),
+                                )
+                                .clicked()
+                            {
+                                move_tab = Some((idx, idx + 1));
+                                ui.close_menu();
+                            }
+                            let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
+                            if ui.add(compact_menu_item(mute_label)).clicked() {
+                                mute_tab = Some((idx, !tab.muted));
+                                ui.close_menu();
+                            }
+                            let dark_label = if tab.force_dark {
+                                "Disable force dark"
+                            } else {
+                                "Enable force dark"
+                            };
+                            if ui.add(compact_menu_item(dark_label)).clicked() {
+                                force_dark_tab = Some((idx, !tab.force_dark));
+                                ui.close_menu();
+                            }
+                            let reader_label = if tab.reader_mode {
+                                "Disable reader mode"
+                            } else {
+                                "Enable reader mode"
+                            };
+                            if ui.add(compact_menu_item(reader_label)).clicked() {
+                                reader_tab = Some((idx, !tab.reader_mode));
+                                ui.close_menu();
+                            }
+                            let scripts_label = if tab.user_scripts {
+                                "Disable userscripts"
+                            } else {
+                                "Enable userscripts"
+                            };
+                            if ui.add(compact_menu_item(scripts_label)).clicked() {
+                                user_scripts_tab = Some((idx, !tab.user_scripts));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            for container in ContainerProfile::ALL {
+                                if ui
+                                    .add_enabled(
+                                        tab.container != container,
+                                        compact_menu_item(container.label()),
+                                    )
+                                    .clicked()
+                                {
+                                    container_tab = Some((idx, container));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            for display_target in DisplayTarget::ALL {
+                                if ui
+                                    .add_enabled(
+                                        tab.display_target != display_target,
+                                        compact_menu_item(display_target.label()),
+                                    )
+                                    .clicked()
+                                {
+                                    display_tab = Some((idx, display_target));
+                                    ui.close_menu();
+                                }
+                            }
+                            if ui.add(compact_menu_item("Close tab")).clicked() {
+                                close = Some(idx);
+                                ui.close_menu();
+                            }
+                        });
+                    if inline_close_button(ui).clicked() {
+                        close = Some(idx);
+                    }
+                }
+                engine_new_tab_buttons(ui, state, false);
+            });
+        });
+
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(last_active_id, state.active));
+
+    // Resolve a settled drag to a concrete reorder against the laid-out pills.
+    if let (Some(from), Some(pointer)) = (drag_from, drop_pointer) {
+        if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Horizontal) {
+            if to != from {
+                move_tab = Some((from, to));
             }
         }
-        engine_new_tab_buttons(ui, state, false);
-    });
+    }
+
+    #[cfg(test)]
+    {
+        let rects: Vec<egui::Rect> = pill_rects.iter().map(|(_, r)| *r).collect();
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(tab_pill_rects_id(), rects));
+    }
+
     if let Some((idx, muted)) = mute_tab {
         state.select_tab(idx);
         state.set_active_tab_muted(muted);
@@ -3467,6 +3525,13 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
+
+    // Drag-reorder bookkeeping mirrors the horizontal strip, but the drop point is
+    // matched along Y — a vertical drag reorders the stacked pills.
+    let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut drag_from: Option<usize> = None;
+    let mut drop_pointer: Option<egui::Pos2> = None;
+
     egui::Frame::NONE
         .fill(Style::SURFACE)
         .inner_margin(egui::Margin::same(4))
@@ -3483,6 +3548,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             let width = (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
                                 .max(CHROME_NEW_TAB_W);
                             let resp = tab_pill_sized(ui, &label, active, width);
+                            pill_rects.push((idx, resp.rect));
                             if resp.clicked() {
                                 select = Some(idx);
                             }
@@ -3490,6 +3556,12 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             // horizontal strip.
                             if resp.middle_clicked() {
                                 close = Some(idx);
+                            }
+                            // A settled vertical drag reorders this pill to where it
+                            // was dropped (matched along Y).
+                            if resp.drag_stopped() {
+                                drag_from = Some(idx);
+                                drop_pointer = resp.interact_pointer_pos();
                             }
                             resp.on_hover_text(tab_hover(tab)).context_menu(|ui| {
                                 if ui
@@ -3580,6 +3652,23 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                     engine_new_tab_buttons(ui, state, true);
                 });
         });
+
+    // Resolve a settled vertical drag to a concrete reorder against the pills.
+    if let (Some(from), Some(pointer)) = (drag_from, drop_pointer) {
+        if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Vertical) {
+            if to != from {
+                move_tab = Some((from, to));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    {
+        let rects: Vec<egui::Rect> = pill_rects.iter().map(|(_, r)| *r).collect();
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(tab_pill_rects_id(), rects));
+    }
+
     if let Some((idx, muted)) = mute_tab {
         state.select_tab(idx);
         state.set_active_tab_muted(muted);
@@ -3634,6 +3723,63 @@ fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: boo
     }
 }
 
+/// Which way a tab strip runs, so the shared drag-reorder hit-test knows whether
+/// to compare drop points along X (horizontal strip) or Y (vertical strip).
+#[derive(Clone, Copy)]
+enum TabAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Distance from a pill rect's centre to `point` along the strip's running axis.
+fn tab_axis_distance(rect: egui::Rect, point: egui::Pos2, axis: TabAxis) -> f32 {
+    match axis {
+        TabAxis::Horizontal => (rect.center().x - point.x).abs(),
+        TabAxis::Vertical => (rect.center().y - point.y).abs(),
+    }
+}
+
+/// Given the laid-out tab pill rects (in tab order) and where a drag was
+/// released, return the tab index whose slot the dragged tab should take — the
+/// pill whose centre is nearest the drop point along the strip's axis. Reused by
+/// both strip variants so horizontal and vertical drag-reorder share one rule.
+fn tab_drag_target_index(
+    pills: &[(usize, egui::Rect)],
+    drop: egui::Pos2,
+    axis: TabAxis,
+) -> Option<usize> {
+    pills
+        .iter()
+        .min_by(|(_, a), (_, b)| {
+            let da = tab_axis_distance(*a, drop, axis);
+            let db = tab_axis_distance(*b, drop, axis);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| *idx)
+}
+
+/// The width of each pill in the single-row horizontal strip: full width when the
+/// strip is roomy, shrinking toward [`CHROME_TAB_MIN_W`] as tabs multiply. Once at
+/// the floor the strip scrolls horizontally rather than wrapping onto stacked rows
+/// (the industry-standard tab overflow behaviour).
+fn horizontal_tab_pill_width(available: f32, tab_count: usize) -> f32 {
+    let tab_count = tab_count.max(1) as f32;
+    // Each pill also carries its inline close button plus the item spacing on both
+    // sides; reserve that so the *visible* pill width is honest and the fit
+    // estimate lines up with the real layout.
+    let per_slot_overhead = CHROME_TAB_CLOSE + 2.0 * CHROME_GAP;
+    let per_tab = available / tab_count - per_slot_overhead;
+    per_tab.clamp(CHROME_TAB_MIN_W, CHROME_TAB_W)
+}
+
+/// The egui temp-memory key under which the horizontal/vertical strips stash the
+/// laid-out pill rects, so egui-driven tests can aim pointer drags at real pill
+/// centres (Buttons have no stable id to `read_response`).
+#[cfg(test)]
+fn tab_pill_rects_id() -> egui::Id {
+    egui::Id::new("browser-test-tab-pill-rects")
+}
+
 fn tab_pill(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     tab_pill_sized(ui, label, active, CHROME_TAB_W)
 }
@@ -3645,10 +3791,14 @@ fn tab_pill_sized(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> e
     } else {
         Style::SURFACE
     };
+    // `click_and_drag` so the same pill activates on a plain click, closes on a
+    // middle-click, AND reorders on a horizontal/vertical drag. egui's built-in
+    // click-vs-drag threshold (`max_click_dist`, 6pt) keeps a click a click.
     ui.add(
         egui::Button::new(RichText::new(label).size(CHROME_FONT).color(color))
             .fill(fill)
-            .min_size(egui::vec2(width, CHROME_TAB_H)),
+            .min_size(egui::vec2(width, CHROME_TAB_H))
+            .sense(Sense::click_and_drag()),
     )
 }
 
