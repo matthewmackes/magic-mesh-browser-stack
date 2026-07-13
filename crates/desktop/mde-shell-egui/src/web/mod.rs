@@ -201,6 +201,22 @@ struct Tab {
     /// drag-resize drives the helper's CSS viewport once, not every frame
     /// (browser-1).
     resizer: ViewportResizer,
+    /// The decoded favicon texture cache for this tab, keyed to the fingerprint of
+    /// the [`WebSession::favicon`] PNG bytes it was built from — a favicon is
+    /// PNG-decoded once per distinct set of bytes, not every frame (§Q7 bound).
+    /// `None` until the page reports its first favicon; `Some` with an inner
+    /// `texture: None` records "these exact bytes failed to decode" so a
+    /// malformed favicon isn't retried every frame either.
+    favicon_cache: Option<FaviconCache>,
+}
+
+/// One tab's decoded-favicon cache slot. See [`Tab::favicon_cache`].
+#[derive(Clone)]
+struct FaviconCache {
+    /// A cheap hash of the PNG bytes the cached texture was decoded from.
+    fingerprint: u64,
+    /// The uploaded texture, or `None` when those bytes failed to PNG-decode.
+    texture: Option<TextureHandle>,
 }
 
 /// How long a new panel device size must hold steady before it is committed to the
@@ -1135,6 +1151,7 @@ impl WebState {
             texture: None,
             last_frame: None,
             resizer: ViewportResizer::default(),
+            favicon_cache: None,
         });
         self.active = self.tabs.len() - 1;
         self.publish_session_snapshot();
@@ -3761,6 +3778,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     // wrapping onto stacked rows.
     let pill_width = horizontal_tab_pill_width(ui.available_width(), state.tabs.len());
 
+    // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
+    // below — see `resolve_tab_favicon_textures`.
+    let favicon_textures = resolve_tab_favicon_textures(ui.ctx(), &mut state.tabs);
+
     // Scroll the active pill into view only when the active tab actually CHANGED,
     // so the operator can still scroll the strip freely while a tab stays selected.
     let last_active_id = egui::Id::new("browser-horizontal-tabs-last-active");
@@ -3781,6 +3802,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                 for (idx, tab) in state.tabs.iter().enumerate() {
                     let active = idx == state.active;
                     let label = tab_label(tab);
+                    tab_favicon_image(ui, favicon_textures.get(idx).and_then(Option::as_ref));
                     let tab_response = tab_pill_sized(ui, &label, active, pill_width);
                     pill_rects.push((idx, tab_response.rect));
                     if tab_response.clicked() {
@@ -3955,6 +3977,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut drag_from: Option<usize> = None;
     let mut drop_pointer: Option<egui::Pos2> = None;
 
+    // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
+    // below — see `resolve_tab_favicon_textures`.
+    let favicon_textures = resolve_tab_favicon_textures(ui.ctx(), &mut state.tabs);
+
     egui::Frame::NONE
         .fill(Style::SURFACE)
         .inner_margin(egui::Margin::same(4))
@@ -3968,6 +3994,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         let active = idx == state.active;
                         let label = tab_label(tab);
                         ui.horizontal(|ui| {
+                            tab_favicon_image(
+                                ui,
+                                favicon_textures.get(idx).and_then(Option::as_ref),
+                            );
                             let width = (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
                                 .max(CHROME_NEW_TAB_W);
                             let resp = tab_pill_sized(ui, &label, active, width);
@@ -4315,6 +4345,86 @@ fn tab_hover(tab: &Tab) -> String {
         format!(
             "{state} - {url}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
+    }
+}
+
+/// A cheap fingerprint of a favicon's PNG bytes, so [`tab_favicon_texture`] can
+/// tell "the same favicon as last frame" from "the page just reported a new one"
+/// without diffing the byte vector itself on every frame.
+fn favicon_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Resolve this tab's favicon texture for the current frame.
+///
+/// Reuses [`Tab::favicon_cache`] when the underlying PNG bytes are unchanged from
+/// last frame; otherwise PNG-decodes via the same `png`-crate path the boot
+/// splash / offline-cache viewport already use ([`crate::chooser::decode_png_rgba`])
+/// and caches the result. A decode failure caches an honest `None` rather than
+/// panicking or re-attempting the decode every frame (§7).
+fn tab_favicon_texture(ctx: &egui::Context, tab: &mut Tab) -> Option<TextureHandle> {
+    let bytes = tab.session.favicon()?;
+    let fingerprint = favicon_fingerprint(bytes);
+    if let Some(cache) = &tab.favicon_cache {
+        if cache.fingerprint == fingerprint {
+            return cache.texture.clone();
+        }
+    }
+    let texture = crate::chooser::decode_png_rgba(bytes).map(|image| {
+        ctx.load_texture(
+            format!("browser-tab-favicon::{fingerprint:x}"),
+            image,
+            TextureOptions::LINEAR,
+        )
+    });
+    tab.favicon_cache = Some(FaviconCache {
+        fingerprint,
+        texture: texture.clone(),
+    });
+    texture
+}
+
+/// Resolve (and cache) every tab's favicon texture for this frame, in tab order.
+///
+/// One mutable pass over `tabs` up front, so the tab-strip render loops below —
+/// which already borrow each `Tab` by shared reference while building its pill
+/// label + context menu — can index into the returned slice instead of fighting
+/// this cache for a second `&mut Tab`.
+fn resolve_tab_favicon_textures(
+    ctx: &egui::Context,
+    tabs: &mut [Tab],
+) -> Vec<Option<TextureHandle>> {
+    tabs.iter_mut()
+        .map(|tab| tab_favicon_texture(ctx, tab))
+        .collect()
+}
+
+/// The favicon slot's fixed size — small enough to sit inline with the pill's
+/// [`CHROME_FONT`] label, matching the desktop-browser convention of a page icon
+/// immediately left of its tab title.
+const TAB_FAVICON_SIZE: f32 = 16.0;
+
+/// Draw one tab's favicon slot immediately before its pill.
+///
+/// Paints the decoded texture when one resolved this frame; otherwise reserves
+/// the same [`TAB_FAVICON_SIZE`] square blank — the pill's own state glyph
+/// (`●`/`◌`/`!`, from [`tab_label`]) already carries "no favicon yet", so there is
+/// no separate placeholder icon to draw, and reserving the space either way keeps
+/// every pill's leading edge aligned regardless of whether its favicon has loaded.
+fn tab_favicon_image(ui: &mut egui::Ui, texture: Option<&TextureHandle>) {
+    let size = egui::vec2(TAB_FAVICON_SIZE, TAB_FAVICON_SIZE);
+    match texture {
+        Some(handle) => {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                handle.id(),
+                size,
+            )));
+        }
+        None => {
+            ui.allocate_space(size);
+        }
     }
 }
 
@@ -7165,6 +7275,35 @@ mod tests {
             .expect("write helper event");
     }
 
+    /// A bare socketpair session with no shm/frame plumbing — enough to drive
+    /// wire-level events (favicons, nav, …) without a fake helper thread.
+    /// Mirrors `the_ad_filter_blocked_count_surfaces_on_the_active_tab`'s recipe;
+    /// testkit's `connect()` doesn't expose its peer socket for manual events.
+    fn raw_session_pair() -> (WebSession, UnixStream) {
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        let session = WebSession::from_stream(shell, None).expect("session");
+        (session, helper)
+    }
+
+    /// Push an `EventMsg::Favicon` carrying `png_bytes` to a raw session's peer.
+    /// Caller polls the session afterward to fold it in.
+    fn send_favicon(peer: &UnixStream, png_bytes: &[u8]) {
+        write_helper_event(
+            peer,
+            &mde_web_preview_client::EventMsg::Favicon {
+                png: png_bytes.to_vec(),
+            },
+        );
+    }
+
+    /// A raw session that has already polled in one favicon's PNG bytes.
+    fn session_with_favicon(png_bytes: &[u8]) -> WebSession {
+        let (mut session, peer) = raw_session_pair();
+        send_favicon(&peer, png_bytes);
+        session.poll();
+        session
+    }
+
     fn live_page_session() -> (
         WebSession,
         UnixStream,
@@ -9329,6 +9468,126 @@ mod tests {
     }
 
     #[test]
+    fn a_well_formed_favicon_png_decodes_to_a_texture() {
+        let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
+        img.pixels[0] = egui::Color32::RED;
+        img.pixels[3] = egui::Color32::BLUE;
+        let png = encode_color_image_png(&img).expect("encode a tiny favicon PNG");
+
+        let decoded =
+            crate::chooser::decode_png_rgba(&png).expect("a well-formed favicon PNG decodes");
+        assert_eq!(decoded.size, [2, 2]);
+    }
+
+    #[test]
+    fn garbage_favicon_bytes_fail_soft_instead_of_panicking() {
+        assert!(
+            crate::chooser::decode_png_rgba(b"not a png").is_none(),
+            "malformed bytes decode to None, never a panic"
+        );
+
+        let mut state = WebState::default();
+        state.push_session(session_with_favicon(b"not a png"));
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(
+            tab_favicon_texture(&ctx, &mut state.tabs[0]).is_none(),
+            "a garbage favicon resolves to no texture, falling back to the pill's own glyph"
+        );
+        // The failed decode is still cached (fingerprint recorded, texture None) so
+        // the same garbage bytes aren't re-decoded every frame.
+        let cache = state.tabs[0]
+            .favicon_cache
+            .as_ref()
+            .expect("a decode attempt is cached even on failure");
+        assert!(cache.texture.is_none());
+    }
+
+    #[test]
+    fn unchanged_favicon_bytes_reuse_the_cached_texture_and_changed_bytes_invalidate_it() {
+        let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
+        img.pixels[0] = egui::Color32::RED;
+        let png_a = encode_color_image_png(&img).expect("encode favicon A");
+        img.pixels[0] = egui::Color32::BLUE;
+        let png_b = encode_color_image_png(&img).expect("encode favicon B");
+
+        let (mut session, peer) = raw_session_pair();
+        send_favicon(&peer, &png_a);
+        session.poll();
+
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let first = tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon A decodes");
+        let second =
+            tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon A decodes again");
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "the same favicon bytes must reuse the cached texture, not re-decode"
+        );
+
+        // A genuinely new favicon (different bytes) invalidates the cache and gets
+        // its own fresh texture — proving the fingerprint gates on content, not a
+        // permanent "decoded once, ever" latch.
+        send_favicon(&peer, &png_b);
+        state.tabs[0].session.poll();
+        let third = tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon B decodes");
+        assert_ne!(
+            second.id(),
+            third.id(),
+            "changed favicon bytes must decode a fresh texture"
+        );
+    }
+
+    #[test]
+    fn horizontal_tab_strip_renders_a_favicon_without_panicking() {
+        let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
+        img.pixels[0] = egui::Color32::GREEN;
+        let png = encode_color_image_png(&img).expect("encode favicon");
+
+        let mut state = WebState::default();
+        state.push_session(session_with_favicon(&png));
+        assert!(
+            run_panel(&mut state),
+            "the horizontal tab strip with a favicon produced no primitives"
+        );
+        assert!(
+            state.tabs[0]
+                .favicon_cache
+                .as_ref()
+                .is_some_and(|cache| cache.texture.is_some()),
+            "the frame should have decoded + cached the favicon texture"
+        );
+    }
+
+    #[test]
+    fn vertical_tab_strip_renders_a_favicon_without_panicking() {
+        let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
+        img.pixels[0] = egui::Color32::GREEN;
+        let png = encode_color_image_png(&img).expect("encode favicon");
+
+        let mut state = WebState::default();
+        state.push_session(session_with_favicon(&png));
+        state.set_vertical_tabs(true);
+        assert!(
+            run_panel(&mut state),
+            "the vertical tab strip with a favicon produced no primitives"
+        );
+        assert!(
+            state.tabs[0]
+                .favicon_cache
+                .as_ref()
+                .is_some_and(|cache| cache.texture.is_some()),
+            "the frame should have decoded + cached the favicon texture"
+        );
+    }
+
+    #[test]
     fn ctrl_tab_cycles_tabs_and_ctrl_digits_jump_to_them() {
         let (first, _h1) = testkit::connect().expect("connect 1");
         let (second, _h2) = testkit::connect().expect("connect 2");
@@ -9914,6 +10173,7 @@ mod tests {
             texture: None,
             last_frame: None,
             resizer: ViewportResizer::default(),
+            favicon_cache: None,
         });
         // The nav chrome (with the "N blocked" shield) renders without panicking.
         assert!(run_panel(&mut state), "the browser chrome produced no draw");
