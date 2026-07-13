@@ -98,6 +98,26 @@ pub struct PasskeyRequestStatus {
     pub body: String,
 }
 
+/// A browser-initiated download's latest state (B2). Re-reported on progress and
+/// completion, keyed by `id`; the shell folds these into its downloads drawer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadStatus {
+    /// Helper-minted download id (stable across the download's lifetime).
+    pub id: u64,
+    /// Source URL.
+    pub url: String,
+    /// Chosen/suggested file name (basename).
+    pub filename: String,
+    /// Bytes received so far.
+    pub received: u64,
+    /// Total bytes expected (0 if unknown).
+    pub total: u64,
+    /// Finished writing successfully.
+    pub done: bool,
+    /// Canceled or interrupted.
+    pub canceled: bool,
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
@@ -127,6 +147,7 @@ pub struct WebSession {
     page_text_events: VecDeque<PageTextStatus>,
     page_scrape_events: VecDeque<PageScrapeStatus>,
     passkey_events: VecDeque<PasskeyRequestStatus>,
+    download_events: VecDeque<DownloadStatus>,
     recent_resource_requests: VecDeque<ResourceRequestStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
@@ -159,6 +180,7 @@ impl WebSession {
             page_text_events: VecDeque::new(),
             page_scrape_events: VecDeque::new(),
             passkey_events: VecDeque::new(),
+            download_events: VecDeque::new(),
             recent_resource_requests: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
@@ -349,6 +371,25 @@ impl WebSession {
             EventMsg::PasskeyRequest { body } => {
                 self.passkey_events.push_back(PasskeyRequestStatus { body });
             }
+            EventMsg::Download {
+                id,
+                url,
+                filename,
+                received,
+                total,
+                done,
+                canceled,
+            } => {
+                self.download_events.push_back(DownloadStatus {
+                    id,
+                    url,
+                    filename,
+                    received,
+                    total,
+                    done,
+                    canceled,
+                });
+            }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
         Ok(())
@@ -383,6 +424,12 @@ impl WebSession {
     /// Drain passkey/WebAuthn ceremony requests reported by the helper.
     pub fn drain_passkey_events(&mut self) -> Vec<PasskeyRequestStatus> {
         self.passkey_events.drain(..).collect()
+    }
+
+    /// Drain browser download progress/completion events (B2) — the shell folds
+    /// each into its downloads drawer, keyed by [`DownloadStatus::id`].
+    pub fn drain_download_events(&mut self) -> Vec<DownloadStatus> {
+        self.download_events.drain(..).collect()
     }
 
     /// Recent subresource requests observed for the current page.

@@ -826,6 +826,24 @@ pub enum EventMsg {
         /// user / allow-credential metadata.
         body: String,
     },
+    /// A browser-initiated download started or advanced (B2). One row in the shell's
+    /// downloads drawer, keyed by `id`; re-sent on progress and at completion.
+    Download {
+        /// Helper-minted download id (stable across the download's lifetime).
+        id: u64,
+        /// The source URL being downloaded.
+        url: String,
+        /// The chosen/suggested file name (basename).
+        filename: String,
+        /// Bytes received so far.
+        received: u64,
+        /// Total bytes expected (0 if unknown).
+        total: u64,
+        /// The download finished writing successfully.
+        done: bool,
+        /// The download was canceled or interrupted.
+        canceled: bool,
+    },
 }
 
 impl EventMsg {
@@ -884,6 +902,24 @@ impl EventMsg {
                 put_u64(&mut out, *id);
                 put_str(&mut out, body);
             }
+            Self::Download {
+                id,
+                url,
+                filename,
+                received,
+                total,
+                done,
+                canceled,
+            } => {
+                out.push(10);
+                put_u64(&mut out, *id);
+                put_str(&mut out, url);
+                put_str(&mut out, filename);
+                put_u64(&mut out, *received);
+                put_u64(&mut out, *total);
+                out.push(u8::from(*done));
+                out.push(u8::from(*canceled));
+            }
         }
         out
     }
@@ -925,6 +961,15 @@ impl EventMsg {
             9 => Self::PageScrape {
                 id: c.u64()?,
                 body: c.string()?,
+            },
+            10 => Self::Download {
+                id: c.u64()?,
+                url: c.string()?,
+                filename: c.string()?,
+                received: c.u64()?,
+                total: c.u64()?,
+                done: c.bool()?,
+                canceled: c.bool()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1244,6 +1289,24 @@ mod tests {
         });
         round_event(&EventMsg::PasskeyRequest {
             body: r#"{"ceremony":"create","origin":"https://login.example"}"#.to_owned(),
+        });
+        round_event(&EventMsg::Download {
+            id: 7,
+            url: "https://files.example/report.pdf".to_owned(),
+            filename: "report.pdf".to_owned(),
+            received: 2048,
+            total: 65536,
+            done: false,
+            canceled: false,
+        });
+        round_event(&EventMsg::Download {
+            id: 7,
+            url: "https://files.example/report.pdf".to_owned(),
+            filename: "report.pdf".to_owned(),
+            received: 65536,
+            total: 65536,
+            done: true,
+            canceled: false,
         });
     }
 
