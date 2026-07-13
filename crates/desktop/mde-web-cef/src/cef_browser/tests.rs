@@ -5,6 +5,55 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn lookup_peer_handler_sizes_are_unique() {
+    // `lookup_peer` resolves a handler block for a state by its byte size, so every
+    // handler resolved that way MUST have a distinct size — a collision would hand
+    // CEF the wrong vtable. (life_span and print both == 88, which is exactly why
+    // print is resolved via an explicit stored ptr, not lookup_peer.) B1 added the
+    // display + load handlers; guard that they don't collide with the existing set.
+    let sizes = [
+        ("life_span", CEF_LIFE_SPAN_HANDLER_SIZE),
+        ("render", CEF_RENDER_HANDLER_SIZE),
+        ("request", CEF_REQUEST_HANDLER_SIZE),
+        ("resource_request", CEF_RESOURCE_REQUEST_HANDLER_SIZE),
+        ("display", CEF_DISPLAY_HANDLER_SIZE),
+        ("load", CEF_LOAD_HANDLER_SIZE),
+    ];
+    for (i, (na, sa)) in sizes.iter().enumerate() {
+        for (nb, sb) in &sizes[i + 1..] {
+            assert_ne!(
+                sa, sb,
+                "lookup_peer handlers {na} and {nb} share size {sa} — lookup_peer would \
+                 return the wrong block; give one an explicit stored ptr like print"
+            );
+        }
+    }
+}
+
+#[test]
+fn b1_client_handler_offsets_match_the_cef149_client_layout() {
+    // The cef_client_t vtable is a 40-byte ref-counted base then 8-byte fn ptrs.
+    // Anchor on the already-proven offsets and derive display/load by field index
+    // (display = index 4, load = index 14, right before print at index 15).
+    const BASE: usize = 40;
+    assert_eq!(CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET, BASE + 4 * 8);
+    assert_eq!(CEF_CLIENT_GET_LOAD_HANDLER_OFFSET, BASE + 14 * 8);
+    // Internal consistency with the anchors this file already trusts.
+    assert_eq!(
+        CEF_CLIENT_GET_LOAD_HANDLER_OFFSET + 8,
+        CEF_CLIENT_GET_PRINT_HANDLER_OFFSET
+    );
+    assert!(CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET < CEF_CLIENT_GET_LIFE_SPAN_HANDLER_OFFSET);
+    // Handler struct sizes = 40-byte base + N fn ptrs.
+    assert_eq!(CEF_DISPLAY_HANDLER_SIZE, BASE + 13 * 8);
+    assert_eq!(CEF_LOAD_HANDLER_SIZE, BASE + 4 * 8);
+    // The two display methods B1 registers sit at the front of the vtable.
+    assert_eq!(CEF_DISPLAY_HANDLER_ON_ADDRESS_CHANGE_OFFSET, BASE);
+    assert_eq!(CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET, BASE + 8);
+    assert_eq!(CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET, BASE);
+}
+
 fn unique_test_pdf_path(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

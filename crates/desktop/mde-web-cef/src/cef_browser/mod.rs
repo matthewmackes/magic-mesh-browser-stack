@@ -15,7 +15,7 @@ use std::os::raw::c_int;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,6 +60,20 @@ pub const CEF_CLIENT_GET_PRINT_HANDLER_OFFSET: usize = 160;
 pub const CEF_CLIENT_GET_RENDER_HANDLER_OFFSET: usize = 168;
 /// `offsetof(cef_client_t, get_request_handler)`.
 pub const CEF_CLIENT_GET_REQUEST_HANDLER_OFFSET: usize = 176;
+/// `offsetof(cef_client_t, get_display_handler)` — carries nav/title state (B1).
+pub const CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET: usize = 72;
+/// `offsetof(cef_client_t, get_load_handler)` — carries loading/back/forward (B1).
+pub const CEF_CLIENT_GET_LOAD_HANDLER_OFFSET: usize = 152;
+/// `sizeof(cef_display_handler_t)` for pinned Linux CEF 149 (13 fn ptrs + 40-byte base).
+pub const CEF_DISPLAY_HANDLER_SIZE: usize = 144;
+/// `offsetof(cef_display_handler_t, on_address_change)`.
+pub const CEF_DISPLAY_HANDLER_ON_ADDRESS_CHANGE_OFFSET: usize = 40;
+/// `offsetof(cef_display_handler_t, on_title_change)`.
+pub const CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET: usize = 48;
+/// `sizeof(cef_load_handler_t)` for pinned Linux CEF 149 (4 fn ptrs + 40-byte base).
+pub const CEF_LOAD_HANDLER_SIZE: usize = 72;
+/// `offsetof(cef_load_handler_t, on_loading_state_change)`.
+pub const CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET: usize = 40;
 /// `sizeof(cef_life_span_handler_t)` for pinned Linux CEF 149.
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
@@ -1047,6 +1061,8 @@ struct CefBrowserCallbacks {
     request: Box<CefCallbackBlock<CEF_REQUEST_HANDLER_SIZE>>,
     resource_request: Box<CefCallbackBlock<CEF_RESOURCE_REQUEST_HANDLER_SIZE>>,
     print: Box<CefCallbackBlock<CEF_PRINT_HANDLER_SIZE>>,
+    display: Box<CefCallbackBlock<CEF_DISPLAY_HANDLER_SIZE>>,
+    load: Box<CefCallbackBlock<CEF_LOAD_HANDLER_SIZE>>,
 }
 
 impl CefBrowserCallbacks {
@@ -1070,6 +1086,8 @@ impl CefBrowserCallbacks {
             request: Box::new(CefCallbackBlock::new(CEF_REQUEST_HANDLER_SIZE)),
             resource_request: Box::new(CefCallbackBlock::new(CEF_RESOURCE_REQUEST_HANDLER_SIZE)),
             print: Box::new(CefCallbackBlock::new(CEF_PRINT_HANDLER_SIZE)),
+            display: Box::new(CefCallbackBlock::new(CEF_DISPLAY_HANDLER_SIZE)),
+            load: Box::new(CefCallbackBlock::new(CEF_LOAD_HANDLER_SIZE)),
         };
         callbacks.install();
         Ok(callbacks)
@@ -1124,6 +1142,28 @@ impl CefBrowserCallbacks {
             CEF_PRINT_HANDLER_GET_PDF_PAPER_SIZE_OFFSET,
             fn_ptr(get_pdf_paper_size as *const ()),
         );
+        // B1 — nav/load/title state feeding the chrome's omnibox + back/forward +
+        // loading indicator (the wire + shell already consume EventMsg::NavState/Title).
+        self.client.put_fn(
+            CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET,
+            fn_ptr(get_display_handler as *const ()),
+        );
+        self.client.put_fn(
+            CEF_CLIENT_GET_LOAD_HANDLER_OFFSET,
+            fn_ptr(get_load_handler as *const ()),
+        );
+        self.display.put_fn(
+            CEF_DISPLAY_HANDLER_ON_ADDRESS_CHANGE_OFFSET,
+            fn_ptr(on_address_change as *const ()),
+        );
+        self.display.put_fn(
+            CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET,
+            fn_ptr(on_title_change as *const ()),
+        );
+        self.load.put_fn(
+            CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET,
+            fn_ptr(on_loading_state_change as *const ()),
+        );
 
         let state = self.state.as_ref() as *const CefBrowserState as usize;
         self.state
@@ -1136,6 +1176,8 @@ impl CefBrowserCallbacks {
         registry.insert(self.request.as_usize(), state);
         registry.insert(self.resource_request.as_usize(), state);
         registry.insert(self.print.as_usize(), state);
+        registry.insert(self.display.as_usize(), state);
+        registry.insert(self.load.as_usize(), state);
     }
 
     fn client_ptr(&self) -> *mut c_void {
@@ -1193,6 +1235,8 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.request.as_usize());
         registry.remove(&self.resource_request.as_usize());
         registry.remove(&self.print.as_usize());
+        registry.remove(&self.display.as_usize());
+        registry.remove(&self.load.as_usize());
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
@@ -1220,6 +1264,13 @@ struct CefBrowserState {
     pdf_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_PDF_PRINT_CALLBACK_SIZE>>>>,
     print_handler_ptr: AtomicUsize,
     string_userfree_free: CefStringUserfreeUtf16Free,
+    /// B1 nav state, assembled across the display + load handlers: the committed
+    /// URL (from `on_address_change`) and the loading/history flags (from
+    /// `on_loading_state_change`), published together as `EventMsg::NavState`.
+    nav_url: Mutex<String>,
+    nav_loading: AtomicBool,
+    nav_can_back: AtomicBool,
+    nav_can_forward: AtomicBool,
 }
 
 impl CefBrowserState {
@@ -1255,6 +1306,10 @@ impl CefBrowserState {
             pdf_callbacks: Mutex::new(Vec::new()),
             print_handler_ptr: AtomicUsize::new(0),
             string_userfree_free,
+            nav_url: Mutex::new(String::new()),
+            nav_loading: AtomicBool::new(false),
+            nav_can_back: AtomicBool::new(false),
+            nav_can_forward: AtomicBool::new(false),
         })
     }
 
@@ -1416,6 +1471,33 @@ impl CefBrowserState {
 
     fn publish_passkey_request(&self, body: String) {
         let event = EventMsg::PasskeyRequest { body };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// B1 — emit the current nav snapshot (URL + loading/history flags) so the
+    /// shell chrome lights up the omnibox, Back/Forward, and the loading control.
+    fn publish_nav_state(&self) {
+        let url = self.nav_url.lock().map(|u| u.clone()).unwrap_or_default();
+        let event = EventMsg::NavState {
+            can_back: self.nav_can_back.load(Ordering::SeqCst),
+            can_forward: self.nav_can_forward.load(Ordering::SeqCst),
+            loading: self.nav_loading.load(Ordering::SeqCst),
+            url,
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// B1 — emit the page title so the chrome labels the tab with it (not the URL).
+    fn publish_title(&self, title: String) {
+        let event = EventMsg::Title(title);
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -1706,6 +1788,59 @@ unsafe extern "C" fn on_before_resource_load(
     .unwrap_or(RV_CONTINUE)
 }
 
+unsafe extern "C" fn get_display_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.display_ptr()).unwrap_or(ptr::null_mut())
+}
+
+unsafe extern "C" fn get_load_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.load_ptr()).unwrap_or(ptr::null_mut())
+}
+
+/// CEF `on_address_change(self, browser, frame, url)` — the committed URL changed.
+unsafe extern "C" fn on_address_change(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    _frame: *mut c_void,
+    url: *const CefString,
+) {
+    let url = cef_string_to_string(url);
+    let _ = with_state(self_, |state| {
+        if let Ok(mut current) = state.nav_url.lock() {
+            *current = url;
+        }
+        state.publish_nav_state();
+    });
+}
+
+/// CEF `on_title_change(self, browser, title)` — the page title changed.
+unsafe extern "C" fn on_title_change(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    title: *const CefString,
+) {
+    let title = cef_string_to_string(title);
+    let _ = with_state(self_, |state| state.publish_title(title));
+}
+
+/// CEF `on_loading_state_change(self, browser, isLoading, canGoBack, canGoForward)`
+/// — the load/back/forward edges changed; combine with the stored URL into NavState.
+unsafe extern "C" fn on_loading_state_change(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    is_loading: c_int,
+    can_go_back: c_int,
+    can_go_forward: c_int,
+) {
+    let _ = with_state(self_, |state| {
+        state.nav_loading.store(is_loading != 0, Ordering::SeqCst);
+        state.nav_can_back.store(can_go_back != 0, Ordering::SeqCst);
+        state
+            .nav_can_forward
+            .store(can_go_forward != 0, Ordering::SeqCst);
+        state.publish_nav_state();
+    });
+}
+
 unsafe extern "C" fn on_print_dialog(
     _self: *mut c_void,
     _browser: *mut c_void,
@@ -1792,6 +1927,14 @@ impl CefBrowserState {
 
     fn print_ptr(&self) -> *mut c_void {
         self.print_handler_ptr.load(Ordering::SeqCst) as *mut c_void
+    }
+
+    fn display_ptr(&self) -> *mut c_void {
+        lookup_peer(self, CEF_DISPLAY_HANDLER_SIZE)
+    }
+
+    fn load_ptr(&self) -> *mut c_void {
+        lookup_peer(self, CEF_LOAD_HANDLER_SIZE)
     }
 }
 
