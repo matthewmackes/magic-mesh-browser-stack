@@ -530,6 +530,12 @@ impl WebSession {
     }
 
     /// Find text on the current page.
+    /// Run a clipboard/editing command on the page's focused element (in-page
+    /// context menu). Reuses the engine's native frame edit commands.
+    pub fn edit_command(&mut self, command: crate::wire::EditCommand) {
+        self.send(&ControlMsg::EditCommand { command });
+    }
+
     pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool, find_next: bool) {
         self.send(&ControlMsg::FindInPage {
             query: query.into(),

@@ -24,7 +24,8 @@ use crate::cef_abi::{CefAbi, CefStringUserfreeUtf16Free};
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
 use crate::wire::{
-    self, ControlMsg, CursorKind, EventMsg, InputEvent, KeyCode, Modifiers, PointerButton,
+    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode, Modifiers,
+    PointerButton,
 };
 
 mod scripts;
@@ -147,6 +148,21 @@ pub const CEF_BROWSER_RELOAD_OFFSET: usize = 96;
 pub const CEF_BROWSER_STOP_LOAD_OFFSET: usize = 112;
 /// `offsetof(cef_browser_t, get_main_frame)`.
 pub const CEF_BROWSER_GET_MAIN_FRAME_OFFSET: usize = 152;
+/// `cef_frame_t` edit-command offsets (base 40 + field*8): undo=1, redo=2, cut=3,
+/// copy=4, paste=5, del=7, select_all=8. Each is `void method(self)`.
+pub const CEF_FRAME_UNDO_OFFSET: usize = 48;
+/// `offsetof(cef_frame_t, redo)`.
+pub const CEF_FRAME_REDO_OFFSET: usize = 56;
+/// `offsetof(cef_frame_t, cut)`.
+pub const CEF_FRAME_CUT_OFFSET: usize = 64;
+/// `offsetof(cef_frame_t, copy)`.
+pub const CEF_FRAME_COPY_OFFSET: usize = 72;
+/// `offsetof(cef_frame_t, paste)`.
+pub const CEF_FRAME_PASTE_OFFSET: usize = 80;
+/// `offsetof(cef_frame_t, del)`.
+pub const CEF_FRAME_DELETE_OFFSET: usize = 96;
+/// `offsetof(cef_frame_t, select_all)`.
+pub const CEF_FRAME_SELECT_ALL_OFFSET: usize = 104;
 /// `sizeof(cef_browser_host_t)` for pinned Linux CEF 149.
 pub const CEF_BROWSER_HOST_SIZE: usize = 592;
 /// `offsetof(cef_browser_host_t, close_browser)`.
@@ -894,6 +910,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
             find_next,
         } => apply_find_in_page(browser, query, *backwards, *find_next),
         ControlMsg::ClearFind => clear_find_in_page(browser),
+        ControlMsg::EditCommand { command } => apply_edit_command(browser, *command),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
         ControlMsg::SetForceDark { enabled } => apply_force_dark(browser, *enabled),
         ControlMsg::SetReaderMode { enabled } => apply_reader_mode(browser, *enabled),
@@ -3144,6 +3161,29 @@ fn apply_find_in_page(browser: *mut c_void, query: &str, backwards: bool, find_n
             c_int::from(find_next),
         );
     }
+}
+
+/// Run a native `cef_frame_t` edit command on the main frame's focused element.
+fn apply_edit_command(browser: *mut c_void, command: EditCommand) {
+    let offset = match command {
+        EditCommand::Undo => CEF_FRAME_UNDO_OFFSET,
+        EditCommand::Redo => CEF_FRAME_REDO_OFFSET,
+        EditCommand::Cut => CEF_FRAME_CUT_OFFSET,
+        EditCommand::Copy => CEF_FRAME_COPY_OFFSET,
+        EditCommand::Paste => CEF_FRAME_PASTE_OFFSET,
+        EditCommand::Delete => CEF_FRAME_DELETE_OFFSET,
+        EditCommand::SelectAll => CEF_FRAME_SELECT_ALL_OFFSET,
+    };
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    let Some(callback) = read_fn(frame, offset) else {
+        return;
+    };
+    // SAFETY: every cef_frame_t edit command is `void method(cef_frame_t* self)`.
+    let callback: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(callback) };
+    // SAFETY: `frame` came from get_main_frame and is valid for the call.
+    unsafe { callback(frame) };
 }
 
 fn clear_find_in_page(browser: *mut c_void) {

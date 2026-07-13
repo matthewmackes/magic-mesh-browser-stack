@@ -67,7 +67,7 @@ pub use input::map_event;
 pub use session::{
     NavState, PasskeyRequestStatus, ResourceRequestStatus, SessionState, WebSession,
 };
-pub use wire::{ControlMsg, CursorKind, EventMsg, InputEvent, WireError};
+pub use wire::{ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, WireError};
 
 // The ad-filter engine types the shell compiles a session's [`RequestFilter`]
 // from (BOOKMARKS-7). Re-exported so the Browser surface + the live-helper spawn

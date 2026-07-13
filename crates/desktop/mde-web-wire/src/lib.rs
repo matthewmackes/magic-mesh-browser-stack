@@ -153,6 +153,45 @@ impl CursorKind {
     }
 }
 
+/// A clipboard / editing command the page's focused element should run — the
+/// in-page context menu (and page keyboard shortcuts) drive these through the
+/// engine's native frame edit commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EditCommand {
+    /// Undo the last edit.
+    Undo = 0,
+    /// Redo the last undone edit.
+    Redo = 1,
+    /// Cut the selection to the clipboard.
+    Cut = 2,
+    /// Copy the selection to the clipboard.
+    Copy = 3,
+    /// Paste from the clipboard.
+    Paste = 4,
+    /// Delete the selection.
+    Delete = 5,
+    /// Select all content in the focused element.
+    SelectAll = 6,
+}
+
+impl EditCommand {
+    /// Decode from the wire byte.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Undo),
+            1 => Some(Self::Redo),
+            2 => Some(Self::Cut),
+            3 => Some(Self::Copy),
+            4 => Some(Self::Paste),
+            5 => Some(Self::Delete),
+            6 => Some(Self::SelectAll),
+            _ => None,
+        }
+    }
+}
+
 /// Keyboard-modifier bitflags, engine-neutral (matches the common egui set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Modifiers(pub u8);
@@ -583,6 +622,12 @@ pub enum ControlMsg {
         /// Maximum heading records the helper may include.
         max_headings: u16,
     },
+    /// Run a clipboard/editing command on the page's focused element (in-page
+    /// context menu: Copy/Paste/Cut/Select-All/Undo/Redo/Delete).
+    EditCommand {
+        /// Which command.
+        command: EditCommand,
+    },
     /// Apply shell-owned spellcheck highlights to visible page text. Empty words
     /// clear prior highlights.
     SetSpellcheckHighlights {
@@ -757,6 +802,10 @@ impl ControlMsg {
                 put_u16(&mut out, *max_links);
                 put_u16(&mut out, *max_headings);
             }
+            Self::EditCommand { command } => {
+                out.push(27);
+                out.push(*command as u8);
+            }
         }
         out
     }
@@ -836,6 +885,9 @@ impl ControlMsg {
                 max_bytes: c.u32()?,
                 max_links: c.u16()?,
                 max_headings: c.u16()?,
+            },
+            27 => Self::EditCommand {
+                command: EditCommand::from_u8(c.u8()?).ok_or(WireError::BadTag(27))?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1376,6 +1428,13 @@ mod tests {
             max_links: 64,
             max_headings: 32,
         });
+        round_control(&ControlMsg::EditCommand {
+            command: EditCommand::Copy,
+        });
+        round_control(&ControlMsg::EditCommand {
+            command: EditCommand::SelectAll,
+        });
+        assert_eq!(EditCommand::from_u8(99), None);
         round_control(&ControlMsg::SetSpellcheckHighlights {
             words: vec!["wrold".to_owned(), "msh".to_owned()],
         });

@@ -641,6 +641,22 @@ fn native_zoom_level_follows_chromium_convention_and_clamps() {
 }
 
 #[test]
+fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
+    // cef_frame_t: 40-byte base then 8-byte fn ptrs. is_valid=0(40), undo=1(48),
+    // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104).
+    assert_eq!(CEF_FRAME_UNDO_OFFSET, 40 + 1 * 8);
+    assert_eq!(CEF_FRAME_REDO_OFFSET, 40 + 2 * 8);
+    assert_eq!(CEF_FRAME_CUT_OFFSET, 40 + 3 * 8);
+    assert_eq!(CEF_FRAME_COPY_OFFSET, 40 + 4 * 8);
+    assert_eq!(CEF_FRAME_PASTE_OFFSET, 40 + 5 * 8);
+    assert_eq!(CEF_FRAME_DELETE_OFFSET, 40 + 7 * 8);
+    assert_eq!(CEF_FRAME_SELECT_ALL_OFFSET, 40 + 8 * 8);
+    // Reconcile with the proven get_main_frame=152 (browser field 14, unrelated
+    // struct) — the frame commands sit well before execute_java_script (field 14).
+    assert!(CEF_FRAME_SELECT_ALL_OFFSET < CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET);
+}
+
+#[test]
 fn find_handler_offsets_reconcile_with_the_client_and_host_layout() {
     // get_find_handler is client field 7 (get_display=72/field4 + get_download=80
     // /field5 pin the run); the 48-byte 1-field handler holds on_find_result at 40.
