@@ -36,8 +36,8 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    host_of, EditCommand, FilterListSource, FilterListStore, RequestFilter, SafeBrowsingBlocklist,
-    SessionState, WebSession,
+    host_of, CertError, EditCommand, FilterListSource, FilterListStore, RequestFilter,
+    SafeBrowsingBlocklist, SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -3709,28 +3709,55 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
 }
 
 fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
-    // Read the active tab's status first so the crashed arm can set the respawn
-    // flag without holding a `&mut Tab` borrow of `state`.
+    // Read the active tab's status first so the crashed/cert-error arms can
+    // mutate `state` (respawn flag, back/close) without holding a `&mut Tab`
+    // borrow of it.
     let active = state.active;
     let status = state.tabs.get(active).map(|t| {
+        let is_crashed = t.session.is_crashed();
+        let cert_error = t.session.cert_error().cloned();
+        // `shows_cert_interstitial` is the single source of truth for the
+        // crashed-wins precedence; fold its verdict into the option here so
+        // the match arms below don't have to re-derive the ordering.
+        let cert_interstitial =
+            shows_cert_interstitial(is_crashed, cert_error.as_ref()).then_some(cert_error);
         (
-            t.session.is_crashed(),
+            is_crashed,
+            cert_interstitial.flatten(),
             t.texture.is_some(),
             is_new_tab_url(t.session.nav().url.trim()),
             crash_reason(&t.session),
+            t.session.nav().can_back,
         )
     });
     match status {
-        Some((true, _, _, reason)) => {
+        Some((true, _, _, _, reason, _)) => {
             if let Some(snapshot) = state.offline_cache_fallback_for_unavailable().cloned() {
                 cached_offline_body(ui, &snapshot, Some(reason.as_str()));
             } else {
                 crashed_body(ui, reason, &mut state.respawn_requested);
             }
         }
-        Some((false, _, true, _)) => new_tab_dashboard(ui, state),
-        Some((false, true, false, _)) => paint_body(ui, state, active),
-        Some((false, false, false, _)) => {
+        // The engine blocks the navigation by default on a TLS/certificate
+        // error (§ cert-error ENGINE half) and hands the shell a `CertError`;
+        // this takes precedence over a normal frame/dashboard the same way
+        // `is_crashed` does — checked right beside it, one arm down.
+        Some((false, Some(err), _, _, _, can_back)) => {
+            if cert_error_body(ui, &err, can_back) {
+                match cert_error_back_action(can_back) {
+                    CertErrorBackAction::GoBack => {
+                        if let Some(tab) = state.active_tab() {
+                            tab.session.go_back();
+                        }
+                        state.mark_active_tab_activity();
+                    }
+                    CertErrorBackAction::CloseTab => state.close_tab(active),
+                }
+            }
+        }
+        Some((false, None, _, true, _, _)) => new_tab_dashboard(ui, state),
+        Some((false, None, true, false, _, _)) => paint_body(ui, state, active),
+        Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet — an honest loading note, never a blank.
             centered(ui, |ui| {
                 muted_note(ui, "Loading the page\u{2026}");
@@ -4445,6 +4472,40 @@ fn crash_reason(session: &WebSession) -> String {
     match session.state() {
         SessionState::Crashed { reason } => reason.clone(),
         _ => String::new(),
+    }
+}
+
+/// Whether a tab should show the TLS/certificate-error interstitial instead
+/// of its normal frame — the same precedence `active_body` encodes: crashed
+/// wins if a tab is somehow both crashed and cert-blocked, so this is only
+/// `true` once `is_crashed` has been ruled out. Pure + testable in isolation
+/// from the egui paint path.
+fn shows_cert_interstitial(is_crashed: bool, cert_error: Option<&CertError>) -> bool {
+    !is_crashed && cert_error.is_some()
+}
+
+/// The host to name in the cert-error interstitial, reusing the same
+/// dependency-free `host_of` parser the ad filter and third-party checks use
+/// (BOOKMARKS-7). Falls back to the raw blocked URL on the rare shape with no
+/// `scheme://host` authority, rather than showing a blank domain.
+fn cert_error_host(err: &CertError) -> String {
+    host_of(&err.url).unwrap_or_else(|| err.url.clone())
+}
+
+/// What "Back to safety" does on the cert-error interstitial — go back if the
+/// tab has history, otherwise there is nowhere honest to land it but closed
+/// (there is no "proceed anyway" past a blocked certificate). Pure decision,
+/// factored out of `active_body` so the choice is unit-testable on its own.
+enum CertErrorBackAction {
+    GoBack,
+    CloseTab,
+}
+
+fn cert_error_back_action(can_back: bool) -> CertErrorBackAction {
+    if can_back {
+        CertErrorBackAction::GoBack
+    } else {
+        CertErrorBackAction::CloseTab
     }
 }
 
@@ -6998,6 +7059,55 @@ fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool)
     });
 }
 
+/// The honest TLS/certificate-error interstitial: a full-content-area "sad
+/// tab" painted instead of the page frame when the engine blocked a load for
+/// a bad certificate (mirrors `crashed_body`'s pattern exactly). The engine
+/// blocks by default and there is no "proceed anyway" affordance here — only
+/// a way back. Returns `true` when "Back to safety" was clicked; the caller
+/// decides go-back vs. close-tab from `can_back` (this fn has no session
+/// access to act on it directly).
+///
+/// `TODO(security)`: an optional advanced "proceed anyway" override is a
+/// deliberate follow-up — the blocking-by-default posture stays as-is here.
+fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
+    let mut back_to_safety = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("Your connection is not private")
+                .size(Style::HEADING)
+                .color(Style::DANGER),
+        );
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(cert_error_host(err))
+                .size(Style::HEADING)
+                .color(Style::TEXT),
+        );
+        ui.add_space(Style::SP_S);
+        muted_note(ui, err.message.as_str());
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(format!("Error code {}", err.code))
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("\u{2190} Back to safety").color(Style::TEXT),
+            ))
+            .clicked()
+        {
+            back_to_safety = true;
+        }
+        if !can_back {
+            ui.add_space(Style::SP_XS);
+            muted_note(ui, "No history to return to — this closes the tab.");
+        }
+    });
+    back_to_safety
+}
+
 /// Render a daemon-owned private offline copy when the live page is unavailable.
 fn cached_offline_body(
     ui: &mut egui::Ui,
@@ -7300,6 +7410,28 @@ mod tests {
     fn session_with_favicon(png_bytes: &[u8]) -> WebSession {
         let (mut session, peer) = raw_session_pair();
         send_favicon(&peer, png_bytes);
+        session.poll();
+        session
+    }
+
+    /// Push an `EventMsg::CertError` to a raw session's peer. Caller polls the
+    /// session afterward to fold it in.
+    fn send_cert_error(peer: &UnixStream, url: &str, code: i32, message: &str) {
+        write_helper_event(
+            peer,
+            &mde_web_preview_client::EventMsg::CertError {
+                url: url.to_owned(),
+                code,
+                message: message.to_owned(),
+            },
+        );
+    }
+
+    /// A raw session that has already polled in one blocked-navigation
+    /// certificate error.
+    fn session_with_cert_error(url: &str, code: i32, message: &str) -> WebSession {
+        let (mut session, peer) = raw_session_pair();
+        send_cert_error(&peer, url, code, message);
         session.poll();
         session
     }
@@ -10116,6 +10248,125 @@ mod tests {
         run_panel(&mut state); // polls all tabs
         assert!(state.tabs[0].session.is_crashed(), "tab 0 crashed");
         assert!(!state.tabs[1].session.is_crashed(), "tab 1 unaffected");
+    }
+
+    #[test]
+    fn shows_cert_interstitial_reflects_presence_and_crash_precedence() {
+        let err = CertError {
+            url: "https://bad.example.com/x".to_owned(),
+            code: -202,
+            message: "The certificate authority is not trusted".to_owned(),
+        };
+        assert!(
+            shows_cert_interstitial(false, Some(&err)),
+            "a cert error on a live tab shows the interstitial"
+        );
+        assert!(
+            !shows_cert_interstitial(false, None),
+            "no cert error renders the normal body"
+        );
+        assert!(
+            !shows_cert_interstitial(true, Some(&err)),
+            "a crash always wins over a cert error"
+        );
+    }
+
+    #[test]
+    fn cert_error_host_extracts_the_domain() {
+        let err = CertError {
+            url: "https://bad.example.com/x".to_owned(),
+            code: -202,
+            message: "The certificate authority is not trusted".to_owned(),
+        };
+        assert_eq!(cert_error_host(&err), "bad.example.com");
+    }
+
+    #[test]
+    fn cert_error_host_falls_back_to_the_raw_url_with_no_authority() {
+        let err = CertError {
+            url: "not-a-url".to_owned(),
+            code: -202,
+            message: "x".to_owned(),
+        };
+        assert_eq!(cert_error_host(&err), "not-a-url");
+    }
+
+    #[test]
+    fn a_cert_error_paints_the_interstitial_instead_of_a_panic() {
+        let session = session_with_cert_error(
+            "https://bad.example.com/",
+            -202,
+            "The certificate authority is not trusted",
+        );
+        assert_eq!(
+            session.cert_error(),
+            Some(&CertError {
+                url: "https://bad.example.com/".to_owned(),
+                code: -202,
+                message: "The certificate authority is not trusted".to_owned(),
+            })
+        );
+        let mut state = WebState::default();
+        state.push_session(session);
+
+        // A render pass must not panic with a cert error present on the active
+        // (and only) tab — it paints the interstitial in place of the frame.
+        assert!(run_panel(&mut state), "the interstitial produced no draw");
+    }
+
+    #[test]
+    fn the_active_tabs_cert_error_does_not_disturb_another_tab() {
+        let clean = session_with_favicon(&[0x89, b'P', b'N', b'G']);
+        let blocked = session_with_cert_error("https://bad.example.com/", -202, "not trusted");
+        let mut state = WebState::default();
+        state.push_session(clean); // tab 0
+        state.push_session(blocked); // tab 1 (active)
+
+        assert!(run_panel(&mut state), "the interstitial produced no draw");
+        assert!(
+            state.tabs[0].session.cert_error().is_none(),
+            "tab 0 unaffected"
+        );
+        assert!(
+            state.tabs[1].session.cert_error().is_some(),
+            "tab 1 blocked"
+        );
+    }
+
+    #[test]
+    fn cert_error_back_action_prefers_history_over_closing() {
+        assert!(
+            matches!(cert_error_back_action(true), CertErrorBackAction::GoBack),
+            "with back history, \"Back to safety\" navigates back"
+        );
+        assert!(
+            matches!(cert_error_back_action(false), CertErrorBackAction::CloseTab),
+            "with no back history, \"Back to safety\" closes the tab"
+        );
+    }
+
+    #[test]
+    fn back_to_safety_with_no_history_closes_the_tab() {
+        let session = session_with_cert_error("https://bad.example.com/", -202, "not trusted");
+        assert!(
+            !session.nav().can_back,
+            "a raw socketpair session starts with no back history"
+        );
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert_eq!(state.tabs.len(), 1);
+        assert!(run_panel(&mut state), "the interstitial produced no draw");
+
+        // No pointer harness clicks the real button here (that needs the live
+        // widget rect); this proves the wiring `active_body` takes on a click —
+        // the pure `cert_error_back_action` decision — matches the tab's actual
+        // history state.
+        let can_back = state.tabs[0].session.nav().can_back;
+        match cert_error_back_action(can_back) {
+            CertErrorBackAction::GoBack => panic!("expected CloseTab with no history"),
+            CertErrorBackAction::CloseTab => state.close_tab(0),
+        }
+        assert!(state.tabs.is_empty(), "the tab closed");
     }
 
     #[test]
