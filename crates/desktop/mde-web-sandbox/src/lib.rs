@@ -232,8 +232,13 @@ pub fn readonly_binds() -> Vec<PathBuf> {
         "/sbin",
         "/lib",
         "/lib64",
-        "/etc/pki", // Fedora system CA trust store (system-CA TLS)
-        "/etc/ssl", // the OpenSSL cert dir / symlinks
+        "/etc/pki",          // Fedora system CA trust store (system-CA TLS)
+        "/etc/ssl",          // the OpenSSL cert dir / symlinks
+        "/etc/alternatives", // the symlink farm the NSS CA path traverses:
+        // /usr/lib64/libnssckbi.so -> /etc/alternatives/libnssckbi.so.x86_64 ->
+        // /usr/lib64/pkcs11/p11-kit-trust.so. Without this hop the link dangles in
+        // the rootfs and Chromium's NSS root-cert module fails to dlopen (system +
+        // enterprise CA trust silently lost). Every target resolves under /usr.
         "/etc/crypto-policies",
         "/etc/resolv.conf",
         "/etc/hosts",
