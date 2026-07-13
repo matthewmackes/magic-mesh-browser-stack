@@ -28,7 +28,9 @@
 //! 5. **read-only rootfs + tmpfs** — a fresh tmpfs root that bind-mounts ONLY
 //!    the read-only system runtime (`/usr`, the loader, the system CA bundle,
 //!    DNS resolv/hosts, the GPU device), any caller-named **extra** read-only
-//!    paths (e.g. a vendored engine runtime bundle), and a private `/tmp`. There
+//!    paths (e.g. a vendored engine runtime bundle), a private `/tmp`, and a
+//!    private `/dev/shm` (a multi-process Chromium/CEF engine's mandatory
+//!    POSIX-shared-memory surface — it aborts without it). There
 //!    is **no `$HOME`, no `/root`, no `/var`, no ssh/mesh keys, no mesh data** —
 //!    they are simply absent from the new root, so the engine cannot read them
 //!    even if it is compromised. This is *also* what makes "no persistent
@@ -244,6 +246,15 @@ pub fn readonly_binds() -> Vec<PathBuf> {
     .filter(|p| p.exists())
     .collect()
 }
+
+/// Rootfs-relative directories that receive a private writable tmpfs.
+///
+/// `tmp` is general engine scratch. `dev/shm` is MANDATORY for a multi-process
+/// Chromium/CEF engine: it passes frame + IPC buffers between the browser, GPU,
+/// and renderer subprocesses through POSIX shared memory rooted there, and
+/// aborts at startup without it. Both are ephemeral, `mode=1777`, size-capped,
+/// and charged to the engine cgroup — no data persists past the sandbox.
+const WRITABLE_TMPFS_SUBDIRS: [&str; 2] = ["tmp", "dev/shm"];
 
 /// Minimal `/dev` nodes bind-mounted individually (no `mknod` in the userns).
 #[must_use]
@@ -499,17 +510,26 @@ fn build_rootfs(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf]) -> Resu
     for src in dev_binds() {
         bind_readonly(&src, newroot)?;
     }
-    // A private writable /tmp (tmpfs) — the only writable surface.
-    let tmp_dir = newroot.join("tmp");
-    std::fs::create_dir_all(&tmp_dir)?;
-    mount(
-        Some("tmpfs"),
-        &tmp_dir,
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some("size=512m,mode=1777"),
-    )
-    .context("mount /tmp")?;
+    // The private writable tmpfs surfaces (see WRITABLE_TMPFS_SUBDIRS): `/tmp`
+    // general scratch, and `/dev/shm` which a multi-process Chromium/CEF engine
+    // REQUIRES for the POSIX-shared-memory frame + IPC buffers it passes between
+    // the browser, GPU, and renderer subprocesses — with no /dev/shm the browser
+    // aborts at startup ("Unable to access(W_OK|X_OK) /dev/shm"). Each is a fresh
+    // tmpfs in the new rootfs (never a host bind), namespace-isolated
+    // (CLONE_NEWIPC) and ephemeral, and its pages are charged to the engine's
+    // cgroup RAM cap — a bounded per-sandbox scratch area, nothing persists.
+    for sub in WRITABLE_TMPFS_SUBDIRS {
+        let dir = newroot.join(sub);
+        std::fs::create_dir_all(&dir)?;
+        mount(
+            Some("tmpfs"),
+            &dir,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("size=512m,mode=1777"),
+        )
+        .with_context(|| format!("mount /{sub}"))?;
+    }
     // A fresh proc for the new pid namespace (host processes invisible). This
     // succeeds because apply unshared CLONE_NEWPID and forked, so we are PID 1 of
     // a pid namespace our user namespace owns. If a fresh procfs is somehow
@@ -838,6 +858,27 @@ mod tests {
         let ro = mountinfo_mount_flags("1 2 0:3 / /etc/resolv.conf ro,noatime - tmpfs t ro");
         assert!(ro.contains(MsFlags::MS_RDONLY));
         assert!(ro.contains(MsFlags::MS_NOATIME));
+    }
+
+    #[test]
+    fn writable_tmpfs_provisions_dev_shm_for_the_chromium_engine() {
+        // Regression for the "Unable to access(W_OK|X_OK) /dev/shm" startup
+        // crash: a multi-process Chromium/CEF engine aborts without a writable
+        // /dev/shm, so the sandbox MUST provision it (alongside /tmp). build_rootfs
+        // can't be unit-tested (it needs a real userns), so pin the policy here.
+        assert!(
+            WRITABLE_TMPFS_SUBDIRS.contains(&"dev/shm"),
+            "sandbox must provide a writable /dev/shm or Chromium aborts"
+        );
+        assert!(WRITABLE_TMPFS_SUBDIRS.contains(&"tmp"));
+        // All writable surfaces are ephemeral tmpfs under the rootfs — never a
+        // host path, never an absolute escape.
+        for s in WRITABLE_TMPFS_SUBDIRS {
+            assert!(
+                !s.starts_with('/'),
+                "writable tmpfs must be rootfs-relative: {s}"
+            );
+        }
     }
 
     #[test]
