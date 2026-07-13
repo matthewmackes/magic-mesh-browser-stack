@@ -1838,6 +1838,16 @@ unsafe extern "C" fn on_loading_state_change(
             .nav_can_forward
             .store(can_go_forward != 0, Ordering::SeqCst);
         state.publish_nav_state();
+        // Probe-only liveness line (no production journal noise): proves the CEF
+        // load handler is registered + firing with real state during a probe run.
+        if std::env::var_os("MDE_CEF_BROWSER_PROBE").is_some() {
+            eprintln!(
+                "CEF_NAV loading={} back={} forward={}",
+                is_loading != 0,
+                can_go_back != 0,
+                can_go_forward != 0
+            );
+        }
     });
 }
 
