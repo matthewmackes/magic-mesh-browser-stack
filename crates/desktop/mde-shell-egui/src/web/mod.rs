@@ -279,6 +279,19 @@ struct SavedPdf {
     title: String,
 }
 
+/// A CEF-intercepted download whose filename tripped [`download_is_dangerous`],
+/// parked pending the user's explicit Keep/Discard choice (the downloads
+/// drawer's "this type of file can harm your device" banner). Only one is
+/// parked at a time — a second dangerous interception before the first is
+/// resolved simply replaces it, matching the single-slot `insecure_prompt` /
+/// `pending_saved_pdfs`-style gates already used elsewhere in this surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDangerousDownload {
+    id: u64,
+    url: String,
+    filename: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessOutput {
     success: bool,
@@ -423,6 +436,59 @@ const fn download_state_rank(state: TransferState) -> u8 {
         TransferState::Failed => 3,
         TransferState::Done => 4,
     }
+}
+
+/// Extensions Chrome-style download-danger checks flag as potentially harmful:
+/// executables, installers, scripts, and the package formats every desktop OS
+/// this shell targets would happily run on double-click.
+const DANGEROUS_DOWNLOAD_EXTENSIONS: &[&str] = &[
+    "exe", "scr", "bat", "cmd", "com", "pif", "msi", "msix", "vbs", "vbe", "js", "jse", "jar",
+    "ps1", "wsf", "hta", "cpl", "dll", "lnk", "reg", "sh", "run", "deb", "rpm", "dmg", "pkg",
+    "apk", "gadget",
+];
+
+/// Pure classifier: does `filename` look like it could harm the device if run?
+/// Case-insensitive on the final extension — the one that actually decides how
+/// the OS opens the file — plus the second-to-last segment, so a masquerading
+/// double extension is caught from either side (`invoice.pdf.exe` *and*
+/// `invoice.exe.pdf` both flag, not just the visible-name trick). Paint-free
+/// and side-effect-free so it's directly unit-testable ([`submit_download_to_ledger`]
+/// is the only caller that acts on it).
+fn download_is_dangerous(filename: &str) -> bool {
+    fn is_dangerous_ext(part: &str) -> bool {
+        DANGEROUS_DOWNLOAD_EXTENSIONS.contains(&part.to_ascii_lowercase().as_str())
+    }
+    let mut parts: Vec<&str> = filename.trim().split('.').collect();
+    // A leading empty segment is a dotfile's leading dot (`.bashrc`), not an
+    // extension boundary.
+    if parts.first() == Some(&"") {
+        parts.remove(0);
+    }
+    if parts.len() < 2 {
+        return false;
+    }
+    if is_dangerous_ext(parts[parts.len() - 1]) {
+        return true;
+    }
+    parts.len() >= 3 && is_dangerous_ext(parts[parts.len() - 2])
+}
+
+/// The filename a download should be saved under: the engine's suggested name
+/// if it gave one, else derived from the URL's last non-empty path segment
+/// (query/fragment stripped FIRST — otherwise a signed link like
+/// `…/file.zip?token=x` derives the query as the filename instead of
+/// `file.zip`).
+fn resolve_download_filename(url: &str, filename: &str) -> String {
+    let name = filename.trim();
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    let path_only = url.split(['?', '#']).next().unwrap_or(url);
+    path_only
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("download")
+        .to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,6 +742,21 @@ pub(crate) struct WebState {
     session_snapshot_last_poll: Option<Instant>,
     /// Last lifecycle dispatch failure, shown inline instead of being swallowed.
     download_notice: Option<String>,
+    /// A CEF-intercepted download flagged by [`download_is_dangerous`], parked
+    /// pending the user's Keep/Discard choice instead of being silently
+    /// submitted to the ledger. `None` once resolved either way; a safe
+    /// download never touches this field.
+    pending_dangerous_download: Option<PendingDangerousDownload>,
+    /// Ledger job ids the user dismissed from the downloads drawer ("Remove
+    /// from list" / "Clear all"). The Transfers ledger job itself is
+    /// untouched — this only hides it from the Browser's own view, which
+    /// [`WebState::refresh_downloads`] rebuilds from the ledger every poll.
+    dismissed_download_ids: BTreeSet<String>,
+    /// The source URL behind each ledger-submitted download, keyed by ledger
+    /// job id, so the drawer's "Copy link" can put the real download URL on
+    /// the clipboard — the ledger job's own `source` field is the local
+    /// `.download.json` manifest path, not the URL.
+    download_source_urls: BTreeMap<String, String>,
     /// Last viewport-capture result, shown inline instead of being swallowed.
     capture_notice: Option<String>,
     /// Last successfully saved user PDF. CUPS spool PDFs are excluded; this feeds
@@ -808,6 +889,9 @@ impl Default for WebState {
             downloads_last_poll: None,
             session_snapshot_last_poll: None,
             download_notice: None,
+            pending_dangerous_download: None,
+            dismissed_download_ids: BTreeSet::new(),
+            download_source_urls: BTreeMap::new(),
             capture_notice: None,
             last_saved_pdf: None,
             pending_saved_pdfs: BTreeMap::new(),
@@ -875,7 +959,10 @@ impl WebState {
             .transfers
             .jobs()
             .into_iter()
-            .filter(|job| job.method == TransferMethod::BrowserDownload)
+            .filter(|job| {
+                job.method == TransferMethod::BrowserDownload
+                    && !self.dismissed_download_ids.contains(&job.id)
+            })
             .collect();
         jobs.sort_by(|a, b| {
             download_state_rank(a.state)
@@ -2180,31 +2267,49 @@ impl WebState {
     }
 
     /// B2 — a browser download was intercepted by the engine (which cancelled its
-    /// own write). Submit it to the mesh Transfers ledger: write a
-    /// `.download.json` manifest naming the URL and let the daemon's
-    /// browser-download lane fetch it into the mesh share (the downloads drawer
-    /// already renders the resulting `browser_download` ledger row).
+    /// own write). A filename [`download_is_dangerous`] flags is parked in
+    /// [`Self::pending_dangerous_download`] instead of being silently handed to
+    /// the ledger — the downloads drawer surfaces a Keep/Discard warning, and
+    /// only Keep resumes this same path via [`Self::enqueue_download_to_ledger`].
+    /// A safe filename submits immediately, unchanged from before.
     fn submit_download_to_ledger(&mut self, id: u64, url: &str, filename: &str) {
         let url = url.trim();
         if url.is_empty() {
             return;
         }
-        let filename = {
-            let name = filename.trim();
-            if name.is_empty() {
-                // Strip the query/fragment FIRST, then take the last path segment —
-                // otherwise a signed link like `…/file.zip?token=x` derives the
-                // query (`token=x`) as the filename instead of `file.zip`.
-                let path_only = url.split(['?', '#']).next().unwrap_or(url);
-                path_only
-                    .rsplit('/')
-                    .find(|part| !part.is_empty())
-                    .unwrap_or("download")
-                    .to_owned()
-            } else {
-                name.to_owned()
-            }
-        };
+        let filename = resolve_download_filename(url, filename);
+        if download_is_dangerous(&filename) {
+            self.pending_dangerous_download = Some(PendingDangerousDownload {
+                id,
+                url: url.to_owned(),
+                filename,
+            });
+            self.downloads_open = true;
+            return;
+        }
+        self.enqueue_download_to_ledger(id, url, &filename);
+    }
+
+    /// The user confirmed **Keep** on a dangerous-download warning — proceed
+    /// exactly as a safe download would.
+    fn keep_pending_dangerous_download(&mut self) {
+        if let Some(pending) = self.pending_dangerous_download.take() {
+            self.enqueue_download_to_ledger(pending.id, &pending.url, &pending.filename);
+        }
+    }
+
+    /// The user chose **Discard** on a dangerous-download warning — drop it
+    /// with no ledger job ever created.
+    fn discard_pending_dangerous_download(&mut self) {
+        self.pending_dangerous_download = None;
+    }
+
+    /// Write the `.download.json` manifest and enqueue the mesh Transfers job
+    /// for a download already cleared to proceed — the daemon's
+    /// browser-download lane fetches `asset_url` into the mesh share (the
+    /// downloads drawer already renders the resulting `browser_download`
+    /// ledger row).
+    fn enqueue_download_to_ledger(&mut self, id: u64, url: &str, filename: &str) {
         let spool = browser_media_spool_dir();
         let dest = browser_capture_dir();
         if std::fs::create_dir_all(&spool).is_err() || std::fs::create_dir_all(&dest).is_err() {
@@ -2229,13 +2334,32 @@ impl WebState {
             &path.to_string_lossy(),
             dest.to_string_lossy().as_ref(),
         ) {
-            Ok(_) => {
+            Ok(job_id) => {
+                self.download_source_urls.insert(job_id, url.to_owned());
                 self.downloads_open = true;
                 self.refresh_downloads();
                 self.capture_notice = Some(format!("Downloading {filename} to the mesh share"));
             }
             Err(err) => self.capture_notice = Some(format!("Download failed: {err}")),
         }
+    }
+
+    /// Hide one ledger job from the Browser's downloads view without touching
+    /// the ledger job itself (the drawer's per-item "Remove from list").
+    fn dismiss_download(&mut self, id: &str) {
+        self.dismissed_download_ids.insert(id.to_owned());
+        self.download_source_urls.remove(id);
+        self.download_jobs.retain(|job| job.id != id);
+    }
+
+    /// Hide every job currently visible in the downloads drawer (the header's
+    /// "Clear all"). New downloads after this point are unaffected.
+    fn dismiss_all_downloads(&mut self) {
+        for job in &self.download_jobs {
+            self.dismissed_download_ids.insert(job.id.clone());
+            self.download_source_urls.remove(&job.id);
+        }
+        self.download_jobs.clear();
     }
 
     fn record_capture_success(&mut self, label: &str, path: &Path) {
@@ -13724,6 +13848,215 @@ mod tests {
         let body = std::fs::read_to_string(&job.source).expect("manifest written to spool");
         let manifest: serde_json::Value = serde_json::from_str(&body).expect("manifest JSON");
         assert_eq!(manifest["suggested_filename"], "archive.tar.gz");
+        let _ = std::fs::remove_file(&job.source);
+    }
+
+    #[test]
+    fn download_is_dangerous_flags_executable_and_script_extensions() {
+        for filename in [
+            "setup.exe",
+            "Invoice.pdf.exe",
+            "script.PS1",
+            "x.jar",
+            "installer.MSI",
+            "payload.scr",
+            "run.bat",
+            "run.cmd",
+            "legacy.com",
+            "auto.pif",
+            "app.msix",
+            "creds.vbs",
+            "creds.vbe",
+            "worker.js",
+            "worker.jse",
+            "task.wsf",
+            "help.hta",
+            "panel.cpl",
+            "lib.dll",
+            "shortcut.lnk",
+            "tweak.reg",
+            "install.sh",
+            "binary.run",
+            "package.deb",
+            "package.rpm",
+            "image.dmg",
+            "bundle.pkg",
+            "app.apk",
+            "widget.gadget",
+            // A masquerading double extension from either side.
+            "notes.exe.pdf",
+        ] {
+            assert!(
+                download_is_dangerous(filename),
+                "{filename} should be flagged dangerous"
+            );
+        }
+    }
+
+    #[test]
+    fn download_is_dangerous_allows_ordinary_files() {
+        for filename in [
+            "photo.jpg",
+            "report.pdf",
+            "archive.tar.gz",
+            "data.csv",
+            "notes.txt",
+            "song.mp3",
+            "video.mp4",
+            ".bashrc",
+            "README",
+            "",
+        ] {
+            assert!(
+                !download_is_dangerous(filename),
+                "{filename} should NOT be flagged dangerous"
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_download_parks_pending_and_does_not_submit() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(11, "https://files.example.test/setup.exe", "setup.exe");
+
+        assert!(
+            transfers.verbs().is_empty(),
+            "a dangerous download must not touch the ledger before Keep/Discard"
+        );
+        let pending = state
+            .pending_dangerous_download
+            .clone()
+            .expect("dangerous download parked pending confirmation");
+        assert_eq!(pending.id, 11);
+        assert_eq!(pending.url, "https://files.example.test/setup.exe");
+        assert_eq!(pending.filename, "setup.exe");
+        // The drawer opens so the user actually sees the warning.
+        assert!(state.downloads_open);
+    }
+
+    #[test]
+    fn keeping_a_dangerous_download_submits_exactly_one_ledger_job() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(12, "https://files.example.test/setup.exe", "setup.exe");
+        assert!(state.pending_dangerous_download.is_some());
+
+        state.keep_pending_dangerous_download();
+
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "Keep resolves the pending confirmation"
+        );
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1, "exactly one ledger submission on Keep");
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        let body = std::fs::read_to_string(&job.source).expect("manifest written to spool");
+        let manifest: serde_json::Value = serde_json::from_str(&body).expect("manifest JSON");
+        assert_eq!(
+            manifest["asset_url"],
+            "https://files.example.test/setup.exe"
+        );
+        assert_eq!(manifest["suggested_filename"], "setup.exe");
+        let _ = std::fs::remove_file(&job.source);
+    }
+
+    #[test]
+    fn discarding_a_dangerous_download_drops_it_with_no_ledger_job() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(13, "https://files.example.test/setup.exe", "setup.exe");
+        assert!(state.pending_dangerous_download.is_some());
+
+        state.discard_pending_dangerous_download();
+
+        assert!(state.pending_dangerous_download.is_none());
+        assert!(
+            transfers.verbs().is_empty(),
+            "Discard must never create a ledger job"
+        );
+    }
+
+    #[test]
+    fn safe_download_submits_immediately_without_parking() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(14, "https://files.example.test/report.pdf", "report.pdf");
+
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "a safe download never parks for confirmation"
+        );
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1, "exactly one ledger submission, no parking");
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        let _ = std::fs::remove_file(&job.source);
+    }
+
+    #[test]
+    fn drawer_remove_hides_a_job_and_clear_all_hides_every_job() {
+        // `RecordingTransfers::jobs()` is a static double for the daemon-owned
+        // ledger — it never shrinks on its own — so this proves dismissal is a
+        // Browser-local view filter, NOT a mutation of the shared ledger.
+        let a = transfer_fixture(
+            "browser-a",
+            TransferMethod::BrowserDownload,
+            TransferState::Done,
+            10,
+        );
+        let b = transfer_fixture(
+            "browser-b",
+            TransferMethod::BrowserDownload,
+            TransferState::Done,
+            20,
+        );
+        let transfers = RecordingTransfers::with_jobs(vec![a, b]);
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        assert_eq!(state.download_jobs.len(), 2);
+
+        state.dismiss_download("browser-a");
+        assert_eq!(state.download_jobs.len(), 1);
+        assert!(!state.download_jobs.iter().any(|job| job.id == "browser-a"));
+        // The ledger itself still carries both jobs — only the Browser's view
+        // dropped one — and a dismissed id stays hidden across a rebuild.
+        assert_eq!(transfers.jobs().len(), 2);
+        state.refresh_downloads();
+        assert_eq!(state.download_jobs.len(), 1);
+        assert_eq!(state.download_jobs[0].id, "browser-b");
+
+        state.dismiss_all_downloads();
+        assert!(state.download_jobs.is_empty());
+        state.refresh_downloads();
+        assert!(
+            state.download_jobs.is_empty(),
+            "Clear all stays hidden across a ledger refresh too"
+        );
+        assert_eq!(
+            transfers.jobs().len(),
+            2,
+            "Clear all never mutates the shared ledger"
+        );
+    }
+
+    #[test]
+    fn copy_link_source_url_is_tracked_per_ledger_job() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(17, "https://files.example.test/report.pdf", "report.pdf");
+
+        let verbs = transfers.verbs();
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        assert_eq!(
+            state.download_source_urls.get(&job.id).map(String::as_str),
+            Some("https://files.example.test/report.pdf")
+        );
         let _ = std::fs::remove_file(&job.source);
     }
 
