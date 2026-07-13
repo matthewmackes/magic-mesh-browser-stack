@@ -3118,6 +3118,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let mut page_text_events = Vec::new();
     let mut page_scrape_events = Vec::new();
     let mut passkey_events = Vec::new();
+    let mut popup_opens = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
@@ -3135,6 +3136,14 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         for event in tab.session.drain_passkey_events() {
             passkey_events.push((idx, tab.engine, event.body));
         }
+        // window.open / target=_blank the engine cancelled → open as a real tab
+        // on the same engine (the popup-producer chain, EventMsg::PopupRequested).
+        for request in tab.session.drain_popup_requests() {
+            popup_opens.push((tab.engine, request.url));
+        }
+    }
+    for (engine, url) in popup_opens {
+        state.request_new_tab_with_url(engine, url);
     }
     let mut pdf_notice = None;
     for (path, ok) in pdf_events {
