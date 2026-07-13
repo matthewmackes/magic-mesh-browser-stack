@@ -3780,10 +3780,6 @@ fn tab_pill_rects_id() -> egui::Id {
     egui::Id::new("browser-test-tab-pill-rects")
 }
 
-fn tab_pill(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
-    tab_pill_sized(ui, label, active, CHROME_TAB_W)
-}
-
 fn tab_pill_sized(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
     let color = if active { Style::TEXT } else { Style::TEXT_DIM };
     let fill = if active {
@@ -8097,6 +8093,294 @@ mod tests {
         state.move_tab(0, 2);
         assert_eq!(state.active, 2);
         assert_eq!(state.tabs[state.active].session.title(), active_title);
+    }
+
+    /// Drive ONE headless frame of just the tab strip (isolating it from the full
+    /// panel's polling), mirroring `middle_clicking_a_tab_pill_closes_that_tab`.
+    fn run_tab_strip_frame(ctx: &egui::Context, state: &mut WebState, input: egui::RawInput) {
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| tab_strip(ui, state));
+        });
+    }
+
+    /// The laid-out pill centres the strip stashed on its last frame, in tab order.
+    fn tab_pill_centers(ctx: &egui::Context) -> Vec<egui::Pos2> {
+        ctx.data(|d| d.get_temp::<Vec<Rect>>(tab_pill_rects_id()))
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.center())
+            .collect()
+    }
+
+    /// Press on `from`, drag past egui's click threshold to `to`, then release —
+    /// a real pointer drag-reorder gesture routed through the tab strip.
+    fn drag_pill(ctx: &egui::Context, state: &mut WebState, from: egui::Pos2, to: egui::Pos2) {
+        let mut press = body_input();
+        press.events = vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        run_tab_strip_frame(ctx, state, press);
+
+        let mut moved = body_input();
+        moved.events = vec![egui::Event::PointerMoved(to)];
+        run_tab_strip_frame(ctx, state, moved);
+
+        let mut release = body_input();
+        release.events = vec![egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        run_tab_strip_frame(ctx, state, release);
+    }
+
+    #[test]
+    fn tab_drag_target_index_picks_the_nearest_slot_center() {
+        let pills = vec![
+            (0, Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 20.0))),
+            (1, Rect::from_min_size(pos2(100.0, 0.0), vec2(100.0, 20.0))),
+            (2, Rect::from_min_size(pos2(200.0, 0.0), vec2(100.0, 20.0))),
+        ];
+        // Horizontal centres sit at x = 50, 150, 250.
+        assert_eq!(
+            tab_drag_target_index(&pills, pos2(260.0, 10.0), TabAxis::Horizontal),
+            Some(2)
+        );
+        assert_eq!(
+            tab_drag_target_index(&pills, pos2(160.0, 10.0), TabAxis::Horizontal),
+            Some(1)
+        );
+        assert_eq!(
+            tab_drag_target_index(&pills, pos2(40.0, 10.0), TabAxis::Horizontal),
+            Some(0)
+        );
+        // The vertical axis compares Y instead of X.
+        let stacked = vec![
+            (0, Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 20.0))),
+            (1, Rect::from_min_size(pos2(0.0, 20.0), vec2(100.0, 20.0))),
+        ];
+        assert_eq!(
+            tab_drag_target_index(&stacked, pos2(50.0, 38.0), TabAxis::Vertical),
+            Some(1)
+        );
+        assert_eq!(
+            tab_drag_target_index(&[], pos2(0.0, 0.0), TabAxis::Horizontal),
+            None
+        );
+    }
+
+    #[test]
+    fn dragging_a_tab_pill_reorders_it_and_keeps_the_active_tab() {
+        let (a, _ha) = testkit::connect().expect("connect a");
+        let (b, _hb) = testkit::connect().expect("connect b");
+        let (c, _hc) = testkit::connect().expect("connect c");
+        let mut state = WebState::default();
+        state.push_session(a);
+        state.push_session(b);
+        state.push_session(c);
+        // Distinct per-tab markers so we can follow both the dragged tab and the
+        // active session across the reorder (testkit titles are identical).
+        state.tabs[0].force_dark = true; // the tab we drag
+        state.tabs[2].reader_mode = true; // the active session
+        state.select_tab(2);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Settle one frame so the strip publishes its pill rects.
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        let centers = tab_pill_centers(&ctx);
+        assert_eq!(centers.len(), 3, "three pills laid out");
+
+        // Drag tab 0 onto tab 1's slot.
+        drag_pill(&ctx, &mut state, centers[0], centers[1]);
+
+        // The dragged tab moved from slot 0 to slot 1 ...
+        assert!(state.tabs[1].force_dark, "the dragged tab landed in slot 1");
+        assert!(!state.tabs[0].force_dark);
+        // ... and the SAME session stays active (a reorder below the active index
+        // leaves the active index in place, still pointing at tab C).
+        assert_eq!(
+            state.active, 2,
+            "reorder below the active index leaves it put"
+        );
+        assert!(
+            state.tabs[state.active].reader_mode,
+            "the active tab is still the same session after the reorder"
+        );
+    }
+
+    #[test]
+    fn dragging_a_tab_across_the_active_index_adjusts_active() {
+        let (a, _ha) = testkit::connect().expect("connect a");
+        let (b, _hb) = testkit::connect().expect("connect b");
+        let (c, _hc) = testkit::connect().expect("connect c");
+        let mut state = WebState::default();
+        state.push_session(a);
+        state.push_session(b);
+        state.push_session(c);
+        state.tabs[1].reader_mode = true; // follow the active session (B)
+        state.select_tab(1);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        let centers = tab_pill_centers(&ctx);
+        assert_eq!(centers.len(), 3);
+
+        // Drag tab 0 (A) past the active tab to the last slot.
+        drag_pill(&ctx, &mut state, centers[0], centers[2]);
+
+        // A moved to the end; B slid one slot left but is STILL the active session.
+        assert_eq!(
+            state.active, 0,
+            "active index follows its session across the reorder"
+        );
+        assert!(
+            state.tabs[state.active].reader_mode,
+            "the same session (B) stays active after crossing the active index"
+        );
+    }
+
+    #[test]
+    fn a_tiny_pointer_move_on_a_pill_activates_instead_of_reordering() {
+        let (a, _ha) = testkit::connect().expect("connect a");
+        let (b, _hb) = testkit::connect().expect("connect b");
+        let mut state = WebState::default();
+        state.push_session(a);
+        state.push_session(b);
+        state.tabs[0].force_dark = true; // marker proving the order is unchanged
+        assert_eq!(state.active, 1, "pushing two tabs leaves the second active");
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        let centers = tab_pill_centers(&ctx);
+        let from = centers[0];
+        // A jitter well under egui's 6pt click threshold — must read as a CLICK.
+        let nudged = from + vec2(2.0, 0.0);
+
+        let mut press = body_input();
+        press.events = vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        run_tab_strip_frame(&ctx, &mut state, press);
+
+        let mut release = body_input();
+        release.events = vec![
+            egui::Event::PointerMoved(nudged),
+            egui::Event::PointerButton {
+                pos: nudged,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        run_tab_strip_frame(&ctx, &mut state, release);
+
+        assert_eq!(
+            state.active, 0,
+            "a sub-threshold move is a click, so tab 0 activates"
+        );
+        assert!(
+            state.tabs[0].force_dark,
+            "a click must NOT reorder — the order is untouched"
+        );
+        assert_eq!(state.tabs.len(), 2, "and nothing was closed");
+    }
+
+    #[test]
+    fn dragging_a_tab_reorders_in_the_vertical_strip() {
+        let (a, _ha) = testkit::connect().expect("connect a");
+        let (b, _hb) = testkit::connect().expect("connect b");
+        let (c, _hc) = testkit::connect().expect("connect c");
+        let mut state = WebState::default();
+        state.push_session(a);
+        state.push_session(b);
+        state.push_session(c);
+        state.set_vertical_tabs(true);
+        state.tabs[0].force_dark = true; // follow the dragged (and active) tab
+        state.select_tab(0);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        let centers = tab_pill_centers(&ctx);
+        assert_eq!(centers.len(), 3, "three stacked pills laid out");
+
+        // Drag the top pill DOWN onto the bottom slot (matched along Y).
+        drag_pill(&ctx, &mut state, centers[0], centers[2]);
+
+        assert!(
+            state.tabs[2].force_dark,
+            "the vertical drag moved the pill to the bottom slot"
+        );
+        assert_eq!(
+            state.active, 2,
+            "the dragged tab was active and its index followed the move"
+        );
+    }
+
+    #[test]
+    fn horizontal_tab_pills_shrink_to_a_floor_then_scroll_instead_of_wrapping() {
+        // A roomy strip with few tabs keeps full-width pills.
+        assert_eq!(horizontal_tab_pill_width(1200.0, 2), CHROME_TAB_W);
+        // A crowded strip shrinks pills to the floor (never below), so the strip
+        // scrolls in ONE row instead of stacking onto a second row.
+        assert_eq!(horizontal_tab_pill_width(1200.0, 40), CHROME_TAB_MIN_W);
+        // The floor holds even in an absurdly narrow strip.
+        assert!(horizontal_tab_pill_width(40.0, 40) >= CHROME_TAB_MIN_W);
+        // More tabs never widen a pill.
+        assert!(horizontal_tab_pill_width(1200.0, 20) <= horizontal_tab_pill_width(1200.0, 4));
+    }
+
+    #[test]
+    fn many_tabs_stay_on_one_scrolling_row_and_the_active_tab_stays_reachable() {
+        let mut state = WebState::default();
+        let mut _helpers = Vec::new();
+        for _ in 0..20 {
+            let (s, h) = testkit::connect().expect("connect");
+            state.push_session(s);
+            _helpers.push(h);
+        }
+        assert_eq!(state.tabs.len(), 20);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Measure the vertical space the strip consumes: a single scrolling row is
+        // ~one tab tall (plus a scrollbar), NOT the many rows the old wrap made.
+        let mut used_h = 0.0f32;
+        let _ = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let top = ui.next_widget_position().y;
+                tab_strip(ui, &mut state);
+                used_h = ui.next_widget_position().y - top;
+            });
+        });
+        assert!(
+            used_h < CHROME_TAB_H * 3.0,
+            "20 tabs must stay on ONE scrolling row (strip height {used_h})"
+        );
+
+        // The far tab is still selectable — it scrolls into view and renders.
+        state.select_tab(19);
+        assert_eq!(state.active, 19);
+        assert!(
+            run_panel(&mut state),
+            "the active far tab renders in the single scrolling row"
+        );
     }
 
     #[test]
