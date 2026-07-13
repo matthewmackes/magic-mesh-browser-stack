@@ -1379,6 +1379,18 @@ impl CefBrowserCallbacks {
         self.state
             .print_handler_ptr
             .store(self.print.as_usize(), Ordering::SeqCst);
+        self.state
+            .display_handler_ptr
+            .store(self.display.as_usize(), Ordering::SeqCst);
+        self.state
+            .load_handler_ptr
+            .store(self.load.as_usize(), Ordering::SeqCst);
+        self.state
+            .find_handler_ptr
+            .store(self.find.as_usize(), Ordering::SeqCst);
+        self.state
+            .download_handler_ptr
+            .store(self.download.as_usize(), Ordering::SeqCst);
         let mut registry = registry().lock().expect("cef callback registry");
         registry.insert(self.client.as_usize(), state);
         registry.insert(self.life_span.as_usize(), state);
@@ -1631,6 +1643,14 @@ struct CefBrowserState {
     /// delivery. Mirrors `pdf_callbacks`; accepts the same small retention leak.
     download_image_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE>>>>,
     print_handler_ptr: AtomicUsize,
+    /// Cached child-handler block pointers, set at `install()` time — resolved
+    /// DIRECTLY (not via the size-keyed `lookup_peer`, whose `callback_size`
+    /// whitelist omits these sizes and whose find(48) aliases pdf_print(48)).
+    /// Returning null here silently disables the handler on live CEF.
+    display_handler_ptr: AtomicUsize,
+    load_handler_ptr: AtomicUsize,
+    find_handler_ptr: AtomicUsize,
+    download_handler_ptr: AtomicUsize,
     string_userfree_free: CefStringUserfreeUtf16Free,
     /// `cef_string_list_size` / `cef_string_list_value` exports (dlsym'd via the
     /// ABI), used to read the favicon `icon_urls` list in `on_favicon_urlchange`.
@@ -1693,6 +1713,10 @@ impl CefBrowserState {
             pdf_callbacks: Mutex::new(Vec::new()),
             download_image_callbacks: Mutex::new(Vec::new()),
             print_handler_ptr: AtomicUsize::new(0),
+            display_handler_ptr: AtomicUsize::new(0),
+            load_handler_ptr: AtomicUsize::new(0),
+            find_handler_ptr: AtomicUsize::new(0),
+            download_handler_ptr: AtomicUsize::new(0),
             string_userfree_free,
             string_list_size,
             string_list_value,
@@ -2902,20 +2926,30 @@ impl CefBrowserState {
         self.print_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
+    // These four resolve their handler block DIRECTLY from the owned field
+    // (like `print_ptr`/`client_ptr`), NOT via the size-keyed `lookup_peer`.
+    // `lookup_peer` gates on `callback_size()`'s whitelist, which does NOT list
+    // the display(144)/load(72)/find(48)/download(64) sizes — so routing these
+    // through it returned NULL, silently disabling on_address_change/title/
+    // favicon/cursor, loading-state, find results, and download interception on
+    // live CEF (unit tests never exercise the real vtable). `as_mut_ptr()` is the
+    // exact pointer each block is registered under, so the callbacks still resolve
+    // their state. find(48) also aliases pdf_print_callback(48), so a whitelist
+    // fix would mis-resolve — direct access is the only collision-proof answer.
     fn display_ptr(&self) -> *mut c_void {
-        lookup_peer(self, CEF_DISPLAY_HANDLER_SIZE)
+        self.display_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
     fn load_ptr(&self) -> *mut c_void {
-        lookup_peer(self, CEF_LOAD_HANDLER_SIZE)
+        self.load_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
     fn find_ptr(&self) -> *mut c_void {
-        lookup_peer(self, CEF_FIND_HANDLER_SIZE)
+        self.find_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
     fn download_ptr(&self) -> *mut c_void {
-        lookup_peer(self, CEF_DOWNLOAD_HANDLER_SIZE)
+        self.download_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 }
 

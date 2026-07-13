@@ -479,6 +479,50 @@ fn stop_control_uses_cef_stop_load_slot() {
     assert_eq!(STOP_LOAD_CALLS.load(AtomicOrdering::SeqCst), 1);
 }
 
+#[test]
+fn child_handler_pointers_resolve_non_null_to_their_registered_block() {
+    // REGRESSION: get_display_handler/get_load_handler/get_find_handler/
+    // get_download_handler resolved via the size-keyed `lookup_peer`, whose
+    // `callback_size` whitelist did NOT list the display(144)/load(72)/find(48)/
+    // download(64) sizes (and find(48) aliases pdf_print(48)) — so they returned
+    // NULL and CEF silently never dispatched on_address_change/title/favicon/
+    // cursor, on_loading_state_change, on_find_result, or the download handler on
+    // the LIVE vtable. Every feature still passed its unit tests because those
+    // never exercise the real CEF callback path. Assert each child handler now
+    // resolves DIRECTLY to its registered block (non-null), and that the
+    // whitelisted peers did not regress.
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    assert_eq!(
+        callbacks.state.display_ptr(),
+        callbacks.display.as_mut_ptr()
+    );
+    assert_eq!(callbacks.state.load_ptr(), callbacks.load.as_mut_ptr());
+    assert_eq!(callbacks.state.find_ptr(), callbacks.find.as_mut_ptr());
+    assert_eq!(
+        callbacks.state.download_ptr(),
+        callbacks.download.as_mut_ptr()
+    );
+    for ptr in [
+        callbacks.state.display_ptr(),
+        callbacks.state.load_ptr(),
+        callbacks.state.find_ptr(),
+        callbacks.state.download_ptr(),
+        // whitelisted peers must still resolve too (no regression):
+        callbacks.state.render_ptr(),
+        callbacks.state.request_ptr(),
+    ] {
+        assert!(!ptr.is_null(), "child handler must resolve to a live block");
+    }
+}
+
 unsafe extern "C" fn record_audio_muted(_host: *mut c_void, muted: c_int) {
     AUDIO_MUTED_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     AUDIO_MUTED_LAST.store(muted, AtomicOrdering::SeqCst);
