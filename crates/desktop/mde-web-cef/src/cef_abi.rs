@@ -53,6 +53,12 @@ type CefBrowserHostCreateBrowserSync = unsafe extern "C" fn(
     *mut c_void,
 ) -> *mut c_void;
 pub(crate) type CefStringUserfreeUtf16Free = unsafe extern "C" fn(*mut c_void);
+/// `size_t cef_string_list_size(cef_string_list_t)` — the count of a CEF string
+/// list (e.g. the favicon `icon_urls` the display handler delivers).
+pub(crate) type CefStringListSize = unsafe extern "C" fn(*mut c_void) -> usize;
+/// `int cef_string_list_value(cef_string_list_t, size_t, cef_string_t*)` — copies
+/// the element at the index into the caller's `cef_string_t` (owning copy).
+pub(crate) type CefStringListValue = unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> c_int;
 type CefShutdown = unsafe extern "C" fn();
 
 /// Loaded metadata from `libcef.so`.
@@ -163,6 +169,8 @@ pub struct CefAbi {
     cef_do_message_loop_work: CefDoMessageLoopWork,
     cef_browser_host_create_browser_sync: CefBrowserHostCreateBrowserSync,
     cef_string_userfree_utf16_free: CefStringUserfreeUtf16Free,
+    cef_string_list_size: CefStringListSize,
+    cef_string_list_value: CefStringListValue,
     cef_shutdown: CefShutdown,
 }
 
@@ -204,6 +212,8 @@ impl CefAbi {
                 &path,
                 "cef_string_userfree_utf16_free",
             )?,
+            cef_string_list_size: load_symbol(handle, &path, "cef_string_list_size")?,
+            cef_string_list_value: load_symbol(handle, &path, "cef_string_list_value")?,
             cef_shutdown: load_symbol(handle, &path, "cef_shutdown")?,
             path,
             handle,
@@ -360,6 +370,20 @@ impl CefAbi {
     #[must_use]
     pub(crate) const fn string_userfree_utf16_free(&self) -> CefStringUserfreeUtf16Free {
         self.cef_string_userfree_utf16_free
+    }
+
+    /// The `cef_string_list_size` export — count elements of a CEF string list
+    /// (the display handler's favicon `icon_urls`).
+    #[must_use]
+    pub(crate) const fn string_list_size(&self) -> CefStringListSize {
+        self.cef_string_list_size
+    }
+
+    /// The `cef_string_list_value` export — copy one element of a CEF string list
+    /// into a caller-owned `cef_string_t`.
+    #[must_use]
+    pub(crate) const fn string_list_value(&self) -> CefStringListValue {
+        self.cef_string_list_value
     }
 
     /// Shut down CEF after a successful browser-process initialization.

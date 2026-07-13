@@ -447,8 +447,15 @@ fn stop_control_uses_cef_stop_load_slot() {
     browser
         [CEF_BROWSER_STOP_LOAD_OFFSET..CEF_BROWSER_STOP_LOAD_OFFSET + std::mem::size_of::<usize>()]
         .copy_from_slice(&(record_stop_load as *const () as usize).to_ne_bytes());
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
 
     apply_control_frame(browser.as_mut_ptr().cast(), &callbacks, &ControlMsg::Stop);
 
@@ -475,8 +482,15 @@ fn audio_mute_control_uses_cef_host_audio_slot() {
     browser
         [CEF_BROWSER_GET_HOST_OFFSET..CEF_BROWSER_GET_HOST_OFFSET + std::mem::size_of::<usize>()]
         .copy_from_slice(&(test_browser_host as *const () as usize).to_ne_bytes());
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
 
     apply_control_frame(
         browser.as_mut_ptr().cast(),
@@ -543,8 +557,15 @@ fn print_controls_use_cef_host_print_slots() {
     browser
         [CEF_BROWSER_GET_HOST_OFFSET..CEF_BROWSER_GET_HOST_OFFSET + std::mem::size_of::<usize>()]
         .copy_from_slice(&(test_browser_host as *const () as usize).to_ne_bytes());
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
 
     apply_control_frame(
         browser.as_mut_ptr().cast(),
@@ -1084,8 +1105,15 @@ fn wait_for_readable_returns_promptly_when_the_fd_is_readable() {
 
 #[test]
 fn record_navigation_advances_the_generation_seen_by_the_pump() {
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     assert_eq!(callbacks.navigations(), 0);
     callbacks.state.record_navigation();
     callbacks.state.record_navigation();
@@ -1100,8 +1128,15 @@ fn js_string_literal_escapes_script_sensitive_characters() {
 
 #[test]
 fn callback_registry_returns_lifespan_and_render_peers() {
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let life = unsafe { get_life_span_handler(callbacks.client_ptr()) };
     let render = unsafe { get_render_handler(callbacks.client_ptr()) };
     let request = unsafe { get_request_handler(callbacks.client_ptr()) };
@@ -1114,8 +1149,15 @@ fn callback_registry_returns_lifespan_and_render_peers() {
 
 #[test]
 fn callbacks_record_created_and_view_paint() {
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let life = unsafe { get_life_span_handler(callbacks.client_ptr()) };
     let render = unsafe { get_render_handler(callbacks.client_ptr()) };
     unsafe { on_after_created(life, ptr::null_mut()) };
@@ -1148,8 +1190,15 @@ fn callbacks_record_created_and_view_paint() {
 
 #[test]
 fn resize_control_changes_the_next_view_rect() {
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let render = unsafe { get_render_handler(callbacks.client_ptr()) };
     callbacks.resize(640, 480);
     let mut rect = CefRect {
@@ -1168,8 +1217,15 @@ fn callbacks_publish_paint_to_the_bookmarks_frame_sink() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
 
     let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
@@ -1215,8 +1271,15 @@ fn pdf_completion_callback_publishes_helper_event() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
 
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
@@ -1251,8 +1314,15 @@ fn pdf_completion_callback_rejects_missing_pdf_output() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
     };
@@ -1280,8 +1350,15 @@ fn pdf_completion_callback_rejects_missing_pdf_output() {
 
 #[test]
 fn request_handler_registry_returns_resource_request_peer() {
-    let callbacks =
-        CefBrowserCallbacks::new(320, 200, None, noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let request = unsafe { get_request_handler(callbacks.client_ptr()) };
     let mut disable_default_handling = -1;
     let resource_request = unsafe {
@@ -1306,8 +1383,15 @@ fn resource_verdict_transport_uses_async_cef_callback() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
     };
@@ -1347,8 +1431,15 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
     };
@@ -1385,8 +1476,15 @@ fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() 
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
     };
@@ -1423,8 +1521,15 @@ fn passkey_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::wire::{take_frame, EventMsg};
 
     let (helper, shell) = UnixStream::pair().expect("socketpair");
-    let callbacks =
-        CefBrowserCallbacks::new(2, 2, Some(&helper), noop_userfree_free).expect("callbacks");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
     let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
         panic!("expected attach")
     };
@@ -1547,6 +1652,20 @@ fn read_u16(bytes: &[u8], offset: usize) -> u16 {
 }
 
 unsafe extern "C" fn noop_userfree_free(_string: *mut c_void) {}
+
+/// Empty string-list stub: reports zero elements, so `request_favicon` no-ops.
+unsafe extern "C" fn noop_string_list_size(_list: *mut c_void) -> usize {
+    0
+}
+
+/// Never-called string-list value stub (the size stub reports an empty list).
+unsafe extern "C" fn noop_string_list_value(
+    _list: *mut c_void,
+    _index: usize,
+    _value: *mut c_void,
+) -> c_int {
+    0
+}
 
 struct TestCefCallback {
     block: CefCallbackBlock<CEF_CALLBACK_SIZE>,

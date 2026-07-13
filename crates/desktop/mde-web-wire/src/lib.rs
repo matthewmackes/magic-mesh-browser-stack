@@ -1011,6 +1011,12 @@ pub enum EventMsg {
         /// This is the final result for the search (counts have settled).
         final_update: bool,
     },
+    /// The page's favicon was fetched through the engine's sandboxed connection
+    /// and decoded to PNG bytes — the shell uploads it as the tab-strip icon.
+    Favicon {
+        /// The favicon image encoded as PNG (32px, engine-decoded).
+        png: Vec<u8>,
+    },
 }
 
 impl EventMsg {
@@ -1105,6 +1111,10 @@ impl EventMsg {
                 put_u32(&mut out, *active);
                 out.push(u8::from(*final_update));
             }
+            Self::Favicon { png } => {
+                out.push(14);
+                put_bytes(&mut out, png);
+            }
         }
         out
     }
@@ -1164,6 +1174,9 @@ impl EventMsg {
                 count: c.u32()?,
                 active: c.u32()?,
                 final_update: c.bool()?,
+            },
+            14 => Self::Favicon {
+                png: c.bytes()?.to_vec(),
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -1230,6 +1243,12 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     put_len(out, s.len());
     out.extend_from_slice(s.as_bytes());
 }
+/// Write a length-prefixed raw byte blob (`[u32 LE len][bytes]`) — the binary
+/// counterpart to [`put_str`], used for engine payloads like the favicon PNG.
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_len(out, b.len());
+    out.extend_from_slice(b);
+}
 fn put_string_vec(out: &mut Vec<u8>, values: &[String]) {
     put_len(out, values.len());
     for value in values {
@@ -1291,6 +1310,15 @@ impl<'a> Cursor<'a> {
         std::str::from_utf8(b)
             .map(ToOwned::to_owned)
             .map_err(|_| WireError::BadUtf8)
+    }
+    /// Read a length-prefixed raw byte blob (the binary counterpart to
+    /// [`Self::string`]) — engine payloads like the favicon PNG.
+    fn bytes(&mut self) -> Result<&'a [u8], WireError> {
+        let len = self.u32()? as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(WireError::TooLong(len));
+        }
+        self.take(len)
     }
     fn string_vec(&mut self) -> Result<Vec<String>, WireError> {
         let len = self.u32()? as usize;
@@ -1527,6 +1555,8 @@ mod tests {
             active: 3,
             final_update: true,
         });
+        round_event(&EventMsg::Favicon { png: vec![1, 2, 3] });
+        round_event(&EventMsg::Favicon { png: Vec::new() });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }

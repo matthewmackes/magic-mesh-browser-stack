@@ -20,7 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cef_abi::{CefAbi, CefStringUserfreeUtf16Free};
+use crate::cef_abi::{CefAbi, CefStringListSize, CefStringListValue, CefStringUserfreeUtf16Free};
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
 use crate::wire::{
@@ -94,6 +94,10 @@ pub const CEF_DISPLAY_HANDLER_ON_TITLE_CHANGE_OFFSET: usize = 48;
 /// `offsetof(cef_display_handler_t, on_cursor_change)` — engine cursor shape
 /// (field 9; on_address_change=40 pins field 0, on_title_change=48 field 1).
 pub const CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET: usize = 112;
+/// `offsetof(cef_display_handler_t, on_favicon_urlchange)` — the page's favicon
+/// URLs changed (field 2, right after on_title_change=48). Signature
+/// `void(self, cef_browser_t*, cef_string_list_t icon_urls)`.
+pub const CEF_DISPLAY_HANDLER_ON_FAVICON_URLCHANGE_OFFSET: usize = 56;
 /// `sizeof(cef_load_handler_t)` for pinned Linux CEF 149 (4 fn ptrs + 40-byte base).
 pub const CEF_LOAD_HANDLER_SIZE: usize = 72;
 /// `offsetof(cef_load_handler_t, on_loading_state_change)`.
@@ -184,6 +188,11 @@ pub const CEF_BROWSER_HOST_SET_FOCUS_OFFSET: usize = 72;
 /// `offsetof(cef_browser_host_t, set_zoom_level)` — native page zoom (field 15,
 /// reconciled against close_browser=48 and set_focus=72).
 pub const CEF_BROWSER_HOST_SET_ZOOM_LEVEL_OFFSET: usize = 160;
+/// `offsetof(cef_browser_host_t, download_image)` — fetch an image URL through
+/// the engine's connection (field 18, between set_zoom_level=160 and find=208).
+/// Signature `void(self, const cef_string_t* image_url, int is_favicon,
+/// uint32_t max_image_size, int bypass_cache, cef_download_image_callback_t*)`.
+pub const CEF_BROWSER_HOST_DOWNLOAD_IMAGE_OFFSET: usize = 184;
 /// `offsetof(cef_browser_host_t, find)` — native find-in-page (field 21).
 pub const CEF_BROWSER_HOST_FIND_OFFSET: usize = 208;
 /// `offsetof(cef_browser_host_t, stop_finding)` (field 22).
@@ -228,6 +237,24 @@ pub const CEF_CALLBACK_CANCEL_OFFSET: usize = 48;
 pub const CEF_PDF_PRINT_CALLBACK_SIZE: usize = 48;
 /// `offsetof(cef_pdf_print_callback_t, on_pdf_print_finished)`.
 pub const CEF_PDF_PRINT_CALLBACK_ON_FINISHED_OFFSET: usize = 40;
+/// `sizeof(cef_download_image_callback_t)` for pinned Linux CEF 149 (base 40 +
+/// one fn ptr). Numerically equal to `CEF_PDF_PRINT_CALLBACK_SIZE` — both are
+/// single-method one-shot callbacks — so `callback_size` needs no new arm.
+pub const CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE: usize = 48;
+/// `offsetof(cef_download_image_callback_t, on_download_image_finished)`.
+/// Signature `void(self, const cef_string_t* image_url, int http_status_code,
+/// cef_image_t* image)` (image may be NULL on failure).
+pub const CEF_DOWNLOAD_IMAGE_CALLBACK_ON_FINISHED_OFFSET: usize = 40;
+/// `offsetof(cef_image_t, get_as_png)` for pinned Linux CEF 149 (field 11).
+/// Signature `cef_binary_value_t* get_as_png(self, float scale_factor,
+/// int with_transparency, int* pixel_width, int* pixel_height)`.
+pub const CEF_IMAGE_GET_AS_PNG_OFFSET: usize = 128;
+/// `offsetof(cef_binary_value_t, get_size)` for pinned Linux CEF 149 (field 6).
+pub const CEF_BINARY_VALUE_GET_SIZE_OFFSET: usize = 88;
+/// `offsetof(cef_binary_value_t, get_data)` for pinned Linux CEF 149 (field 7).
+/// Signature `size_t get_data(self, void* buffer, size_t buffer_size,
+/// size_t data_offset)`.
+pub const CEF_BINARY_VALUE_GET_DATA_OFFSET: usize = 96;
 /// `sizeof(cef_mouse_event_t)` for pinned Linux CEF 149.
 pub const CEF_MOUSE_EVENT_SIZE: usize = 12;
 /// `offsetof(cef_mouse_event_t, x)`.
@@ -432,8 +459,14 @@ pub fn run_windowless_browser_probe_with_stream(
     let window_info = CefWindowInfo::windowless(width, height);
     let browser_settings = CefBrowserSettings::windowless(30);
     let url = CefStringOwned::new(url)?;
-    let callbacks =
-        CefBrowserCallbacks::new(width, height, stream, abi.string_userfree_utf16_free())?;
+    let callbacks = CefBrowserCallbacks::new(
+        width,
+        height,
+        stream,
+        abi.string_userfree_utf16_free(),
+        abi.string_list_size(),
+        abi.string_list_value(),
+    )?;
 
     let browser = abi.create_browser_sync(
         window_info.as_ptr(),
@@ -519,6 +552,8 @@ pub fn run_windowless_text_probe(
         height,
         Some(&helper),
         abi.string_userfree_utf16_free(),
+        abi.string_list_size(),
+        abi.string_list_value(),
     )?;
 
     let browser = abi.create_browser_sync(
@@ -736,6 +771,8 @@ pub fn run_windowless_tab(
         height,
         Some(stream),
         abi.string_userfree_utf16_free(),
+        abi.string_list_size(),
+        abi.string_list_value(),
     )?;
 
     let browser = abi.create_browser_sync(
@@ -1173,12 +1210,16 @@ impl CefBrowserCallbacks {
         height: u32,
         stream: Option<&UnixStream>,
         string_userfree_free: CefStringUserfreeUtf16Free,
+        string_list_size: CefStringListSize,
+        string_list_value: CefStringListValue,
     ) -> Result<Self, CefBrowserError> {
         let state = Box::new(CefBrowserState::new(
             width,
             height,
             stream,
             string_userfree_free,
+            string_list_size,
+            string_list_value,
         )?);
         let mut callbacks = Self {
             state,
@@ -1287,6 +1328,12 @@ impl CefBrowserCallbacks {
         self.display.put_fn(
             CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET,
             fn_ptr(on_cursor_change as *const ()),
+        );
+        // Favicon fetch: the engine reports the page's icon URLs; we pull the PNG
+        // through CEF's sandboxed connection and forward the bytes to the shell.
+        self.display.put_fn(
+            CEF_DISPLAY_HANDLER_ON_FAVICON_URLCHANGE_OFFSET,
+            fn_ptr(on_favicon_urlchange as *const ()),
         );
         self.load.put_fn(
             CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET,
@@ -1405,6 +1452,11 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.find.as_usize());
         registry.remove(&self.download.as_usize());
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
+            for callback in callbacks.iter() {
+                registry.remove(&callback.as_usize());
+            }
+        }
+        if let Ok(callbacks) = self.state.download_image_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
             }
@@ -1563,8 +1615,15 @@ struct CefBrowserState {
     next_resource_request_id: AtomicU64,
     pending_resource_requests: Mutex<HashMap<u64, usize>>,
     pdf_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_PDF_PRINT_CALLBACK_SIZE>>>>,
+    /// One-shot favicon `download_image` callbacks, retained for CEF's async
+    /// delivery. Mirrors `pdf_callbacks`; accepts the same small retention leak.
+    download_image_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE>>>>,
     print_handler_ptr: AtomicUsize,
     string_userfree_free: CefStringUserfreeUtf16Free,
+    /// `cef_string_list_size` / `cef_string_list_value` exports (dlsym'd via the
+    /// ABI), used to read the favicon `icon_urls` list in `on_favicon_urlchange`.
+    string_list_size: CefStringListSize,
+    string_list_value: CefStringListValue,
     /// B1 nav state, assembled across the display + load handlers: the committed
     /// URL (from `on_address_change`) and the loading/history flags (from
     /// `on_loading_state_change`), published together as `EventMsg::NavState`.
@@ -1593,6 +1652,8 @@ impl CefBrowserState {
         height: u32,
         stream: Option<&UnixStream>,
         string_userfree_free: CefStringUserfreeUtf16Free,
+        string_list_size: CefStringListSize,
+        string_list_value: CefStringListValue,
     ) -> Result<Self, CefBrowserError> {
         let frame_sink = stream
             .map(|stream| {
@@ -1618,8 +1679,11 @@ impl CefBrowserState {
             next_resource_request_id: AtomicU64::new(1),
             pending_resource_requests: Mutex::new(HashMap::new()),
             pdf_callbacks: Mutex::new(Vec::new()),
+            download_image_callbacks: Mutex::new(Vec::new()),
             print_handler_ptr: AtomicUsize::new(0),
             string_userfree_free,
+            string_list_size,
+            string_list_value,
             nav_url: Mutex::new(String::new()),
             nav_loading: AtomicBool::new(false),
             nav_can_back: AtomicBool::new(false),
@@ -1660,6 +1724,17 @@ impl CefBrowserState {
             return;
         }
         let event = EventMsg::CursorChanged { kind };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// Forward an engine-decoded favicon (PNG bytes) to the shell, which uploads
+    /// it as the tab-strip icon.
+    fn publish_favicon(&self, png: Vec<u8>) {
+        let event = EventMsg::Favicon { png };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -1830,6 +1905,90 @@ impl CefBrowserState {
         } else {
             ptr::null_mut()
         }
+    }
+
+    /// Allocate a one-shot `cef_download_image_callback_t` for a favicon fetch,
+    /// wired to [`on_download_image_finished`]. Mirrors [`Self::retain_pdf_callback`]
+    /// exactly — the Box is retained in `download_image_callbacks` for CEF's async
+    /// delivery and registered so `with_state` resolves it in the callback.
+    fn retain_download_image_callback(&self) -> *mut c_void {
+        let mut callback = Box::new(CefCallbackBlock::new(CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE));
+        callback.put_fn(
+            CEF_DOWNLOAD_IMAGE_CALLBACK_ON_FINISHED_OFFSET,
+            fn_ptr(on_download_image_finished as *const ()),
+        );
+        let ptr = callback.as_mut_ptr();
+        if let Ok(mut callbacks) = self.download_image_callbacks.lock() {
+            let state = self as *const CefBrowserState as usize;
+            if let Ok(mut registry) = registry().lock() {
+                registry.insert(callback.as_usize(), state);
+            }
+            // TODO(perf): bound favicon callback retention (Box stays in the Vec).
+            callbacks.push(callback);
+            ptr
+        } else {
+            ptr::null_mut()
+        }
+    }
+
+    /// The engine reported the page's favicon URLs. Read the first, then pull the
+    /// image through CEF's sandboxed connection via `download_image` — the decoded
+    /// PNG arrives asynchronously in [`on_download_image_finished`].
+    fn request_favicon(&self, browser: *mut c_void, icon_urls: *mut c_void) {
+        if icon_urls.is_null() {
+            return;
+        }
+        // SAFETY: `icon_urls` is the live `cef_string_list_t` CEF passed to the
+        // display handler; `string_list_size` is its matching libcef export.
+        let count = unsafe { (self.string_list_size)(icon_urls) };
+        if count == 0 {
+            return;
+        }
+        let mut first = CefString {
+            str_: ptr::null(),
+            length: 0,
+            dtor: 0,
+        };
+        // SAFETY: `cef_string_list_value` copies element 0 into `first`, allocating
+        // a heap buffer whose `dtor` we invoke below. The out-pointer is a live,
+        // zeroed `cef_string_t`.
+        let got = unsafe {
+            (self.string_list_value)(icon_urls, 0, (&mut first as *mut CefString).cast())
+        };
+        if got == 0 || first.str_.is_null() || first.length == 0 {
+            free_cef_string_copy(&mut first);
+            return;
+        }
+        let Some(host) = browser_host(browser) else {
+            free_cef_string_copy(&mut first);
+            return;
+        };
+        let Some(download_image) = read_fn(host, CEF_BROWSER_HOST_DOWNLOAD_IMAGE_OFFSET) else {
+            free_cef_string_copy(&mut first);
+            return;
+        };
+        let callback = self.retain_download_image_callback();
+        if callback.is_null() {
+            free_cef_string_copy(&mut first);
+            return;
+        }
+        // SAFETY: `download_image` is read from `cef_browser_host_t::download_image`,
+        // whose pinned C signature is `(cef_browser_host_t*, const cef_string_t*,
+        // int is_favicon, uint32_t max_image_size, int bypass_cache,
+        // cef_download_image_callback_t*)`.
+        let download_image: unsafe extern "C" fn(
+            *mut c_void,
+            *const CefString,
+            c_int,
+            u32,
+            c_int,
+            *mut c_void,
+        ) = unsafe { std::mem::transmute(download_image) };
+        // SAFETY: `host` came from CEF, `first` is a live `cef_string_t` for the
+        // call (CEF copies the URL synchronously), and `callback` is retained by
+        // the browser state until shutdown.
+        unsafe { download_image(host, &first as *const CefString, 1, 32, 0, callback) };
+        free_cef_string_copy(&mut first);
     }
 
     fn publish_pdf_finished(&self, path: String, ok: bool) {
@@ -2482,6 +2641,17 @@ unsafe extern "C" fn on_title_change(
     let _ = with_state(self_, |state| state.publish_title(title));
 }
 
+/// CEF `on_favicon_urlchange(self, browser, icon_urls)` — the page's favicon URLs
+/// changed. Kick off a `download_image` fetch of the first URL; the PNG arrives
+/// asynchronously in [`on_download_image_finished`].
+unsafe extern "C" fn on_favicon_urlchange(
+    self_: *mut c_void,
+    browser: *mut c_void,
+    icon_urls: *mut c_void,
+) {
+    let _ = with_state(self_, |state| state.request_favicon(browser, icon_urls));
+}
+
 /// Map a `cef_cursor_type_t` (CEF 149) onto the engine-neutral [`CursorKind`].
 fn cursor_kind_for_cef_type(cef_type: c_int) -> CursorKind {
     match cef_type {
@@ -2602,6 +2772,24 @@ fn pdf_file_looks_written(path: &str) -> bool {
 unsafe extern "C" fn on_pdf_print_finished(self_: *mut c_void, path: *const c_void, ok: c_int) {
     let path = cef_string_to_string(path.cast::<CefString>());
     let _ = with_state(self_, |state| state.publish_pdf_finished(path, ok != 0));
+}
+
+/// CEF `on_download_image_finished(self, image_url, http_status_code, image)` —
+/// the favicon fetch completed. `image` may be NULL on failure. Encode it to PNG
+/// and forward the bytes to the shell.
+unsafe extern "C" fn on_download_image_finished(
+    self_: *mut c_void,
+    _image_url: *const CefString,
+    _http_status_code: c_int,
+    image: *mut c_void,
+) {
+    let Some(png) = image_as_png(image) else {
+        return;
+    };
+    if png.is_empty() {
+        return;
+    }
+    let _ = with_state(self_, |state| state.publish_favicon(png));
 }
 
 fn with_state<T>(key: *mut c_void, f: impl FnOnce(&CefBrowserState) -> T) -> Option<T> {
@@ -3528,6 +3716,77 @@ fn cef_string_to_string(raw: *const CefString) -> String {
             String::from_utf16_lossy(std::slice::from_raw_parts((*raw).str_, (*raw).length))
         }
     }
+}
+
+/// Encode a `cef_image_t*` to PNG bytes via `get_as_png` (scale 1.0, with
+/// transparency) and the returned `cef_binary_value_t`. Returns `None` if the
+/// image is NULL or yields no PNG representation. The image's ref-count is NOT
+/// touched (CEF owns it, borrowed for the callback); the returned binary value
+/// is intentionally left unreleased — a small bounded leak matching the one-shot
+/// callback retention. TODO(perf): release the binary value once retention is
+/// bounded.
+fn image_as_png(image: *mut c_void) -> Option<Vec<u8>> {
+    if image.is_null() {
+        return None;
+    }
+    let get_as_png = read_fn(image, CEF_IMAGE_GET_AS_PNG_OFFSET)?;
+    // SAFETY: read from `cef_image_t::get_as_png`, whose pinned C signature is
+    // `cef_binary_value_t* (cef_image_t*, float, int, int*, int*)`.
+    let get_as_png: unsafe extern "C" fn(
+        *mut c_void,
+        f32,
+        c_int,
+        *mut c_int,
+        *mut c_int,
+    ) -> *mut c_void = unsafe { std::mem::transmute(get_as_png) };
+    let mut pixel_width: c_int = 0;
+    let mut pixel_height: c_int = 0;
+    // SAFETY: `image` is a live CEF image for the callback; the out-params are
+    // stack ints written by CEF.
+    let binary = unsafe { get_as_png(image, 1.0, 1, &mut pixel_width, &mut pixel_height) };
+    if binary.is_null() {
+        return None;
+    }
+    read_binary_value(binary)
+}
+
+/// Copy a `cef_binary_value_t`'s bytes out via `get_size` + `get_data`.
+fn read_binary_value(binary: *mut c_void) -> Option<Vec<u8>> {
+    let get_size = read_fn(binary, CEF_BINARY_VALUE_GET_SIZE_OFFSET)?;
+    // SAFETY: read from `cef_binary_value_t::get_size`, sig `size_t (self)`.
+    let get_size: unsafe extern "C" fn(*mut c_void) -> usize =
+        unsafe { std::mem::transmute(get_size) };
+    // SAFETY: `binary` is the live value returned by `get_as_png`.
+    let size = unsafe { get_size(binary) };
+    if size == 0 {
+        return None;
+    }
+    let get_data = read_fn(binary, CEF_BINARY_VALUE_GET_DATA_OFFSET)?;
+    // SAFETY: read from `cef_binary_value_t::get_data`, sig
+    // `size_t (self, void* buffer, size_t buffer_size, size_t data_offset)`.
+    let get_data: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> usize =
+        unsafe { std::mem::transmute(get_data) };
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` holds `size` writable bytes; CEF copies at most `size` from
+    // offset 0.
+    let copied = unsafe { get_data(binary, buf.as_mut_ptr().cast(), size, 0) };
+    buf.truncate(copied.min(size));
+    (!buf.is_empty()).then_some(buf)
+}
+
+/// Free a `cef_string_t` that `cef_string_list_value` populated with an owning
+/// heap copy: invoke its `dtor` on the backing buffer, then clear the fields so a
+/// double free is impossible.
+fn free_cef_string_copy(s: &mut CefString) {
+    if s.dtor != 0 && !s.str_.is_null() {
+        // SAFETY: `cef_string_list_value` set `dtor` to libcef's matching free
+        // function for the `str_` buffer it allocated. Call it exactly once.
+        let dtor: unsafe extern "C" fn(*mut u16) = unsafe { std::mem::transmute(s.dtor) };
+        unsafe { dtor(s.str_ as *mut u16) };
+    }
+    s.str_ = ptr::null();
+    s.length = 0;
+    s.dtor = 0;
 }
 
 fn add_ref_cef(object: *mut c_void) {

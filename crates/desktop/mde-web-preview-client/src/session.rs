@@ -150,6 +150,9 @@ pub struct WebSession {
     nav: NavState,
     title: String,
     cursor: CursorKind,
+    /// The latest engine-fetched favicon (PNG bytes), if the page reported one.
+    /// The shell uploads it as the tab-strip icon.
+    favicon: Option<Vec<u8>>,
     /// Latest find-in-page tally `(active_ordinal, total_count)`.
     find_result: Option<(u32, u32)>,
     last_seq: u64,
@@ -187,6 +190,7 @@ impl WebSession {
             nav: NavState::default(),
             title: String::new(),
             cursor: CursorKind::default(),
+            favicon: None,
             find_result: None,
             last_seq: 0,
             pending: None,
@@ -409,6 +413,7 @@ impl WebSession {
                 self.popup_requests.push_back(PopupRequestStatus { url });
             }
             EventMsg::CursorChanged { kind } => self.cursor = kind,
+            EventMsg::Favicon { png } => self.favicon = Some(png),
             EventMsg::FindResult { count, active, .. } => {
                 self.find_result = Some((active, count));
             }
@@ -495,6 +500,13 @@ impl WebSession {
     #[must_use]
     pub const fn cursor(&self) -> CursorKind {
         self.cursor
+    }
+
+    /// The latest engine-fetched favicon as PNG bytes, if the page reported one.
+    /// The shell uploads it as the tab-strip icon.
+    #[must_use]
+    pub fn favicon(&self) -> Option<&[u8]> {
+        self.favicon.as_deref()
     }
 
     /// Navigate to `url`.
@@ -999,6 +1011,22 @@ mod tests {
             session.drain_pdf_events().is_empty(),
             "events are drained exactly once"
         );
+    }
+
+    #[test]
+    fn favicon_events_expose_the_png_bytes() {
+        let (mut session, peer) = filtered_session();
+        assert!(session.favicon().is_none(), "no favicon before any event");
+        send_event(
+            &peer,
+            &EventMsg::Favicon {
+                png: vec![0x89, b'P', b'N', b'G'],
+            },
+        );
+
+        session.poll();
+
+        assert_eq!(session.favicon(), Some(&[0x89, b'P', b'N', b'G'][..]));
     }
 
     #[test]
