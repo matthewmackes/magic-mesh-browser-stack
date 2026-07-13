@@ -417,12 +417,26 @@ pub fn run_windowless_browser_probe_with_stream(
                 last_paint_width: callbacks.last_paint_width(),
                 last_paint_height: callbacks.last_paint_height(),
             };
+            // Close the browser and drain the loop BEFORE cef_shutdown, exactly
+            // like run_windowless_tab — shutting down with a live browser races
+            // the multi-process teardown and intermittently segfaults (observed
+            // ~1/6 probe runs exiting 139 after a correct result).
+            close_browser(browser);
+            for _ in 0..8 {
+                abi.do_message_loop_work();
+                thread::sleep(Duration::from_millis(4));
+            }
             abi.shutdown();
             return Ok(probe);
         }
         thread::sleep(Duration::from_millis(10));
     }
 
+    close_browser(browser);
+    for _ in 0..8 {
+        abi.do_message_loop_work();
+        thread::sleep(Duration::from_millis(4));
+    }
     abi.shutdown();
     Err(CefBrowserError::TimedOut {
         created: callbacks.created(),
@@ -535,6 +549,12 @@ pub fn run_windowless_text_probe(
         thread::sleep(Duration::from_millis(8));
     }
 
+    // Same live-browser-before-shutdown discipline as the success path.
+    close_browser(browser);
+    for _ in 0..8 {
+        abi.do_message_loop_work();
+        thread::sleep(Duration::from_millis(4));
+    }
     abi.shutdown();
     Err(CefBrowserError::TextProbeMissing {
         created: callbacks.created(),
