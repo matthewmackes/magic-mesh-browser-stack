@@ -313,6 +313,102 @@ const SESSION_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_TAB_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
 const CURATED_USERSCRIPT_COUNT: usize = 100;
 
+// ── BOOKMARKS-BAR: the daemon bookmark-store mirror + single-row chrome layout ──
+/// The daemon-retained converged bookmark [`mde_bookmarks::Collection`] topic —
+/// the SAME `state/bookmarks/collection` the mackesd bookmarks worker publishes
+/// and the Surface::Bookmarks manager hydrates from. The Browser mirrors it into
+/// its own bar row (§6 local mirror of a Bus topic, never a mackesd dep).
+const STATE_BOOKMARKS_COLLECTION: &str = "state/bookmarks/collection";
+/// The bookmark collection is a persisted+synced store, not per-frame chatter, so
+/// the bar mirror re-reads on a relaxed cadence (an explicit user act adds one).
+const BOOKMARKS_COLLECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
+/// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
+const BOOKMARK_BTN_W: f32 = 132.0;
+/// The width reserved for the ">>" overflow menu button when the row can't hold
+/// every bookmark.
+const BOOKMARK_OVERFLOW_W: f32 = 26.0;
+/// The elision budget for a bookmark button's title (fits inside [`BOOKMARK_BTN_W`]
+/// at [`CHROME_FONT`]); the full title rides the hover tooltip.
+const BOOKMARK_TITLE_CHARS: usize = 18;
+
+/// One top-level bookmark projected onto the bar: just the display title and its
+/// navigation target. Folded from the daemon [`mde_bookmarks::Collection`]'s
+/// render-ordered roots ([`bookmark_bar_links_from`]); the browser never re-derives
+/// the CRDT tree — it mirrors the converged leaves it means to click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BookmarkBarLink {
+    /// The display title (falls back to the URL when the stored title is blank so a
+    /// bar button always shows something legible).
+    title: String,
+    /// The navigation target handed to `load_target` / `request_new_tab_with_url`.
+    url: String,
+}
+
+/// Fold a converged [`mde_bookmarks::Collection`] into the bar's top-level bookmark
+/// links, in the collection's own render order (`roots()` is order-key sorted).
+/// Folders are omitted — the bar is a flat quick-launch strip of the top-level
+/// bookmarks, the same subset a browser's bookmarks bar surfaces.
+fn bookmark_bar_links_from(collection: &mde_bookmarks::Collection) -> Vec<BookmarkBarLink> {
+    collection
+        .roots()
+        .into_iter()
+        .filter_map(|item| match item {
+            mde_bookmarks::Item::Bookmark(b) => {
+                let title = if b.title.trim().is_empty() {
+                    b.url.clone()
+                } else {
+                    b.title
+                };
+                Some(BookmarkBarLink { title, url: b.url })
+            }
+            mde_bookmarks::Item::Folder(_) => None,
+        })
+        .collect()
+}
+
+/// How many of `total` fixed-width bookmark buttons fit on the single bar row of
+/// `available` width. When every button fits, the return is `total` (no overflow
+/// slot). Otherwise one `overflow_w`-wide ">>" slot is reserved and the return is
+/// how many buttons precede it (possibly zero on a very narrow bar). Pure so the
+/// overflow split is unit-tested without a GPU.
+fn bookmark_bar_visible_count(
+    total: usize,
+    available: f32,
+    btn_w: f32,
+    gap: f32,
+    overflow_w: f32,
+) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    // Width if every button sits on the row: n buttons with (n-1) inter-button gaps.
+    let all = total as f32 * btn_w + (total.saturating_sub(1)) as f32 * gap;
+    if all <= available {
+        return total;
+    }
+    // They don't all fit: reserve the overflow button (its own leading gap) and
+    // pack as many leading buttons as the remaining width allows.
+    let budget = available - overflow_w - gap;
+    let mut count = 0usize;
+    let mut used = 0.0f32;
+    while count < total {
+        let next = if count == 0 {
+            btn_w
+        } else {
+            used + gap + btn_w
+        };
+        if next > budget {
+            break;
+        }
+        used = next;
+        count += 1;
+    }
+    // At least one bookmark always lands in the overflow menu here, so cap the
+    // visible run at `total - 1` even if rounding would otherwise show them all.
+    count.min(total.saturating_sub(1))
+}
+
 mod userscripts;
 use userscripts::*;
 
@@ -594,6 +690,19 @@ pub(crate) struct WebState {
     /// client data dir; tests inject a temp root so persisted actions are asserted
     /// without touching the operator's real bus.
     bus_root: Option<PathBuf>,
+    /// BOOKMARKS-BAR — whether the horizontal bookmarks bar is shown below the nav
+    /// chrome. A session-only chrome toggle (View → Show Bookmarks Bar), defaulting
+    /// hidden like the other browser chrome toggles (find / downloads / vertical).
+    bookmarks_bar_visible: bool,
+    /// The top-level bookmark links mirrored from `state/bookmarks/collection` — the
+    /// buttons the bar renders. Rebuilt each poll from the converged daemon
+    /// collection; empty until the first snapshot is seen.
+    bookmark_bar_links: Vec<BookmarkBarLink>,
+    /// Bus cursor for the bookmark-collection mirror, so each converged snapshot is
+    /// folded once (the exact `list_since` cursor idiom the other pollers use).
+    bookmarks_collection_cursor: Option<String>,
+    /// Throttle for the relaxed bookmark-collection re-read.
+    bookmarks_collection_last_poll: Option<Instant>,
     /// Region-capture mode is armed; the next drag over the page image writes a
     /// cropped PNG from the retained helper frame.
     capture_region_mode: bool,
@@ -699,6 +808,10 @@ impl Default for WebState {
             cups_settings: CupsPrintSettings::default(),
             pending_cups_prints: BTreeMap::new(),
             bus_root: mde_bus::client_data_dir(),
+            bookmarks_bar_visible: false,
+            bookmark_bar_links: Vec::new(),
+            bookmarks_collection_cursor: None,
+            bookmarks_collection_last_poll: None,
             capture_region_mode: false,
             capture_region_start: None,
             capture_region_current: None,
@@ -1233,6 +1346,49 @@ impl WebState {
         }
     }
 
+    /// BOOKMARKS-BAR — mirror the daemon's converged bookmark [`mde_bookmarks::Collection`]
+    /// from `state/bookmarks/collection` into the bar's top-level link row. The
+    /// EXACT cursor-based `list_since` idiom the sibling pollers use: read every new
+    /// retained snapshot since the last cursor, keep the LAST one (the topic is
+    /// retained-latest), and fold it into flat bar links. A `state/*` mirror only —
+    /// the mackesd bookmarks worker stays the single writer of the op-log (§6).
+    fn poll_bookmarks_collection(&mut self) {
+        if self
+            .bookmarks_collection_last_poll
+            .is_some_and(|last| last.elapsed() < BOOKMARKS_COLLECTION_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.bookmarks_collection_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let Ok(msgs) = persist.list_since(
+            STATE_BOOKMARKS_COLLECTION,
+            self.bookmarks_collection_cursor.as_deref(),
+        ) else {
+            return;
+        };
+        for msg in msgs {
+            self.bookmarks_collection_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            if let Ok(collection) = serde_json::from_str::<mde_bookmarks::Collection>(body) {
+                self.bookmark_bar_links = bookmark_bar_links_from(&collection);
+            }
+        }
+    }
+
+    /// Toggle the bookmarks bar (View → Show/Hide Bookmarks Bar). Session-only, like
+    /// the vertical-tabs and downloads chrome toggles.
+    fn toggle_bookmarks_bar(&mut self) {
+        self.bookmarks_bar_visible = !self.bookmarks_bar_visible;
+    }
+
     fn poll_speech_statuses(&mut self) {
         if self
             .speech_status_last_poll
@@ -1669,6 +1825,23 @@ impl WebState {
         if let Some(tab) = self.active_tab() {
             tab.session.load(url);
         }
+    }
+
+    /// BOOKMARKS-BAR — open a bar bookmark. A plain click navigates the active tab
+    /// (`load_target`, syncing the omnibox like the toolbar Go button); a
+    /// middle-click — or a click with no live tab to reuse — opens it in a new
+    /// foreground tab on the preferred engine (`request_new_tab_with_url`), the same
+    /// two open seams the tab strip and History reopen already use.
+    fn open_bookmark(&mut self, url: String, new_tab: bool) {
+        if url.trim().is_empty() {
+            return;
+        }
+        if new_tab || self.tabs.is_empty() {
+            self.request_new_tab_with_url(self.engine, url);
+            return;
+        }
+        self.address = url.clone();
+        self.load_target(url);
     }
 
     fn publish_external_protocol(&mut self, protocol: ExternalProtocol, url: &str) {
@@ -3142,6 +3315,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_translation_results();
     state.poll_offline_cache_results();
     state.poll_security_update_status();
+    state.poll_bookmarks_collection();
     state.suspend_idle_tabs(Instant::now());
 
     // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
@@ -3241,6 +3415,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 // The navigation chrome (back / forward / reload / address bar),
                 // wired to the active session's control socket.
                 nav_chrome(ui, state);
+                bookmarks_bar(ui, state);
                 find_chrome(ui, state);
                 insecure_prompt(ui, state);
                 capture_notice(ui, state);
@@ -3265,6 +3440,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         // The navigation chrome (back / forward / reload / address bar), wired to
         // the active session's control socket.
         nav_chrome(ui, state);
+        bookmarks_bar(ui, state);
         find_chrome(ui, state);
         insecure_prompt(ui, state);
         capture_notice(ui, state);
@@ -5214,6 +5390,99 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 /// tracked across frames (and driven by the tests).
 fn omnibox_widget_id() -> egui::Id {
     egui::Id::new("browser-omnibox")
+}
+
+/// BOOKMARKS-BAR — the single-row horizontal bookmarks bar below the nav chrome.
+///
+/// Renders the top-level bookmarks mirrored from `state/bookmarks/collection` as
+/// elided-title buttons: a plain click navigates the active tab, a middle-click
+/// opens a new tab. When the row can't hold them all, the tail collapses into a
+/// ">>" overflow menu ([`bookmark_bar_visible_count`] does the exact fixed-width
+/// split). Hidden unless the View → Show Bookmarks Bar toggle is on; when shown
+/// but empty it carries an honest hint rather than a blank strip (§7). Look reads
+/// only from `Style` (no raw colour), matching the sibling chrome rows.
+fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.bookmarks_bar_visible {
+        return;
+    }
+    // Clone the small link row so the click closures can drive `&mut state` after
+    // the layout closure (the find-bar's collect-then-act pattern).
+    let links = state.bookmark_bar_links.clone();
+    // (url, open_in_new_tab) chosen this frame, applied once after the layout.
+    let mut chosen: Option<(String, bool)> = None;
+    egui::Frame::NONE
+        .fill(Style::SURFACE)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            if links.is_empty() {
+                muted_note(
+                    ui,
+                    "No bookmarks yet \u{2014} add one from Bookmarks \u{2192} Add Bookmark",
+                );
+                return;
+            }
+            ui.horizontal(|ui| {
+                let avail = ui.available_width();
+                let visible = bookmark_bar_visible_count(
+                    links.len(),
+                    avail,
+                    BOOKMARK_BTN_W,
+                    CHROME_GAP,
+                    BOOKMARK_OVERFLOW_W,
+                );
+                for link in &links[..visible] {
+                    let resp = ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(ellipsize(&link.title, BOOKMARK_TITLE_CHARS))
+                                    .size(CHROME_FONT)
+                                    .color(Style::TEXT),
+                            )
+                            .fill(Style::SURFACE)
+                            .min_size(egui::vec2(BOOKMARK_BTN_W, CHROME_BUTTON)),
+                        )
+                        .on_hover_text(format!("{}\n{}", link.title, link.url));
+                    if resp.clicked() {
+                        chosen = Some((link.url.clone(), false));
+                    } else if resp.middle_clicked() {
+                        chosen = Some((link.url.clone(), true));
+                    }
+                }
+                if visible < links.len() {
+                    ui.menu_button(
+                        RichText::new("\u{00BB}")
+                            .size(CHROME_FONT)
+                            .color(Style::TEXT),
+                        |ui| {
+                            for link in &links[visible..] {
+                                let resp = ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(ellipsize(&link.title, 40))
+                                                .size(CHROME_FONT)
+                                                .color(Style::TEXT),
+                                        )
+                                        .fill(Style::SURFACE),
+                                    )
+                                    .on_hover_text(link.url.clone());
+                                if resp.clicked() {
+                                    chosen = Some((link.url.clone(), false));
+                                    ui.close_menu();
+                                } else if resp.middle_clicked() {
+                                    chosen = Some((link.url.clone(), true));
+                                    ui.close_menu();
+                                }
+                            }
+                        },
+                    )
+                    .response
+                    .on_hover_text("More bookmarks");
+                }
+            });
+        });
+    if let Some((url, new_tab)) = chosen {
+        state.open_bookmark(url, new_tab);
+    }
 }
 
 fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {

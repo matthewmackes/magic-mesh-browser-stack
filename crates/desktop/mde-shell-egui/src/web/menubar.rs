@@ -63,6 +63,8 @@ pub(super) enum MenuAction {
     ToggleVerticalTabs,
     /// Toggle the browser download manager drawer.
     ToggleDownloads,
+    /// Toggle the BOOKMARKS-BAR horizontal bookmarks bar below the nav chrome.
+    ToggleBookmarksBar,
     /// Toggle BROWSER-DD-8 power mode.
     TogglePowerMode,
     /// Cycle the active tab through the built-in container profiles.
@@ -210,6 +212,8 @@ struct Snapshot {
     find_open: bool,
     /// Download manager drawer is open.
     downloads_open: bool,
+    /// The BOOKMARKS-BAR bookmarks bar is shown.
+    bookmarks_bar_visible: bool,
     /// Active browser-originated transfer count.
     active_downloads: usize,
     /// Total browser-originated transfer count.
@@ -307,6 +311,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 page_zoom_percent: state.page_zoom_percent,
                 find_open: state.find_open,
                 downloads_open: state.downloads_open,
+                bookmarks_bar_visible: state.bookmarks_bar_visible,
                 active_downloads,
                 total_downloads,
                 power_mode: state.power_mode,
@@ -336,6 +341,7 @@ fn snapshot(state: &WebState) -> Snapshot {
     snap.page_zoom_percent = state.page_zoom_percent;
     snap.find_open = state.find_open;
     snap.downloads_open = state.downloads_open;
+    snap.bookmarks_bar_visible = state.bookmarks_bar_visible;
     snap.power_mode = state.power_mode;
     snap.capture_region_mode = state.capture_region_mode;
     snap.print_settings_open = state.print_settings_open;
@@ -426,6 +432,14 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         "Hide Downloads"
                     } else {
                         "Show Downloads"
+                    },
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ToggleBookmarksBar,
+                    if s.bookmarks_bar_visible {
+                        "Hide Bookmarks Bar"
+                    } else {
+                        "Show Bookmarks Bar"
                     },
                 )),
                 Entry::Item(
@@ -1033,6 +1047,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
                 state.refresh_downloads();
             }
         }
+        MenuAction::ToggleBookmarksBar => state.toggle_bookmarks_bar(),
         MenuAction::TogglePowerMode => state.toggle_power_mode(),
         MenuAction::CycleContainer => state.cycle_active_tab_container(),
         MenuAction::CycleDisplayTarget => state.cycle_active_tab_display_target(),
