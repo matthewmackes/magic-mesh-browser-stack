@@ -98,6 +98,14 @@ pub struct PasskeyRequestStatus {
     pub body: String,
 }
 
+/// A page-initiated request to open a new window/tab (window.open, target=_blank).
+/// The helper cancels the native popup; the shell opens the URL as a regular tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupRequestStatus {
+    /// The popup's target URL.
+    pub url: String,
+}
+
 /// A browser-initiated download's latest state (B2). Re-reported on progress and
 /// completion, keyed by `id`; the shell folds these into its downloads drawer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +156,7 @@ pub struct WebSession {
     page_scrape_events: VecDeque<PageScrapeStatus>,
     passkey_events: VecDeque<PasskeyRequestStatus>,
     download_events: VecDeque<DownloadStatus>,
+    popup_requests: VecDeque<PopupRequestStatus>,
     recent_resource_requests: VecDeque<ResourceRequestStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
@@ -181,6 +190,7 @@ impl WebSession {
             page_scrape_events: VecDeque::new(),
             passkey_events: VecDeque::new(),
             download_events: VecDeque::new(),
+            popup_requests: VecDeque::new(),
             recent_resource_requests: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
@@ -390,6 +400,9 @@ impl WebSession {
                     canceled,
                 });
             }
+            EventMsg::PopupRequested { url } => {
+                self.popup_requests.push_back(PopupRequestStatus { url });
+            }
             EventMsg::Crashed { reason } => self.mark_crashed(reason),
         }
         Ok(())
@@ -430,6 +443,12 @@ impl WebSession {
     /// each into its downloads drawer, keyed by [`DownloadStatus::id`].
     pub fn drain_download_events(&mut self) -> Vec<DownloadStatus> {
         self.download_events.drain(..).collect()
+    }
+
+    /// Drain page-initiated popup requests (window.open / target=_blank) — the
+    /// shell opens each URL as a regular new tab.
+    pub fn drain_popup_requests(&mut self) -> Vec<PopupRequestStatus> {
+        self.popup_requests.drain(..).collect()
     }
 
     /// Recent subresource requests observed for the current page.

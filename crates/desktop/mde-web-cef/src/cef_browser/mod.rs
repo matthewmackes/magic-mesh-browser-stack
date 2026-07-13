@@ -78,6 +78,9 @@ pub const CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET: usize = 40;
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
 pub const CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET: usize = 64;
+/// `offsetof(cef_life_span_handler_t, on_before_popup)` — window.open /
+/// target=_blank interception (field 0; on_after_created=64 pins field 3).
+pub const CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET: usize = 40;
 /// `sizeof(cef_render_handler_t)` for pinned Linux CEF 149.
 pub const CEF_RENDER_HANDLER_SIZE: usize = 176;
 /// `offsetof(cef_render_handler_t, get_view_rect)`.
@@ -1145,6 +1148,12 @@ impl CefBrowserCallbacks {
             CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET,
             fn_ptr(on_after_created as *const ()),
         );
+        // window.open / target=_blank → cancel the native popup (windowless CEF
+        // cannot host one) and hand the URL to the shell as a new-tab request.
+        self.life_span.put_fn(
+            CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET,
+            fn_ptr(on_before_popup as *const ()),
+        );
         self.render.put_fn(
             CEF_RENDER_HANDLER_GET_VIEW_RECT_OFFSET,
             fn_ptr(get_view_rect as *const ()),
@@ -1744,6 +1753,17 @@ impl CefBrowserState {
         });
     }
 
+    /// The page asked for a new window/tab — forward the URL so the shell opens
+    /// it as a regular tab (the native popup is cancelled by the caller).
+    fn publish_popup_requested(&self, url: String) {
+        let event = EventMsg::PopupRequested { url };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
     /// The renderer process died — tell the shell so the tab shows its crashed
     /// (sad-tab) state instead of a frozen last frame.
     fn publish_crashed(&self, reason: String) {
@@ -1965,6 +1985,37 @@ unsafe extern "C" fn on_after_created(self_: *mut c_void, _browser: *mut c_void)
     let _ = with_state(self_, |state| {
         state.created.fetch_add(1, Ordering::SeqCst);
     });
+}
+
+/// CEF `on_before_popup(...)` — the page asked for a new window (window.open,
+/// target=_blank). A windowless offscreen browser cannot host a native popup, so
+/// cancel it (return 1) and forward the target URL for the shell to open as a
+/// regular tab. Signature pinned to CEF 149's 14-arg layout.
+#[allow(clippy::too_many_arguments, reason = "the CEF C vtable signature")]
+unsafe extern "C" fn on_before_popup(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    _frame: *mut c_void,
+    _popup_id: c_int,
+    target_url: *const CefString,
+    _target_frame_name: *const CefString,
+    _target_disposition: c_int,
+    _user_gesture: c_int,
+    _popup_features: *const c_void,
+    _window_info: *mut c_void,
+    _client: *mut *mut c_void,
+    _settings: *mut c_void,
+    _extra_info: *mut *mut c_void,
+    _no_javascript_access: *mut c_int,
+) -> c_int {
+    if !target_url.is_null() {
+        let url = cef_string_to_string(target_url);
+        if !url.is_empty() {
+            let _ = with_state(self_, |state| state.publish_popup_requested(url.clone()));
+        }
+    }
+    // 1 = cancel the native popup; the shell opens the URL as a tab instead.
+    1
 }
 
 unsafe extern "C" fn get_view_rect(self_: *mut c_void, _browser: *mut c_void, rect: *mut CefRect) {

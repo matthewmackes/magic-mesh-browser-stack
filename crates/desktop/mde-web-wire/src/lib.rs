@@ -859,6 +859,13 @@ pub enum EventMsg {
         /// The download was canceled or interrupted.
         canceled: bool,
     },
+    /// The page asked to open a new window/tab (window.open, target=_blank). The
+    /// helper cancels the native popup (windowless CEF cannot host one) and asks
+    /// the shell to open the URL as a regular tab instead.
+    PopupRequested {
+        /// The popup's target URL.
+        url: String,
+    },
 }
 
 impl EventMsg {
@@ -935,6 +942,10 @@ impl EventMsg {
                 out.push(u8::from(*done));
                 out.push(u8::from(*canceled));
             }
+            Self::PopupRequested { url } => {
+                out.push(11);
+                put_str(&mut out, url);
+            }
         }
         out
     }
@@ -986,6 +997,7 @@ impl EventMsg {
                 done: c.bool()?,
                 canceled: c.bool()?,
             },
+            11 => Self::PopupRequested { url: c.string()? },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1324,6 +1336,9 @@ mod tests {
             total: 65536,
             done: true,
             canceled: false,
+        });
+        round_event(&EventMsg::PopupRequested {
+            url: "https://example.com/window-open-target".to_owned(),
         });
     }
 
