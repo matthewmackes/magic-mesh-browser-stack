@@ -2806,6 +2806,12 @@ unsafe extern "C" fn on_address_change(
     url: *const CefString,
 ) {
     let url = cef_string_to_string(url);
+    // Off-by-default live diagnostic: proves the display handler is actually being
+    // dispatched by CEF on the real vtable (the class of bug fixed in the
+    // display/load/download handler resolution). Set MDE_CEF_TRACE_NAV=1 to emit.
+    if std::env::var_os("MDE_CEF_TRACE_NAV").is_some() {
+        eprintln!("MDE_TRACE on_address_change url={url}");
+    }
     let _ = with_state(self_, |state| {
         if let Ok(mut current) = state.nav_url.lock() {
             *current = url;

@@ -537,6 +537,46 @@ fn child_handler_pointers_resolve_non_null_to_their_registered_block() {
     ] {
         assert!(!ptr.is_null(), "child handler must resolve to a live block");
     }
+
+    // Demonstrate the EXACT pre-fix defect on the SAME live state: the old
+    // resolution path — `lookup_peer(state, <size>)`, gated by `callback_size`'s
+    // whitelist — returns NULL for display(144)/load(72)/download(64) because none
+    // of those sizes is whitelisted. This is precisely the pointer CEF was handed
+    // for get_display_handler/get_load_handler/get_download_handler before the fix,
+    // so on the LIVE vtable CEF never dispatched on_address_change/on_title_change/
+    // on_favicon_urlchange/on_cursor_change (display), on_loading_state_change
+    // (load), or can_download/on_before_download (download) — while the unit tests,
+    // which never exercise the real callback path, stayed green.
+    for size in [
+        CEF_DISPLAY_HANDLER_SIZE,
+        CEF_LOAD_HANDLER_SIZE,
+        CEF_DOWNLOAD_HANDLER_SIZE,
+    ] {
+        assert!(
+            lookup_peer(&callbacks.state, size).is_null(),
+            "the old size-keyed lookup_peer path returned NULL — the bug this fix replaces"
+        );
+    }
+    // find(48) is a subtler case: 48 IS whitelisted (as pdf_print_callback(48)) and
+    // the find handler is the only size-48 block registered at install, so the old
+    // lookup happened to resolve it — but that is fragile (a later print_to_pdf
+    // registers a second 48-block and the resolution becomes order-dependent). The
+    // dedicated-pointer fix removes that fragility; the old path returned the right
+    // block here only by coincidence.
+    assert_eq!(
+        lookup_peer(&callbacks.state, CEF_FIND_HANDLER_SIZE),
+        callbacks.find.as_mut_ptr(),
+        "find(48) resolved via the whitelisted pdf size — fragile but not null"
+    );
+    // ...and the genuinely-whitelisted peers resolved correctly all along.
+    assert_eq!(
+        lookup_peer(&callbacks.state, CEF_RENDER_HANDLER_SIZE),
+        callbacks.render.as_mut_ptr()
+    );
+    assert_eq!(
+        lookup_peer(&callbacks.state, CEF_REQUEST_HANDLER_SIZE),
+        callbacks.request.as_mut_ptr()
+    );
 }
 
 unsafe extern "C" fn record_audio_muted(_host: *mut c_void, muted: c_int) {
