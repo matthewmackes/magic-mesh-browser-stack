@@ -2957,6 +2957,21 @@ impl WebState {
 
     fn update_suggestions_for_address(&mut self) {
         self.suggestions.update_for_draft(&self.address);
+        // History matches independently of the SearXNG fetch gate
+        // (`should_fetch_suggestions`): a URL-like draft that skips the search
+        // round-trip should still surface a matching visit. Guarded on a
+        // non-empty trimmed draft so an empty omnibox doesn't dump the whole
+        // recent-visits list into the dropdown.
+        let hits: Vec<String> = if self.address.trim().is_empty() {
+            Vec::new()
+        } else {
+            self.history
+                .matching(&self.address)
+                .map(|v| v.url.clone())
+                .take(5)
+                .collect()
+        };
+        self.suggestions.set_history_matches(hits);
     }
 
     fn accept_suggestion(&mut self, suggestion: String) {
@@ -4767,6 +4782,13 @@ struct SuggestionState {
     notice: Option<String>,
     in_flight: Option<String>,
     rx: Option<mpsc::Receiver<SuggestionResult>>,
+    /// Matching browsing-history visit URLs for the current draft — most-recent-first,
+    /// capped (see [`WebState::update_suggestions_for_address`]). Rendered ABOVE the
+    /// SearXNG `items` in the omnibox dropdown (Chrome-style). Set independently of the
+    /// search-suggestion fetch gate ([`should_fetch_suggestions`]), so a URL-like draft
+    /// that skips the SearXNG round-trip still surfaces a matching visit. Session-only —
+    /// mirrors [`HistoryStore`], never persisted.
+    history: Vec<String>,
 }
 
 impl SuggestionState {
@@ -4776,6 +4798,12 @@ impl SuggestionState {
         self.notice = None;
         self.in_flight = None;
         self.rx = None;
+        self.history.clear();
+    }
+
+    /// Replace the history-match list (see [`SuggestionState::history`]).
+    fn set_history_matches(&mut self, matches: Vec<String>) {
+        self.history = matches;
     }
 
     fn poll(&mut self) {
@@ -5663,14 +5691,44 @@ const fn download_state_color(state: TransferState) -> egui::Color32 {
     }
 }
 
+/// Omnibox search `items` with any entry that duplicates a history hit removed
+/// (a history-matched URL is already shown once, above, by
+/// [`suggestions_panel`] — Chrome-style history-then-search ordering with no
+/// repeats). Pure and paint-free so it's directly unit-testable.
+fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a String> {
+    items.iter().filter(|s| !history.contains(s)).collect()
+}
+
 fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
-    if state.suggestions.items.is_empty() && state.suggestions.notice.is_none() {
+    let history = &state.suggestions.history;
+    let search_items = dedup_search_items(&state.suggestions.items, history);
+    if history.is_empty() && search_items.is_empty() && state.suggestions.notice.is_none() {
         return None;
     }
     let mut accepted = None;
     ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_XL * 4.0);
-        for suggestion in &state.suggestions.items {
+        if !history.is_empty() {
+            muted_note(ui, "History");
+            for url in history {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(ellipsize(url, 36))
+                                .size(CHROME_FONT)
+                                .color(Style::TEXT),
+                        )
+                        .fill(Style::SURFACE)
+                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
+                    )
+                    .on_hover_text(format!("Visited: {url}"))
+                    .clicked()
+                {
+                    accepted = Some(url.clone());
+                }
+            }
+        }
+        for suggestion in search_items {
             if ui
                 .add(
                     egui::Button::new(
@@ -5687,7 +5745,7 @@ fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
                 accepted = Some(suggestion.clone());
             }
         }
-        if state.suggestions.items.is_empty() {
+        if state.suggestions.items.is_empty() && history.is_empty() {
             if let Some(notice) = state.suggestions.notice.as_deref() {
                 muted_note(ui, notice);
             }
@@ -12508,6 +12566,65 @@ mod tests {
             wait_for_fresh_frame(&mut state),
             "accepted suggestion reached the helper through submit_address"
         );
+    }
+
+    #[test]
+    fn history_matches_feed_the_omnibox_suggestions_even_for_url_like_drafts() {
+        let mut state = WebState::default();
+        state
+            .history
+            .record("https://example.com/mesh-docs", "Mesh Docs", 1);
+        state.history.record("https://other.test/", "Other", 2);
+
+        // A URL-like draft skips the SearXNG fetch gate entirely (no thread is
+        // spawned) — the history match must still surface independently of it.
+        state.address = "https://example.com/mesh".to_owned();
+        assert!(!should_fetch_suggestions(&state.address));
+        state.update_suggestions_for_address();
+        assert_eq!(
+            state.suggestions.history,
+            ["https://example.com/mesh-docs".to_owned()]
+        );
+
+        // An empty (or whitespace-only) draft shows no history matches at all,
+        // even though the store still holds visits.
+        state.address = "   ".to_owned();
+        state.update_suggestions_for_address();
+        assert!(state.suggestions.history.is_empty());
+    }
+
+    #[test]
+    fn accepting_a_history_hit_uses_the_normal_omnibox_load_path() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        // History suggestions are plain visit-URL strings, flowing through the
+        // exact same accept path as a search suggestion.
+        state.accept_suggestion("https://example.com/visited".to_owned());
+
+        assert_eq!(state.address, "https://example.com/visited");
+        assert!(
+            wait_for_fresh_frame(&mut state),
+            "accepted history suggestion reached the helper through submit_address"
+        );
+    }
+
+    #[test]
+    fn dedup_search_items_omits_entries_already_shown_as_history_hits() {
+        let items = vec![
+            "https://example.com/mesh".to_owned(),
+            "mesh browser".to_owned(),
+        ];
+        let history = vec!["https://example.com/mesh".to_owned()];
+
+        let deduped: Vec<String> = dedup_search_items(&items, &history)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        assert_eq!(deduped, vec!["mesh browser".to_owned()]);
     }
 
     #[derive(Clone, Default)]
