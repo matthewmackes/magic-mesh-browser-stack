@@ -2178,6 +2178,65 @@ impl WebState {
         )
     }
 
+    /// B2 — a browser download was intercepted by the engine (which cancelled its
+    /// own write). Submit it to the mesh Transfers ledger: write a
+    /// `.download.json` manifest naming the URL and let the daemon's
+    /// browser-download lane fetch it into the mesh share (the downloads drawer
+    /// already renders the resulting `browser_download` ledger row).
+    fn submit_download_to_ledger(&mut self, id: u64, url: &str, filename: &str) {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
+        }
+        let filename = {
+            let name = filename.trim();
+            if name.is_empty() {
+                // Strip the query/fragment FIRST, then take the last path segment —
+                // otherwise a signed link like `…/file.zip?token=x` derives the
+                // query (`token=x`) as the filename instead of `file.zip`.
+                let path_only = url.split(['?', '#']).next().unwrap_or(url);
+                path_only
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or("download")
+                    .to_owned()
+            } else {
+                name.to_owned()
+            }
+        };
+        let spool = browser_media_spool_dir();
+        let dest = browser_capture_dir();
+        if std::fs::create_dir_all(&spool).is_err() || std::fs::create_dir_all(&dest).is_err() {
+            self.capture_notice =
+                Some("Download failed: could not prepare the transfer spool".into());
+            return;
+        }
+        let body = serde_json::json!({
+            "op": "browser_media_download_request",
+            "asset_url": url,
+            "suggested_filename": filename,
+        })
+        .to_string();
+        let path = spool.join(format!("browser-download-{id}-{}.download.json", unix_ms()));
+        if std::fs::write(&path, body).is_err() {
+            self.capture_notice =
+                Some("Download failed: could not write the transfer request".into());
+            return;
+        }
+        match enqueue_browser_output(
+            self.transfers.as_ref(),
+            &path.to_string_lossy(),
+            dest.to_string_lossy().as_ref(),
+        ) {
+            Ok(_) => {
+                self.downloads_open = true;
+                self.refresh_downloads();
+                self.capture_notice = Some(format!("Downloading {filename} to the mesh share"));
+            }
+            Err(err) => self.capture_notice = Some(format!("Download failed: {err}")),
+        }
+    }
+
     fn record_capture_success(&mut self, label: &str, path: &Path) {
         let notice = format!("{label} {}", path.display());
         self.capture_notice = Some(notice.clone());
@@ -3349,6 +3408,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let mut page_scrape_events = Vec::new();
     let mut passkey_events = Vec::new();
     let mut popup_opens = Vec::new();
+    let mut download_submits = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
@@ -3371,9 +3431,17 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         for request in tab.session.drain_popup_requests() {
             popup_opens.push((tab.engine, request.url));
         }
+        // Downloads the engine intercepted (B2) → submit to the mesh Transfers
+        // ledger (the daemon fetches into the mesh share).
+        for event in tab.session.drain_download_events() {
+            download_submits.push((event.id, event.url, event.filename));
+        }
     }
     for (engine, url) in popup_opens {
         state.request_new_tab_with_url(engine, url);
+    }
+    for (id, url, filename) in download_submits {
+        state.submit_download_to_ledger(id, &url, &filename);
     }
     let mut pdf_notice = None;
     for (path, ok) in pdf_events {
@@ -13167,6 +13235,60 @@ mod tests {
             assert!(job.source.ends_with(".download.json"));
             assert!(job.policy.verify);
         }
+    }
+
+    #[test]
+    fn intercepted_download_becomes_a_browser_download_ledger_job() {
+        // B2: a CEF `on_before_download` interception (surfaced by the helper as an
+        // EventMsg::Download and drained in the pump) is handed to the Transfers
+        // ledger — NOT saved locally. Prove the ledger job + its `.download.json`
+        // manifest carry the asset URL the daemon will fetch.
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(7, "https://files.example.test/report.pdf", "report.pdf");
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1, "exactly one ledger submission");
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        assert!(job.source.ends_with(".download.json"));
+        assert_eq!(job.dest, browser_capture_dir().to_string_lossy().as_ref());
+
+        let body = std::fs::read_to_string(&job.source).expect("manifest written to spool");
+        let manifest: serde_json::Value = serde_json::from_str(&body).expect("manifest JSON");
+        assert_eq!(manifest["op"], "browser_media_download_request");
+        assert_eq!(
+            manifest["asset_url"],
+            "https://files.example.test/report.pdf"
+        );
+        assert_eq!(manifest["suggested_filename"], "report.pdf");
+        // The interception opens the Downloads drawer so the user sees it land.
+        assert!(state.downloads_open);
+        let _ = std::fs::remove_file(&job.source);
+    }
+
+    #[test]
+    fn intercepted_download_without_a_filename_derives_one_from_the_url() {
+        // A `Content-Disposition`-less download arrives with an empty suggested
+        // name; the last non-empty URL segment becomes the filename.
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(
+            9,
+            "https://dl.example.test/a/b/archive.tar.gz?token=x",
+            "",
+        );
+
+        let verbs = transfers.verbs();
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        let body = std::fs::read_to_string(&job.source).expect("manifest written to spool");
+        let manifest: serde_json::Value = serde_json::from_str(&body).expect("manifest JSON");
+        assert_eq!(manifest["suggested_filename"], "archive.tar.gz");
+        let _ = std::fs::remove_file(&job.source);
     }
 
     #[test]
