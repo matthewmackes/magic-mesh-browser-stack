@@ -266,7 +266,13 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::Back => engine.go_back(1),
         ControlMsg::Forward => engine.go_forward(1),
         ControlMsg::SetZoom { percent } => engine.set_zoom(*percent),
-        ControlMsg::FindInPage { query, backwards } => engine.find_in_page(query, *backwards),
+        // Servo's find has no continue-from-current hook, so `find_next` is ignored
+        // (the same engine limitation as the no-cancel-load note above).
+        ControlMsg::FindInPage {
+            query,
+            backwards,
+            find_next: _,
+        } => engine.find_in_page(query, *backwards),
         ControlMsg::ClearFind => engine.clear_find(),
         ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
         ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
@@ -333,7 +339,17 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         | ControlMsg::Input(_)
         | ControlMsg::ResourceVerdict { .. }
         | ControlMsg::CosmeticFilters(_)
-        | ControlMsg::SavePdf { .. } => {}
+        | ControlMsg::SavePdf { .. }
+        // No-ops on the Servo fallback: EditCommand (in-page edit menu),
+        // PermissionDecision (Servo has no permission-prompt round-trip), and the
+        // IME preedit controls (IME is wired for CEF only) all have no Servo path.
+        // Listed explicitly rather than `_ =>` so a NEW wire control forces a
+        // conscious Servo decision instead of silently no-op'ing.
+        | ControlMsg::EditCommand { .. }
+        | ControlMsg::PermissionDecision { .. }
+        | ControlMsg::ImeSetComposition { .. }
+        | ControlMsg::ImeCommitText { .. }
+        | ControlMsg::ImeFinishComposition => {}
     }
 }
 
