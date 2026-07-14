@@ -1314,6 +1314,30 @@ fn login_fill_script_targets_the_login_form_and_dispatches_events() {
 }
 
 #[test]
+fn login_capture_script_installs_an_idempotent_submit_beacon() {
+    let s = login_capture_script();
+    assert!(s.contains("addEventListener('submit'"));
+    assert!(s.contains("input[type=password]"));
+    assert!(s.contains("mde-login.invalid/capture/")); // beacons to the intercepted URL
+    assert!(s.contains("__mdeLoginCaptureInstalled")); // install-once guard
+    assert!(s.contains("location.origin"));
+    assert!(!s.contains("</script>"));
+}
+
+#[test]
+fn decode_login_beacon_extracts_json_and_rejects_non_login_urls() {
+    // %7B{ %22" %3A: %7D}  →  {"ok":1}
+    let decoded = decode_login_beacon("https://mde-login.invalid/capture/?body=%7B%22ok%22%3A1%7D")
+        .expect("a login beacon decodes");
+    assert_eq!(decoded, "{\"ok\":1}");
+    // Non-login URLs (incl. the passkey beacon) are ignored.
+    assert!(decode_login_beacon("https://example.com/login").is_none());
+    assert!(decode_login_beacon("https://mde-passkey.invalid/request/?body=%7B%7D").is_none());
+    // A body that isn't a JSON object is rejected.
+    assert!(decode_login_beacon("https://mde-login.invalid/capture/?body=notjson").is_none());
+}
+
+#[test]
 fn device_profile_script_installs_and_clears_page_visible_device_metadata() {
     let enable = device_profile_script("phone", 390, 844, 300, true);
     assert!(enable.contains("mdeDeviceProfile"));

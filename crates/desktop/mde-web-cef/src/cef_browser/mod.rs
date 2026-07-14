@@ -246,6 +246,11 @@ const CEF_PAGE_SCRAPE_BEACON_PREFIX: &str = "https://mde-page-scrape.invalid/cap
 const CEF_PAGE_SCRAPE_BEACON_MAX_BYTES: usize = 32 * 1024;
 const CEF_PASSKEY_BEACON_PREFIX: &str = "https://mde-passkey.invalid/request/";
 const CEF_PASSKEY_BEACON_MAX_BYTES: usize = 8 * 1024;
+/// Login-capture beacon: the page-side [`scripts::login_capture_script`] posts a
+/// submitted login's JSON here; the resource-request handler intercepts + cancels it
+/// (never hits the network — creds stay in the sandbox), mirroring the passkey beacon.
+const CEF_LOGIN_BEACON_PREFIX: &str = "https://mde-login.invalid/capture/";
+const CEF_LOGIN_BEACON_MAX_BYTES: usize = 8 * 1024;
 /// `sizeof(cef_print_handler_t)` for pinned Linux CEF 149.
 pub const CEF_PRINT_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_print_handler_t, on_print_dialog)`.
@@ -2191,6 +2196,13 @@ impl CefBrowserState {
             }
             return RV_CANCEL;
         }
+        if let Some(body) = decode_login_beacon(&url) {
+            self.publish_login_submitted(body);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
         if callback.is_null() {
             return RV_CONTINUE;
         }
@@ -2378,6 +2390,15 @@ impl CefBrowserState {
 
     fn publish_passkey_request(&self, body: String) {
         let event = EventMsg::PasskeyRequest { body };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    fn publish_login_submitted(&self, body: String) {
+        let event = EventMsg::LoginSubmitted { body };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -4286,6 +4307,7 @@ fn inject_context_shims(browser: *mut c_void) {
     };
     execute_java_script(frame, webrtc_block_script());
     execute_java_script(frame, &passkey_bridge_script());
+    execute_java_script(frame, &login_capture_script());
 }
 
 /// Drain any page-initiated passkey ceremonies queued since the last tick. This
@@ -4462,6 +4484,19 @@ fn decode_passkey_beacon(url: &str) -> Option<String> {
         .find_map(|pair| pair.strip_prefix("body="))
         .unwrap_or_default();
     let body = clamp_utf8(&percent_decode(body), CEF_PASSKEY_BEACON_MAX_BYTES);
+    body.trim_start().starts_with('{').then_some(body)
+}
+
+/// Decode a login-capture beacon URL into its bounded JSON body (mirrors
+/// [`decode_passkey_beacon`]). Returns `None` for any non-login-beacon URL.
+fn decode_login_beacon(url: &str) -> Option<String> {
+    let query = url.strip_prefix(CEF_LOGIN_BEACON_PREFIX)?;
+    let query = query.strip_prefix('?').unwrap_or(query);
+    let body = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("body="))
+        .unwrap_or_default();
+    let body = clamp_utf8(&percent_decode(body), CEF_LOGIN_BEACON_MAX_BYTES);
     body.trim_start().starts_with('{').then_some(body)
 }
 

@@ -227,6 +227,9 @@ pub struct WebSession {
     page_text_events: VecDeque<PageTextStatus>,
     page_scrape_events: VecDeque<PageScrapeStatus>,
     passkey_events: VecDeque<PasskeyRequestStatus>,
+    /// Bounded JSON bodies from submitted login forms (auto-capture); the shell
+    /// drains these and offers to save the credential (session-only).
+    login_captures: VecDeque<String>,
     download_events: VecDeque<DownloadStatus>,
     popup_requests: VecDeque<PopupRequestStatus>,
     recent_resource_requests: VecDeque<ResourceRequestStatus>,
@@ -270,6 +273,7 @@ impl WebSession {
             page_text_events: VecDeque::new(),
             page_scrape_events: VecDeque::new(),
             passkey_events: VecDeque::new(),
+            login_captures: VecDeque::new(),
             download_events: VecDeque::new(),
             popup_requests: VecDeque::new(),
             recent_resource_requests: VecDeque::new(),
@@ -479,6 +483,13 @@ impl WebSession {
             EventMsg::PasskeyRequest { body } => {
                 self.passkey_events.push_back(PasskeyRequestStatus { body });
             }
+            EventMsg::LoginSubmitted { body } => {
+                const MAX_PENDING_LOGIN_CAPTURES: usize = 16;
+                if self.login_captures.len() >= MAX_PENDING_LOGIN_CAPTURES {
+                    self.login_captures.pop_front();
+                }
+                self.login_captures.push_back(body);
+            }
             EventMsg::Download {
                 id,
                 url,
@@ -570,6 +581,12 @@ impl WebSession {
     /// Drain passkey/WebAuthn ceremony requests reported by the helper.
     pub fn drain_passkey_events(&mut self) -> Vec<PasskeyRequestStatus> {
         self.passkey_events.drain(..).collect()
+    }
+
+    /// Drain submitted-login JSON bodies (auto-capture) reported by the helper. The
+    /// shell parses each and offers to save the credential (session-only).
+    pub fn drain_login_captures(&mut self) -> Vec<String> {
+        self.login_captures.drain(..).collect()
     }
 
     /// Drain browser download progress/completion events (B2) — the shell folds

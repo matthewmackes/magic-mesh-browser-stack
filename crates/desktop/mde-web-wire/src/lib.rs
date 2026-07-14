@@ -1142,6 +1142,16 @@ pub enum EventMsg {
         /// The requesting page's origin (scheme + host), for the prompt.
         origin: String,
     },
+    /// A login form was submitted — the shell may offer to save the credential
+    /// (session-only password manager, auto-capture). `body` is a bounded JSON object
+    /// `{"origin":..,"username":..,"password":..}` the page beaconed to the engine over
+    /// the SAME intercepted-`invalid`-URL channel passkey ceremonies use (the request
+    /// never hits the network; creds stay in the sandbox). The shell parses it, so the
+    /// wire stays engine-neutral, mirroring [`Self::PasskeyRequest`].
+    LoginSubmitted {
+        /// Bounded JSON `{origin, username, password}`.
+        body: String,
+    },
 }
 
 impl EventMsg {
@@ -1272,6 +1282,10 @@ impl EventMsg {
                 out.push(*kind);
                 put_str(&mut out, origin);
             }
+            Self::LoginSubmitted { body } => {
+                out.push(20);
+                put_str(&mut out, body);
+            }
         }
         out
     }
@@ -1352,6 +1366,7 @@ impl EventMsg {
                 kind: c.u8()?,
                 origin: c.string()?,
             },
+            20 => Self::LoginSubmitted { body: c.string()? },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1715,6 +1730,9 @@ mod tests {
         round_event(&EventMsg::PageScrape {
             id: 43,
             body: r#"{"text":"hello","links":[],"headings":[]}"#.to_owned(),
+        });
+        round_event(&EventMsg::LoginSubmitted {
+            body: "{\"origin\":\"https://x\",\"username\":\"a\",\"password\":\"b\"}".to_owned(),
         });
         round_event(&EventMsg::PasskeyRequest {
             body: r#"{"ceremony":"create","origin":"https://login.example"}"#.to_owned(),

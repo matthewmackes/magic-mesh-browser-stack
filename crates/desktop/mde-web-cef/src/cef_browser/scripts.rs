@@ -27,6 +27,19 @@ pub(super) fn login_fill_script(username: &str, password: &str) -> String {
     )
 }
 
+/// Page-side login-capture bridge (password-manager auto-capture): a capture-phase
+/// `submit` listener beacons `{origin, username, password}` for any form carrying a
+/// non-empty password field to the login-capture URL, which the engine intercepts +
+/// cancels before the network (the credential never leaves the sandbox — the same
+/// channel passkey ceremonies use). Idempotent per context. Injected with the other
+/// per-context security shims; the shell offers to save what it reports.
+pub(super) fn login_capture_script() -> String {
+    format!(
+        "(function(){{if(window.__mdeLoginCaptureInstalled)return;window.__mdeLoginCaptureInstalled=true;document.addEventListener('submit',function(e){{try{{var form=e.target;if(!form||!form.querySelector)return;var pw=form.querySelector('input[type=password]');if(!pw||!pw.value)return;var u=form.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');var body=JSON.stringify({{origin:location.origin,username:u?u.value:'',password:pw.value}});fetch('{prefix}?body='+encodeURIComponent(body),{{mode:'no-cors',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}}},true);}})();",
+        prefix = CEF_LOGIN_BEACON_PREFIX
+    )
+}
+
 pub(super) fn force_dark_script(enabled: bool) -> String {
     if !enabled {
         return "(function(){var id='mde-cef-force-dark-style';var el=document.getElementById(id);if(el)el.remove();document.documentElement.style.colorScheme='';})();".to_owned();

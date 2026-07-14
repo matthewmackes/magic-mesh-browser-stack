@@ -958,6 +958,9 @@ pub(crate) struct WebState {
     /// Draft inputs for the 🔑 menu's "save a login for this site" mini-form.
     login_user_draft: String,
     login_pass_draft: String,
+    /// An auto-captured login awaiting the user's "Save password?" decision (a form
+    /// submit the engine beaconed). `None` when nothing is pending.
+    pending_login_save: Option<StoredLogin>,
     /// Whether the Site Styles editor drawer is open, and its two input drafts.
     site_styles_open: bool,
     site_style_host_draft: String,
@@ -1093,6 +1096,7 @@ impl Default for WebState {
             session_logins: Vec::new(),
             login_user_draft: String::new(),
             login_pass_draft: String::new(),
+            pending_login_save: None,
             site_styles_open: false,
             site_style_host_draft: String::new(),
             site_style_css_draft: String::new(),
@@ -3625,6 +3629,43 @@ impl WebState {
         self.mark_active_tab_activity();
     }
 
+    /// Fold an auto-captured login (engine-beaconed JSON `{origin, username,
+    /// password}`) into a pending "Save password?" offer. Skipped if the exact
+    /// credential is already stored, so a re-login never re-prompts.
+    fn handle_login_capture(&mut self, body: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+        let origin = v.get("origin").and_then(|x| x.as_str()).unwrap_or_default();
+        let username = v
+            .get("username")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let password = v
+            .get("password")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let host = host_of(origin).unwrap_or_default();
+        if host.is_empty() || username.is_empty() || password.is_empty() {
+            return;
+        }
+        if self
+            .session_logins
+            .iter()
+            .any(|l| l.host == host && l.username == username && l.password == password)
+        {
+            return; // already saved — no offer
+        }
+        self.pending_login_save = Some(StoredLogin {
+            host,
+            username,
+            password,
+        });
+    }
+
     fn compiled_request_filter_for_url(&self, url: &str) -> RequestFilter {
         let mut filter = self.compiled_request_filter();
         filter.set_page(url);
@@ -4068,6 +4109,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let mut passkey_events = Vec::new();
     let mut popup_opens = Vec::new();
     let mut download_submits = Vec::new();
+    let mut login_captures = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
@@ -4095,6 +4137,10 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         for event in tab.session.drain_download_events() {
             download_submits.push((event.id, event.url, event.filename));
         }
+        // A submitted login (auto-capture) → offer to save it (session-only).
+        for body in tab.session.drain_login_captures() {
+            login_captures.push(body);
+        }
     }
     for (engine, url) in popup_opens {
         state.request_new_tab_with_url(engine, url);
@@ -4117,6 +4163,9 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     }
     for (tab_index, engine, body) in passkey_events {
         state.handle_passkey_event(tab_index, engine, &body);
+    }
+    for body in login_captures {
+        state.handle_login_capture(&body);
     }
     state.poll_spellcheck();
     // Engine-driven navigations (redirects, page scripts) land in the address
@@ -4260,6 +4309,17 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         if let Some((origin, kind)) = state.pending_permission_prompt() {
             if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
                 state.answer_active_permission(&origin, kind, allow);
+            }
+        }
+        // "Save password?" offer for an auto-captured login submit.
+        if let Some(pending) = state.pending_login_save.clone() {
+            match login_save_prompt_bar(ui, &pending.host, &pending.username) {
+                Some(true) => {
+                    state.save_login(&pending.host, &pending.username, &pending.password);
+                    state.pending_login_save = None;
+                }
+                Some(false) => state.pending_login_save = None,
+                None => {}
             }
         }
     }
@@ -8536,6 +8596,38 @@ fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bo
     decision
 }
 
+/// A "Save password?" bar for an auto-captured login. Returns `Some(true)` to save,
+/// `Some(false)` to dismiss, `None` while undecided. Mirrors the permission bar.
+fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &str) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(Style::SURFACE_HI)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Save login for {host} ({username})?"))
+                        .color(Style::TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("Save").color(Style::TEXT)))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Not now").color(Style::TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
 fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
     let mut back_to_safety = false;
     centered(ui, |ui| {
@@ -11134,6 +11226,47 @@ mod tests {
             )),
             "fill_active_login sends the chosen credential to the page: {controls:?}"
         );
+    }
+
+    #[test]
+    fn auto_captured_login_offers_to_save_then_dedups() {
+        let mut state = WebState::default();
+        // A captured submit (engine-beaconed JSON) → a pending save offer.
+        state.handle_login_capture(
+            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw"}"#,
+        );
+        let pending = state.pending_login_save.clone().expect("a save offer");
+        assert_eq!(pending.host, "mail.example.com");
+        assert_eq!(pending.username, "alice");
+
+        // Accept → save + clear.
+        state.save_login(&pending.host, &pending.username, &pending.password);
+        state.pending_login_save = None;
+        assert_eq!(state.logins_for_host("mail.example.com").len(), 1);
+
+        // The SAME credential again does NOT re-offer (dedup).
+        state.handle_login_capture(
+            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw"}"#,
+        );
+        assert!(
+            state.pending_login_save.is_none(),
+            "an already-saved credential does not re-prompt"
+        );
+
+        // A CHANGED password DOES re-offer (to update).
+        state.handle_login_capture(
+            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw2"}"#,
+        );
+        assert!(
+            state.pending_login_save.is_some(),
+            "a changed password re-offers"
+        );
+
+        // Malformed / blank captures are ignored.
+        state.pending_login_save = None;
+        state.handle_login_capture("not json at all");
+        state.handle_login_capture(r#"{"origin":"https://x","username":"","password":"p"}"#);
+        assert!(state.pending_login_save.is_none());
     }
 
     // ----------------------------------------------------------------------
