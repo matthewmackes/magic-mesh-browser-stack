@@ -1128,6 +1128,197 @@ impl BrowserEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserPolicySourceKind {
+    SafeBrowsing,
+    ManagedUrl,
+}
+
+impl BrowserPolicySourceKind {
+    const fn policy(self) -> &'static str {
+        match self {
+            Self::SafeBrowsing => "safe_browsing",
+            Self::ManagedUrl => "managed_url",
+        }
+    }
+
+    const fn op(self) -> &'static str {
+        match self {
+            Self::SafeBrowsing => "browser_safe_browsing_source_status",
+            Self::ManagedUrl => "browser_managed_url_policy_source_status",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SafeBrowsing => "Safe browsing",
+            Self::ManagedUrl => "Managed policy",
+        }
+    }
+
+    const fn item_label(self) -> &'static str {
+        match self {
+            Self::SafeBrowsing => "unsafe host",
+            Self::ManagedUrl => "URL block rule",
+        }
+    }
+
+    fn topic(self, host: &str) -> String {
+        match self {
+            Self::SafeBrowsing => browser_safe_browsing_source_topic(host),
+            Self::ManagedUrl => browser_managed_policy_source_topic(host),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserPolicySourceState {
+    Unknown,
+    Loaded,
+    Empty,
+    Missing,
+    Error,
+}
+
+impl BrowserPolicySourceState {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Loaded => "loaded",
+            Self::Empty => "empty",
+            Self::Missing => "missing",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserPolicySourceStatus {
+    kind: BrowserPolicySourceKind,
+    state: BrowserPolicySourceState,
+    source_path: PathBuf,
+    item_count: usize,
+    effective_count: usize,
+    checked_ms: u64,
+    loaded_ms: Option<u64>,
+    error: Option<String>,
+}
+
+impl BrowserPolicySourceStatus {
+    fn unknown(kind: BrowserPolicySourceKind, path: PathBuf) -> Self {
+        Self {
+            kind,
+            state: BrowserPolicySourceState::Unknown,
+            source_path: path,
+            item_count: 0,
+            effective_count: 0,
+            checked_ms: 0,
+            loaded_ms: None,
+            error: None,
+        }
+    }
+
+    fn loaded(
+        kind: BrowserPolicySourceKind,
+        path: PathBuf,
+        item_count: usize,
+        checked_ms: u64,
+    ) -> Self {
+        Self {
+            kind,
+            state: if item_count == 0 {
+                BrowserPolicySourceState::Empty
+            } else {
+                BrowserPolicySourceState::Loaded
+            },
+            source_path: path,
+            item_count,
+            effective_count: item_count,
+            checked_ms,
+            loaded_ms: Some(checked_ms),
+            error: None,
+        }
+    }
+
+    fn missing(&self, path: PathBuf, checked_ms: u64, effective_count: usize) -> Self {
+        self.failed(
+            BrowserPolicySourceState::Missing,
+            path,
+            checked_ms,
+            effective_count,
+            None,
+        )
+    }
+
+    fn error(&self, path: PathBuf, checked_ms: u64, effective_count: usize, error: String) -> Self {
+        self.failed(
+            BrowserPolicySourceState::Error,
+            path,
+            checked_ms,
+            effective_count,
+            Some(error),
+        )
+    }
+
+    fn failed(
+        &self,
+        state: BrowserPolicySourceState,
+        path: PathBuf,
+        checked_ms: u64,
+        effective_count: usize,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            kind: self.kind,
+            state,
+            source_path: path,
+            item_count: 0,
+            effective_count,
+            checked_ms,
+            loaded_ms: self.loaded_ms,
+            error,
+        }
+    }
+
+    fn summary(&self) -> String {
+        let item = self.kind.item_label();
+        let items = plural(self.effective_count);
+        match self.state {
+            BrowserPolicySourceState::Unknown => {
+                format!("{}: source not checked yet", self.kind.label())
+            }
+            BrowserPolicySourceState::Loaded => format!(
+                "{}: {} {}{} loaded",
+                self.kind.label(),
+                self.effective_count,
+                item,
+                items
+            ),
+            BrowserPolicySourceState::Empty => {
+                format!(
+                    "{}: source loaded, no {}s configured",
+                    self.kind.label(),
+                    item
+                )
+            }
+            BrowserPolicySourceState::Missing => format!(
+                "{}: source missing; {} last-good {}{} active",
+                self.kind.label(),
+                self.effective_count,
+                item,
+                items
+            ),
+            BrowserPolicySourceState::Error => format!(
+                "{}: source read error; {} last-good {}{} active",
+                self.kind.label(),
+                self.effective_count,
+                item,
+                items
+            ),
+        }
+    }
+}
+
 /// The Browser surface's state: the open tabs, the active one, and the address-bar
 /// edit buffer.
 pub(crate) struct WebState {
@@ -1232,9 +1423,13 @@ pub(crate) struct WebState {
     /// Mesh-hosted safe-browsing host blocklists. The worker/file-sync half can
     /// replace these hosts; the Browser compiles them into every live session.
     safe_browsing_hosts: Vec<String>,
+    /// Current read posture for the mesh-hosted safe-browsing source file.
+    safe_browsing_source_status: BrowserPolicySourceStatus,
     /// Operator-managed URL policy. Rules are read from the workgroup root and
     /// enforced before chrome-initiated loads and helper resource fetches.
     managed_url_policy: ManagedUrlPolicy,
+    /// Current read posture for the operator-managed URL policy source file.
+    managed_policy_source_status: BrowserPolicySourceStatus,
     /// BROWSER-DD-3 per-site permission manager. The helpers enforce default-deny
     /// for sensitive prompts; the shell tracks sites the operator explicitly
     /// forgot so the menu has a real state transition without offering fake allow
@@ -1492,7 +1687,15 @@ impl Default for WebState {
             pending_offline_cache_requests: BTreeMap::new(),
             adfilter_store: FilterListStore::with_bundled(),
             safe_browsing_hosts: Vec::new(),
+            safe_browsing_source_status: BrowserPolicySourceStatus::unknown(
+                BrowserPolicySourceKind::SafeBrowsing,
+                default_workgroup_root().join(SAFE_BROWSING_HOSTS_PATH),
+            ),
             managed_url_policy: ManagedUrlPolicy::empty(),
+            managed_policy_source_status: BrowserPolicySourceStatus::unknown(
+                BrowserPolicySourceKind::ManagedUrl,
+                default_workgroup_root().join(MANAGED_URL_POLICY_PATH),
+            ),
             forgotten_permission_sites: Vec::new(),
             site_permission_prompts: Vec::new(),
             site_data: SiteDataManager::default(),
@@ -4742,31 +4945,11 @@ impl WebState {
     }
 
     fn safe_browsing_summary(&self) -> String {
-        if self.safe_browsing_hosts.is_empty() {
-            "Safe browsing: no mesh-hosted unsafe hosts loaded".to_owned()
-        } else {
-            format!(
-                "Safe browsing: {} mesh-hosted unsafe host{} loaded",
-                self.safe_browsing_hosts.len(),
-                if self.safe_browsing_hosts.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        }
+        self.safe_browsing_source_status.summary()
     }
 
     fn managed_policy_summary(&self) -> String {
-        if self.managed_url_policy.is_empty() {
-            "Managed policy: no URL blocks loaded".to_owned()
-        } else {
-            format!(
-                "Managed policy: {} URL block rule{} loaded",
-                self.managed_url_policy.len(),
-                plural(self.managed_url_policy.len())
-            )
-        }
+        self.managed_policy_source_status.summary()
     }
 
     fn site_data_summary(&self) -> String {
@@ -4961,6 +5144,25 @@ impl WebState {
         publish_to_bus(
             self.bus_root.as_deref(),
             EVENT_BROWSER_SAFE_BROWSING_BLOCK,
+            &body,
+        );
+    }
+
+    fn publish_policy_source_status(&self, status: &BrowserPolicySourceStatus) {
+        let body = browser_policy_source_status_body(
+            status.kind.op(),
+            status.kind.policy(),
+            &status.source_path,
+            status.state.wire(),
+            status.item_count,
+            status.effective_count,
+            status.checked_ms,
+            status.loaded_ms,
+            status.error.as_deref(),
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            &status.kind.topic(&local_hostname()),
             &body,
         );
     }
@@ -5183,13 +5385,38 @@ impl WebState {
         }
         self.safe_browsing_last_poll = Some(Instant::now());
         let path = default_workgroup_root().join(SAFE_BROWSING_HOSTS_PATH);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let hosts = parse_safe_browsing_hosts(&text);
-        if hosts != self.safe_browsing_hosts {
-            self.set_safe_browsing_hosts(hosts);
+        let checked_ms = unix_ms();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let hosts = parse_safe_browsing_hosts(&text);
+                let status = BrowserPolicySourceStatus::loaded(
+                    BrowserPolicySourceKind::SafeBrowsing,
+                    path,
+                    hosts.len(),
+                    checked_ms,
+                );
+                if hosts != self.safe_browsing_hosts {
+                    self.set_safe_browsing_hosts(hosts);
+                }
+                self.safe_browsing_source_status = status;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.safe_browsing_source_status = self.safe_browsing_source_status.missing(
+                    path,
+                    checked_ms,
+                    self.safe_browsing_hosts.len(),
+                );
+            }
+            Err(err) => {
+                self.safe_browsing_source_status = self.safe_browsing_source_status.error(
+                    path,
+                    checked_ms,
+                    self.safe_browsing_hosts.len(),
+                    err.to_string(),
+                );
+            }
         }
+        self.publish_policy_source_status(&self.safe_browsing_source_status);
     }
 
     /// Populate the operator-managed URL policy from
@@ -5204,13 +5431,38 @@ impl WebState {
         }
         self.managed_policy_last_poll = Some(Instant::now());
         let path = default_workgroup_root().join(MANAGED_URL_POLICY_PATH);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let policy = parse_managed_url_policy(&text);
-        if policy != self.managed_url_policy {
-            self.set_managed_url_policy(policy);
+        let checked_ms = unix_ms();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let policy = parse_managed_url_policy(&text);
+                let status = BrowserPolicySourceStatus::loaded(
+                    BrowserPolicySourceKind::ManagedUrl,
+                    path,
+                    policy.len(),
+                    checked_ms,
+                );
+                if policy != self.managed_url_policy {
+                    self.set_managed_url_policy(policy);
+                }
+                self.managed_policy_source_status = status;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.managed_policy_source_status = self.managed_policy_source_status.missing(
+                    path,
+                    checked_ms,
+                    self.managed_url_policy.len(),
+                );
+            }
+            Err(err) => {
+                self.managed_policy_source_status = self.managed_policy_source_status.error(
+                    path,
+                    checked_ms,
+                    self.managed_url_policy.len(),
+                    err.to_string(),
+                );
+            }
         }
+        self.publish_policy_source_status(&self.managed_policy_source_status);
     }
 }
 
@@ -7137,6 +7389,12 @@ const EVENT_BROWSER_OFFLINE_CACHE_PREFIX: &str = "event/browser-offline-cache/";
 
 /// Browser CEF security-update status prefix, owned by the daemon updater worker.
 const STATE_BROWSER_SECURITY_UPDATE_PREFIX: &str = "state/browser-security-update/";
+
+/// Browser safe-browsing source-read status prefix.
+const STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX: &str = "state/browser-safe-browsing-source/";
+
+/// Browser managed URL policy source-read status prefix.
+const STATE_BROWSER_MANAGED_POLICY_SOURCE_PREFIX: &str = "state/browser-managed-url-policy-source/";
 
 /// Browser managed-policy block audit event. Operators/admin tooling can consume
 /// this without scraping UI notices.
@@ -10967,19 +11225,16 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "live-helper")]
     fn browser_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    #[cfg(feature = "live-helper")]
     struct EnvRestore {
         key: &'static str,
         value: Option<std::ffi::OsString>,
     }
 
-    #[cfg(feature = "live-helper")]
     impl EnvRestore {
         fn capture(key: &'static str) -> Self {
             Self {
@@ -10989,7 +11244,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "live-helper")]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             if let Some(value) = self.value.as_ref() {
@@ -15636,6 +15890,88 @@ mod tests {
     }
 
     #[test]
+    fn managed_policy_source_status_retains_last_good_on_read_error() {
+        let _env = browser_env_lock();
+        let _workgroup = EnvRestore::capture("MDE_WORKGROUP_ROOT");
+        let workgroup = tempfile::tempdir().expect("temp workgroup");
+        let browser_dir = workgroup.path().join("browser");
+        std::fs::create_dir_all(&browser_dir).expect("browser policy dir");
+        let source_path = browser_dir.join("managed-url-policy.txt");
+        std::fs::write(&source_path, "blocked.example\n").expect("managed policy source");
+        std::env::set_var("MDE_WORKGROUP_ROOT", workgroup.path());
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+
+        state.poll_managed_url_policy();
+
+        assert_eq!(
+            state
+                .managed_policy_block_for("https://blocked.example/private")
+                .as_ref()
+                .map(|block| block.rule.as_str()),
+            Some("host:blocked.example")
+        );
+        assert_eq!(
+            state.managed_policy_source_status.state,
+            BrowserPolicySourceState::Loaded
+        );
+        assert_eq!(state.managed_policy_source_status.item_count, 1);
+        assert_eq!(state.managed_policy_source_status.effective_count, 1);
+        let loaded_ms = state
+            .managed_policy_source_status
+            .loaded_ms
+            .expect("loaded timestamp");
+
+        std::fs::remove_file(&source_path).expect("remove policy source");
+        std::fs::create_dir(&source_path).expect("directory at policy source path");
+        state.managed_policy_last_poll = None;
+        state.poll_managed_url_policy();
+
+        assert_eq!(
+            state
+                .managed_policy_block_for("https://blocked.example/private")
+                .as_ref()
+                .map(|block| block.rule.as_str()),
+            Some("host:blocked.example"),
+            "a read error must not clear the last-good managed policy"
+        );
+        assert_eq!(
+            state.managed_policy_source_status.state,
+            BrowserPolicySourceState::Error
+        );
+        assert_eq!(state.managed_policy_source_status.effective_count, 1);
+        assert_eq!(
+            state.managed_policy_source_status.loaded_ms,
+            Some(loaded_ms)
+        );
+        assert!(
+            state.managed_policy_source_status.error.is_some(),
+            "read errors should carry the filesystem error text"
+        );
+        assert!(state
+            .managed_policy_source_status
+            .summary()
+            .contains("source read error"));
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_managed_policy_source_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list managed policy source status");
+        assert_eq!(msgs.len(), 2);
+        let error: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("error body"))
+                .expect("valid error JSON");
+        assert_eq!(error["op"], "browser_managed_url_policy_source_status");
+        assert_eq!(error["policy"], "managed_url");
+        assert_eq!(error["state"], "error");
+        assert_eq!(error["effective_count"], 1);
+        assert_eq!(error["loaded_ms"], loaded_ms);
+        assert!(error["error"].as_str().is_some_and(|msg| !msg.is_empty()));
+    }
+
+    #[test]
     fn managed_policy_blocks_chrome_loads_before_the_helper() {
         let bus = tempfile::tempdir().expect("temp bus");
         let (session, _helper) = testkit::connect().expect("connect");
@@ -16367,6 +16703,85 @@ mod tests {
             ]
         );
         assert!(parse_safe_browsing_hosts("# only comments\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn safe_browsing_policy_source_status_retains_last_good_on_missing_source() {
+        let _env = browser_env_lock();
+        let _workgroup = EnvRestore::capture("MDE_WORKGROUP_ROOT");
+        let workgroup = tempfile::tempdir().expect("temp workgroup");
+        let browser_dir = workgroup.path().join("browser");
+        std::fs::create_dir_all(&browser_dir).expect("browser policy dir");
+        let source_path = browser_dir.join("safe-browsing-hosts.txt");
+        std::fs::write(&source_path, "# source\nMalware.test\n\n").expect("safe-browsing source");
+        std::env::set_var("MDE_WORKGROUP_ROOT", workgroup.path());
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+
+        state.poll_safe_browsing_hosts();
+
+        assert_eq!(state.safe_browsing_hosts, vec!["malware.test".to_owned()]);
+        assert_eq!(
+            state.safe_browsing_source_status.state,
+            BrowserPolicySourceState::Loaded
+        );
+        assert_eq!(state.safe_browsing_source_status.item_count, 1);
+        assert_eq!(state.safe_browsing_source_status.effective_count, 1);
+        let loaded_ms = state
+            .safe_browsing_source_status
+            .loaded_ms
+            .expect("loaded timestamp");
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_safe_browsing_source_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list safe-browsing source status");
+        assert_eq!(msgs.len(), 1);
+        let loaded: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("loaded body"))
+                .expect("valid loaded JSON");
+        assert_eq!(loaded["op"], "browser_safe_browsing_source_status");
+        assert_eq!(loaded["policy"], "safe_browsing");
+        assert_eq!(loaded["state"], "loaded");
+        assert_eq!(
+            loaded["source_path"],
+            source_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(loaded["item_count"], 1);
+        assert_eq!(loaded["effective_count"], 1);
+
+        std::fs::remove_file(&source_path).expect("remove source");
+        state.safe_browsing_last_poll = None;
+        state.poll_safe_browsing_hosts();
+
+        assert_eq!(
+            state.safe_browsing_hosts,
+            vec!["malware.test".to_owned()],
+            "a missing source must not clear the last-good blocklist"
+        );
+        assert_eq!(
+            state.safe_browsing_source_status.state,
+            BrowserPolicySourceState::Missing
+        );
+        assert_eq!(state.safe_browsing_source_status.effective_count, 1);
+        assert_eq!(state.safe_browsing_source_status.loaded_ms, Some(loaded_ms));
+        assert!(state
+            .safe_browsing_source_status
+            .summary()
+            .contains("source missing"));
+
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list safe-browsing missing status");
+        assert_eq!(msgs.len(), 2);
+        let missing: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("missing body"))
+                .expect("valid missing JSON");
+        assert_eq!(missing["state"], "missing");
+        assert_eq!(missing["effective_count"], 1);
+        assert_eq!(missing["loaded_ms"], loaded_ms);
     }
 
     #[test]
@@ -17171,6 +17586,63 @@ mod tests {
         assert_eq!(v["source"], "browser");
         assert_eq!(v["node"], local_hostname());
         assert_eq!(v["blocked_ms"], 456);
+    }
+
+    #[test]
+    fn browser_policy_source_status_body_is_the_audit_state_shape() {
+        assert_eq!(
+            browser_safe_browsing_source_topic("node-a"),
+            "state/browser-safe-browsing-source/node-a"
+        );
+        assert_eq!(
+            browser_managed_policy_source_topic("node-a"),
+            "state/browser-managed-url-policy-source/node-a"
+        );
+
+        let source = Path::new("/mesh/browser/safe-browsing-hosts.txt");
+        let body = browser_policy_source_status_body(
+            BrowserPolicySourceKind::SafeBrowsing.op(),
+            BrowserPolicySourceKind::SafeBrowsing.policy(),
+            source,
+            BrowserPolicySourceState::Loaded.wire(),
+            3,
+            3,
+            123,
+            Some(120),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_safe_browsing_source_status");
+        assert_eq!(v["policy"], "safe_browsing");
+        assert_eq!(v["state"], "loaded");
+        assert_eq!(v["source_path"], "/mesh/browser/safe-browsing-hosts.txt");
+        assert_eq!(v["item_count"], 3);
+        assert_eq!(v["effective_count"], 3);
+        assert_eq!(v["loaded_ms"], 120);
+        assert!(v["error"].is_null());
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["checked_ms"], 123);
+
+        let body = browser_policy_source_status_body(
+            BrowserPolicySourceKind::ManagedUrl.op(),
+            BrowserPolicySourceKind::ManagedUrl.policy(),
+            Path::new("/mesh/browser/managed-url-policy.txt"),
+            BrowserPolicySourceState::Error.wire(),
+            0,
+            2,
+            456,
+            Some(400),
+            Some("is a directory"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_managed_url_policy_source_status");
+        assert_eq!(v["policy"], "managed_url");
+        assert_eq!(v["state"], "error");
+        assert_eq!(v["item_count"], 0);
+        assert_eq!(v["effective_count"], 2);
+        assert_eq!(v["loaded_ms"], 400);
+        assert_eq!(v["error"], "is a directory");
     }
 
     #[test]
@@ -22839,7 +23311,7 @@ mod tests {
         assert_eq!(state.tabs.len(), 1, "CEF live smoke attached one tab");
         assert_eq!(state.tabs[0].engine, BrowserEngine::Cef);
         assert!(
-            run_until_texture(&mut state),
+            run_until_texture_for(&mut state, 600),
             "CEF did not produce the initial Browser UI frame"
         );
 

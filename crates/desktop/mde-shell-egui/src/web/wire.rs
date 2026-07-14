@@ -438,6 +438,34 @@ pub(super) fn browser_safe_browsing_block_body(
     .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn browser_policy_source_status_body(
+    op: &str,
+    policy: &str,
+    source_path: &Path,
+    state: &str,
+    item_count: usize,
+    effective_count: usize,
+    checked_ms: u64,
+    loaded_ms: Option<u64>,
+    error: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "op": op.trim(),
+        "policy": policy.trim(),
+        "state": state.trim(),
+        "source_path": source_path.to_string_lossy(),
+        "item_count": item_count,
+        "effective_count": effective_count,
+        "loaded_ms": loaded_ms,
+        "error": error.map(str::trim),
+        "source": "browser",
+        "node": local_hostname(),
+        "checked_ms": checked_ms,
+    })
+    .to_string()
+}
+
 pub(super) fn browser_certificate_error_body(
     engine: BrowserEngine,
     url: &str,
@@ -1030,6 +1058,14 @@ pub(super) fn browser_offline_cache_result_topic(host: &str) -> String {
 
 pub(super) fn browser_security_update_status_topic(host: &str) -> String {
     format!("{STATE_BROWSER_SECURITY_UPDATE_PREFIX}{host}")
+}
+
+pub(super) fn browser_safe_browsing_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX}{host}")
+}
+
+pub(super) fn browser_managed_policy_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_MANAGED_POLICY_SOURCE_PREFIX}{host}")
 }
 
 pub(super) fn cache_url_keys(url: &str) -> Vec<String> {
