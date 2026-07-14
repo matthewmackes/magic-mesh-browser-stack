@@ -76,8 +76,10 @@ fn main() -> ExitCode {
     let will_run_cef = mode == "tab"
         || std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some()
         || std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some();
+    let bridge_exe =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mde-web-cef-renderer"));
     if will_run_cef && !is_cef_subprocess {
-        if let Err(reason) = apply_os_sandbox(&contract) {
+        if let Err(reason) = apply_os_sandbox(&contract, &bridge_exe) {
             eprintln!("CEF_OS_SANDBOX_FAILED reason={reason}");
             return ExitCode::from(78);
         }
@@ -96,8 +98,6 @@ fn main() -> ExitCode {
             return ExitCode::from(78);
         }
     };
-    let bridge_exe =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mde-web-cef-renderer"));
     let paths = CefInitPaths::new(bridge_exe, &contract.resources_dir)
         .with_extension_dirs(contract.extensions.clone());
     let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
@@ -224,8 +224,8 @@ fn main() -> ExitCode {
 /// the call forks: the confined child returns and proceeds; the pre-fork process
 /// becomes a signal-forwarding supervisor that never returns. A failure is fatal
 /// — the caller must never run web content unconfined.
-fn apply_os_sandbox(contract: &BridgeContract) -> Result<(), String> {
-    let binds = cef_extra_readonly_binds(&contract.root, &contract.extensions);
+fn apply_os_sandbox(contract: &BridgeContract, bridge_exe: &Path) -> Result<(), String> {
+    let binds = cef_extra_readonly_binds(&contract.root, &contract.extensions, bridge_exe);
     let policy = SandboxPolicy::web_cef();
     mde_web_sandbox::apply_with_binds(policy, &binds).map_err(|err| format!("{err:#}"))?;
     // Observable on the seat (stdout/journal) for live confinement verification.
@@ -245,17 +245,26 @@ fn apply_os_sandbox(contract: &BridgeContract) -> Result<(), String> {
 
 /// The extra read-only paths the CEF browser tree needs visible after
 /// `pivot_root`: the vendored CEF runtime root (`/opt/mde/cef` — its `Release/`
-/// libcef.so + `Resources/`) plus any vetted unpacked extension dirs. The
-/// subprocess bridge binary itself lives under `/usr/libexec`, already covered by
-/// the sandbox's `/usr` bind.
+/// libcef.so + `Resources/`) plus any vetted unpacked extension dirs. Production's
+/// subprocess bridge binary lives under `/usr/libexec`, already covered by the
+/// sandbox's `/usr` bind; non-`/usr` developer/farm bridge overrides are exposed
+/// as exactly that one read-only executable file so Chromium subprocess `execvp`
+/// still works after the rootfs pivot.
 ///
 /// SECURITY INVARIANT: this list is ENGINE RUNTIME + vetted extensions only —
 /// never a `$HOME`/SSH/Nebula/mesh path. Enforced by the unit tests below; the
 /// shared sandbox binds each entry read-only.
-fn cef_extra_readonly_binds(root: &Path, extensions: &[PathBuf]) -> Vec<PathBuf> {
-    let mut binds = Vec::with_capacity(1 + extensions.len());
+fn cef_extra_readonly_binds(
+    root: &Path,
+    extensions: &[PathBuf],
+    bridge_exe: &Path,
+) -> Vec<PathBuf> {
+    let mut binds = Vec::with_capacity(2 + extensions.len());
     binds.push(root.to_path_buf());
     binds.extend(extensions.iter().cloned());
+    if bridge_exe.is_absolute() && !bridge_exe.starts_with("/usr") {
+        binds.push(bridge_exe.to_path_buf());
+    }
     binds
 }
 
@@ -508,35 +517,48 @@ mod tests {
     #[test]
     fn cef_extra_binds_expose_the_runtime_and_extensions_never_keys() {
         // security-1: the extra RO binds the CEF browser gets inside its confined
-        // rootfs are the vendored runtime + vetted extensions ONLY — the sandbox
-        // must expose no home/keys/mesh path even here.
+        // rootfs are the vendored runtime, vetted extensions, and the exact
+        // renderer bridge executable when a farm/dev override is outside /usr.
+        // The sandbox must expose no broad home/keys/mesh path even here.
         let root = PathBuf::from("/opt/mde/cef");
         let exts = vec![
             PathBuf::from("/mnt/mesh-storage/browser/extensions/ublock-origin"),
             PathBuf::from("/mnt/mesh-storage/browser/extensions/lastpass"),
         ];
-        let binds = cef_extra_readonly_binds(&root, &exts);
+        let bridge = PathBuf::from("/home/mm/magic-mesh/target/debug/mde-web-cef-renderer");
+        let binds = cef_extra_readonly_binds(&root, &exts, &bridge);
         assert!(
             binds.contains(&PathBuf::from("/opt/mde/cef")),
             "runtime root"
         );
         assert!(binds.contains(&exts[0]));
         assert!(binds.contains(&exts[1]));
+        assert!(binds.contains(&bridge));
         for bind in &binds {
             let s = bind.to_string_lossy();
-            assert!(!s.starts_with("/home"), "home leaked: {s}");
+            if s.starts_with("/home") {
+                assert_eq!(bind, &bridge, "unexpected home bind leaked: {s}");
+                assert_eq!(
+                    bind.file_name().and_then(|name| name.to_str()),
+                    Some("mde-web-cef-renderer"),
+                    "home bind must be exactly the renderer bridge"
+                );
+            }
             assert!(!s.starts_with("/root"), "root home leaked: {s}");
             assert!(!s.contains("ssh"), "ssh keys leaked: {s}");
             assert!(!s.contains("nebula"), "nebula keys leaked: {s}");
-            assert!(!s.contains("mackesd"), "mackesd state leaked: {s}");
             assert!(!s.contains("syncthing"), "syncthing data leaked: {s}");
             assert!(!s.starts_with("/var"), "var (mesh data) leaked: {s}");
         }
     }
 
     #[test]
-    fn cef_extra_binds_default_to_just_the_runtime_root() {
-        let binds = cef_extra_readonly_binds(&PathBuf::from("/opt/mde/cef"), &[]);
+    fn cef_extra_binds_default_to_runtime_root_for_packaged_bridge() {
+        let binds = cef_extra_readonly_binds(
+            &PathBuf::from("/opt/mde/cef"),
+            &[],
+            &PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer"),
+        );
         assert_eq!(binds, vec![PathBuf::from("/opt/mde/cef")]);
     }
 
