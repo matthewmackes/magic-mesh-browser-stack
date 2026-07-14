@@ -281,6 +281,22 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_CLIENT_GET_PRINT_HANDLER_OFFSET, 160);
     assert_eq!(CEF_CLIENT_GET_RENDER_HANDLER_OFFSET, 168);
     assert_eq!(CEF_CLIENT_GET_REQUEST_HANDLER_OFFSET, 176);
+    // get_audio_handler is index 0 of the client vtable — the first getter after
+    // the 40-byte base. The known anchors above pin the same struct, so 40 + 0*8.
+    assert_eq!(CEF_CLIENT_GET_AUDIO_HANDLER_OFFSET, 40);
+    assert_eq!(CEF_CLIENT_GET_AUDIO_HANDLER_OFFSET, 40 + 0 * 8);
+    // cef_audio_handler_t: 5 fn ptrs after the 40-byte base (get_audio_parameters
+    // =40, on_audio_stream_started=48, packet=56, stopped=64, error=72).
+    assert_eq!(CEF_AUDIO_HANDLER_SIZE, 80);
+    assert_eq!(CEF_AUDIO_HANDLER_SIZE, 40 + 5 * 8);
+    assert_eq!(CEF_AUDIO_HANDLER_GET_AUDIO_PARAMETERS_OFFSET, 40 + 0 * 8);
+    assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STARTED_OFFSET, 40 + 1 * 8);
+    assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_PACKET_OFFSET, 40 + 2 * 8);
+    assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET, 40 + 3 * 8);
+    assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET, 40 + 4 * 8);
+    // cef_audio_parameters_t is three 4-byte ints (no ref-counted base).
+    assert_eq!(CEF_AUDIO_PARAMETERS_SIZE, 12);
+    assert_eq!(size_of::<CefAudioParameters>(), CEF_AUDIO_PARAMETERS_SIZE);
     assert_eq!(CEF_LIFE_SPAN_HANDLER_SIZE, 88);
     assert_eq!(CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET, 64);
     assert_eq!(CEF_RENDER_HANDLER_SIZE, 176);
@@ -631,6 +647,97 @@ fn audio_mute_control_uses_cef_host_audio_slot() {
 
     assert_eq!(AUDIO_MUTED_CALLS.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(AUDIO_MUTED_LAST.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[test]
+fn audio_handler_publishes_audible_state_on_stream_start_and_stop() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        4,
+        4,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    // Resolve the audio handler through the client vtable's get_audio_handler slot,
+    // then drive its callbacks straight from the installed vtable offsets (proving
+    // each fn-ptr was written to the right slot), not the Rust fns by name.
+    let audio = unsafe { get_audio_handler(callbacks.client_ptr()) };
+    assert!(!audio.is_null(), "get_audio_handler returned null");
+
+    // get_audio_parameters MUST return non-zero (else CEF delivers no streams) and
+    // fill the out-param with our sane STEREO / 48 kHz defaults.
+    let get_params: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut CefAudioParameters,
+    ) -> c_int = unsafe {
+        std::mem::transmute(
+            read_fn(audio, CEF_AUDIO_HANDLER_GET_AUDIO_PARAMETERS_OFFSET)
+                .expect("get_audio_parameters slot"),
+        )
+    };
+    let mut params = CefAudioParameters {
+        channel_layout: 0,
+        sample_rate: 0,
+        frames_per_buffer: 0,
+    };
+    let rv = unsafe { get_params(audio, ptr::null_mut(), &mut params) };
+    assert_ne!(rv, 0, "get_audio_parameters must return true");
+    assert_eq!(params.channel_layout, CEF_CHANNEL_LAYOUT_STEREO);
+    assert!(params.sample_rate > 0 && params.frames_per_buffer > 0);
+
+    // Stream started → AudioState { audible: true }.
+    let on_started: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *const CefAudioParameters,
+        c_int,
+    ) = unsafe {
+        std::mem::transmute(
+            read_fn(audio, CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STARTED_OFFSET)
+                .expect("on_audio_stream_started slot"),
+        )
+    };
+    unsafe { on_started(audio, ptr::null_mut(), &params, 2) };
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("audio started recv") else {
+        panic!("expected audio started event")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::AudioState { audible: true }
+    );
+
+    // Stream stopped → AudioState { audible: false }.
+    let on_stopped: unsafe extern "C" fn(*mut c_void, *mut c_void) = unsafe {
+        std::mem::transmute(
+            read_fn(audio, CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET)
+                .expect("on_audio_stream_stopped slot"),
+        )
+    };
+    unsafe { on_stopped(audio, ptr::null_mut()) };
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("audio stopped recv") else {
+        panic!("expected audio stopped event")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::AudioState { audible: false }
+    );
 }
 
 static SET_HEADER_CALLS: AtomicUsize = AtomicUsize::new(0);

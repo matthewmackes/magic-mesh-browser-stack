@@ -63,6 +63,14 @@ pub const CEF_CLIENT_GET_PRINT_HANDLER_OFFSET: usize = 160;
 pub const CEF_CLIENT_GET_RENDER_HANDLER_OFFSET: usize = 168;
 /// `offsetof(cef_client_t, get_request_handler)`.
 pub const CEF_CLIENT_GET_REQUEST_HANDLER_OFFSET: usize = 176;
+/// `offsetof(cef_client_t, get_audio_handler)` — the FIRST handler getter, right
+/// after the 40-byte `cef_base_ref_counted_t` base (index 0 → 40 + 0*8 = 40).
+/// The rest of the frozen CEF 149 client vtable pins this: get_display_handler=72
+/// (index 4), get_download_handler=80 (5), get_find_handler=96 (7),
+/// get_jsdialog_handler=128 (11), get_life_span_handler=144 (13), get_load_handler
+/// =152 (14), get_request_handler=176 (17) all land exactly on `40 + index*8`, and
+/// `CEF_CLIENT_SIZE`=192 = 40 + 19*8 caps the 19-method struct — so audio sits at 40.
+pub const CEF_CLIENT_GET_AUDIO_HANDLER_OFFSET: usize = 40;
 /// `offsetof(cef_client_t, get_display_handler)` — carries nav/title state (B1).
 pub const CEF_CLIENT_GET_DISPLAY_HANDLER_OFFSET: usize = 72;
 /// `offsetof(cef_client_t, get_find_handler)` — find-in-page match results (field 7).
@@ -116,6 +124,29 @@ pub const CEF_DISPLAY_HANDLER_ON_FULLSCREEN_MODE_CHANGE_OFFSET: usize = 64;
 pub const CEF_LOAD_HANDLER_SIZE: usize = 72;
 /// `offsetof(cef_load_handler_t, on_loading_state_change)`.
 pub const CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET: usize = 40;
+/// `sizeof(cef_audio_handler_t)` for pinned Linux CEF 149 (5 fn ptrs + 40-byte
+/// base = 40 + 5*8): get_audio_parameters, on_audio_stream_{started,packet,
+/// stopped,error}. Resolved via a dedicated cached pointer (`audio_handler_ptr`),
+/// never the size-keyed `lookup_peer`, so this 80 need not join its whitelist.
+pub const CEF_AUDIO_HANDLER_SIZE: usize = 80;
+/// `offsetof(cef_audio_handler_t, get_audio_parameters)` — index 0 (40 + 0*8).
+pub const CEF_AUDIO_HANDLER_GET_AUDIO_PARAMETERS_OFFSET: usize = 40;
+/// `offsetof(cef_audio_handler_t, on_audio_stream_started)` — index 1 (40 + 1*8).
+pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STARTED_OFFSET: usize = 48;
+/// `offsetof(cef_audio_handler_t, on_audio_stream_packet)` — index 2 (40 + 2*8).
+pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_PACKET_OFFSET: usize = 56;
+/// `offsetof(cef_audio_handler_t, on_audio_stream_stopped)` — index 3 (40 + 3*8).
+pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET: usize = 64;
+/// `offsetof(cef_audio_handler_t, on_audio_stream_error)` — index 4 (40 + 4*8).
+pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET: usize = 72;
+/// `sizeof(cef_audio_parameters_t)` — three 4-byte ints, no ref-counted base:
+/// `channel_layout` (a `cef_channel_layout_t` enum = int), `sample_rate`,
+/// `frames_per_buffer`. POD out-param filled by `get_audio_parameters`.
+pub const CEF_AUDIO_PARAMETERS_SIZE: usize = 12;
+/// `CEF_CHANNEL_LAYOUT_STEREO` from the CEF 149 `cef_channel_layout_t` enum
+/// (NONE=0, UNSUPPORTED=1, MONO=2, STEREO=3) — the sane default we request so CEF
+/// actually spins up an audio stream and fires the started/stopped callbacks.
+pub const CEF_CHANNEL_LAYOUT_STEREO: i32 = 3;
 /// `sizeof(cef_life_span_handler_t)` for pinned Linux CEF 149.
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
@@ -1244,6 +1275,7 @@ struct CefBrowserCallbacks {
     find: Box<CefCallbackBlock<CEF_FIND_HANDLER_SIZE>>,
     download: Box<CefCallbackBlock<CEF_DOWNLOAD_HANDLER_SIZE>>,
     jsdialog: Box<CefCallbackBlock<CEF_JSDIALOG_HANDLER_SIZE>>,
+    audio: Box<CefCallbackBlock<CEF_AUDIO_HANDLER_SIZE>>,
 }
 
 impl CefBrowserCallbacks {
@@ -1276,6 +1308,7 @@ impl CefBrowserCallbacks {
             find: Box::new(CefCallbackBlock::new(CEF_FIND_HANDLER_SIZE)),
             download: Box::new(CefCallbackBlock::new(CEF_DOWNLOAD_HANDLER_SIZE)),
             jsdialog: Box::new(CefCallbackBlock::new(CEF_JSDIALOG_HANDLER_SIZE)),
+            audio: Box::new(CefCallbackBlock::new(CEF_AUDIO_HANDLER_SIZE)),
         };
         callbacks.install();
         Ok(callbacks)
@@ -1430,6 +1463,34 @@ impl CefBrowserCallbacks {
             CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET,
             fn_ptr(on_jsdialog as *const ()),
         );
+        // Per-page audible state → the shell's 🔊 tab indicator. get_audio_parameters
+        // MUST return non-zero (with a sane STEREO/48kHz default) or CEF never spins
+        // up a stream and the started/stopped callbacks stay silent. Carried on a
+        // dedicated `audio_handler_ptr` (never the size-keyed `lookup_peer`).
+        self.client.put_fn(
+            CEF_CLIENT_GET_AUDIO_HANDLER_OFFSET,
+            fn_ptr(get_audio_handler as *const ()),
+        );
+        self.audio.put_fn(
+            CEF_AUDIO_HANDLER_GET_AUDIO_PARAMETERS_OFFSET,
+            fn_ptr(get_audio_parameters as *const ()),
+        );
+        self.audio.put_fn(
+            CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STARTED_OFFSET,
+            fn_ptr(on_audio_stream_started as *const ()),
+        );
+        self.audio.put_fn(
+            CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_PACKET_OFFSET,
+            fn_ptr(on_audio_stream_packet as *const ()),
+        );
+        self.audio.put_fn(
+            CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET,
+            fn_ptr(on_audio_stream_stopped as *const ()),
+        );
+        self.audio.put_fn(
+            CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET,
+            fn_ptr(on_audio_stream_error as *const ()),
+        );
 
         let state = self.state.as_ref() as *const CefBrowserState as usize;
         self.state
@@ -1450,6 +1511,9 @@ impl CefBrowserCallbacks {
         self.state
             .jsdialog_handler_ptr
             .store(self.jsdialog.as_usize(), Ordering::SeqCst);
+        self.state
+            .audio_handler_ptr
+            .store(self.audio.as_usize(), Ordering::SeqCst);
         let mut registry = registry().lock().expect("cef callback registry");
         registry.insert(self.client.as_usize(), state);
         registry.insert(self.life_span.as_usize(), state);
@@ -1462,6 +1526,7 @@ impl CefBrowserCallbacks {
         registry.insert(self.find.as_usize(), state);
         registry.insert(self.download.as_usize(), state);
         registry.insert(self.jsdialog.as_usize(), state);
+        registry.insert(self.audio.as_usize(), state);
     }
 
     fn client_ptr(&self) -> *mut c_void {
@@ -1535,6 +1600,7 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.load.as_usize());
         registry.remove(&self.find.as_usize());
         registry.remove(&self.download.as_usize());
+        registry.remove(&self.audio.as_usize());
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
@@ -1715,6 +1781,10 @@ struct CefBrowserState {
     /// like `print_handler_ptr` because its sizeof (72) collides with the load
     /// handler under the size-keyed `lookup_peer`.
     jsdialog_handler_ptr: AtomicUsize,
+    /// The audio handler block address (per-page audible state → the 🔊 tab
+    /// indicator). Stored directly like the other child handlers so the callback
+    /// resolves without the size-keyed `lookup_peer`.
+    audio_handler_ptr: AtomicUsize,
     string_userfree_free: CefStringUserfreeUtf16Free,
     /// `cef_string_list_size` / `cef_string_list_value` exports (dlsym'd via the
     /// ABI), used to read the favicon `icon_urls` list in `on_favicon_urlchange`.
@@ -1788,6 +1858,7 @@ impl CefBrowserState {
             find_handler_ptr: AtomicUsize::new(0),
             download_handler_ptr: AtomicUsize::new(0),
             jsdialog_handler_ptr: AtomicUsize::new(0),
+            audio_handler_ptr: AtomicUsize::new(0),
             string_userfree_free,
             string_list_size,
             string_list_value,
@@ -1859,6 +1930,18 @@ impl CefBrowserState {
     /// Forward an HTML5 fullscreen enter/leave to the shell (it hides/shows chrome).
     fn publish_fullscreen(&self, enabled: bool) {
         let event = EventMsg::Fullscreen { enabled };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// Forward the page's audible state (audio stream started/stopped) to the
+    /// shell, which shows/hides the 🔊 "playing audio" indicator on the tab. We
+    /// carry only the audible bit — never any audio samples.
+    fn publish_audio_state(&self, audible: bool) {
+        let event = EventMsg::AudioState { audible };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -2405,6 +2488,18 @@ struct CefSize {
     height: c_int,
 }
 
+/// `cef_audio_parameters_t` — the POD struct CEF passes (by out-pointer to
+/// `get_audio_parameters`, by const-pointer to `on_audio_stream_started`). Three
+/// 4-byte ints, no ref-counted base; matches `CEF_AUDIO_PARAMETERS_SIZE` (12).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CefAudioParameters {
+    /// A `cef_channel_layout_t` enum value (see `CEF_CHANNEL_LAYOUT_STEREO`).
+    channel_layout: c_int,
+    sample_rate: c_int,
+    frames_per_buffer: c_int,
+}
+
 unsafe extern "C" fn add_ref(_self: *mut c_void) {}
 
 unsafe extern "C" fn release(_self: *mut c_void) -> c_int {
@@ -2744,6 +2839,71 @@ unsafe extern "C" fn get_download_handler(self_: *mut c_void) -> *mut c_void {
 
 unsafe extern "C" fn get_jsdialog_handler(self_: *mut c_void) -> *mut c_void {
     with_state(self_, |state| state.jsdialog_ptr()).unwrap_or(ptr::null_mut())
+}
+
+unsafe extern "C" fn get_audio_handler(self_: *mut c_void) -> *mut c_void {
+    with_state(self_, |state| state.audio_ptr()).unwrap_or(ptr::null_mut())
+}
+
+/// CEF `get_audio_parameters(self, browser, params) -> int` — CEF asks whether we
+/// want the page's audio stream and, if so, in what format. Returning 0 makes CEF
+/// skip audio delivery entirely (the started/stopped callbacks never fire), so we
+/// return 1 (true) and fill a sane STEREO / 48 kHz / 1024-frame default. We never
+/// consume the samples — this only unlocks the audible-state signalling.
+unsafe extern "C" fn get_audio_parameters(
+    _self: *mut c_void,
+    _browser: *mut c_void,
+    params: *mut CefAudioParameters,
+) -> c_int {
+    if !params.is_null() {
+        // SAFETY: CEF supplied a non-null, writable `cef_audio_parameters_t`.
+        unsafe {
+            (*params).channel_layout = CEF_CHANNEL_LAYOUT_STEREO;
+            (*params).sample_rate = 48_000;
+            (*params).frames_per_buffer = 1024;
+        }
+    }
+    1
+}
+
+/// CEF `on_audio_stream_started(self, browser, params, channels)` — the page began
+/// producing audio. Publish `AudioState { audible: true }` for the 🔊 tab pip. We
+/// deliberately ignore `params`/`channels`: only the audible bit reaches the shell.
+unsafe extern "C" fn on_audio_stream_started(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    _params: *const CefAudioParameters,
+    _channels: c_int,
+) {
+    let _ = with_state(self_, |state| state.publish_audio_state(true));
+}
+
+/// CEF `on_audio_stream_packet(self, browser, data, frames, pts)` — a buffer of raw
+/// PCM samples. Intentionally a no-op: we surface only the audible bit, never the
+/// audio data itself (no capture, no forwarding).
+unsafe extern "C" fn on_audio_stream_packet(
+    _self: *mut c_void,
+    _browser: *mut c_void,
+    _data: *const c_void,
+    _frames: c_int,
+    _pts: i64,
+) {
+}
+
+/// CEF `on_audio_stream_stopped(self, browser)` — the page's audio stream ended.
+/// Publish `AudioState { audible: false }` so the shell clears the 🔊 tab pip.
+unsafe extern "C" fn on_audio_stream_stopped(self_: *mut c_void, _browser: *mut c_void) {
+    let _ = with_state(self_, |state| state.publish_audio_state(false));
+}
+
+/// CEF `on_audio_stream_error(self, browser, message)` — the audio stream failed.
+/// No-op: CEF stops the stream itself (a paired `on_audio_stream_stopped` clears
+/// the pip); we do not surface the error text.
+unsafe extern "C" fn on_audio_stream_error(
+    _self: *mut c_void,
+    _browser: *mut c_void,
+    _message: *const CefString,
+) {
 }
 
 /// CEF `on_jsdialog(self, browser, origin_url, dialog_type, message_text,
@@ -3107,6 +3267,10 @@ impl CefBrowserState {
 
     fn jsdialog_ptr(&self) -> *mut c_void {
         self.jsdialog_handler_ptr.load(Ordering::SeqCst) as *mut c_void
+    }
+
+    fn audio_ptr(&self) -> *mut c_void {
+        self.audio_handler_ptr.load(Ordering::SeqCst) as *mut c_void
     }
 
     // These four resolve their handler block DIRECTLY via a cached pointer set at
