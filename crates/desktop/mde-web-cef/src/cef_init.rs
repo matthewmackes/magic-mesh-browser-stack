@@ -77,6 +77,16 @@ pub const CEF_GENERIC_LOCALE: &str = "en-US";
 /// Stable Accept-Language list exposed to web content by the Chromium helper.
 pub const CEF_GENERIC_ACCEPT_LANGUAGE: &str = "en-US,en";
 
+/// Ephemeral CEF cache root inside the sandbox's private writable `/tmp`.
+///
+/// The OS sandbox provides `/tmp` as a fresh tmpfs and does not bind `$HOME` or
+/// `/var`, so these paths satisfy CEF's process-singleton/cache requirement
+/// without creating persistent browsing state.
+pub const CEF_EPHEMERAL_ROOT_CACHE_PATH: &str = "/tmp/mde-web-cef-cache";
+
+/// Per-profile CEF cache path under [`CEF_EPHEMERAL_ROOT_CACHE_PATH`].
+pub const CEF_EPHEMERAL_CACHE_PATH: &str = "/tmp/mde-web-cef-cache/profile";
+
 /// Default loopback Chromium DevTools discovery port for the CEF helper, used
 /// **only** when the operator has explicitly opted the debug endpoint in (see
 /// [`remote_debugging_port`]).
@@ -264,13 +274,23 @@ impl CefSettings {
     #[must_use]
     pub fn status_line(&self) -> String {
         format!(
-            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={} remote_debugging_port={}",
+            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={} remote_debugging_port={} root_cache_path={} cache_path={}",
             self.get_usize(CEF_SETTINGS_SIZE_OFFSET),
             self.get_i32(CEF_SETTINGS_NO_SANDBOX_OFFSET),
             self.get_i32(CEF_SETTINGS_WINDOWLESS_RENDERING_ENABLED_OFFSET),
             self.get_i32(CEF_SETTINGS_EXTERNAL_MESSAGE_PUMP_OFFSET),
             self.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET),
-            self.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET)
+            self.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET),
+            if self.get_usize(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET) == 0 {
+                0
+            } else {
+                1
+            },
+            if self.get_usize(CEF_SETTINGS_CACHE_PATH_OFFSET) == 0 {
+                0
+            } else {
+                1
+            }
         )
     }
 
@@ -308,6 +328,10 @@ pub struct CefInitPaths {
     pub locales_dir_path: PathBuf,
     /// CEF log file path.
     pub log_file: PathBuf,
+    /// App-level cache root. Under the sandbox this is a private tmpfs path.
+    pub root_cache_path: PathBuf,
+    /// Per-profile cache path. Under the sandbox this is a private tmpfs path.
+    pub cache_path: PathBuf,
     /// Vetted unpacked extension directories to load, when extension support is enabled.
     pub extension_dirs: Vec<PathBuf>,
 }
@@ -322,6 +346,8 @@ impl CefInitPaths {
             locales_dir_path: resources_dir.join("locales"),
             resources_dir_path: resources_dir,
             log_file: std::env::temp_dir().join("mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         }
     }
@@ -485,6 +511,18 @@ impl CefSettingsOwned {
         set_path_string(
             &mut settings,
             &mut strings,
+            CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET,
+            &paths.root_cache_path,
+        );
+        set_path_string(
+            &mut settings,
+            &mut strings,
+            CEF_SETTINGS_CACHE_PATH_OFFSET,
+            &paths.cache_path,
+        );
+        set_path_string(
+            &mut settings,
+            &mut strings,
             CEF_SETTINGS_BROWSER_SUBPROCESS_PATH_OFFSET,
             &paths.browser_subprocess_path,
         );
@@ -633,6 +671,8 @@ mod tests {
         let line = settings.status_line();
         assert!(line.contains("CEF_INIT_PLAN"));
         assert!(line.contains("windowless=1"));
+        assert!(line.contains("root_cache_path=0"));
+        assert!(line.contains("cache_path=0"));
         assert!(line.contains(&format!(
             "remote_debugging_port={}",
             remote_debugging_port()
@@ -659,9 +699,13 @@ mod tests {
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
         assert_ne!(
             settings.ptr_field(CEF_SETTINGS_BROWSER_SUBPROCESS_PATH_OFFSET),
             0
@@ -677,6 +721,38 @@ mod tests {
             1
         );
         assert!(settings.status_line().contains("CEF_INIT_PLAN"));
+        assert!(settings.status_line().contains("root_cache_path=1"));
+        assert!(settings.status_line().contains("cache_path=1"));
+    }
+
+    #[test]
+    fn owned_settings_pin_ephemeral_cache_paths_inside_private_tmpfs() {
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        assert_eq!(
+            paths.root_cache_path,
+            PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH)
+        );
+        assert_eq!(paths.cache_path, PathBuf::from(CEF_EPHEMERAL_CACHE_PATH));
+        assert!(
+            paths.cache_path.starts_with(&paths.root_cache_path),
+            "CEF cache_path must stay under root_cache_path"
+        );
+
+        let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
+        let encoded = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_ROOT_CACHE_PATH)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_CACHE_PATH)));
+        assert!(settings.status_line().contains("root_cache_path=1"));
+        assert!(settings.status_line().contains("cache_path=1"));
     }
 
     #[test]
@@ -866,11 +942,15 @@ mod tests {
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
         let encoded = |text: &str| text.encode_utf16().collect::<Vec<_>>();
 
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
         assert_ne!(settings.ptr_field(CEF_SETTINGS_USER_AGENT_OFFSET), 0);
         assert_ne!(settings.ptr_field(CEF_SETTINGS_LOCALE_OFFSET), 0);
         assert_ne!(
@@ -882,6 +962,12 @@ mod tests {
         assert!(settings
             ._strings
             .contains(&encoded(CEF_GENERIC_ACCEPT_LANGUAGE)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_ROOT_CACHE_PATH)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_CACHE_PATH)));
     }
 
     #[test]
