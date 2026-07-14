@@ -24,8 +24,8 @@ use crate::cef_abi::{CefAbi, CefStringListSize, CefStringListValue, CefStringUse
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
 use crate::wire::{
-    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode,
-    MediaTransportAction, Modifiers, PointerButton,
+    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode, MediaTransportAction,
+    Modifiers, PointerButton,
 };
 
 mod scripts;
@@ -848,6 +848,10 @@ const SHIM_SETTLE: Duration = Duration::from_millis(1000);
 /// request native must pick up), so a lightweight drain keeps running — but it no
 /// longer recompiles the multi-KB bridge shim on every tick.
 const PASSKEY_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Emergency/privacy override: when set to `1`/`true`/`yes`/`on`, CEF keeps the
+/// legacy best-effort JS WebRTC block. The operational default is enabled WebRTC
+/// with CEF's real IP-handling policy plus the native media permission callback.
+const CEF_WEBRTC_BLOCK_ENV: &str = "MDE_CEF_WEBRTC_BLOCKED";
 
 /// perf-6: pick the next pump/poll interval from how active the tab is.
 ///
@@ -865,9 +869,9 @@ fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
     }
 }
 
-/// browser-8: decides when to (re)inject the per-context security shims (WebRTC
-/// block + passkey bridge) so they land once per navigation generation instead of
-/// on a blind 250 ms timer.
+/// browser-8: decides when to (re)inject the per-context document shims (optional
+/// WebRTC block + passkey/login/autoplay bridges) so they land once per navigation
+/// generation instead of on a blind 250 ms timer.
 ///
 /// The pinned CEF ABI exposes no `OnContextCreated`/load-end callback, only an
 /// `is_navigation` flag on the resource handler, so navigation is modelled as a
@@ -875,11 +879,26 @@ fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
 /// that generation is still `settling` (document committing / first paints
 /// arriving) it re-injects at most once per [`Self::SETTLE_INTERVAL`] so a slow
 /// commit is covered. Once the context is stable it never re-injects — the
-/// per-document WebRTC `MutationObserver` keeps new subframes covered on its own.
+/// per-document WebRTC `MutationObserver` keeps new subframes covered on its own
+/// when the optional block is enabled.
 #[derive(Debug, Default)]
 struct ShimInjector {
     injected_generation: Option<u64>,
     last_inject: Option<Instant>,
+}
+
+fn cef_webrtc_blocked_from_env() -> bool {
+    let value = std::env::var(CEF_WEBRTC_BLOCK_ENV).ok();
+    cef_webrtc_blocked_from_env_value(value.as_deref())
+}
+
+fn cef_webrtc_blocked_from_env_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl ShimInjector {
@@ -970,8 +989,7 @@ pub fn run_windowless_tab(
         return Err(CefBrowserError::CreateReturnedNull);
     }
     notify_browser_view_ready(browser);
-    // Best-effort earliest injection, ahead of the poll loop below (§
-    // `webrtc_block_script` doc comment covers why this cannot be airtight).
+    // Best-effort earliest document-shim injection, ahead of the poll loop below.
     inject_context_shims(browser, &callbacks.state);
 
     let mut first_paint = None;
@@ -979,8 +997,9 @@ pub fn run_windowless_tab(
     let mut rbuf = Vec::new();
     let fd = stream.as_raw_fd();
 
-    // browser-8: inject the per-context security shims (WebRTC block + passkey
-    // bridge) once per navigation generation instead of on a fixed 250 ms timer.
+    // browser-8: inject the per-context document shims (optional WebRTC block +
+    // passkey/login/autoplay bridges) once per navigation generation instead of on
+    // a fixed 250 ms timer.
     let mut shims = ShimInjector::new();
     let mut last_nav = callbacks.navigations();
     let mut last_passkey_drain = Instant::now();
@@ -2051,6 +2070,10 @@ struct CefBrowserState {
     /// document is patched immediately, and the navigation shim injector reapplies
     /// the block to fresh documents while this is true.
     autoplay_blocked: AtomicBool,
+    /// Optional legacy WebRTC API remover. Default is false so CEF can satisfy
+    /// browser-page WebRTC compatibility; deployments can set
+    /// [`CEF_WEBRTC_BLOCK_ENV`] to restore the old WebRTC-off posture.
+    webrtc_blocked: AtomicBool,
 }
 
 impl CefBrowserState {
@@ -2116,6 +2139,7 @@ impl CefBrowserState {
             download_seq: AtomicU64::new(1),
             user_agent_override: Mutex::new(String::new()),
             autoplay_blocked: AtomicBool::new(false),
+            webrtc_blocked: AtomicBool::new(cef_webrtc_blocked_from_env()),
         })
     }
 
@@ -3105,7 +3129,9 @@ impl CefKeyEvent {
 
 #[derive(Clone, Copy, Debug)]
 enum PendingPermissionCallback {
-    Prompt { callback: usize },
+    Prompt {
+        callback: usize,
+    },
     MediaAccess {
         callback: usize,
         requested_permissions: u32,
@@ -4859,14 +4885,16 @@ fn request_page_scrape(
     );
 }
 
-/// Inject the per-context security shims (WebRTC block + passkey bridge) into
-/// the current document (browser-8). Called once per navigation generation and
-/// through a fresh document's settle window — not on a wall-clock timer.
+/// Inject the per-context document shims into the current document (browser-8).
+/// Called once per navigation generation and through a fresh document's settle
+/// window — not on a wall-clock timer.
 fn inject_context_shims(browser: *mut c_void, state: &CefBrowserState) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    execute_java_script(frame, webrtc_block_script());
+    if state.webrtc_blocked.load(Ordering::SeqCst) {
+        execute_java_script(frame, webrtc_block_script());
+    }
     execute_java_script(frame, &passkey_bridge_script());
     execute_java_script(frame, &login_capture_script());
     if state.autoplay_blocked.load(Ordering::SeqCst) {

@@ -1677,8 +1677,8 @@ fn passkey_shim_feature_detects_credential_type_and_gates_on_a_gesture() {
 #[test]
 fn webrtc_block_script_removes_the_reachable_webrtc_surface() {
     // `--disable-webrtc` (cef_init.rs) is confirmed non-functional (see
-    // its doc comment); this renderer-level shim is the real mitigation,
-    // so pin exactly which JS-reachable entry points it removes.
+    // its doc comment); this opt-in renderer-level shim is the emergency block,
+    // so pin exactly which JS-reachable entry points it removes when enabled.
     let script = webrtc_block_script();
     assert!(script.contains("delete w.RTCPeerConnection"));
     assert!(script.contains("delete w.webkitRTCPeerConnection"));
@@ -1721,6 +1721,26 @@ fn webrtc_block_script_covers_subframes_not_just_the_main_frame() {
     assert!(script.contains("childList:true,subtree:true"));
     // The entry point sweeps from the top window (which recurses down).
     assert!(script.contains("sweep(window)"));
+}
+
+#[test]
+fn cef_webrtc_block_env_defaults_to_operational_surface() {
+    assert!(
+        !cef_webrtc_blocked_from_env_value(None),
+        "CEF WebRTC should be available unless explicitly blocked"
+    );
+    for value in ["0", "false", "no", "off", "", "unexpected"] {
+        assert!(
+            !cef_webrtc_blocked_from_env_value(Some(value)),
+            "{value:?} must not enable the legacy block"
+        );
+    }
+    for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+        assert!(
+            cef_webrtc_blocked_from_env_value(Some(value)),
+            "{value:?} should enable the legacy block"
+        );
+    }
 }
 
 #[test]
@@ -3258,8 +3278,11 @@ fn resolve_on_request_media_access(
     assert!(!handler.is_null(), "get_permission_handler returned null");
     let on_request: OnRequestMediaAccessFn = unsafe {
         std::mem::transmute(
-            read_fn(handler, CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET)
-                .expect("on_request_media_access_permission slot"),
+            read_fn(
+                handler,
+                CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET,
+            )
+            .expect("on_request_media_access_permission slot"),
         )
     };
     (on_request, handler)
@@ -3528,13 +3551,24 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
         permission_kind_from_cef(CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(2)
     );
-    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM), Some(3));
-    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_MIC_STREAM), Some(4));
     assert_eq!(
-        permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_MIC_STREAM),
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM),
+        Some(3)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_MIC_STREAM),
+        Some(4)
+    );
+    assert_eq!(
+        permission_kind_from_cef(
+            CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_MIC_STREAM
+        ),
         Some(5)
     );
-    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_MIDI_SYSEX), None);
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_MIDI_SYSEX),
+        None
+    );
     assert_eq!(permission_kind_from_cef(0), None); // NONE
                                                    // Several in-scope bits at once → earlier wire order wins.
     assert_eq!(
@@ -3565,8 +3599,7 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     );
     assert_eq!(
         media_access_kind_from_cef(
-            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE
-                | CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE
         ),
         None
     );

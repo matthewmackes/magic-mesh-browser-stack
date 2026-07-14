@@ -27,9 +27,10 @@
 //!    invisible.
 //! 5. **read-only rootfs + tmpfs** — a fresh tmpfs root that bind-mounts ONLY
 //!    the read-only system runtime (`/usr`, the loader, the system CA bundle,
-//!    DNS resolv/hosts, the GPU device), any caller-named **extra** read-only
-//!    paths (e.g. a vendored engine runtime bundle), a private `/tmp`, and a
-//!    private `/dev/shm` (a multi-process Chromium/CEF engine's mandatory
+//!    DNS resolv/hosts, the GPU device, and explicitly allowlisted local media
+//!    capture devices when present), any caller-named **extra** read-only paths
+//!    (e.g. a vendored engine runtime bundle), a private `/tmp`, and a private
+//!    `/dev/shm` (a multi-process Chromium/CEF engine's mandatory
 //!    POSIX-shared-memory surface — it aborts without it). There
 //!    is **no `$HOME`, no `/root`, no `/var`, no ssh/mesh keys, no mesh data** —
 //!    they are simply absent from the new root, so the engine cannot read them
@@ -220,13 +221,15 @@ pub fn denied_syscalls() -> Vec<i64> {
 /// The read-only host paths bind-mounted into the tmpfs rootfs.
 ///
 /// Deliberately: the read-only system runtime + the system CA bundle + DNS
-/// resolution files + the GPU render node. Deliberately ABSENT: `$HOME`,
-/// `/root`, `/var`, `/etc/ssh`, the mesh's Nebula/Syncthing state — anything
-/// carrying user data or keys. (A caller may add read-only ENGINE-RUNTIME paths
-/// via [`apply_with_binds`]; those must likewise never name a key/home path.)
+/// resolution files + the GPU render node + local media capture devices
+/// (`/dev/snd`, `/dev/videoN`) when present. Deliberately ABSENT: `$HOME`,
+/// `/root`, `/var`, `/etc/ssh`, the mesh's Nebula/Syncthing state, or a broad
+/// `/dev` bind — anything carrying user data, keys, or unrelated devices. (A
+/// caller may add read-only ENGINE-RUNTIME paths via [`apply_with_binds`]; those
+/// must likewise never name a key/home path.)
 #[must_use]
 pub fn readonly_binds() -> Vec<PathBuf> {
-    [
+    let mut binds = [
         "/usr", // the whole system runtime + fonts + resources
         "/bin", // usrmerge symlinks (harmless if already under /usr)
         "/sbin",
@@ -249,7 +252,38 @@ pub fn readonly_binds() -> Vec<PathBuf> {
     .into_iter()
     .map(PathBuf::from)
     .filter(|p| p.exists())
-    .collect()
+    .collect::<Vec<_>>();
+    binds.extend(media_device_binds_in(Path::new("/dev")));
+    binds.sort_unstable();
+    binds.dedup();
+    binds
+}
+
+fn media_device_binds_in(dev_root: &Path) -> Vec<PathBuf> {
+    let mut binds = Vec::new();
+    let snd = dev_root.join("snd");
+    if snd.exists() {
+        binds.push(snd);
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dev_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("video") else {
+                continue;
+            };
+            if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                binds.push(path);
+            }
+        }
+    }
+
+    binds.sort_unstable();
+    binds.dedup();
+    binds
 }
 
 /// Rootfs-relative directories that receive a private writable tmpfs.
@@ -899,5 +933,28 @@ mod tests {
             assert!(!s.contains("nebula"), "nebula keys leaked: {s}");
             assert!(!s.contains("syncthing"), "syncthing data leaked: {s}");
         }
+    }
+
+    #[test]
+    fn media_device_bind_plan_is_limited_to_audio_and_video_capture_nodes() {
+        let root = std::env::temp_dir().join(format!(
+            "mde-web-sandbox-media-bind-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("snd")).expect("snd test dir");
+        std::fs::write(root.join("video0"), b"").expect("video0 test node");
+        std::fs::write(root.join("video12"), b"").expect("video12 test node");
+        std::fs::write(root.join("video-control"), b"").expect("non-capture video name");
+        std::fs::write(root.join("media0"), b"").expect("media test node");
+        std::fs::write(root.join("dri"), b"").expect("dri test node");
+
+        let binds = media_device_binds_in(&root);
+        assert_eq!(
+            binds,
+            vec![root.join("snd"), root.join("video0"), root.join("video12")]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

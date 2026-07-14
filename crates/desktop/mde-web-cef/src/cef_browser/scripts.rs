@@ -374,11 +374,15 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 /// points instead, matching the CEF community's own recommended technique
 /// (remove the interfaces from the renderer's global scope at script-inject
 /// time) and this codebase's existing shim-injection pattern
-/// (`passkey_bridge_script`). Injected once per navigation generation (and
-/// re-applied through a fresh document's settle window — see `ShimInjector` /
+/// (`passkey_bridge_script`). This is now an opt-in emergency/privacy override
+/// (`MDE_CEF_WEBRTC_BLOCKED=1`), not the normal CEF posture: browser-page WebRTC
+/// compatibility needs these APIs reachable, while privacy is handled by the real
+/// Chromium IP-handling policy plus native media permission callbacks.
+///
+/// When enabled, it is injected once per navigation generation (and re-applied
+/// through a fresh document's settle window — see `ShimInjector` /
 /// `inject_context_shims`) rather than on a blind 250 ms timer; the installed
 /// `MutationObserver` keeps late subframes covered within a stable document.
-/// This is a baseline privacy default, not a per-tab, user-toggleable feature.
 ///
 /// This is defense-in-depth, not an airtight guarantee: this ABI has no
 /// `OnContextCreated`-equivalent early-injection hook, so a page's own inline
@@ -392,29 +396,25 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 ///
 /// Cross-engine posture (browser-5). The shell runs CEF and Servo
 /// interchangeably on the same seat (CEF is the default when its runtime is
-/// present; the `mde-web-preview` Servo helper is the fallback), so a given
-/// user's WebRTC guarantee depends on which engine rendered the page. The two
-/// engines are deliberately brought as close as each platform allows:
+/// present; the `mde-web-preview` Servo helper is the fallback), so WebRTC
+/// capability depends on which engine rendered the page:
 /// * Servo turns WebRTC off at the engine level — `secure_preferences()` sets
 ///   `dom_webrtc_enabled = false`, so `RTCPeerConnection` never exists and there
-///   is no bypass. This is the *reference* posture; it must not be weakened.
+///   is no bypass.
 /// * CEF has no equivalent hard off switch on a prebuilt binary (see the
-///   `chromium_privacy_switches()` doc), so it reaches parity for the *actual
-///   harm* — the raw-local-IP leak — via the engine-level
-///   `--force-webrtc-ip-handling-policy` switch above, and removes the JS API
-///   surface only best-effort via this shim.
+///   `chromium_privacy_switches()` doc), so its normal operational posture is
+///   WebRTC available, constrained for the *actual harm* — raw-local-IP leaks —
+///   by the engine-level `--force-webrtc-ip-handling-policy` switch above and by
+///   the shell's session-only camera/microphone permission prompt.
 ///
-/// Residual gap flagged for the operator (CEF-only, and minimized, not closed):
-/// because this ABI has no early `OnContextCreated` hook, a hostile page's own
-/// inline script can touch the WebRTC *API surface* (e.g. construct an
-/// `RTCPeerConnection`) in the sub-tick before this shim's first injection lands.
-/// That surviving connection still cannot leak a raw local IP — the engine-level
-/// ip-handling switch blocks non-proxied UDP regardless — so the residual is API
-/// *presence*, not the IP leak Servo defends against. Fully closing it needs
-/// either the build-time `enable_webrtc=false` GN flag (unavailable on the
-/// vendored CEF) or a native `CefPermissionHandler` deny (no ABI vtable offset
-/// verified from the pinned CEF 149 headers). Revisit if either becomes
-/// available.
+/// Residual gap flagged for the operator (CEF-only): if the opt-in block is used,
+/// this ABI still has no early `OnContextCreated` hook, so a hostile page's own
+/// inline script can touch the WebRTC API surface in the sub-tick before this
+/// shim's first injection lands. That surviving connection still cannot leak a raw
+/// local IP — the engine-level IP-handling switch blocks non-proxied UDP
+/// regardless — so the residual is API presence, not the IP leak Servo defends
+/// against. Fully closing that mode needs the build-time `enable_webrtc=false` GN
+/// flag, unavailable on the vendored CEF.
 pub(super) const fn webrtc_block_script() -> &'static str {
     // browser-3: the removal is applied to EVERY reachable frame, not just the
     // main frame. `strip(w)` deletes the JS-reachable WebRTC surface on a target
@@ -423,11 +423,10 @@ pub(super) const fn webrtc_block_script() -> &'static str {
     // A `MutationObserver` re-sweeps on DOM mutation so a *newly inserted* iframe
     // is patched as soon as it appears, between the 250ms poll ticks. Cross-origin
     // subframes are unreachable from JS by same-origin policy (property access on
-    // them throws and is swallowed) — the `--force-webrtc-ip-handling-policy`
-    // switch remains the backstop for that residual, see this file's cef_init
-    // companion. A native `CefPermissionHandler`/ICE-layer deny would be airtight
-    // but the pinned CEF 149 ABI exposes no permission-handler or frame-enumeration
-    // vtable offset verified from the farm headers, so it is not attempted here.
+    // them throws and is swallowed). The native `CefPermissionHandler` now gates
+    // camera/microphone access; this opt-in script only removes reachable API
+    // symbols for deployments that want the legacy posture, with the IP-handling
+    // switch as the transport privacy backstop.
     "(function(){function strip(w){try{delete w.RTCPeerConnection;}catch(_e){}try{delete w.webkitRTCPeerConnection;}catch(_e){}try{delete w.RTCDataChannel;}catch(_e){}try{delete w.RTCSessionDescription;}catch(_e){}try{delete w.RTCIceCandidate;}catch(_e){}try{if(w.MediaDevices&&w.MediaDevices.prototype){delete w.MediaDevices.prototype.getUserMedia;delete w.MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(w.navigator&&w.navigator.mediaDevices){delete w.navigator.mediaDevices.getUserMedia;delete w.navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete w.navigator.getUserMedia;}catch(_e){}try{delete w.navigator.webkitGetUserMedia;}catch(_e){}try{delete w.navigator.mozGetUserMedia;}catch(_e){}}function sweep(w){try{strip(w);}catch(_e){}var kids=null;try{kids=w.frames;}catch(_e){kids=null;}if(kids){for(var i=0;i<kids.length;i++){var cw=null;try{cw=kids[i];}catch(_e){cw=null;}if(cw&&cw!==w){try{sweep(cw);}catch(_e){}}}}}sweep(window);try{if(!window.__mdeWebrtcBlockObserver&&window.MutationObserver&&document&&document.documentElement){window.__mdeWebrtcBlockObserver=new MutationObserver(function(){try{sweep(window);}catch(_e){}});window.__mdeWebrtcBlockObserver.observe(document.documentElement,{childList:true,subtree:true});}}catch(_e){}})();"
 }
 

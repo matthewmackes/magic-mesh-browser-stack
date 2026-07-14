@@ -452,12 +452,13 @@ impl CefInitPaths {
 /// proxied/relayed transport, which is the correct mechanism for the
 /// local-IP-leak concern this bundle is defending against.
 ///
-/// The actual JS-reachable WebRTC surface (`RTCPeerConnection`,
-/// `getUserMedia`) has no real command-line or `cef_settings_t` kill switch
-/// on a prebuilt CEF binary, so it is now removed at the renderer level
-/// instead — see `cef_browser::webrtc_block_script`/`inject_context_shims`,
-/// injected per navigation on every `run_windowless_tab` session the same way
-/// the passkey bridge shim is.
+/// The JS-reachable WebRTC surface (`RTCPeerConnection`, `getUserMedia`) has no
+/// real command-line or `cef_settings_t` kill switch on a prebuilt CEF binary.
+/// Since BROWSER-DD-9's camera/microphone permission path exists, CEF leaves that
+/// surface reachable by default for browser-page compatibility and relies on the
+/// real IP-handling switch above plus native media permission prompts. Operators
+/// can still restore the legacy best-effort JS removal with
+/// `MDE_CEF_WEBRTC_BLOCKED=1` — see `cef_browser::webrtc_block_script`.
 fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
     [
         "--disable-background-networking",
@@ -793,11 +794,10 @@ mod tests {
         assert!(switches.contains(&"--disable-sync".to_owned()));
         assert!(switches.contains(&"--disable-extensions".to_owned()));
         assert!(switches.contains(&"--disable-metrics-reporting".to_owned()));
-        // browser-5 cross-engine parity: this engine-level switch is CEF's
-        // counterpart to Servo's `dom_webrtc_enabled = false` hard-off. Pinning
-        // the strongest policy value (`disable_non_proxied_udp`) guards against a
-        // silent downgrade that would drop CEF's raw-local-IP-leak guarantee
-        // below Servo's. See `cef_browser::webrtc_block_script` for the layering.
+        // browser-5 cross-engine privacy: CEF leaves WebRTC reachable for browser
+        // compatibility, so this engine-level policy is the raw-local-IP-leak
+        // guarantee. Pinning the strongest policy value
+        // (`disable_non_proxied_udp`) guards against a silent downgrade.
         assert!(switches
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned()));
         assert!(switches.iter().any(|s| {
@@ -815,9 +815,9 @@ mod tests {
         // registries, and Chromium silently no-ops unrecognized `--` switches
         // rather than erroring — so shipping it here was a false sense of
         // privacy hardening (WebRTC stayed fully reachable). Regression guard
-        // against reintroducing it; the real mitigations are
-        // `--force-webrtc-ip-handling-policy` (kept above) plus renderer-level
-        // API removal (`cef_browser::webrtc_block_script`).
+        // against reintroducing it; the real mitigations are the
+        // `--force-webrtc-ip-handling-policy` switch, native media permission
+        // prompts, and the opt-in `MDE_CEF_WEBRTC_BLOCKED=1` API removal.
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
