@@ -2340,6 +2340,12 @@ impl WebState {
         self.history.clear();
         self.dismiss_all_downloads();
         self.closed_tabs.clear();
+        // Site data: saved logins + per-site permission grants are browsing data too,
+        // so "Clear All Browsing Data" forgets them (a granted site then re-prompts;
+        // a saved login must be re-entered). HSTS is deliberately NOT cleared — it's a
+        // security upgrade, and forgetting it would downgrade a site back to plain http.
+        self.session_logins.clear();
+        self.granted_permissions.clear();
         self.clear_active_session_data();
     }
 
@@ -13278,8 +13284,13 @@ mod tests {
             title: "Closed".into(),
             engine: BrowserEngine::Servo,
         });
+        // Site data: a saved login + a permission grant must also be forgotten.
+        state.save_login("saved.example", "alice", "pw");
+        state.grant_permission("https://granted.example", 0);
         assert!(!state.history.is_empty());
         assert_eq!(state.closed_tabs.len(), 1);
+        assert_eq!(state.session_logins.len(), 1);
+        assert!(state.is_permission_granted("https://granted.example", 0));
 
         // Drive it through the real Privacy-menu action, not the private method.
         let ctx = egui::Context::default();
@@ -13291,6 +13302,11 @@ mod tests {
 
         assert!(state.history.is_empty(), "history forgotten");
         assert!(state.closed_tabs.is_empty(), "reopen stack forgotten");
+        assert!(state.session_logins.is_empty(), "saved logins forgotten");
+        assert!(
+            !state.is_permission_granted("https://granted.example", 0),
+            "permission grants forgotten"
+        );
         assert_eq!(state.address, NEW_TAB_URL, "returns to the new-tab surface");
     }
 
