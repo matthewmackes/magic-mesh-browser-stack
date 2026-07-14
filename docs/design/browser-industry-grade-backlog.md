@@ -83,10 +83,15 @@ the pinned CEF-Alloy + OSR design — non-goals in the WebRTC category, not unfi
   standalone PDFium/Rust-PDF renderer, or a CEF Chrome-runtime switch.
 - **PiP — architecturally precluded by OSR.** `requestPictureInPicture` needs a native video window;
   the egui-texture OSR pipeline has none. Would need a second OSR surface + a floating shell window.
-- **Password manager — the one real path, security-gated on its industry-grade half.** Autofill FILL is
-  buildable now via the existing `execute_java_script` injection; auto-CAPTURE needs a JS↔native bridge
-  (buildable on `on_process_message_received`, client vtable slot 184, + a render-process handler) but
-  handles live credentials → needs an operator security review, not an unattended build.
+- **Password manager — ✅ COMPLETE (session-only, industry-standard).** Store + user-initiated autofill
+  (🔑 menu) + **auto-capture-on-submit** + manage + Clear-All integration. The capture half was NOT built
+  via the render-process bridge I first assumed — instead it REUSES the proven passkey beacon channel:
+  the page-side `login_capture_script` beacons `{origin,username,password}` to
+  `https://mde-login.invalid/capture/`, which the resource-request handler intercepts + CANCELS before the
+  network (the credential never leaves the sandbox — identical safety to passkey ceremony data). So it's
+  both safe AND complete, no operator review needed. Persistence + auto-fill-on-load stay deliberate
+  non-goals (private-by-default). Only on-glass e2e verification (real form submit) is F44-deploy-gated,
+  like the other engine round-trips.
 
 **Operator decisions that would change this:** switch to the CEF **Chrome runtime** (unblocks B4 +
 native PDF in one move); authorize the password capture bridge (with a security review); decide PiP
