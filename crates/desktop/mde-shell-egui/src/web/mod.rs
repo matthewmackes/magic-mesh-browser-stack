@@ -1939,6 +1939,9 @@ impl WebState {
             if idx == self.active || tab.idle_suspended || tab.session.is_crashed() {
                 continue;
             }
+            if tab.session.audible() && !tab.muted {
+                continue;
+            }
             if now.duration_since(tab.last_activity) < IDLE_TAB_SUSPEND_AFTER {
                 continue;
             }
@@ -13278,6 +13281,54 @@ mod tests {
             "suspended tabs wear the idle marker"
         );
         assert!(tab_hover(&state.tabs[0]).contains("Idle suspended"));
+    }
+
+    #[test]
+    fn audible_inactive_tabs_are_not_idle_suspended() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (first, first_helper, _first_writer) = live_page_session();
+        let (second, _second_helper, _second_writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(first, BrowserEngine::Cef);
+        state.push_session_with_engine(second, BrowserEngine::Servo);
+        assert_eq!(state.active, 1, "second tab is active");
+        state.tabs[0].session.poll();
+        let _ = drain_control_messages(&first_helper);
+
+        write_helper_event(
+            &first_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        state.tabs[0].session.poll();
+        assert!(
+            state.tabs[0].session.audible(),
+            "precondition: inactive tab is producing audio"
+        );
+
+        let now = Instant::now();
+        state.tabs[0].last_activity = now - IDLE_TAB_SUSPEND_AFTER - Duration::from_secs(1);
+        state.suspend_idle_tabs(now);
+
+        assert!(
+            !state.tabs[0].idle_suspended,
+            "background audio must not be stopped by idle suspension"
+        );
+        let controls = drain_control_messages(&first_helper);
+        assert!(
+            !controls
+                .iter()
+                .any(|msg| matches!(msg, mde_web_preview_client::ControlMsg::Stop)),
+            "audible inactive tab must not receive Stop: {controls:?}"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(ACTION_BROWSER_TAB_SUSPEND, None)
+            .expect("list browser suspend actions");
+        assert!(
+            msgs.is_empty(),
+            "audible inactive tab should not publish a suspend handoff"
+        );
     }
 
     #[test]
