@@ -153,6 +153,20 @@ pub struct JsDialog {
     pub origin: String,
 }
 
+/// A page's pending request for a powerful capability (geolocation / notifications
+/// / clipboard). The engine holds the CEF permission callback open and awaits the
+/// shell's [`crate::ControlMsg::PermissionDecision`] carrying the same `id`; the
+/// shell prompts the user, then calls [`WebSession::answer_permission`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    /// Correlates the request with its decision.
+    pub id: u64,
+    /// Engine-neutral kind: `0` geolocation, `1` notifications, `2` clipboard.
+    pub kind: u8,
+    /// The requesting page's origin (scheme + host).
+    pub origin: String,
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
@@ -196,6 +210,9 @@ pub struct WebSession {
     /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
     /// already auto-resolved it; this is a passive notice for the shell.
     pending_js_dialog: Option<JsDialog>,
+    /// A page's pending permission request awaiting the user's allow/block. The
+    /// engine holds the CEF callback open until [`Self::answer_permission`] replies.
+    pending_permission: Option<PermissionRequest>,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -238,6 +255,7 @@ impl WebSession {
             cert_error: None,
             safe_browsing_block: None,
             pending_js_dialog: None,
+            pending_permission: None,
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -478,6 +496,9 @@ impl WebSession {
             EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
             EventMsg::AudioState { audible } => self.audible = audible,
+            EventMsg::PermissionRequest { id, kind, origin } => {
+                self.pending_permission = Some(PermissionRequest { id, kind, origin });
+            }
             EventMsg::Favicon { png } => self.favicon = Some(png),
             EventMsg::CertError { url, code, message } => {
                 self.cert_error = Some(CertError { url, code, message });
@@ -679,6 +700,27 @@ impl WebSession {
     #[must_use]
     pub const fn pending_js_dialog(&self) -> Option<&JsDialog> {
         self.pending_js_dialog.as_ref()
+    }
+
+    /// The page's pending permission request awaiting the user's allow/block, if
+    /// any. The shell renders a prompt from this and replies via
+    /// [`Self::answer_permission`].
+    #[must_use]
+    pub const fn pending_permission(&self) -> Option<&PermissionRequest> {
+        self.pending_permission.as_ref()
+    }
+
+    /// Answer the pending permission request: send the engine a
+    /// [`ControlMsg::PermissionDecision`] carrying the request's `id`, then clear it
+    /// (the engine continues the held CEF callback with accept/deny). A no-op when
+    /// nothing is pending. Session-only — the client persists no permission state.
+    pub fn answer_permission(&mut self, allow: bool) {
+        if let Some(request) = self.pending_permission.take() {
+            self.send(&ControlMsg::PermissionDecision {
+                id: request.id,
+                allow,
+            });
+        }
     }
 
     /// Clear the page-find selection/highlight where the helper supports it.
@@ -1110,6 +1152,41 @@ mod tests {
         send_event(&peer, &EventMsg::AudioState { audible: false });
         session.poll();
         assert!(!session.audible(), "an audio stream stop clears it");
+    }
+
+    #[test]
+    fn a_permission_request_prompts_then_the_answer_replies_with_the_id() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.pending_permission().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::PermissionRequest {
+                id: 42,
+                kind: 0,
+                origin: "https://maps.example".to_owned(),
+            },
+        );
+        session.poll();
+        let pending = session.pending_permission().expect("a pending prompt");
+        assert_eq!(pending.id, 42);
+        assert_eq!(pending.kind, 0);
+        assert_eq!(pending.origin, "https://maps.example");
+
+        // Answering sends the engine a decision carrying the request's id and clears it.
+        session.answer_permission(true);
+        assert!(
+            session.pending_permission().is_none(),
+            "answering clears the pending prompt"
+        );
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision {
+                id: 42,
+                allow: true
+            }
+        );
     }
 
     #[test]
