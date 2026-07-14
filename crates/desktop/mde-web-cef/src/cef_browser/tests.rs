@@ -324,6 +324,11 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 152);
     assert_eq!(CEF_REQUEST_SIZE, 216);
     assert_eq!(CEF_REQUEST_GET_URL_OFFSET, 48);
+    // set_header_by_name is index 13 of the fn-ptr block after the 40-byte base;
+    // the classic cef_request_capi.h core (indices 0..14) is ABI-frozen. Anchored
+    // by get_url=48 (index 1) and the 22-method size 216 = 40 + 22*8.
+    assert_eq!(CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET, 40 + 13 * 8);
+    assert_eq!(CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET, 144);
     assert_eq!(CEF_CALLBACK_SIZE, 56);
     assert_eq!(CEF_CALLBACK_CONT_OFFSET, 40);
     assert_eq!(CEF_CALLBACK_CANCEL_OFFSET, 48);
@@ -626,6 +631,123 @@ fn audio_mute_control_uses_cef_host_audio_slot() {
 
     assert_eq!(AUDIO_MUTED_CALLS.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(AUDIO_MUTED_LAST.load(AtomicOrdering::SeqCst), 0);
+}
+
+static SET_HEADER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SET_HEADER_OVERWRITE: AtomicI32 = AtomicI32::new(-1);
+static SET_HEADER_NAME: Mutex<String> = Mutex::new(String::new());
+static SET_HEADER_VALUE: Mutex<String> = Mutex::new(String::new());
+
+/// Fake `cef_request_t::set_header_by_name`: records the header name/value and the
+/// overwrite flag so the before-load path can be asserted without live CEF.
+unsafe extern "C" fn record_set_header(
+    _request: *mut c_void,
+    name: *const c_void,
+    value: *const c_void,
+    overwrite: c_int,
+) {
+    SET_HEADER_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    SET_HEADER_OVERWRITE.store(overwrite, AtomicOrdering::SeqCst);
+    // SAFETY: the before-load path passes live `CefStringOwned` pointers for the
+    // header name and value, valid for the duration of this call.
+    let read = |raw: *const c_void| -> String {
+        let raw = raw.cast::<CefString>();
+        unsafe {
+            if raw.is_null() || (*raw).str_.is_null() || (*raw).length == 0 {
+                String::new()
+            } else {
+                String::from_utf16_lossy(std::slice::from_raw_parts((*raw).str_, (*raw).length))
+            }
+        }
+    };
+    if let Ok(mut guard) = SET_HEADER_NAME.lock() {
+        *guard = read(name);
+    }
+    if let Ok(mut guard) = SET_HEADER_VALUE.lock() {
+        *guard = read(value);
+    }
+}
+
+#[test]
+fn user_agent_override_stamps_real_http_header_in_before_load() {
+    SET_HEADER_CALLS.store(0, AtomicOrdering::SeqCst);
+    SET_HEADER_OVERWRITE.store(-1, AtomicOrdering::SeqCst);
+    SET_HEADER_NAME.lock().unwrap().clear();
+    SET_HEADER_VALUE.lock().unwrap().clear();
+
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+
+    // A fake, mutable cef_request_t whose set_header_by_name slot records the call.
+    // Its get_url slot is left null: request_url() then yields None and the path
+    // returns RV_CONTINUE — but the header stamp happens first, which is the SUT.
+    let mut request = vec![0u8; CEF_REQUEST_SIZE];
+    request[CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET
+        ..CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_set_header as *const () as usize).to_ne_bytes());
+
+    // `self_` is the resource-request handler block; with_state() resolves it to
+    // this browser's state via the callback registry, exactly as live CEF does.
+    let self_ = callbacks.state.resource_request_ptr();
+    assert!(!self_.is_null(), "resource-request handler must resolve");
+
+    // 1) No override stored → the before-load path must NOT touch the header.
+    unsafe {
+        on_before_resource_load(
+            self_,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            request.as_mut_ptr().cast(),
+            ptr::null_mut(),
+        );
+    }
+    assert_eq!(
+        SET_HEADER_CALLS.load(AtomicOrdering::SeqCst),
+        0,
+        "an empty User-Agent override must leave the request header untouched"
+    );
+
+    // 2) Store an override through the real control path, then the before-load path
+    //    must stamp `User-Agent: <ua>` with overwrite=1. The zeroed fake browser
+    //    makes apply_user_agent()'s JS injection a harmless no-op (no main frame).
+    const UA: &str = "Mozilla/5.0 (X11; Fedora; Linux x86_64) MDE/1.0 Chrome/149.0 Safari/537.36";
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    apply_control_frame(
+        browser.as_mut_ptr().cast(),
+        &callbacks,
+        &ControlMsg::SetUserAgent {
+            user_agent: UA.to_owned(),
+        },
+    );
+
+    unsafe {
+        on_before_resource_load(
+            self_,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            request.as_mut_ptr().cast(),
+            ptr::null_mut(),
+        );
+    }
+    assert_eq!(
+        SET_HEADER_CALLS.load(AtomicOrdering::SeqCst),
+        1,
+        "a stored override stamps the real HTTP User-Agent header exactly once"
+    );
+    assert_eq!(
+        SET_HEADER_OVERWRITE.load(AtomicOrdering::SeqCst),
+        1,
+        "overwrite=1 replaces Chromium's default User-Agent"
+    );
+    assert_eq!(&*SET_HEADER_NAME.lock().unwrap(), "User-Agent");
+    assert_eq!(&*SET_HEADER_VALUE.lock().unwrap(), UA);
 }
 
 static PRINT_CALLS: AtomicUsize = AtomicUsize::new(0);

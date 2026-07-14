@@ -246,6 +246,22 @@ pub const CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET: usize = 152;
 pub const CEF_REQUEST_SIZE: usize = 216;
 /// `offsetof(cef_request_t, get_url)`.
 pub const CEF_REQUEST_GET_URL_OFFSET: usize = 48;
+/// `offsetof(cef_request_t, set_header_by_name)` for pinned Linux CEF 149.
+///
+/// `set_header_by_name` is index 13 of the `_cef_request_t` fn-ptr block that
+/// follows the 40-byte `cef_base_ref_counted_t`: base 40 + 13*8 = 144. The order
+/// of the classic `cef_request_capi.h` core (indices 0..14) — is_read_only(0),
+/// get_url(1), set_url(2), get_method(3), set_method(4), set_referrer(5),
+/// get_referrer_url(6), get_referrer_policy(7), get_post_data(8), set_post_data(9),
+/// get_header_map(10), set_header_map(11), get_header_by_name(12),
+/// set_header_by_name(13), set(14) — is ABI-frozen; CEF only appends new methods
+/// after the last (get_identifier, index 21). Cross-checked by the two in-crate
+/// anchors that pin the SAME struct: `CEF_REQUEST_GET_URL_OFFSET`=48 fixes index 1
+/// against base 40, and `CEF_REQUEST_SIZE`=216 = 40 + 22*8 fixes the method count
+/// at exactly 22 (indices 0..21) — both consistent only with this layout.
+/// Signature `void(self, const cef_string_t* name, const cef_string_t* value,
+/// int overwrite)`.
+pub const CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET: usize = 144;
 /// `sizeof(cef_callback_t)` for pinned Linux CEF 149.
 pub const CEF_CALLBACK_SIZE: usize = 56;
 /// `offsetof(cef_callback_t, cont)`.
@@ -985,7 +1001,13 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::SetUserScripts { enabled, bundle } => {
             apply_user_scripts(browser, *enabled, bundle);
         }
-        ControlMsg::SetUserAgent { user_agent } => apply_user_agent(browser, user_agent),
+        ControlMsg::SetUserAgent { user_agent } => {
+            // Store the override for the real HTTP `User-Agent:` header path
+            // (on_before_resource_load), AND keep injecting the JS
+            // `navigator.userAgent` shim for client-side sniffers.
+            callbacks.state.set_user_agent_override(user_agent);
+            apply_user_agent(browser, user_agent);
+        }
         ControlMsg::SetDeviceProfile {
             profile,
             width,
@@ -1718,6 +1740,12 @@ struct CefBrowserState {
     last_cursor: AtomicI32,
     /// Monotonic id minted per intercepted download (B2), keying the shell row.
     download_seq: AtomicU64,
+    /// The shell-supplied real HTTP `User-Agent` override (empty = none). Set from
+    /// `ControlMsg::SetUserAgent` alongside the `navigator.userAgent` JS shim, and
+    /// stamped onto every outgoing request's `User-Agent:` header in
+    /// `on_before_resource_load` so server-side sniffers see the spoofed agent too
+    /// (the JS shim only fools client-side `navigator.userAgent` reads).
+    user_agent_override: Mutex<String>,
 }
 
 impl CefBrowserState {
@@ -1772,7 +1800,25 @@ impl CefBrowserState {
             popup: Mutex::new(PopupOverlay::default()),
             last_cursor: AtomicI32::new(-1),
             download_seq: AtomicU64::new(1),
+            user_agent_override: Mutex::new(String::new()),
         })
+    }
+
+    /// Store (or clear, when empty) the shell's real HTTP `User-Agent` override.
+    /// The next `on_before_resource_load` stamps it onto the request header.
+    fn set_user_agent_override(&self, user_agent: &str) {
+        if let Ok(mut guard) = self.user_agent_override.lock() {
+            *guard = user_agent.to_owned();
+        }
+    }
+
+    /// The current `User-Agent` override, or `None` when unset/empty.
+    fn user_agent_override(&self) -> Option<String> {
+        self.user_agent_override
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .filter(|ua| !ua.is_empty())
     }
 
     /// B2 — a download was intercepted; forward its URL + name so the shell
@@ -2665,6 +2711,13 @@ unsafe extern "C" fn on_before_resource_load(
     callback: *mut c_void,
 ) -> c_int {
     with_state(self_, |state| {
+        // Override the REAL HTTP `User-Agent:` header (not just the JS-injected
+        // `navigator.userAgent`) when the shell supplied one, so server-side
+        // sniffers match the spoofed agent. Stamped before the URL extraction so
+        // it applies to every outgoing request the resource handler sees.
+        if let Some(user_agent) = state.user_agent_override() {
+            set_request_header(request, "User-Agent", &user_agent);
+        }
         let Some(url) = request_url(request, state.string_userfree_free) else {
             return RV_CONTINUE;
         };
@@ -3934,6 +3987,29 @@ fn request_url(
         value
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Stamp an HTTP request header onto a live, mutable `cef_request_t` via
+/// `set_header_by_name(name, value, overwrite=1)`. Used to override the real
+/// `User-Agent:` header so server-side sniffers match the JS `navigator.userAgent`
+/// shim. No-op if the request/slot is null or the header text contains a NUL. Only
+/// safe to call on the mutable request CEF hands to `on_before_resource_load`.
+fn set_request_header(request: *mut c_void, name: &str, value: &str) {
+    let (Ok(name), Ok(value)) = (CefStringOwned::new(name), CefStringOwned::new(value)) else {
+        return;
+    };
+    let Some(set_header) = read_fn(request, CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET) else {
+        return;
+    };
+    // SAFETY: `set_header` is read from `cef_request_t::set_header_by_name`, whose
+    // pinned C signature is `void (*)(cef_request_t*, const cef_string_t* name,
+    // const cef_string_t* value, int overwrite)`.
+    let set_header: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, c_int) =
+        unsafe { std::mem::transmute(set_header) };
+    // SAFETY: CEF passes a live, mutable `cef_request_t` to on_before_resource_load;
+    // `name`/`value` own their UTF-16 buffers for the duration of the call.
+    // overwrite = 1 replaces the default header CEF already populated.
+    unsafe { set_header(request, name.as_ptr(), value.as_ptr(), 1) };
 }
 
 fn cef_string_to_string(raw: *const CefString) -> String {
