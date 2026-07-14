@@ -2083,6 +2083,54 @@ impl WebState {
         self.active = new_active;
     }
 
+    /// Duplicate the tab at `index` into a fresh foreground tab on the same engine
+    /// and URL (Chrome's "Duplicate tab"), through the exact open seam the `+`
+    /// buttons use. A blank tab duplicates to a new blank tab.
+    fn duplicate_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let engine = tab.engine;
+        let url = tab.session.nav().url.trim().to_owned();
+        if url.is_empty() {
+            self.request_new_tab(engine);
+        } else {
+            self.request_new_tab_with_url(engine, url);
+        }
+    }
+
+    /// Close every tab except `keep` — and except pinned tabs, which Chrome's
+    /// "Close other tabs" always spares. Closes right-to-left so indices stay valid;
+    /// closed non-blank tabs land on the reopen stack; `keep` stays active.
+    fn close_other_tabs(&mut self, keep: usize) {
+        if keep >= self.tabs.len() {
+            return;
+        }
+        let mut keep = keep;
+        for i in (0..self.tabs.len()).rev() {
+            if i != keep && !self.tabs[i].pinned {
+                self.close_tab(i);
+                if i < keep {
+                    keep -= 1; // a removal left of `keep` shifts it down one
+                }
+            }
+        }
+        self.select_tab(keep);
+    }
+
+    /// Close every non-pinned tab to the right of `from` (Chrome's "Close tabs to
+    /// the right"). Right-to-left so indices stay valid; pinned tabs are spared.
+    fn close_tabs_to_the_right(&mut self, from: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        for i in (from + 1..self.tabs.len()).rev() {
+            if !self.tabs[i].pinned {
+                self.close_tab(i);
+            }
+        }
+    }
+
     /// Put the tab at `index` into a fresh tab group (Chrome's "Add tab to new
     /// group"), minting the group with a cycled color and a default name.
     fn new_group_from_tab(&mut self, index: usize) {
@@ -4156,6 +4204,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
     let mut pin_tab: Option<(usize, bool)> = None;
+    let mut duplicate_tab_idx: Option<usize> = None;
+    let mut close_others_idx: Option<usize> = None;
+    let mut close_right_idx: Option<usize> = None;
 
     // Overflow (BROWSER tabstrip): pills shrink toward a floor as they multiply;
     // once at the floor the strip scrolls horizontally in ONE row instead of
@@ -4258,6 +4309,30 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
                             if ui.add(compact_menu_item(pin_label)).clicked() {
                                 pin_tab = Some((idx, !tab.pinned));
+                                ui.close_menu();
+                            }
+                            if ui.add(compact_menu_item("Duplicate tab")).clicked() {
+                                duplicate_tab_idx = Some(idx);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    state.tabs.len() > 1,
+                                    compact_menu_item("Close other tabs"),
+                                )
+                                .clicked()
+                            {
+                                close_others_idx = Some(idx);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(
+                                    idx + 1 < state.tabs.len(),
+                                    compact_menu_item("Close tabs to the right"),
+                                )
+                                .clicked()
+                            {
+                                close_right_idx = Some(idx);
                                 ui.close_menu();
                             }
                             if tab.group.is_none() {
@@ -4387,6 +4462,12 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.set_active_tab_display_target(display_target);
     } else if let Some((idx, pinned)) = pin_tab {
         state.set_tab_pinned(idx, pinned);
+    } else if let Some(idx) = duplicate_tab_idx {
+        state.duplicate_tab(idx);
+    } else if let Some(idx) = close_others_idx {
+        state.close_other_tabs(idx);
+    } else if let Some(idx) = close_right_idx {
+        state.close_tabs_to_the_right(idx);
     } else if let Some(idx) = group_tab {
         state.new_group_from_tab(idx);
     } else if let Some(idx) = ungroup_tab_idx {
@@ -4413,6 +4494,9 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
     let mut pin_tab: Option<(usize, bool)> = None;
+    let mut duplicate_tab_idx: Option<usize> = None;
+    let mut close_others_idx: Option<usize> = None;
+    let mut close_right_idx: Option<usize> = None;
 
     // Drag-reorder bookkeeping mirrors the horizontal strip, but the drop point is
     // matched along Y — a vertical drag reorders the stacked pills.
@@ -4506,6 +4590,30 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
                                 if ui.add(compact_menu_item(pin_label)).clicked() {
                                     pin_tab = Some((idx, !tab.pinned));
+                                    ui.close_menu();
+                                }
+                                if ui.add(compact_menu_item("Duplicate tab")).clicked() {
+                                    duplicate_tab_idx = Some(idx);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        state.tabs.len() > 1,
+                                        compact_menu_item("Close other tabs"),
+                                    )
+                                    .clicked()
+                                {
+                                    close_others_idx = Some(idx);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        idx + 1 < state.tabs.len(),
+                                        compact_menu_item("Close tabs to the right"),
+                                    )
+                                    .clicked()
+                                {
+                                    close_right_idx = Some(idx);
                                     ui.close_menu();
                                 }
                                 if tab.group.is_none() {
@@ -4634,6 +4742,12 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.set_active_tab_display_target(display_target);
     } else if let Some((idx, pinned)) = pin_tab {
         state.set_tab_pinned(idx, pinned);
+    } else if let Some(idx) = duplicate_tab_idx {
+        state.duplicate_tab(idx);
+    } else if let Some(idx) = close_others_idx {
+        state.close_other_tabs(idx);
+    } else if let Some(idx) = close_right_idx {
+        state.close_tabs_to_the_right(idx);
     } else if let Some(idx) = group_tab {
         state.new_group_from_tab(idx);
     } else if let Some(idx) = ungroup_tab_idx {
@@ -10335,6 +10449,88 @@ mod tests {
         run_tab_strip_frame(&ctx, &mut state, body_input());
         state.tabs[0].muted = true;
         run_tab_strip_frame(&ctx, &mut state, body_input());
+    }
+
+    #[test]
+    fn duplicating_a_tab_enqueues_an_open_on_the_same_url() {
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default();
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        let mut peer: &UnixStream = &helper;
+        peer.write_all(&wire::frame(
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://dup.example/".to_owned(),
+            }
+            .encode(),
+        ))
+        .expect("nav");
+        state.tabs[0].session.poll();
+
+        state.duplicate_tab(0);
+        assert!(
+            matches!(
+                state.open_requested.front(),
+                Some(TabOpenIntent::NewForegroundUrl { url, .. }) if url == "https://dup.example/"
+            ),
+            "duplicate enqueues a same-URL foreground open"
+        );
+    }
+
+    #[test]
+    fn close_other_tabs_keeps_only_the_target_and_pinned() {
+        let mut state = tagged_tabs(4); // [Personal, Work, Banking, Research]
+        state.set_tab_pinned(0, true); // Personal pinned, stays at the front
+        let banking = state
+            .tabs
+            .iter()
+            .position(|t| t.container == ContainerProfile::Banking)
+            .expect("banking tab");
+        state.close_other_tabs(banking);
+        // Survivors: the pinned Personal tab + the kept Banking tab.
+        assert_eq!(state.tabs.len(), 2);
+        assert!(state
+            .tabs
+            .iter()
+            .any(|t| t.container == ContainerProfile::Personal && t.pinned));
+        assert_eq!(
+            state.tabs[state.active].container,
+            ContainerProfile::Banking
+        );
+    }
+
+    #[test]
+    fn close_tabs_to_the_right_closes_the_tail() {
+        let mut state = tagged_tabs(4); // [Personal, Work, Banking, Research]
+        state.close_tabs_to_the_right(1); // close Banking + Research
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs[0].container, ContainerProfile::Personal);
+        assert_eq!(state.tabs[1].container, ContainerProfile::Work);
+    }
+
+    #[test]
+    fn close_tabs_to_the_right_spares_pinned_tabs() {
+        let mut state = tagged_tabs(4);
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true); // Personal, Work pinned at the front
+        state.close_tabs_to_the_right(0); // from the first pinned tab
+        assert!(
+            state
+                .tabs
+                .iter()
+                .any(|t| t.container == ContainerProfile::Work && t.pinned),
+            "the other pinned tab is spared"
+        );
+        assert!(
+            !state
+                .tabs
+                .iter()
+                .any(|t| t.container == ContainerProfile::Banking),
+            "the unpinned tail is closed"
+        );
     }
 
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
