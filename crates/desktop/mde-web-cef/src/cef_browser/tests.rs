@@ -2112,3 +2112,381 @@ fn test_counter(
     let ptr = select(state);
     unsafe { &*(ptr as *const AtomicUsize) }
 }
+
+/// A fake `cef_permission_prompt_callback_t` recording add_ref/release counts and
+/// the `cont(result)` argument, so the permission-grant path is asserted without
+/// live CEF. Mirrors `TestCefCallback`, but its `cont` carries the
+/// `cef_permission_request_result_t` int we need to observe (ACCEPT vs DENY).
+struct TestPermissionCallback {
+    block: CefCallbackBlock<CEF_PERMISSION_PROMPT_CALLBACK_SIZE>,
+    add_refs: Box<AtomicUsize>,
+    releases: Box<AtomicUsize>,
+    conts: Box<AtomicUsize>,
+    result: Box<AtomicI32>,
+}
+
+impl TestPermissionCallback {
+    fn new() -> Box<Self> {
+        let add_refs = Box::new(AtomicUsize::new(0));
+        let releases = Box::new(AtomicUsize::new(0));
+        let conts = Box::new(AtomicUsize::new(0));
+        let result = Box::new(AtomicI32::new(-1));
+        let mut block = CefCallbackBlock::new(CEF_PERMISSION_PROMPT_CALLBACK_SIZE);
+        block.put_fn(BASE_ADD_REF_OFFSET, fn_ptr(test_perm_add_ref as *const ()));
+        block.put_fn(BASE_RELEASE_OFFSET, fn_ptr(test_perm_release as *const ()));
+        block.put_fn(
+            CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET,
+            fn_ptr(test_perm_cont as *const ()),
+        );
+        let value = Box::new(Self {
+            block,
+            add_refs,
+            releases,
+            conts,
+            result,
+        });
+        value.install_state_pointers();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn install_state_pointers(&self) {
+        let state = TestPermissionCallbackState {
+            add_refs: self.add_refs.as_ref() as *const AtomicUsize as usize,
+            releases: self.releases.as_ref() as *const AtomicUsize as usize,
+            conts: self.conts.as_ref() as *const AtomicUsize as usize,
+            result: self.result.as_ref() as *const AtomicI32 as usize,
+        };
+        test_permission_registry()
+            .lock()
+            .expect("test permission registry")
+            .insert(self.as_mut_ptr() as usize, state);
+    }
+}
+
+impl Drop for TestPermissionCallback {
+    fn drop(&mut self) {
+        let _ = test_permission_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestPermissionCallbackState {
+    add_refs: usize,
+    releases: usize,
+    conts: usize,
+    result: usize,
+}
+
+fn test_permission_registry() -> &'static Mutex<HashMap<usize, TestPermissionCallbackState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, TestPermissionCallbackState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn test_permission_state(self_: *mut c_void) -> TestPermissionCallbackState {
+    test_permission_registry()
+        .lock()
+        .expect("test permission registry")
+        .get(&(self_ as usize))
+        .copied()
+        .expect("registered test permission callback")
+}
+
+unsafe extern "C" fn test_perm_add_ref(self_: *mut c_void) {
+    let state = test_permission_state(self_);
+    // SAFETY: the recorder outlives the callback (owned by TestPermissionCallback).
+    unsafe { (*(state.add_refs as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+}
+
+unsafe extern "C" fn test_perm_release(self_: *mut c_void) -> c_int {
+    let state = test_permission_state(self_);
+    // SAFETY: as above.
+    unsafe { (*(state.releases as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+    0
+}
+
+unsafe extern "C" fn test_perm_cont(self_: *mut c_void, result: c_int) {
+    let state = test_permission_state(self_);
+    // SAFETY: as above.
+    unsafe {
+        (*(state.conts as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+        (*(state.result as *const AtomicI32)).store(result, Ordering::SeqCst);
+    }
+}
+
+/// `cef_permission_handler_t::on_show_permission_prompt` C signature.
+type OnShowPromptFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    u64,
+    *const CefString,
+    u32,
+    *mut c_void,
+) -> c_int;
+
+/// Resolve `on_show_permission_prompt` through the client vtable's
+/// `get_permission_handler` slot (proving the getter landed at offset 120), then
+/// read the method straight from its installed vtable offset.
+fn resolve_on_show_permission_prompt(
+    callbacks: &CefBrowserCallbacks,
+) -> (OnShowPromptFn, *mut c_void) {
+    let handler = unsafe { get_permission_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_permission_handler returned null");
+    let on_show: OnShowPromptFn = unsafe {
+        std::mem::transmute(
+            read_fn(handler, CEF_PERMISSION_HANDLER_ON_SHOW_PROMPT_OFFSET)
+                .expect("on_show_permission_prompt slot"),
+        )
+    };
+    (on_show, handler)
+}
+
+#[test]
+fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
+    // get_permission_handler is index 10 of the CEF 149 client vtable — between
+    // get_frame_handler (index 9, offset 112) and get_jsdialog_handler (index 11,
+    // offset 128). Verified against /opt/mde/cef/include/capi/cef_client_capi.h.
+    assert_eq!(CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET, 40 + 10 * 8);
+    assert!(CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET > CEF_CLIENT_GET_FIND_HANDLER_OFFSET);
+    assert!(CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET < CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET);
+    assert!(CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET < CEF_CLIENT_SIZE - 8);
+    // cef_permission_handler_t: three methods after the 40-byte base.
+    assert_eq!(CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET, 40);
+    assert_eq!(CEF_PERMISSION_HANDLER_ON_SHOW_PROMPT_OFFSET, 40 + 8);
+    assert_eq!(CEF_PERMISSION_HANDLER_ON_DISMISS_PROMPT_OFFSET, 40 + 2 * 8);
+    assert_eq!(CEF_PERMISSION_HANDLER_SIZE, 40 + 3 * 8);
+    assert!(CEF_PERMISSION_HANDLER_ON_DISMISS_PROMPT_OFFSET < CEF_PERMISSION_HANDLER_SIZE);
+    // cef_permission_prompt_callback_t: cont right after the base.
+    assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET, 40);
+    assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_SIZE, 40 + 8);
+    // cef_permission_request_result_t (ACCEPT=0, DENY=1, DISMISS=2, IGNORE=3).
+    assert_eq!(CEF_PERMISSION_RESULT_ACCEPT, 0);
+    assert_eq!(CEF_PERMISSION_RESULT_DENY, 1);
+    // cef_permission_request_types_t bits (from cef_types.h).
+    assert_eq!(CEF_PERMISSION_TYPE_CLIPBOARD, 1 << 4);
+    assert_eq!(CEF_PERMISSION_TYPE_GEOLOCATION, 1 << 8);
+    assert_eq!(CEF_PERMISSION_TYPE_NOTIFICATIONS, 1 << 15);
+    // Bitmask → engine-neutral wire kind (0 geo, 1 notif, 2 clipboard).
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION),
+        Some(0)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_NOTIFICATIONS),
+        Some(1)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_CLIPBOARD),
+        Some(2)
+    );
+    assert_eq!(permission_kind_from_cef(1 << 12), None); // MIC_STREAM, out of scope
+    assert_eq!(permission_kind_from_cef(0), None); // NONE
+                                                   // Several in-scope bits at once → geolocation wins (wire order).
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION | CEF_PERMISSION_TYPE_CLIPBOARD),
+        Some(0)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_NOTIFICATIONS | CEF_PERMISSION_TYPE_CLIPBOARD),
+        Some(1)
+    );
+}
+
+#[test]
+fn permission_prompt_geolocation_stashes_then_allow_accepts_and_releases() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_show, handler) = resolve_on_show_permission_prompt(&callbacks);
+
+    let origin = CefStringOwned::new("https://maps.example.com").expect("origin");
+    let cef_callback = TestPermissionCallback::new();
+    // A geolocation request is in scope → handled (return 1), callback add_ref'd +
+    // stashed, PermissionRequest{kind:0} emitted.
+    let rv = unsafe {
+        on_show(
+            handler,
+            ptr::null_mut(),
+            7,
+            origin.as_ptr().cast::<CefString>(),
+            CEF_PERMISSION_TYPE_GEOLOCATION,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("permission recv") else {
+        panic!("expected permission request")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PermissionRequest {
+            id: 7,
+            kind: 0,
+            origin: "https://maps.example.com".to_owned(),
+        }
+    );
+
+    // Shell allows → cont(ACCEPT) then release; the entry is cleared.
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id: 7, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cef_callback.result.load(Ordering::SeqCst),
+        CEF_PERMISSION_RESULT_ACCEPT
+    );
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+
+    // A second decision for the same id is a safe no-op (already answered): no
+    // second cont, no double release.
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id: 7, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn permission_prompt_notifications_deny_denies_and_releases() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_show, handler) = resolve_on_show_permission_prompt(&callbacks);
+
+    let origin = CefStringOwned::new("https://news.example.org").expect("origin");
+    let cef_callback = TestPermissionCallback::new();
+    let rv = unsafe {
+        on_show(
+            handler,
+            ptr::null_mut(),
+            11,
+            origin.as_ptr().cast::<CefString>(),
+            CEF_PERMISSION_TYPE_NOTIFICATIONS,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, .. } = recv(&shell).expect("permission recv") else {
+        panic!("expected permission request")
+    };
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PermissionRequest {
+            id: 11,
+            kind: 1,
+            origin: "https://news.example.org".to_owned(),
+        }
+    );
+
+    // Shell denies → cont(DENY) then release.
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision {
+            id: 11,
+            allow: false,
+        },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cef_callback.result.load(Ordering::SeqCst),
+        CEF_PERMISSION_RESULT_DENY
+    );
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn permission_prompt_out_of_scope_types_default_deny_without_emitting() {
+    use crate::sock::{recv, RecvOutcome};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    shell.set_nonblocking(true).expect("nonblocking");
+    let (on_show, handler) = resolve_on_show_permission_prompt(&callbacks);
+
+    let origin = CefStringOwned::new("https://cam.example.com").expect("origin");
+    let cef_callback = TestPermissionCallback::new();
+    // MIC_STREAM (1 << 12) alone is out of scope → return 0 (default handling / deny
+    // under Alloy style): no add_ref, no stash, nothing published.
+    let rv = unsafe {
+        on_show(
+            handler,
+            ptr::null_mut(),
+            3,
+            origin.as_ptr().cast::<CefString>(),
+            1u32 << 12,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 0);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+    // Nothing was emitted to the shell.
+    assert!(matches!(recv(&shell), Ok(RecvOutcome::WouldBlock)));
+
+    // A decision for an id we never stashed is a safe no-op.
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id: 3, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+}
