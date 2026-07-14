@@ -179,6 +179,9 @@ pub struct WebSession {
     cursor: CursorKind,
     /// The page is in HTML5 fullscreen (the shell hides its chrome while true).
     fullscreen: bool,
+    /// The page is currently producing audio (Chromium's audible state). Drives the
+    /// tab-strip 🔊 indicator. Independent of mute — a muted-but-playing tab stays true.
+    audible: bool,
     /// The latest engine-fetched favicon (PNG bytes), if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     favicon: Option<Vec<u8>>,
@@ -229,6 +232,7 @@ impl WebSession {
             title: String::new(),
             cursor: CursorKind::default(),
             fullscreen: false,
+            audible: false,
             favicon: None,
             find_result: None,
             cert_error: None,
@@ -473,6 +477,7 @@ impl WebSession {
             }
             EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
+            EventMsg::AudioState { audible } => self.audible = audible,
             EventMsg::Favicon { png } => self.favicon = Some(png),
             EventMsg::CertError { url, code, message } => {
                 self.cert_error = Some(CertError { url, code, message });
@@ -580,6 +585,12 @@ impl WebSession {
     #[must_use]
     pub const fn fullscreen(&self) -> bool {
         self.fullscreen
+    }
+
+    /// Whether the page is currently producing audio (drives the tab-strip 🔊 glyph).
+    #[must_use]
+    pub const fn audible(&self) -> bool {
+        self.audible
     }
 
     /// The latest engine-fetched favicon as PNG bytes, if the page reported one.
@@ -1086,6 +1097,19 @@ mod tests {
         send_event(&peer, &EventMsg::Fullscreen { enabled: false });
         session.poll();
         assert!(!session.fullscreen(), "leaving fullscreen clears it");
+    }
+
+    #[test]
+    fn an_audio_state_event_flips_the_session_audible_flag() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(!session.audible(), "a fresh session is silent");
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        session.poll();
+        assert!(session.audible(), "an audio stream start sets the flag");
+        send_event(&peer, &EventMsg::AudioState { audible: false });
+        session.poll();
+        assert!(!session.audible(), "an audio stream stop clears it");
     }
 
     #[test]

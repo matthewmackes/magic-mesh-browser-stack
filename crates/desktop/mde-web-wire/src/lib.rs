@@ -1049,6 +1049,15 @@ pub enum EventMsg {
         /// Whether the page is now fullscreen.
         enabled: bool,
     },
+    /// The page's audio stream started or stopped (Chromium's per-browser audible
+    /// state, from the audio handler). Drives the tab-strip "playing audio" 🔊
+    /// speaker indicator + the one-click mute affordance (mirrors a browser tab's
+    /// audible glyph). Independent of mute — a muted-but-playing tab is still
+    /// `audible: true`.
+    AudioState {
+        /// Whether the page is currently producing audio.
+        audible: bool,
+    },
 }
 
 impl EventMsg {
@@ -1169,6 +1178,10 @@ impl EventMsg {
                 out.push(17);
                 out.push(u8::from(*enabled));
             }
+            Self::AudioState { audible } => {
+                out.push(18);
+                out.push(u8::from(*audible));
+            }
         }
         out
     }
@@ -1243,6 +1256,7 @@ impl EventMsg {
                 origin: c.string()?,
             },
             17 => Self::Fullscreen { enabled: c.bool()? },
+            18 => Self::AudioState { audible: c.bool()? },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1639,6 +1653,8 @@ mod tests {
         });
         round_event(&EventMsg::Fullscreen { enabled: true });
         round_event(&EventMsg::Fullscreen { enabled: false });
+        round_event(&EventMsg::AudioState { audible: true });
+        round_event(&EventMsg::AudioState { audible: false });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }
