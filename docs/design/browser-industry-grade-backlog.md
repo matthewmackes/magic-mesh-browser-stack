@@ -71,7 +71,29 @@ Duplicate/Close-others/Close-right, tab-search, per-site permission ALLOW path (
 breakdown, Clear-All, plus 18 adversarial stress-tests. **Plus a real bug fix**: `print`/`print_to_pdf` host
 offsets were stale (504/512 → 192/200) so PrintPage/SavePdf hit the wrong live-CEF methods — fixed `801331e9`.
 
-**The 4 genuinely-remaining features are NOT clean gaps — each is blocked on infrastructure, architecture, or an
+**DEFINITIVE re-analysis (2026-07-13, header-evidenced): 3 of the 4 are architecturally PRECLUDED by
+the pinned CEF-Alloy + OSR design — non-goals in the WebRTC category, not unfinished work — and only
+1 (password) has a real path.**
+- **B4 WebExtensions runtime — CONFIRMED NON-GOAL.** CEF 149's CAPI has NO WebExtensions load API
+  (`cef_request_context_capi.h` has no `load_extension`/`get_extension`; only `cef_register_extension`
+  for V8 native bindings + `cef_get_extensions_for_mime_type` remain). Extensions CANNOT execute on
+  this build — it needs a CEF Chrome-runtime build. Gate made honest: `CEF_EXTENSIONS_NO_RUNTIME` (`c0c0b772`).
+- **In-shell PDF viewer — architecturally precluded on this runtime.** Chromium's PDF viewer is itself
+  an internal extension; with no extension runtime (above), CEF Alloy can't render PDFs inline. Needs a
+  standalone PDFium/Rust-PDF renderer, or a CEF Chrome-runtime switch.
+- **PiP — architecturally precluded by OSR.** `requestPictureInPicture` needs a native video window;
+  the egui-texture OSR pipeline has none. Would need a second OSR surface + a floating shell window.
+- **Password manager — the one real path, security-gated on its industry-grade half.** Autofill FILL is
+  buildable now via the existing `execute_java_script` injection; auto-CAPTURE needs a JS↔native bridge
+  (buildable on `on_process_message_received`, client vtable slot 184, + a render-process handler) but
+  handles live credentials → needs an operator security review, not an unattended build.
+
+**Operator decisions that would change this:** switch to the CEF **Chrome runtime** (unblocks B4 +
+native PDF in one move); authorize the password capture bridge (with a security review); decide PiP
+(build the OSR video-surface or accept non-goal). None are "finish the feature" — they are
+platform-architecture calls.
+
+**(Earlier framing, superseded by the above; kept for history.) The 4 genuinely-remaining features are NOT clean gaps — each is blocked on infrastructure, architecture, or an
 operator-gated resource (not effort I'm choosing to skip):**
 1. **Password manager (auto-capture)** — BLOCKED on missing infrastructure. There is NO JS↔native bridge in the
    crate (no `cefQuery`/message-router/`on_process_message` wiring). Capturing a submitted login needs a
