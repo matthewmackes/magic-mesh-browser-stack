@@ -210,7 +210,15 @@ impl CefExtensionRegistry {
         }
     }
 
-    /// Honest runtime gate while CEF extension host support is not wired.
+    /// Honest runtime gate. The registry validates + allowlists extensions, but the
+    /// pinned CEF 149 CAPI exposes **no WebExtensions load API** — `cef_request_context_t`
+    /// has no `load_extension`/`get_extension` (removed upstream; the only "extension"
+    /// symbols left are `cef_register_extension` for V8 native bindings and
+    /// `cef_get_extensions_for_mime_type` for file-suffix lookup). So a validated
+    /// registry still cannot EXECUTE a WebExtension on this build; that would require a
+    /// CEF Chrome-runtime build with Chromium's own extension system. Verified against
+    /// `/opt/mde/cef/include/capi/cef_request_context_capi.h` (2026-07-13) — this is an
+    /// architectural boundary of the pinned runtime, not a pending smoke test.
     #[must_use]
     pub fn runtime_gate_line(&self) -> Option<String> {
         let Self::Available {
@@ -221,7 +229,7 @@ impl CefExtensionRegistry {
             return None;
         };
         Some(format!(
-            "CEF_EXTENSIONS_UNPROVEN registry={} allowed={} reason=live_extension_runtime_smoke_pending",
+            "CEF_EXTENSIONS_NO_RUNTIME registry={} allowed={} reason=pinned_cef149_capi_has_no_webextensions_load_api",
             registry.display(),
             extensions.len()
         ))
@@ -1640,8 +1648,8 @@ mod tests {
         let gate = detected
             .runtime_gate_line()
             .expect("available registry has a runtime gate");
-        assert!(gate.contains("CEF_EXTENSIONS_UNPROVEN"));
-        assert!(gate.contains("live_extension_runtime_smoke_pending"));
+        assert!(gate.contains("CEF_EXTENSIONS_NO_RUNTIME"));
+        assert!(gate.contains("pinned_cef149_capi_has_no_webextensions_load_api"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
