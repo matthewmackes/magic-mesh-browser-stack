@@ -1,19 +1,11 @@
-//! The Browser surface's shared **MENUBAR-ALL** top bar (design: `menubar-all.md`).
+//! Browser command model and menu renderers.
 //!
-//! The UPPERCASE `BROWSER` title in the Terminals-group accent, the real
-//! `WebSession` menus, and a live status cluster — the one shared
-//! `mde_egui::menubar::MenuBar` every surface embeds. **Page** carries the
-//! address-bar's open seam; Edit / View / History / Bookmarks bind to the session
-//! + page-actions seams the toolbar chrome already drives (§6 glue, no new
-//! behaviour). Engine choice lives in the tab strip as explicit `+ Servo` and
-//! `+ CEF` buttons. A context-gated item renders **disabled** and an absent
-//! capability is **omitted** (§7): no page-text Copy, no keyboard chord table —
-//! and BROWSER-DD-8 **Power mode** is a real View toggle that reveals the
-//! separate Power menu while keeping unfinished power tools honestly captioned. The
-//! status cluster shows the active engine, committed URL, session lifecycle,
-//! http/https security state, and ad-filter shield (BOOKMARKS-7). `use super::{…}`
-//! pulls in the parent's body builders, engine/state/target types, and action
-//! topics. A pure relocation from the `web` god-module.
+//! The command tree is Browser-owned: Page / Edit / View / History / Privacy /
+//! Bookmarks bind to real `WebSession` and page-action seams (§6 glue, no new
+//! behaviour). BROWSER-CHROME retires the default shared MENUBAR-ALL top strip for
+//! this surface, so [`show_chrome_menu`] renders the same state-gated actions under
+//! the toolbar's Chrome-style menu button. [`show`] remains only for legacy
+//! MENUBAR-SWEEP tests and any caller that explicitly wants the shared bar.
 
 use super::{
     bookmark_add_body, chat_share_body, local_hostname, publish, publish_browser_send_tab,
@@ -23,7 +15,7 @@ use super::{
     DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
     ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
 };
-use mde_egui::egui;
+use mde_egui::egui::{self, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{ChipTone, StatusChip, Style};
 use mde_web_preview_client::SessionState;
@@ -1052,6 +1044,85 @@ pub(super) fn show(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
         status: &status,
     };
     MenuBar::show(ui, &model)
+}
+
+/// Render the Browser-local Chrome toolbar menu and return any picked action.
+pub(super) fn show_chrome_menu(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
+    let snap = snapshot(state);
+    let menus = build_menus(&snap);
+    let mut picked = None;
+    ui.menu_button(
+        RichText::new("\u{22EE}")
+            .size(super::CHROME_FONT + 2.0)
+            .color(super::chrome_ui::CHROME_TEXT),
+        |ui| {
+            ui.set_min_width(220.0);
+            for menu in &menus {
+                ui.menu_button(
+                    RichText::new(menu.title.as_str())
+                        .size(super::CHROME_FONT)
+                        .color(super::chrome_ui::CHROME_TEXT),
+                    |ui| render_chrome_menu_entries(ui, &menu.entries, &mut picked),
+                );
+            }
+        },
+    )
+    .response
+    .on_hover_text("Customize and control Browser");
+    picked
+}
+
+fn render_chrome_menu_entries(
+    ui: &mut egui::Ui,
+    entries: &[Entry<MenuAction>],
+    picked: &mut Option<MenuAction>,
+) {
+    for entry in entries {
+        match entry {
+            Entry::Item(item) => {
+                let mut label = String::new();
+                if item.checked == Some(true) {
+                    label.push_str("\u{2713} ");
+                }
+                label.push_str(&item.label);
+                if let Some(shortcut) = &item.shortcut {
+                    label.push_str("    ");
+                    label.push_str(shortcut);
+                }
+                let response = ui.add_enabled(
+                    item.enabled,
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(super::CHROME_FONT)
+                            .color(super::chrome_ui::button_text(item.enabled)),
+                    )
+                    .fill(super::chrome_ui::CHROME_TOOLBAR),
+                );
+                if response.clicked() && item.enabled {
+                    *picked = Some(item.id);
+                    ui.close_menu();
+                }
+            }
+            Entry::Submenu { label, entries, .. } => {
+                ui.menu_button(
+                    RichText::new(label.as_str())
+                        .size(super::CHROME_FONT)
+                        .color(super::chrome_ui::CHROME_TEXT),
+                    |ui| render_chrome_menu_entries(ui, entries, picked),
+                );
+            }
+            Entry::Separator => {
+                ui.separator();
+            }
+            Entry::Caption(caption) => {
+                ui.label(
+                    RichText::new(caption.as_str())
+                        .size(super::CHROME_FONT)
+                        .color(super::chrome_ui::CHROME_TEXT_DIM),
+                );
+            }
+        }
+    }
 }
 
 /// The active tab's committed URL, or empty with no tab.

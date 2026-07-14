@@ -5976,21 +5976,6 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     }
     install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
 
-    // 3. The shared MENUBAR-ALL top bar — the UPPERCASE BROWSER title, the real
-    //    WebSession menus (Edit / View / History / Bookmarks), and the live status
-    //    cluster. It COMPLEMENTS the navigation chrome below (never replaces it —
-    //    the address bar + back/forward/reload buttons stay), the same model→seam
-    //    pattern every other surface uses (design: `docs/design/menubar-all.md`).
-    if let Some(action) = menubar::show(state, ui) {
-        menubar::apply(ui.ctx(), state, action);
-    }
-    // The accelerator + omnibox-sync guards above read LAST frame's chrome
-    // text-field focus; re-collect it from the chrome widgets painted below
-    // (the omnibox, the find bar, and the dashboard search each OR into it).
-    state.chrome_edit_focus = false;
-    state.omnibox_focused = false;
-    ui.add_space(CHROME_GAP);
-
     // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
     // bookmarks, or drawers. Triggered by F11 (manual, state.fullscreen) OR the page
     // itself entering HTML5 fullscreen (on_fullscreen_mode_change → the active
@@ -6004,16 +5989,26 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     }
 
+    // The accelerator + omnibox-sync guards above read LAST frame's chrome
+    // text-field focus; re-collect it from the chrome widgets painted below
+    // (the omnibox, the find bar, and the dashboard search each OR into it).
+    state.chrome_edit_focus = false;
+    state.omnibox_focused = false;
+
     if state.vertical_tabs {
         ui.horizontal(|ui| {
-            tab_strip(ui, state);
+            chrome_ui::scope(ui, |ui| {
+                tab_strip(ui, state);
+            });
             ui.add_space(CHROME_GAP);
             ui.vertical(|ui| {
-                // The navigation chrome (back / forward / reload / address bar),
-                // wired to the active session's control socket.
-                nav_chrome(ui, state);
-                bookmarks_bar(ui, state);
-                find_chrome(ui, state);
+                chrome_ui::scope(ui, |ui| {
+                    // The navigation chrome (back / forward / reload / address bar),
+                    // wired to the active session's control socket.
+                    nav_chrome(ui, state);
+                    bookmarks_bar(ui, state);
+                    find_chrome(ui, state);
+                });
                 insecure_prompt(ui, state);
                 capture_notice(ui, state);
                 qr_share_drawer(ui, state);
@@ -6031,16 +6026,18 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             });
         });
     } else {
-        // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
-        // sessions and expose a real new-tab intent for the live-helper path.
-        tab_strip(ui, state);
-        ui.add_space(CHROME_GAP);
+        chrome_ui::scope(ui, |ui| {
+            // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
+            // sessions and expose a real new-tab intent for the live-helper path.
+            tab_strip(ui, state);
+            ui.add_space(CHROME_GAP);
 
-        // The navigation chrome (back / forward / reload / address bar), wired to
-        // the active session's control socket.
-        nav_chrome(ui, state);
-        bookmarks_bar(ui, state);
-        find_chrome(ui, state);
+            // The navigation chrome (back / forward / reload / address bar), wired
+            // to the active session's control socket.
+            nav_chrome(ui, state);
+            bookmarks_bar(ui, state);
+            find_chrome(ui, state);
+        });
         insecure_prompt(ui, state);
         capture_notice(ui, state);
         qr_share_drawer(ui, state);
@@ -9397,6 +9394,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let has_page = has_tab && !crashed && !page_url.trim().is_empty();
 
     let mut accepted_suggestion: Option<String> = None;
+    let mut toolbar_action: Option<menubar::MenuAction> = None;
     ui.horizontal(|ui| {
         // Back / forward — enabled only when the live session offers the history.
         if nav_button(ui, "\u{2039}", "Back", has_tab && !crashed && nav.can_back) {
@@ -9495,7 +9493,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 if state.downloads_open {
                     Style::ACCENT
                 } else {
-                    Style::TEXT
+                    chrome_ui::CHROME_TEXT
                 },
             ))
             .on_hover_text(downloads_tip)
@@ -9522,7 +9520,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             ui.label(
                 RichText::new(format!("\u{2298} {blocked}"))
                     .size(CHROME_FONT)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
             )
             .on_hover_ui(|ui| {
                 ui.label(format!(
@@ -9557,9 +9555,9 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // The address bar fills the rest of the row.
         let field = egui::TextEdit::singleline(&mut state.address)
             .id(omnibox_widget_id())
-            .desired_width(ui.available_width() - Style::SP_XL * 2.0)
+            .desired_width((ui.available_width() - (CHROME_BUTTON * 2.0 + Style::SP_XL)).max(160.0))
             .hint_text("Enter an address")
-            .text_color(Style::TEXT)
+            .text_color(chrome_ui::CHROME_TEXT)
             .font(egui::TextStyle::Small)
             .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H));
         let resp = ui.add_enabled(has_tab && !crashed, field);
@@ -9630,7 +9628,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 egui::Button::new(
                     RichText::new("\u{2192}")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 )
                 .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
             )
@@ -9648,7 +9646,12 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         } else if go {
             state.submit_address();
         }
+
+        toolbar_action = menubar::show_chrome_menu(state, ui);
     });
+    if let Some(action) = toolbar_action {
+        menubar::apply(ui.ctx(), state, action);
+    }
     if has_tab && !crashed {
         accepted_suggestion = suggestions_panel(ui, state);
     }
@@ -10055,15 +10058,14 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
 
 /// A compact chrome button in the §4 palette, returning whether it was clicked.
 fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool {
-    let color = if enabled {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(glyph).size(CHROME_FONT).color(color))
-            .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+        egui::Button::new(
+            RichText::new(glyph)
+                .size(CHROME_FONT)
+                .color(chrome_ui::button_text(enabled)),
+        )
+        .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
     )
     .on_hover_text(tip)
     .clicked()
@@ -11137,6 +11139,7 @@ fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+mod chrome_ui;
 mod menubar;
 
 #[cfg(test)]
@@ -13284,6 +13287,26 @@ mod tests {
         let mut state = WebState::default();
         assert!(run_panel(&mut state), "the gated EmptyState drew nothing");
         assert!(state.tabs.is_empty());
+    }
+
+    #[test]
+    fn browser_default_chrome_retires_the_shared_menubar_strip() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            !texts.iter().any(|text| text == "BROWSER"),
+            "Browser should no longer paint the shared MENUBAR-ALL title strip: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains('\u{22EE}')),
+            "Browser-local toolbar menu button should remain visible: {texts:?}"
+        );
     }
 
     #[test]
