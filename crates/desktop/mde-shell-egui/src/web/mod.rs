@@ -7795,6 +7795,27 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
                 }
             }
         }
+        // IME composition (CJK / dead-key input) routes to the focused page via the
+        // browser-host IME methods, NOT `send_input` — so it never reaches chrome.
+        if page_focused {
+            if let egui::Event::Ime(ime) = &event {
+                if let Some(tab) = state.tabs.get_mut(active) {
+                    match ime {
+                        egui::ImeEvent::Preedit(text) => {
+                            tab.session.ime_set_composition(text.clone());
+                        }
+                        egui::ImeEvent::Commit(text) => {
+                            tab.session.ime_commit_text(text.clone());
+                        }
+                        egui::ImeEvent::Disabled => tab.session.ime_finish_composition(),
+                        egui::ImeEvent::Enabled => {}
+                    }
+                    tab.last_activity = Instant::now();
+                    tab.idle_suspended = false;
+                }
+                continue;
+            }
+        }
         if let Some(event) = browser_input_event(&event, image_rect, frame_size, page_focused) {
             if let Some(tab) = state.tabs.get_mut(active) {
                 tab.last_activity = Instant::now();
@@ -7805,6 +7826,21 @@ fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
     }
     if let Some(tab) = state.tabs.get_mut(active) {
         tab.page_focused = page_focused;
+    }
+    // While the page body owns input, ask the OS to route IME to it (anchored to the
+    // body — the shell has no page-caret feedback, so the candidate window sits at the
+    // body's top-left). Only set when the body is focused, so a focused omnibox keeps
+    // its own IME. This is what makes the OS emit the `Event::Ime` stream handled above.
+    if page_focused {
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect: image_rect,
+                cursor_rect: egui::Rect::from_min_size(
+                    image_rect.left_top(),
+                    egui::vec2(1.0, 18.0),
+                ),
+            });
+        });
     }
     if let Some(tab) = state.tabs.get(active) {
         install_browser_page_accessibility(ui.ctx(), image_rect, tab, page_focused);
@@ -9640,6 +9676,62 @@ mod tests {
                 ) if text == "mesh"
             )),
             "a focused Browser body must forward committed text: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn a_focused_page_forwards_ime_composition_to_the_helper() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+
+        // Focus the page body.
+        let page_point = pos2(480.0, 420.0);
+        let mut click = body_input();
+        click.events = vec![
+            egui::Event::PointerMoved(page_point),
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        assert!(run_panel_on_ctx(&ctx, &mut state, click));
+        assert!(state.tabs[0].page_focused);
+
+        // A preedit then a commit: the page must receive IME composition controls,
+        // NOT a Text input (composition is a distinct browser-host path).
+        let mut ime = body_input();
+        ime.events = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("\u{4f60}".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Commit("\u{4f60}\u{597d}".to_owned())),
+        ];
+        assert!(run_panel_on_ctx(&ctx, &mut state, ime));
+
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::ImeSetComposition { text } if text == "\u{4f60}"
+            )),
+            "a preedit must forward ImeSetComposition: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::ImeCommitText { text } if text == "\u{4f60}\u{597d}"
+            )),
+            "a commit must forward ImeCommitText: {controls:?}"
         );
     }
 
