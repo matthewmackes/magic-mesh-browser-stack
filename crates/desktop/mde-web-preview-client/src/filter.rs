@@ -21,7 +21,9 @@
 
 use std::collections::BTreeSet;
 
-use mde_adblock::{host_of, AllowReason, Decision, Engine, FilterListStore, ResourceType};
+use mde_adblock::{
+    host_of, AllowReason, BlockTally, Decision, Engine, FilterListStore, ResourceType,
+};
 
 /// A mesh-synced safe-browsing host blocklist.
 ///
@@ -118,6 +120,9 @@ pub struct RequestFilter {
     first_party: String,
     /// Requests blocked on the current page (reset when the page host changes).
     blocked: u32,
+    /// Per-page breakdown of what was blocked (by domain / by filter), for the
+    /// in-chrome "N blocked" shield's detail hover. Reset with [`Self::blocked`].
+    tally: BlockTally,
 }
 
 impl Default for RequestFilter {
@@ -136,6 +141,7 @@ impl RequestFilter {
             safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
             blocked: 0,
+            tally: BlockTally::new(),
         }
     }
 
@@ -147,6 +153,7 @@ impl RequestFilter {
             safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
             blocked: 0,
+            tally: BlockTally::new(),
         }
     }
 
@@ -187,6 +194,7 @@ impl RequestFilter {
         }
         self.first_party = host;
         self.blocked = 0;
+        self.tally = BlockTally::new();
         true
     }
 
@@ -211,9 +219,11 @@ impl RequestFilter {
             }
             if let Some(blocked) = self.safe_browsing.matches(&host) {
                 self.blocked = self.blocked.saturating_add(1);
-                return Decision::Block {
+                let decision = Decision::Block {
                     filter: format!("safe-browsing:{blocked}"),
                 };
+                self.tally.record(&decision, url);
+                return decision;
             }
         }
         let decision = self
@@ -221,8 +231,16 @@ impl RequestFilter {
             .match_request(url, resource_type, &self.first_party);
         if decision.is_block() {
             self.blocked = self.blocked.saturating_add(1);
+            self.tally.record(&decision, url);
         }
         decision
+    }
+
+    /// The per-page block breakdown (by domain / by filter) — powers the "N blocked"
+    /// shield's detail hover. Reset each time the page host changes.
+    #[must_use]
+    pub const fn tally(&self) -> &BlockTally {
+        &self.tally
     }
 
     /// The number of requests blocked on the current page — the Browser surface's
@@ -291,6 +309,42 @@ mod tests {
         let d2 = f.decide("https://doubleclick.net/ad", ResourceType::Image);
         assert!(d2.is_block());
         assert_eq!(f.blocked_count(), 2);
+    }
+
+    #[test]
+    fn the_block_tally_breaks_down_blocks_by_domain_and_resets_per_page() {
+        let mut f = bundled_filter("https://news.example.com/");
+        assert!(f
+            .decide(
+                "https://www.google-analytics.com/collect",
+                ResourceType::Script
+            )
+            .is_block());
+        assert!(f
+            .decide("https://doubleclick.net/ad", ResourceType::Image)
+            .is_block());
+
+        // The shield's detail hover reads this: each blocked domain, counted.
+        let by_domain = f.tally().by_domain();
+        assert!(
+            by_domain
+                .iter()
+                .any(|(d, _)| d.contains("google-analytics")),
+            "GA appears in the by-domain breakdown"
+        );
+        assert!(
+            by_domain.iter().any(|(d, _)| d.contains("doubleclick")),
+            "doubleclick appears in the breakdown"
+        );
+        assert_eq!(
+            by_domain.iter().map(|(_, n)| *n).sum::<u64>(),
+            2,
+            "two blocks recorded in total"
+        );
+
+        // Navigating to a new page host resets the per-page breakdown.
+        f.set_page("https://other.example.com/");
+        assert!(f.tally().is_empty(), "the tally resets with the page");
     }
 
     #[test]

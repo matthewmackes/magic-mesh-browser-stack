@@ -73,4 +73,7 @@ pub use wire::{ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, WireEr
 // The ad-filter engine types the shell compiles a session's [`RequestFilter`]
 // from (BOOKMARKS-7). Re-exported so the Browser surface + the live-helper spawn
 // path resolve the SAME `mde_adblock` types this crate's seam speaks.
-pub use mde_adblock::{host_of, Decision, Engine, FilterListSource, FilterListStore, ResourceType};
+pub use mde_adblock::{
+    confusable_reason, host_of, is_confusable_host, BlockTally, ConfusableReason, Decision, Engine,
+    FilterListSource, FilterListStore, ResourceType,
+};

@@ -36,8 +36,8 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    host_of, CertError, EditCommand, FilterListSource, FilterListStore, RequestFilter,
-    SafeBrowsingBlocklist, SessionState, WebSession,
+    confusable_reason, host_of, CertError, ConfusableReason, EditCommand, FilterListSource,
+    FilterListStore, RequestFilter, SafeBrowsingBlocklist, SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -115,6 +115,12 @@ const NEW_TAB_URL: &str = "about:blank";
 #[cfg(feature = "live-helper")]
 const START_URL: &str = NEW_TAB_URL;
 
+/// Front-door privacy explainer shown on the new-tab dashboard — the browser is
+/// private by design (no persistent profile: the sandbox has no writable `$HOME`),
+/// so history and cookies never outlive the session.
+const PRIVATE_MODE_EXPLAINER: &str =
+    "\u{1F512} Private by default \u{2014} history and cookies clear when you close the browser";
+
 /// The fallback helper view geometry (device px) when no live seat size is known
 /// yet (hermetic tests, first frame before the seat is probed). A live spawn
 /// pre-sizes to the seat instead — see [`WebState::note_seat_px`].
@@ -155,6 +161,27 @@ use engine_runtime::*;
 const BROWSER_TEX: TextureOptions = TextureOptions::LINEAR;
 
 /// One browser tab: its driven session and the GPU texture its frames upload into.
+/// A named, colored tab group (Chrome-style): every tab carrying its index renders
+/// a colored strip and can be operated on as a set (close-group). Session-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabGroup {
+    name: String,
+    color: egui::Color32,
+}
+
+/// A distinct group color, cycled by group index over a fixed accent palette so
+/// successive groups are visually separable. Pure so the cycling is unit-tested.
+fn tab_group_color(index: usize) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 5] = [
+        Style::ACCENT,
+        Style::ACCENT_COMMS,
+        Style::ACCENT_WORKLOADS,
+        Style::ACCENT_TERMINALS,
+        Style::WARN,
+    ];
+    PALETTE[index % PALETTE.len()]
+}
+
 struct Tab {
     /// The IPC + shm session driving one sandboxed helper.
     session: WebSession,
@@ -167,6 +194,9 @@ struct Tab {
     /// multi-display handoff is wired. This is per-tab chrome state, not a fake
     /// output move.
     display_target: DisplayTarget,
+    /// Tab-group membership — an index into [`WebState::tab_groups`], or `None` when
+    /// the tab is ungrouped. Grouped tabs render a colored strip.
+    group: Option<usize>,
     /// Per-tab audio mute state mirrored to the helper.
     muted: bool,
     /// Per-tab forced dark rendering state mirrored to the helper.
@@ -399,6 +429,74 @@ fn bookmark_bar_links_from(collection: &mde_bookmarks::Collection) -> Vec<Bookma
         .collect()
 }
 
+/// Every bookmark in the collection — top-level AND nested in any folder — as
+/// `{title, url}`. Feeds BOTH the toolbar star's bookmarked-state membership (via
+/// [`bookmarked_url_set`]) and the omnibox bookmark autocomplete. Walks the tree via
+/// [`mde_bookmarks::Collection::children`]; runs once per converged collection
+/// update, not per frame. A blank stored title falls back to the URL (as the bar does).
+fn all_bookmarks(collection: &mde_bookmarks::Collection) -> Vec<BookmarkBarLink> {
+    let mut out = Vec::new();
+    let mut folders = vec![None]; // Option<Uuid> stack, seeded with the roots
+    while let Some(parent) = folders.pop() {
+        for item in collection.children(parent) {
+            match item {
+                mde_bookmarks::Item::Bookmark(b) => {
+                    let title = if b.title.trim().is_empty() {
+                        b.url.clone()
+                    } else {
+                        b.title
+                    };
+                    out.push(BookmarkBarLink { title, url: b.url });
+                }
+                mde_bookmarks::Item::Folder(f) => folders.push(Some(f.id)),
+            }
+        }
+    }
+    out
+}
+
+/// The normalized-URL membership set for the toolbar star, derived from
+/// [`all_bookmarks`] (Chrome's star is filled if the page lives in ANY folder).
+fn bookmarked_url_set(bookmarks: &[BookmarkBarLink]) -> std::collections::HashSet<String> {
+    bookmarks
+        .iter()
+        .map(|b| bookmark_membership_key(&b.url).to_owned())
+        .collect()
+}
+
+/// Bookmarks whose title or URL contains the (case-insensitive) draft, most-relevant
+/// first (title-prefix > url-prefix > substring), capped. Powers omnibox bookmark
+/// autocomplete — the highest-signal suggestion class, so it renders above history.
+fn matching_bookmarks(index: &[BookmarkBarLink], draft: &str, cap: usize) -> Vec<BookmarkBarLink> {
+    let q = draft.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let rank = |b: &BookmarkBarLink| -> u8 {
+        let (t, u) = (b.title.to_lowercase(), b.url.to_lowercase());
+        if t.starts_with(&q) {
+            0
+        } else if u.starts_with(&q) || u.contains(&format!("://{q}")) {
+            1
+        } else {
+            2
+        }
+    };
+    let mut hits: Vec<&BookmarkBarLink> = index
+        .iter()
+        .filter(|b| b.title.to_lowercase().contains(&q) || b.url.to_lowercase().contains(&q))
+        .collect();
+    hits.sort_by_key(|b| rank(b));
+    hits.into_iter().take(cap).cloned().collect()
+}
+
+/// Normalize a URL for bookmarked-state membership so a trailing-slash-only
+/// difference (`https://x.com` vs `https://x.com/`) still lights the star, matching
+/// Chrome's host-root equivalence without a full URL parse.
+fn bookmark_membership_key(url: &str) -> &str {
+    url.strip_suffix('/').unwrap_or(url)
+}
+
 /// How many of `total` fixed-width bookmark buttons fit on the single bar row of
 /// `available` width. When every button fits, the return is `total` (no overflow
 /// slot). Otherwise one `overflow_w`-wide ">>" slot is reserved and the return is
@@ -612,6 +710,9 @@ pub(crate) struct WebState {
     /// BROWSER-DD-2 vertical-tabs preference. This is purely chrome layout: it
     /// reuses the same tab/session operations and never creates a second tab model.
     vertical_tabs: bool,
+    /// Immersive/fullscreen mode (F11): the browser chrome (tab strip, nav bar,
+    /// bookmarks bar, drawers) is hidden and only the page body renders. Session-only.
+    fullscreen: bool,
     /// HTTPS-only prompt latch. Explicit `http://` navigations pause here until
     /// the operator upgrades to HTTPS, continues over HTTP, or cancels.
     insecure_prompt: Option<String>,
@@ -802,11 +903,34 @@ pub(crate) struct WebState {
     /// buttons the bar renders. Rebuilt each poll from the converged daemon
     /// collection; empty until the first snapshot is seen.
     bookmark_bar_links: Vec<BookmarkBarLink>,
+    /// Membership set of every bookmarked URL (all folders, normalized via
+    /// [`bookmark_membership_key`]) so the toolbar star reflects bookmarked state.
+    bookmarked_urls: std::collections::HashSet<String>,
+    /// Every bookmark (all folders) as `{title, url}` for omnibox autocomplete
+    /// ([`matching_bookmarks`]). Derived alongside [`Self::bookmarked_urls`].
+    bookmark_index: Vec<BookmarkBarLink>,
+    /// Configurable search engines with keyword shortcuts ([`keyword_search_target`]).
+    search_engines: Vec<SearchEngine>,
+    /// Named, colored tab groups; a tab's [`Tab::group`] indexes into this. Session-only.
+    tab_groups: Vec<TabGroup>,
+    /// User-authored CSS site styles (safe userscript slice — CSS only), folded into
+    /// the injected userscript bundle. Session-only.
+    user_site_styles: Vec<UserSiteStyle>,
+    /// Session HSTS: hosts the user chose to upgrade to HTTPS — future plain-http
+    /// navigations to them auto-upgrade silently instead of re-prompting. In-memory
+    /// only (no persistence, per the operator's session-HSTS decision).
+    hsts_hosts: std::collections::HashSet<String>,
+    /// Whether the Site Styles editor drawer is open, and its two input drafts.
+    site_styles_open: bool,
+    site_style_host_draft: String,
+    site_style_css_draft: String,
     /// Bus cursor for the bookmark-collection mirror, so each converged snapshot is
     /// folded once (the exact `list_since` cursor idiom the other pollers use).
     bookmarks_collection_cursor: Option<String>,
     /// Throttle for the relaxed bookmark-collection re-read.
     bookmarks_collection_last_poll: Option<Instant>,
+    /// Throttle for the operator-curated safe-browsing blocklist re-read.
+    safe_browsing_last_poll: Option<Instant>,
     /// Region-capture mode is armed; the next drag over the page image writes a
     /// cropped PNG from the retained helper frame.
     capture_region_mode: bool,
@@ -848,6 +972,7 @@ impl Default for WebState {
             open_bookmarks_requested: false,
             closed_tabs: Vec::new(),
             vertical_tabs: false,
+            fullscreen: false,
             insecure_prompt: None,
             dashboard_query: String::new(),
             speed_dial: default_speed_dial(),
@@ -919,7 +1044,17 @@ impl Default for WebState {
             bus_root: mde_bus::client_data_dir(),
             bookmarks_bar_visible: false,
             bookmark_bar_links: Vec::new(),
+            bookmarked_urls: std::collections::HashSet::new(),
+            bookmark_index: Vec::new(),
+            search_engines: default_search_engines(),
+            tab_groups: Vec::new(),
+            user_site_styles: Vec::new(),
+            hsts_hosts: std::collections::HashSet::new(),
+            site_styles_open: false,
+            site_style_host_draft: String::new(),
+            site_style_css_draft: String::new(),
             bookmarks_collection_cursor: None,
+            safe_browsing_last_poll: None,
             bookmarks_collection_last_poll: None,
             capture_region_mode: false,
             capture_region_start: None,
@@ -1139,6 +1274,7 @@ impl WebState {
             engine,
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
+            group: None,
             muted: false,
             force_dark: false,
             reader_mode: false,
@@ -1493,6 +1629,9 @@ impl WebState {
             };
             if let Ok(collection) = serde_json::from_str::<mde_bookmarks::Collection>(body) {
                 self.bookmark_bar_links = bookmark_bar_links_from(&collection);
+                let all = all_bookmarks(&collection);
+                self.bookmarked_urls = bookmarked_url_set(&all);
+                self.bookmark_index = all;
             }
         }
     }
@@ -1890,6 +2029,28 @@ impl WebState {
         self.publish_session_snapshot();
     }
 
+    /// Put the tab at `index` into a fresh tab group (Chrome's "Add tab to new
+    /// group"), minting the group with a cycled color and a default name.
+    fn new_group_from_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let group_index = self.tab_groups.len();
+        self.tab_groups.push(TabGroup {
+            name: format!("Group {}", group_index + 1),
+            color: tab_group_color(group_index),
+        });
+        self.tabs[index].group = Some(group_index);
+    }
+
+    /// Remove the tab at `index` from its group (leaves the group itself; other tabs
+    /// keep their membership since group indices must stay stable).
+    fn ungroup_tab(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.group = None;
+        }
+    }
+
     fn set_vertical_tabs(&mut self, enabled: bool) {
         self.vertical_tabs = enabled;
         self.publish_session_snapshot();
@@ -1916,7 +2077,10 @@ impl WebState {
         if self.tabs.is_empty() || crashed {
             return;
         }
-        let Some(url) = omnibox_target(&self.address) else {
+        // A keyword shortcut ("img sunset") wins over the default URL/search router.
+        let Some(url) = keyword_search_target(&self.address, &self.search_engines)
+            .or_else(|| omnibox_target(&self.address))
+        else {
             return;
         };
         self.suggestions.clear();
@@ -1926,6 +2090,13 @@ impl WebState {
 
     fn load_target(&mut self, url: String) {
         if is_plain_http(&url) {
+            // Session HSTS: a host the user already upgraded auto-upgrades silently
+            // (the one-shot recursion re-enters with an https URL, so is_plain_http
+            // is false and it falls through to the normal load).
+            if host_of(&url).is_some_and(|h| self.hsts_hosts.contains(&h)) {
+                self.load_target(https_upgrade(&url));
+                return;
+            }
             self.insecure_prompt = Some(url);
             return;
         }
@@ -1981,7 +2152,8 @@ impl WebState {
         if q.is_empty() {
             return;
         }
-        let url = format!("{DEFAULT_SEARCH_URL}?q={}", percent_encode_query(q));
+        let url = keyword_search_target(q, &self.search_engines)
+            .unwrap_or_else(|| format!("{DEFAULT_SEARCH_URL}?q={}", percent_encode_query(q)));
         self.address = url.clone();
         self.load_target(url);
     }
@@ -2006,6 +2178,10 @@ impl WebState {
         let Some(url) = self.insecure_prompt.take() else {
             return;
         };
+        // Remember this host for the session so we auto-upgrade it next time (HSTS).
+        if let Some(host) = host_of(&url) {
+            self.hsts_hosts.insert(host);
+        }
         let upgraded = https_upgrade(&url);
         self.address = upgraded.clone();
         self.mark_active_tab_activity();
@@ -2016,6 +2192,19 @@ impl WebState {
 
     fn cancel_insecure_load(&mut self) {
         self.insecure_prompt = None;
+    }
+
+    /// Clear ALL browsing data in one front-door action (Privacy → Clear all
+    /// browsing data): the session-only history, every download from the list, the
+    /// reopen-closed-tab stack, and the active tab's session state — the clears that
+    /// were previously scattered across three separate drawers/menus. Everything here
+    /// is session-only by design (nothing was ever persisted — Q74/Q80), so this
+    /// forgets in-memory state rather than wiping a disk profile.
+    fn clear_all_browsing_data(&mut self) {
+        self.history.clear();
+        self.dismiss_all_downloads();
+        self.closed_tabs.clear();
+        self.clear_active_session_data();
     }
 
     fn clear_active_session_data(&mut self) {
@@ -2798,12 +2987,42 @@ impl WebState {
         self.set_active_tab_reader_mode(!enabled);
     }
 
+    /// Add the drafted host + CSS as a user site style (the safe, CSS-only userscript
+    /// slice) and re-inject if userscripts are on. Blank drafts are ignored; a
+    /// successful add clears the drafts.
+    fn add_user_site_style(&mut self) {
+        let host = self.site_style_host_draft.trim().to_owned();
+        let css = self.site_style_css_draft.trim().to_owned();
+        if host.is_empty() || css.is_empty() {
+            return;
+        }
+        self.user_site_styles.push(UserSiteStyle { host, css });
+        self.site_style_host_draft.clear();
+        self.site_style_css_draft.clear();
+        self.reinject_user_scripts_if_active();
+    }
+
+    fn remove_user_site_style(&mut self, index: usize) {
+        if index < self.user_site_styles.len() {
+            self.user_site_styles.remove(index);
+            self.reinject_user_scripts_if_active();
+        }
+    }
+
+    /// Re-push the userscript bundle to the active tab when its userscripts toggle is
+    /// on, so a change to the user site styles takes effect immediately.
+    fn reinject_user_scripts_if_active(&mut self) {
+        if self.tabs.get(self.active).is_some_and(|t| t.user_scripts) {
+            self.set_active_tab_user_scripts(true);
+        }
+    }
+
     fn set_active_tab_user_scripts(&mut self, enabled: bool) {
         if !self.can_drive_page_tools() {
             return;
         }
         let bundle = if enabled {
-            curated_userscript_bundle()
+            curated_userscript_bundle(&self.user_site_styles)
         } else {
             String::new()
         };
@@ -3114,6 +3333,14 @@ impl WebState {
                 .collect()
         };
         self.suggestions.set_history_matches(hits);
+        // Bookmark matches (title OR url) — highest-signal, rendered above history.
+        let bookmarks = matching_bookmarks(&self.bookmark_index, &self.address, 3);
+        self.suggestions.set_bookmark_matches(bookmarks);
+        // Inline top-hit: preselect the first suggestion when it is an inline
+        // completion of the draft (Chrome's omnibox), so Enter accepts the completed
+        // URL; otherwise nothing is preselected and arrow keys drive the highlight.
+        let ordered = self.suggestions.ordered_commit_values();
+        self.suggestions.selected = inline_top_hit(&ordered, &self.address);
     }
 
     fn accept_suggestion(&mut self, suggestion: String) {
@@ -3269,10 +3496,6 @@ impl WebState {
         self.apply_adfilter_to_open_tabs();
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "wired to synced safe-browsing policy follow-up")
-    )]
     fn set_safe_browsing_hosts(&mut self, hosts: impl IntoIterator<Item = impl AsRef<str>>) {
         self.safe_browsing_hosts = hosts
             .into_iter()
@@ -3283,6 +3506,41 @@ impl WebState {
             .collect();
         self.apply_adfilter_to_open_tabs();
     }
+
+    /// Populate the safe-browsing blocklist from the operator-curated mesh policy
+    /// file (`browser/safe-browsing-hosts.txt` under the workgroup root — the mackesd
+    /// sync/operator writes it). Throttled; re-applies to open tabs only on a real
+    /// change. This is the "mesh policy source" wiring that activates the blocklist.
+    fn poll_safe_browsing_hosts(&mut self) {
+        if self
+            .safe_browsing_last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.safe_browsing_last_poll = Some(Instant::now());
+        let path = default_workgroup_root().join(SAFE_BROWSING_HOSTS_PATH);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let hosts = parse_safe_browsing_hosts(&text);
+        if hosts != self.safe_browsing_hosts {
+            self.set_safe_browsing_hosts(hosts);
+        }
+    }
+}
+
+/// The operator-curated safe-browsing blocklist path, relative to the workgroup root.
+const SAFE_BROWSING_HOSTS_PATH: &str = "browser/safe-browsing-hosts.txt";
+
+/// Parse the safe-browsing blocklist file: one host per line, `#` comments and blank
+/// lines skipped, hosts trimmed + lowercased. Pure so the parse is unit-tested.
+fn parse_safe_browsing_hosts(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// The `live-helper` spawn glue: creating live [`WebSession`]s by launching the
@@ -3491,6 +3749,16 @@ impl WebState {
 fn handle_tab_keyboard(ctx: &egui::Context, state: &mut WebState) {
     const CTRL: egui::Modifiers = egui::Modifiers::CTRL;
     const CTRL_SHIFT: egui::Modifiers = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+    // F11 toggles immersive/fullscreen mode; Esc leaves it. Handled before the
+    // edit-focus gate so the immersive view is always escapable, even mid-typing.
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+        state.fullscreen = !state.fullscreen;
+    }
+    if state.fullscreen
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        state.fullscreen = false;
+    }
     // ORDER MATTERS: `consume_key` matches modifiers logically (an EXTRA
     // Shift is ignored — egui's documented behaviour), so the Ctrl+Shift
     // variants must be consumed before their plain-Ctrl counterparts or
@@ -3556,6 +3824,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_offline_cache_results();
     state.poll_security_update_status();
     state.poll_bookmarks_collection();
+    state.poll_safe_browsing_hosts();
     state.suspend_idle_tabs(Instant::now());
 
     // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
@@ -3656,6 +3925,19 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.omnibox_focused = false;
     ui.add_space(CHROME_GAP);
 
+    // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
+    // bookmarks, or drawers. Triggered by F11 (manual, state.fullscreen) OR the page
+    // itself entering HTML5 fullscreen (on_fullscreen_mode_change → the active
+    // session reports it). F11/Esc exits the manual mode; the page exit clears its own.
+    let page_fullscreen = state
+        .tabs
+        .get(state.active)
+        .is_some_and(|tab| tab.session.fullscreen());
+    if state.fullscreen || page_fullscreen {
+        active_body(ui, state);
+        return;
+    }
+
     if state.vertical_tabs {
         ui.horizontal(|ui| {
             tab_strip(ui, state);
@@ -3675,6 +3957,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 translation_drawer(ui, state);
                 offline_cache_drawer(ui, state);
                 print_settings_drawer(ui, state);
+                site_styles_drawer(ui, state);
                 downloads_drawer(ui, state);
                 history_drawer(ui, state);
                 ui.add_space(CHROME_GAP);
@@ -3701,6 +3984,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         translation_drawer(ui, state);
         offline_cache_drawer(ui, state);
         print_settings_drawer(ui, state);
+        site_styles_drawer(ui, state);
         downloads_drawer(ui, state);
         history_drawer(ui, state);
         ui.add_space(CHROME_GAP);
@@ -3713,6 +3997,22 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     // mutate `state` (respawn flag, back/close) without holding a `&mut Tab`
     // borrow of it.
     let active = state.active;
+    // Safe-browsing: a top-level navigation to an unsafe host shows a full-page
+    // "unsafe site" interstitial (the request was already dropped upstream). Taken
+    // before the normal body, mirroring the cert-error precedence.
+    let sb_block = state
+        .tabs
+        .get(active)
+        .and_then(|t| t.session.safe_browsing_block().map(str::to_owned));
+    if let Some(url) = sb_block {
+        if safe_browsing_interstitial_body(ui, &url) {
+            if let Some(tab) = state.active_tab() {
+                tab.session.go_back();
+            }
+            state.mark_active_tab_activity();
+        }
+        return;
+    }
     let status = state.tabs.get(active).map(|t| {
         let is_crashed = t.session.is_crashed();
         let cert_error = t.session.cert_error().cloned();
@@ -3793,6 +4093,8 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut select: Option<usize> = None;
     let mut close: Option<usize> = None;
     let mut move_tab: Option<(usize, usize)> = None;
+    let mut group_tab: Option<usize> = None;
+    let mut ungroup_tab_idx: Option<usize> = None;
     let mut mute_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
@@ -3850,8 +4152,26 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                     if active && active_changed {
                         tab_response.scroll_to_me(Some(egui::Align::Center));
                     }
+                    // Tab-group indicator: a colored strip along the pill's bottom edge
+                    // (Chrome's grouped-tab color band), painted from the response rect
+                    // so it never disturbs the click/drag interaction above.
+                    if let Some(color) = tab
+                        .group
+                        .and_then(|g| state.tab_groups.get(g))
+                        .map(|g| g.color)
+                    {
+                        let r = tab_response.rect;
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
+                                egui::pos2(r.right() - 2.0, r.bottom()),
+                            ),
+                            0.0,
+                            color,
+                        );
+                    }
                     tab_response
-                        .on_hover_text(tab_hover(tab))
+                        .on_hover_ui(|ui| tab_hover_card(ui, tab))
                         .context_menu(|ui| {
                             if ui
                                 .add_enabled(idx > 0, compact_menu_item("Move tab left"))
@@ -3868,6 +4188,15 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 .clicked()
                             {
                                 move_tab = Some((idx, idx + 1));
+                                ui.close_menu();
+                            }
+                            if tab.group.is_none() {
+                                if ui.add(compact_menu_item("Add tab to new group")).clicked() {
+                                    group_tab = Some(idx);
+                                    ui.close_menu();
+                                }
+                            } else if ui.add(compact_menu_item("Remove from group")).clicked() {
+                                ungroup_tab_idx = Some(idx);
                                 ui.close_menu();
                             }
                             let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
@@ -3978,6 +4307,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, display_target)) = display_tab {
         state.select_tab(idx);
         state.set_active_tab_display_target(display_target);
+    } else if let Some(idx) = group_tab {
+        state.new_group_from_tab(idx);
+    } else if let Some(idx) = ungroup_tab_idx {
+        state.ungroup_tab(idx);
     } else if let Some((from, to)) = move_tab {
         state.move_tab(from, to);
     } else if let Some(idx) = close {
@@ -3991,6 +4324,8 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut select: Option<usize> = None;
     let mut close: Option<usize> = None;
     let mut move_tab: Option<(usize, usize)> = None;
+    let mut group_tab: Option<usize> = None;
+    let mut ungroup_tab_idx: Option<usize> = None;
     let mut mute_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
@@ -4043,6 +4378,23 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 drag_from = Some(idx);
                                 drop_pointer = resp.interact_pointer_pos();
                             }
+                            // Tab-group indicator: a colored strip along the pill's LEFT
+                            // edge (the vertical-strip analogue of the horizontal band).
+                            if let Some(color) = tab
+                                .group
+                                .and_then(|g| state.tab_groups.get(g))
+                                .map(|g| g.color)
+                            {
+                                let r = resp.rect;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(r.left(), r.top() + 2.0),
+                                        egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
+                                    ),
+                                    0.0,
+                                    color,
+                                );
+                            }
                             resp.on_hover_text(tab_hover(tab)).context_menu(|ui| {
                                 if ui
                                     .add_enabled(idx > 0, compact_menu_item("Move tab up"))
@@ -4059,6 +4411,15 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     .clicked()
                                 {
                                     move_tab = Some((idx, idx + 1));
+                                    ui.close_menu();
+                                }
+                                if tab.group.is_none() {
+                                    if ui.add(compact_menu_item("Add tab to new group")).clicked() {
+                                        group_tab = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                } else if ui.add(compact_menu_item("Remove from group")).clicked() {
+                                    ungroup_tab_idx = Some(idx);
                                     ui.close_menu();
                                 }
                                 let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
@@ -4167,6 +4528,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, display_target)) = display_tab {
         state.select_tab(idx);
         state.set_active_tab_display_target(display_target);
+    } else if let Some(idx) = group_tab {
+        state.new_group_from_tab(idx);
+    } else if let Some(idx) = ungroup_tab_idx {
+        state.ungroup_tab(idx);
     } else if let Some((from, to)) = move_tab {
         state.move_tab(from, to);
     } else if let Some(idx) = close {
@@ -4372,6 +4737,32 @@ fn tab_hover(tab: &Tab) -> String {
         format!(
             "{state} - {url}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
+    }
+}
+
+/// Fit a native page-frame size into a thumbnail no wider than `max_w`, preserving
+/// aspect ratio; zero for a degenerate (empty) frame. Pure so the fit is unit-tested.
+fn thumbnail_size(native: egui::Vec2, max_w: f32) -> egui::Vec2 {
+    if native.x <= 0.0 || native.y <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    let w = max_w.min(native.x);
+    egui::vec2(w, w * native.y / native.x)
+}
+
+/// Tab hover card (industry-grade tab hover): the text summary PLUS, when the tab
+/// has a cached page frame, a small thumbnail preview scaled by [`thumbnail_size`].
+/// An inactive tab that has not rendered a frame yet just shows the text.
+fn tab_hover_card(ui: &mut egui::Ui, tab: &Tab) {
+    ui.label(tab_hover(tab));
+    if let Some(tex) = &tab.texture {
+        let size = thumbnail_size(tex.size_vec2(), 240.0);
+        if size.x > 0.0 {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                tex.id(),
+                size,
+            )));
+        }
     }
 }
 
@@ -4643,6 +5034,58 @@ const EVENT_NOTIFY_BROWSER: &str = "event/notify/browser";
 /// is plain search text rather than a URL. This is intentionally mesh-local, not a
 /// public search provider default.
 const DEFAULT_SEARCH_URL: &str = "https://search.mesh/search";
+
+/// A user-selectable search engine (Tier-2 "configurable search engines"): a display
+/// `name`, an omnibox `keyword` shortcut (type "`kw` query" to use it — Chrome's
+/// per-keyword search / tab-to-search), and a `template` whose `%s` is replaced by
+/// the percent-encoded query. Session-only for now; the model is the extension point
+/// for an operator-managed list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchEngine {
+    name: String,
+    keyword: String,
+    template: String,
+}
+
+/// The default engine set: the mesh SearXNG search plus its image/video category
+/// shortcuts (SearXNG honors `&categories=`). The first entry is the fallback default
+/// when no keyword matches; the rest are keyword shortcuts. Mesh-local by design (no
+/// public provider default), matching [`DEFAULT_SEARCH_URL`].
+fn default_search_engines() -> Vec<SearchEngine> {
+    vec![
+        SearchEngine {
+            name: "Mesh Search".to_owned(),
+            keyword: "s".to_owned(),
+            template: format!("{DEFAULT_SEARCH_URL}?q=%s"),
+        },
+        SearchEngine {
+            name: "Mesh Images".to_owned(),
+            keyword: "img".to_owned(),
+            template: format!("{DEFAULT_SEARCH_URL}?categories=images&q=%s"),
+        },
+        SearchEngine {
+            name: "Mesh Videos".to_owned(),
+            keyword: "vid".to_owned(),
+            template: format!("{DEFAULT_SEARCH_URL}?categories=videos&q=%s"),
+        },
+    ]
+}
+
+/// If `draft` begins with a configured engine's keyword followed by a query
+/// ("`img` sunset"), return that engine's URL with `%s` replaced by the
+/// percent-encoded query; else `None` (the caller falls back to the default router).
+/// Pure + unit-tested.
+fn keyword_search_target(draft: &str, engines: &[SearchEngine]) -> Option<String> {
+    let (kw, rest) = draft.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let engine = engines
+        .iter()
+        .find(|e| e.keyword.eq_ignore_ascii_case(kw))?;
+    Some(engine.template.replace("%s", &percent_encode_query(rest)))
+}
 
 /// Mesh-local SearXNG autocomplete endpoint. SearXNG deployments commonly expose
 /// autocomplete through this path; the parser below accepts the JSON shapes used
@@ -5085,6 +5528,47 @@ struct SuggestionState {
     /// that skips the SearXNG round-trip still surfaces a matching visit. Session-only —
     /// mirrors [`HistoryStore`], never persisted.
     history: Vec<String>,
+    /// Matching bookmarks (`{title, url}`) for the current draft — rendered ABOVE
+    /// history in the dropdown (Chrome ranks a saved bookmark above a mere visit).
+    bookmarks: Vec<BookmarkBarLink>,
+    /// Keyboard-highlighted suggestion — a flat index into
+    /// [`Self::ordered_commit_values`] (bookmarks, then history, then search).
+    /// `None` = nothing highlighted (Enter submits the typed draft). Reset whenever
+    /// the draft changes; moved by Up/Down while the omnibox has focus.
+    selected: Option<usize>,
+}
+
+/// Next keyboard-highlight index after moving `delta` (±1) over `len` suggestions,
+/// wrapping at both ends; from nothing highlighted, Down picks the first and Up the
+/// last (Chrome's omnibox behavior). Pure so the traversal is unit-tested directly.
+fn next_selection(current: Option<usize>, delta: i32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        None => {
+            if delta > 0 {
+                0
+            } else {
+                len - 1
+            }
+        }
+        Some(cur) => (cur as i32 + delta).rem_euclid(len as i32) as usize,
+    })
+}
+
+/// The index to preselect for Chrome's "inline top-hit": `Some(0)` when the first
+/// suggestion is an inline completion of the draft (the trimmed draft is a
+/// case-insensitive prefix of it AND the suggestion adds more), so Enter accepts the
+/// completed URL. `None` otherwise (nothing preselected; arrows drive selection).
+/// Pure so the preselect rule is unit-tested directly.
+fn inline_top_hit(ordered: &[String], draft: &str) -> Option<usize> {
+    let d = draft.trim().to_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+    let top = ordered.first()?;
+    (top.to_lowercase().starts_with(&d) && top.trim().len() > d.len()).then_some(0)
 }
 
 impl SuggestionState {
@@ -5095,11 +5579,44 @@ impl SuggestionState {
         self.in_flight = None;
         self.rx = None;
         self.history.clear();
+        self.bookmarks.clear();
+        self.selected = None;
     }
 
     /// Replace the history-match list (see [`SuggestionState::history`]).
     fn set_history_matches(&mut self, matches: Vec<String>) {
         self.history = matches;
+    }
+
+    /// Replace the bookmark-match list (see [`SuggestionState::bookmarks`]).
+    fn set_bookmark_matches(&mut self, matches: Vec<BookmarkBarLink>) {
+        self.bookmarks = matches;
+    }
+
+    /// The flat suggestion list in RENDER order (bookmarks, history, deduped search)
+    /// as the strings that get committed on Enter — the index space for [`Self::selected`].
+    fn ordered_commit_values(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.bookmarks.iter().map(|b| b.url.clone()).collect();
+        v.extend(self.history.iter().cloned());
+        v.extend(
+            dedup_search_items(&self.items, &self.history)
+                .into_iter()
+                .cloned(),
+        );
+        v
+    }
+
+    /// Move the keyboard highlight by `delta` (±1), wrapping over the current list.
+    fn move_selection(&mut self, delta: i32) {
+        let len = self.ordered_commit_values().len();
+        self.selected = next_selection(self.selected, delta, len);
+    }
+
+    /// The commit value under the keyboard highlight, if any (Enter accepts it
+    /// instead of the typed draft).
+    fn selected_value(&self) -> Option<String> {
+        self.selected
+            .and_then(|i| self.ordered_commit_values().into_iter().nth(i))
     }
 
     fn poll(&mut self) {
@@ -5548,24 +6065,30 @@ fn page_actions_menu(
 fn page_actions_button(
     ui: &mut egui::Ui,
     has_page: bool,
+    is_bookmarked: bool,
     bus_root: Option<&Path>,
     engine: Option<BrowserEngine>,
     url: &str,
     title: &str,
 ) {
-    let color = if has_page {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
+    // Filled accent star when the current page is bookmarked (in any folder), hollow
+    // otherwise — matching Chrome's star-reflects-state. The glyph still dims when
+    // there is no live page.
+    let (glyph, color) = match (has_page, is_bookmarked) {
+        (false, _) => ("\u{2606}", Style::TEXT_DIM),
+        (true, true) => ("\u{2605}", Style::ACCENT),
+        (true, false) => ("\u{2606}", Style::TEXT),
     };
-    ui.menu_button(
-        RichText::new("\u{2606}").size(CHROME_FONT).color(color),
-        |ui| {
-            page_actions_menu(ui, bus_root, engine, url, title);
-        },
-    )
+    let tip = if is_bookmarked {
+        "Bookmarked \u{2014} page actions: edit bookmark, copy URL, share"
+    } else {
+        "Page actions \u{2014} bookmark, copy URL, share"
+    };
+    ui.menu_button(RichText::new(glyph).size(CHROME_FONT).color(color), |ui| {
+        page_actions_menu(ui, bus_root, engine, url, title);
+    })
     .response
-    .on_hover_text("Page actions \u{2014} bookmark, copy URL, share");
+    .on_hover_text(tip);
 }
 
 /// Whether the compact toolbar's reload slot should present as a real Stop
@@ -5814,18 +6337,44 @@ struct SiteInfoSummary {
     /// navigations upstream (the TLS interstitial), so a live `https` page
     /// reaching this panel has already been certificate-validated.
     cert_line: Option<&'static str>,
+    /// IDN homograph/punycode spoofing warning for the host, or `None` when the
+    /// host is not a confusable risk — see [`confusable_warning`].
+    confusable: Option<String>,
+}
+
+/// Human-readable IDN homograph/spoofing warning for `host`, or `None` when it is
+/// not a confusable/punycode risk. Wires mde-adblock's [`confusable_reason`]
+/// detector into the site-info panel — the place users click to confirm identity,
+/// where a look-alike-domain warning belongs (the detector previously had no UI).
+fn confusable_warning(host: &str) -> Option<String> {
+    confusable_reason(host).map(|reason| {
+        match reason {
+            ConfusableReason::Punycode => {
+                "Punycode/IDN host (xn--) \u{2014} verify this is the site you expect"
+            }
+            ConfusableReason::ConfusableBlock => {
+                "Look-alike letters (Cyrillic/Greek) \u{2014} this host may impersonate another site"
+            }
+            ConfusableReason::MixedScript => {
+                "Mixed-script host \u{2014} letters from more than one alphabet can spoof a name"
+            }
+        }
+        .to_owned()
+    })
 }
 
 fn site_info_summary(page_url: &str) -> SiteInfoSummary {
     let display = omnibox_display(page_url);
     let cert_line = matches!(display.security, SecurityLevel::Secure)
         .then_some("Certificate: valid \u{2014} the connection is encrypted");
+    let confusable = confusable_warning(&display.host);
     SiteInfoSummary {
         security: display.security,
         headline: security_headline(display.security),
         host: display.host,
         host_emphasis: display.host_emphasis,
         cert_line,
+        confusable,
     }
 }
 
@@ -5882,6 +6431,13 @@ fn site_info_panel(ui: &mut egui::Ui, page_url: &str) {
             job.append(&summary.host[end..], 0.0, dim);
         }
         ui.label(job);
+    }
+    if let Some(warn) = summary.confusable.as_deref() {
+        ui.label(
+            RichText::new(format!("\u{26A0} {warn}"))
+                .small()
+                .color(Style::WARN),
+        );
     }
     if let Some(cert_line) = summary.cert_line {
         ui.label(RichText::new(cert_line).small().color(Style::TEXT_DIM));
@@ -6003,9 +6559,14 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // BOOKMARKS-10 — the page-actions menu (bookmark this page / copy its URL /
         // send it in Chat). The SAME three verbs also hang off the address bar's
         // right-click (below), so both the toolbar and the context menu reach them.
+        let is_bookmarked = has_page
+            && state
+                .bookmarked_urls
+                .contains(bookmark_membership_key(&page_url));
         page_actions_button(
             ui,
             has_page,
+            is_bookmarked,
             state.bus_root.as_deref(),
             active_engine,
             &page_url,
@@ -6062,15 +6623,34 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // per-page counter; the engine is compiled from the mackesd `adfilter` blob.
         if blocked > 0 {
             ui.add_space(CHROME_GAP);
+            // The by-domain breakdown behind the count (uBlock-style detail): the top
+            // blocked domains for THIS page, surfaced on hover of the shield.
+            let top_blocked = state
+                .tabs
+                .get(state.active)
+                .map(|t| t.session.block_tally().top_domains(6))
+                .unwrap_or_default();
             ui.label(
                 RichText::new(format!("\u{2298} {blocked}"))
                     .size(CHROME_FONT)
                     .color(Style::TEXT_DIM),
             )
-            .on_hover_text(format!(
-                "Ad-filter blocked {blocked} request{} on this page",
-                if blocked == 1 { "" } else { "s" }
-            ));
+            .on_hover_ui(|ui| {
+                ui.label(format!(
+                    "Ad-filter blocked {blocked} request{} on this page",
+                    if blocked == 1 { "" } else { "s" }
+                ));
+                if !top_blocked.is_empty() {
+                    ui.separator();
+                    for (domain, count) in &top_blocked {
+                        ui.label(
+                            RichText::new(format!("{count}\u{00D7}  {domain}"))
+                                .small()
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
+                }
+            });
         }
 
         ui.add_space(CHROME_GAP);
@@ -6093,6 +6673,10 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // guards (the same tracked-focus idiom as `Tab::page_focused`).
         state.omnibox_focused = resp.has_focus();
         state.chrome_edit_focus |= resp.has_focus();
+        // The branded 2px accent focus ring (mde_egui::focus, the dock/Console/Start
+        // idiom) on the primary keyboard target, so keyboard-only users get a clear,
+        // consistent focus indicator instead of egui's faint default outline (a11y).
+        mde_egui::focus::paint_focus_ring(ui.painter(), resp.rect, resp.has_focus());
         // OMNIBOX-STYLE — when the omnibox is NOT being edited, paint the
         // Chrome-style elided/emphasized read-out ON TOP of the TextEdit
         // (never touching its own layouter/cursor logic, so click-to-edit
@@ -6115,6 +6699,16 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         }
         if resp.changed() && has_tab && !crashed {
             state.update_suggestions_for_address();
+        }
+        // Keyboard-navigate the suggestion dropdown: a single-line TextEdit ignores
+        // vertical arrows, so intercepting Up/Down here (while the omnibox has focus)
+        // is free and doesn't disturb caret motion. Enter then commits the highlight.
+        if resp.has_focus() && has_tab && !crashed {
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                state.suggestions.move_selection(1);
+            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                state.suggestions.move_selection(-1);
+            }
         }
         // BOOKMARKS-10 — right-click the address bar for the same page actions
         // (bookmark / copy URL / Send-in-Chat) the toolbar star exposes.
@@ -6145,7 +6739,15 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             .on_hover_text("Go")
             .clicked();
 
-        if submit || go {
+        if submit {
+            // Enter commits the keyboard-highlighted suggestion if one is selected,
+            // else the typed draft — Chrome's omnibox behavior.
+            if let Some(selected) = state.suggestions.selected_value() {
+                state.accept_suggestion(selected);
+            } else {
+                state.submit_address();
+            }
+        } else if go {
             state.submit_address();
         }
     });
@@ -6350,49 +6952,89 @@ fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a St
 
 fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
     let history = &state.suggestions.history;
+    let bookmarks = &state.suggestions.bookmarks;
     let search_items = dedup_search_items(&state.suggestions.items, history);
-    if history.is_empty() && search_items.is_empty() && state.suggestions.notice.is_none() {
+    if bookmarks.is_empty()
+        && history.is_empty()
+        && search_items.is_empty()
+        && state.suggestions.notice.is_none()
+    {
         return None;
     }
     let mut accepted = None;
+    // Flat render index tracking the keyboard highlight ([`SuggestionState::selected`])
+    // across the bookmark → history → search sections, so a highlighted row gets an
+    // accent fill and Up/Down move visibly.
+    let selected = state.suggestions.selected;
+    let mut idx = 0usize;
+    let fill_for = |idx: usize| {
+        if Some(idx) == selected {
+            Style::SURFACE_HI
+        } else {
+            Style::SURFACE
+        }
+    };
     ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_XL * 4.0);
+        if !bookmarks.is_empty() {
+            muted_note(ui, "Bookmarks");
+            for bm in bookmarks {
+                let clicked = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("\u{2605} {}", ellipsize(&bm.title, 32)))
+                                .size(CHROME_FONT)
+                                .color(Style::ACCENT),
+                        )
+                        .fill(fill_for(idx))
+                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
+                    )
+                    .on_hover_text(format!("Bookmark: {}", bm.url))
+                    .clicked();
+                if clicked {
+                    accepted = Some(bm.url.clone());
+                }
+                idx += 1;
+            }
+        }
         if !history.is_empty() {
             muted_note(ui, "History");
             for url in history {
-                if ui
+                let clicked = ui
                     .add(
                         egui::Button::new(
                             RichText::new(ellipsize(url, 36))
                                 .size(CHROME_FONT)
                                 .color(Style::TEXT),
                         )
-                        .fill(Style::SURFACE)
+                        .fill(fill_for(idx))
                         .min_size(egui::vec2(96.0, CHROME_BUTTON)),
                     )
                     .on_hover_text(format!("Visited: {url}"))
-                    .clicked()
-                {
+                    .clicked();
+                if clicked {
                     accepted = Some(url.clone());
                 }
+                idx += 1;
             }
         }
         for suggestion in search_items {
-            if ui
+            let clicked = ui
                 .add(
                     egui::Button::new(
                         RichText::new(ellipsize(suggestion, 36))
                             .size(CHROME_FONT)
                             .color(Style::TEXT),
                     )
-                    .fill(Style::SURFACE)
+                    .fill(fill_for(idx))
                     .min_size(egui::vec2(96.0, CHROME_BUTTON)),
                 )
                 .on_hover_text(format!("Search for {suggestion}"))
-                .clicked()
-            {
+                .clicked();
+            if clicked {
                 accepted = Some(suggestion.clone());
             }
+            idx += 1;
         }
         if state.suggestions.items.is_empty() && history.is_empty() {
             if let Some(notice) = state.suggestions.notice.as_deref() {
@@ -6457,6 +7099,14 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
             RichText::new("Quasar Browser")
                 .size(Style::HEADING)
                 .color(Style::TEXT),
+        );
+        // Private-by-default explainer — the browser has no persistent profile
+        // (sandbox has no writable $HOME); make that posture legible on the front
+        // door instead of only in the Privacy menu (industry-grade "private mode UX").
+        ui.label(
+            RichText::new(PRIVATE_MODE_EXPLAINER)
+                .small()
+                .color(Style::TEXT_DIM),
         );
         ui.add_space(Style::SP_M);
         ui.horizontal(|ui| {
@@ -7185,6 +7835,38 @@ fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool)
 ///
 /// `TODO(security)`: an optional advanced "proceed anyway" override is a
 /// deliberate follow-up — the blocking-by-default posture stays as-is here.
+/// The full-page "unsafe site" interstitial for a safe-browsing block (mesh policy
+/// source). A red warning naming the blocked host + a "Back to safety" button;
+/// returns `true` when it's clicked. The blocked request was already dropped.
+fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
+    let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
+    let mut back = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("\u{26A0} Unsafe site blocked")
+                .size(Style::HEADING)
+                .color(Style::DANGER),
+        );
+        ui.add_space(Style::SP_M);
+        ui.label(
+            RichText::new(format!(
+                "{host} is on the mesh safe-browsing blocklist. This page was not loaded."
+            ))
+            .color(Style::TEXT),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Back to safety").color(Style::TEXT),
+            ))
+            .clicked()
+        {
+            back = true;
+        }
+    });
+    back
+}
+
 fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
     let mut back_to_safety = false;
     centered(ui, |ui| {
@@ -7430,7 +8112,7 @@ mod tests {
 
     #[test]
     fn curated_userscript_bundle_contains_the_first_site_fixups() {
-        let bundle = curated_userscript_bundle();
+        let bundle = curated_userscript_bundle(&[]);
         assert_eq!(CURATED_USERSCRIPT_COUNT, 100);
         assert_eq!(CURATED_USERSCRIPTS.len(), CURATED_USERSCRIPT_COUNT);
         for needle in [
@@ -7451,6 +8133,32 @@ mod tests {
                 "missing userscript payload: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn curated_userscript_bundle_folds_in_user_site_styles_and_skips_blanks() {
+        let styles = vec![
+            UserSiteStyle {
+                host: "www.Example.com".into(),
+                css: "body{background:#000}".into(),
+            },
+            UserSiteStyle {
+                host: "  ".into(),
+                css: "x{y:z}".into(),
+            }, // blank host → skipped
+            UserSiteStyle {
+                host: "site.test".into(),
+                css: "   ".into(),
+            }, // blank css → skipped
+        ];
+        let bundle = curated_userscript_bundle(&styles);
+        // The user rule renders with a normalized (www-stripped, lowercased) host.
+        assert!(bundle.contains("example.com"));
+        assert!(bundle.contains("body{background:#000}"));
+        assert!(bundle.contains("user:0"));
+        // Blank host / blank CSS entries are skipped.
+        assert!(!bundle.contains("user:1"));
+        assert!(!bundle.contains("user:2"));
     }
 
     #[test]
@@ -9075,6 +9783,7 @@ mod tests {
             copies: 3,
             duplex: true,
             grayscale: true,
+            ..Default::default()
         };
         let mut seen_args = Vec::new();
 
@@ -10338,6 +11047,60 @@ mod tests {
     }
 
     #[test]
+    fn session_hsts_auto_upgrades_a_host_the_user_previously_upgraded() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        // First plain-http visit prompts; the user upgrades → the host is remembered.
+        state.address = "http://shop.example/".to_owned();
+        state.submit_address();
+        assert_eq!(
+            state.insecure_prompt.as_deref(),
+            Some("http://shop.example/")
+        );
+        state.upgrade_insecure_load();
+        assert!(state.hsts_hosts.contains("shop.example"));
+
+        // A later plain-http nav to the SAME host auto-upgrades silently (no prompt).
+        state.address = "http://shop.example/cart".to_owned();
+        state.submit_address();
+        assert!(
+            state.insecure_prompt.is_none(),
+            "a remembered host auto-upgrades without re-prompting"
+        );
+
+        // A different plain-http host still prompts.
+        state.address = "http://other.example/".to_owned();
+        state.submit_address();
+        assert_eq!(
+            state.insecure_prompt.as_deref(),
+            Some("http://other.example/")
+        );
+    }
+
+    #[test]
+    fn fullscreen_mode_renders_the_body_only_and_toggles_back() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        // Immersive mode renders the page body without the chrome (no panic).
+        state.fullscreen = true;
+        assert!(
+            run_panel(&mut state),
+            "fullscreen renders the immersive body view"
+        );
+        // Exiting restores the full chrome.
+        state.fullscreen = false;
+        assert!(
+            run_panel(&mut state),
+            "exiting fullscreen restores the chrome"
+        );
+    }
+
+    #[test]
     fn a_crashed_tab_paints_the_honest_crashed_state() {
         let (session, helper) = testkit::connect().expect("connect");
         let mut state = WebState::default();
@@ -10427,6 +11190,53 @@ mod tests {
 
         // A render pass must not panic with a cert error present on the active
         // (and only) tab — it paints the interstitial in place of the frame.
+        assert!(run_panel(&mut state), "the interstitial produced no draw");
+    }
+
+    #[test]
+    fn a_safe_browsing_block_paints_the_interstitial_instead_of_a_panic() {
+        use mde_web_preview_client::{EventMsg, ResourceType};
+
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default();
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+
+        // The active tab is sitting on a benign page (with back-history)...
+        let mut peer: &UnixStream = &helper;
+        peer.write_all(&wire::frame(
+            &EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://start.example/".to_owned(),
+            }
+            .encode(),
+        ))
+        .expect("nav");
+        state.tabs[0].session.poll();
+
+        // ...then a top-level navigation to a mesh-flagged unsafe host is blocked,
+        // arming the full-page interstitial (a Document block, not a subresource).
+        state.set_safe_browsing_hosts(["malware.test"]);
+        peer.write_all(&wire::frame(
+            &EventMsg::ResourceRequest {
+                id: 7,
+                url: "https://malware.test/".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Document),
+            }
+            .encode(),
+        ))
+        .expect("document request");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.tabs[0].session.safe_browsing_block(),
+            Some("https://malware.test/"),
+            "a top-level Document block arms the interstitial"
+        );
+
+        // The render pass paints the "unsafe site blocked" interstitial in place of
+        // the frame and must not panic with the block present on the active tab.
         assert!(run_panel(&mut state), "the interstitial produced no draw");
     }
 
@@ -10528,6 +11338,7 @@ mod tests {
             engine: BrowserEngine::Servo,
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
+            group: None,
             muted: false,
             force_dark: false,
             reader_mode: false,
@@ -10631,6 +11442,20 @@ mod tests {
                 )),
             "re-enabling site blocking restores the block verdict"
         );
+    }
+
+    #[test]
+    fn parse_safe_browsing_hosts_skips_comments_blanks_and_lowercases() {
+        let text = "# operator blocklist\nMalware.test\n\n  Phish.example  \n# note\nads.bad\n";
+        assert_eq!(
+            parse_safe_browsing_hosts(text),
+            vec![
+                "malware.test".to_string(),
+                "phish.example".to_string(),
+                "ads.bad".to_string(),
+            ]
+        );
+        assert!(parse_safe_browsing_hosts("# only comments\n\n   \n").is_empty());
     }
 
     #[test]
@@ -10939,6 +11764,33 @@ mod tests {
             run_panel(&mut state),
             "new-tab dashboard renders after clear"
         );
+    }
+
+    #[test]
+    fn clear_all_browsing_data_forgets_history_downloads_and_reopen_stack() {
+        let mut state = WebState::default();
+        state
+            .history
+            .record("https://visited.example/", "Visited", 1000);
+        state.closed_tabs.push(ClosedTab {
+            url: "https://closed.example/".into(),
+            title: "Closed".into(),
+            engine: BrowserEngine::Servo,
+        });
+        assert!(!state.history.is_empty());
+        assert_eq!(state.closed_tabs.len(), 1);
+
+        // Drive it through the real Privacy-menu action, not the private method.
+        let ctx = egui::Context::default();
+        super::menubar::apply(
+            &ctx,
+            &mut state,
+            super::menubar::MenuAction::ClearAllBrowsingData,
+        );
+
+        assert!(state.history.is_empty(), "history forgotten");
+        assert!(state.closed_tabs.is_empty(), "reopen stack forgotten");
+        assert_eq!(state.address, NEW_TAB_URL, "returns to the new-tab surface");
     }
 
     #[test]
@@ -11753,6 +12605,24 @@ mod tests {
         assert_eq!(summary.host_emphasis, display.host_emphasis);
         assert_eq!(summary.host, "foo.example.com");
         assert_eq!(&summary.host[summary.host_emphasis.clone()], "example.com");
+    }
+
+    #[test]
+    fn site_info_summary_surfaces_idn_homograph_warning() {
+        // A punycode/IDN host (xn-- prefix) trips the spoofing warning...
+        assert!(
+            site_info_summary("https://xn--pple-43d.com/")
+                .confusable
+                .is_some(),
+            "punycode host warns"
+        );
+        // ...a look-alike Cyrillic 'а' (U+0430) mixed with Latin trips it too...
+        assert!(confusable_warning("\u{0430}pple.com").is_some());
+        // ...and a plain ASCII host does not.
+        assert!(site_info_summary("https://example.com/")
+            .confusable
+            .is_none());
+        assert!(confusable_warning("apple.com").is_none());
     }
 
     #[test]
@@ -13755,6 +14625,131 @@ mod tests {
         assert_eq!(deduped, vec!["mesh browser".to_owned()]);
     }
 
+    #[test]
+    fn next_selection_wraps_and_seeds_from_none() {
+        // From nothing highlighted: Down picks the first, Up the last.
+        assert_eq!(next_selection(None, 1, 3), Some(0));
+        assert_eq!(next_selection(None, -1, 3), Some(2));
+        // Wrap at both ends and step in the middle.
+        assert_eq!(next_selection(Some(2), 1, 3), Some(0));
+        assert_eq!(next_selection(Some(0), -1, 3), Some(2));
+        assert_eq!(next_selection(Some(1), 1, 3), Some(2));
+        // An empty list highlights nothing.
+        assert_eq!(next_selection(Some(0), 1, 0), None);
+        assert_eq!(next_selection(None, 1, 0), None);
+    }
+
+    #[test]
+    fn inline_top_hit_preselects_only_a_genuine_completion() {
+        let list = vec![
+            "https://example.com/".to_string(),
+            "https://other.com/".to_string(),
+        ];
+        // Draft is a prefix of the top hit → preselect it (case-insensitive).
+        assert_eq!(inline_top_hit(&list, "https://exa"), Some(0));
+        assert_eq!(inline_top_hit(&list, "HTTPS://EXA"), Some(0));
+        // Empty draft → nothing.
+        assert_eq!(inline_top_hit(&list, "  "), None);
+        // Draft equals the top (nothing left to complete) → nothing.
+        assert_eq!(inline_top_hit(&list, "https://example.com/"), None);
+        // Draft is not a prefix of the top → nothing (arrows still work).
+        assert_eq!(inline_top_hit(&list, "other"), None);
+        // Empty list → nothing.
+        assert_eq!(inline_top_hit(&[], "http"), None);
+    }
+
+    #[test]
+    fn keyword_search_target_routes_configured_shortcuts() {
+        let engines = default_search_engines();
+        // "img sunset" → the mesh image-category search.
+        assert_eq!(
+            keyword_search_target("img sunset", &engines),
+            Some("https://search.mesh/search?categories=images&q=sunset".to_owned())
+        );
+        // Case-insensitive keyword; the query is percent-encoded (space → '+').
+        assert_eq!(
+            keyword_search_target("VID a b", &engines),
+            Some("https://search.mesh/search?categories=videos&q=a+b".to_owned())
+        );
+        // An unknown leading word is NOT a keyword → None (default router handles it).
+        assert_eq!(keyword_search_target("cat videos", &engines), None);
+        // A bare keyword with no query → None.
+        assert_eq!(keyword_search_target("img", &engines), None);
+        assert_eq!(keyword_search_target("img   ", &engines), None);
+    }
+
+    #[test]
+    fn tab_group_color_cycles_over_the_palette() {
+        // Distinct colors for successive groups, wrapping at the palette length (5).
+        assert_ne!(tab_group_color(0), tab_group_color(1));
+        assert_eq!(tab_group_color(0), tab_group_color(5));
+        assert_eq!(tab_group_color(1), tab_group_color(6));
+    }
+
+    #[test]
+    fn new_group_from_tab_assigns_then_ungroup_detaches() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(state.tabs[0].group.is_none());
+
+        state.new_group_from_tab(0);
+        assert_eq!(state.tabs[0].group, Some(0));
+        assert_eq!(state.tab_groups.len(), 1);
+        assert_eq!(state.tab_groups[0].color, tab_group_color(0));
+
+        state.ungroup_tab(0);
+        assert!(state.tabs[0].group.is_none());
+        // The group itself remains so existing indices stay stable.
+        assert_eq!(state.tab_groups.len(), 1);
+    }
+
+    #[test]
+    fn suggestion_selection_commits_the_highlighted_value_in_render_order() {
+        let mut s = SuggestionState::default();
+        s.set_bookmark_matches(vec![BookmarkBarLink {
+            title: "BM".into(),
+            url: "https://bm.example/".into(),
+        }]);
+        s.set_history_matches(vec!["https://hist.example/".into()]);
+        s.items = vec!["search term".into()];
+        // Render order: bookmark, history, deduped search.
+        assert_eq!(
+            s.ordered_commit_values(),
+            vec![
+                "https://bm.example/".to_string(),
+                "https://hist.example/".to_string(),
+                "search term".to_string(),
+            ]
+        );
+        // Nothing highlighted → Enter submits the typed draft (no committed value).
+        assert!(s.selected_value().is_none());
+        // Arrow down walks the list; the committed value follows the highlight.
+        s.move_selection(1);
+        assert_eq!(s.selected_value().as_deref(), Some("https://bm.example/"));
+        s.move_selection(1);
+        assert_eq!(s.selected_value().as_deref(), Some("https://hist.example/"));
+        s.move_selection(1); // -> search
+        s.move_selection(1); // wraps back to the first
+        assert_eq!(s.selected_value().as_deref(), Some("https://bm.example/"));
+    }
+
+    #[test]
+    fn thumbnail_size_preserves_aspect_and_caps_width() {
+        // Wider than the cap → scaled down, aspect preserved (240 * 800/1280 = 150).
+        let s = thumbnail_size(egui::vec2(1280.0, 800.0), 240.0);
+        assert!((s.x - 240.0).abs() < 0.01);
+        assert!((s.y - 150.0).abs() < 0.01);
+        // Already narrower than the cap → not upscaled.
+        let s2 = thumbnail_size(egui::vec2(100.0, 50.0), 240.0);
+        assert!((s2.x - 100.0).abs() < 0.01 && (s2.y - 50.0).abs() < 0.01);
+        // A degenerate frame yields no thumbnail.
+        assert_eq!(
+            thumbnail_size(egui::vec2(0.0, 800.0), 240.0),
+            egui::Vec2::ZERO
+        );
+    }
+
     #[derive(Clone, Default)]
     struct RecordingTransfers {
         jobs: std::sync::Arc<std::sync::Mutex<Vec<TransferJob>>>,
@@ -15457,6 +16452,84 @@ mod tests {
         assert_eq!(links[0].url, "https://beta.example/");
         // A blank stored title falls back to the URL so the button stays legible.
         assert_eq!(links[1].title, "https://blank-title.example/");
+    }
+
+    #[test]
+    fn all_bookmarked_urls_includes_nested_folder_bookmarks_and_normalizes_slash() {
+        let mut collection = fake_bookmark_collection(&[("Top", "https://top.example/")]);
+        let author = mde_bookmarks::Author::new("tester".into(), "test-node".into());
+        let folder_id = uuid::Uuid::from_u128(0x3000);
+        // A folder, and a bookmark nested INSIDE it (parent = folder id).
+        collection.apply(&mde_bookmarks::Op::new(
+            mde_bookmarks::Hlc::new(300, 0, "test-node".into()),
+            author.clone(),
+            mde_bookmarks::OpKind::AddFolder {
+                id: folder_id,
+                name: "Work".to_string(),
+                parent: None,
+                order_key: "b0".to_string(),
+            },
+        ));
+        collection.apply(&mde_bookmarks::Op::new(
+            mde_bookmarks::Hlc::new(301, 0, "test-node".into()),
+            author,
+            mde_bookmarks::OpKind::AddBookmark {
+                id: uuid::Uuid::from_u128(0x3001),
+                parent: Some(folder_id),
+                order_key: "a0".to_string(),
+                url: "https://nested.example/page".to_string(),
+                title: "Nested".to_string(),
+                favicon_ref: None,
+                tags: Vec::new(),
+                notes: String::new(),
+                added: 100,
+                source: mde_bookmarks::Source::Manual,
+            },
+        ));
+
+        let all = all_bookmarks(&collection);
+        assert_eq!(
+            all.len(),
+            2,
+            "top-level AND nested folder bookmark both counted"
+        );
+        let urls = bookmarked_url_set(&all);
+        // Trailing slash normalized on the stored side.
+        assert!(urls.contains("https://top.example"));
+        assert!(urls.contains("https://nested.example/page"));
+        // Membership key lights the star whether the live page URL has the slash or not.
+        assert!(urls.contains(bookmark_membership_key("https://top.example/")));
+        assert!(urls.contains(bookmark_membership_key("https://top.example")));
+        assert!(!urls.contains(bookmark_membership_key("https://unbookmarked.example/")));
+    }
+
+    #[test]
+    fn matching_bookmarks_ranks_title_prefix_then_url_then_substring() {
+        let index = vec![
+            BookmarkBarLink {
+                title: "Rust docs".into(),
+                url: "https://doc.rust-lang.org/".into(),
+            },
+            BookmarkBarLink {
+                title: "News".into(),
+                url: "https://rust-news.example/".into(),
+            },
+            BookmarkBarLink {
+                title: "Crates".into(),
+                url: "https://crates.io/".into(),
+            },
+        ];
+        // Empty draft → no suggestions (don't dump the whole set).
+        assert!(matching_bookmarks(&index, "  ", 5).is_empty());
+        // "rust" matches the first two; title-prefix ("Rust docs") ranks above the
+        // url-substring match ("News" whose URL contains rust-news).
+        let hits = matching_bookmarks(&index, "rust", 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust docs", "title-prefix ranks first");
+        assert_eq!(hits[1].title, "News", "url-substring match ranked lower");
+        // Cap is honored, and a no-match draft yields nothing.
+        assert_eq!(matching_bookmarks(&index, "http", 1).len(), 1);
+        assert!(matching_bookmarks(&index, "zzz", 5).is_empty());
     }
 
     #[test]

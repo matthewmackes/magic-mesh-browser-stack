@@ -20,8 +20,8 @@ use super::{
     publish_browser_share, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
     BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
     BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
-    DeviceProfile, DisplayTarget, UserAgentOverride, WebState, ACTION_BOOKMARKS_ADD,
-    ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
+    DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
+    ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
 };
 use mde_egui::egui;
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
@@ -39,7 +39,13 @@ const SHIELD: &str = "\u{2298}";
 const URL_MAX: usize = 42;
 
 fn print_options_active(settings: &CupsPrintSettings) -> bool {
-    settings.destination.is_some() || settings.copies > 1 || settings.duplex || settings.grayscale
+    settings.destination.is_some()
+        || settings.copies > 1
+        || settings.duplex
+        || settings.grayscale
+        || settings.orientation != PrintOrientation::Portrait
+        || settings.paper_size != PaperSize::Default
+        || !settings.page_ranges.trim().is_empty()
 }
 
 /// One Browser menu action — each maps to a real [`WebSession`]/page seam in
@@ -88,6 +94,8 @@ pub(super) enum MenuAction {
     ToggleReaderMode,
     /// Toggle the shell-curated userscript bundle for the active tab.
     ToggleUserScripts,
+    /// Open the user-authored Site Styles (CSS-only) editor drawer.
+    OpenSiteStyles,
     /// Run offline Hunspell over helper-extracted page text.
     CheckSpelling,
     /// Send helper-extracted page text to the platform TTS owner.
@@ -150,6 +158,9 @@ pub(super) enum MenuAction {
     PromptClipboardPermission,
     /// Reset the active tab's transient browser state to the new-tab surface.
     ClearCurrentTabData,
+    /// Clear ALL browsing data at once — history, downloads, reopen stack, and the
+    /// active tab's session state (session-only, nothing was persisted).
+    ClearAllBrowsingData,
     /// Toggle the current first-party site's ad/tracker blocking policy.
     ToggleSiteBlocking,
     /// Forget the current site's permission decisions while preserving default-deny.
@@ -546,6 +557,10 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption(format!(
                     "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
                 )),
+                Entry::Item(Item::new(
+                    MenuAction::OpenSiteStyles,
+                    "Site Styles (your CSS)\u{2026}",
+                )),
                 Entry::Item(
                     Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_tools),
                 ),
@@ -667,6 +682,10 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ClearCurrentTabData, "Clear Current Tab Data")
+                        .enabled(s.has_tab && !s.crashed),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ClearAllBrowsingData, "Clear All Browsing Data")
                         .enabled(s.has_tab && !s.crashed),
                 ),
             ];
@@ -1071,6 +1090,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
         MenuAction::ToggleForceDark => state.toggle_active_tab_force_dark(),
         MenuAction::ToggleReaderMode => state.toggle_active_tab_reader_mode(),
         MenuAction::ToggleUserScripts => state.toggle_active_tab_user_scripts(),
+        MenuAction::OpenSiteStyles => state.site_styles_open = !state.site_styles_open,
         MenuAction::CheckSpelling => state.request_active_spellcheck(),
         MenuAction::ReadAloud => state.request_active_read_aloud(),
         MenuAction::TranslatePage => state.request_active_translate_page(),
@@ -1122,6 +1142,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
             state.prompt_active_device_permission(DevicePermissionKind::Clipboard)
         }
         MenuAction::ClearCurrentTabData => state.clear_active_session_data(),
+        MenuAction::ClearAllBrowsingData => state.clear_all_browsing_data(),
         MenuAction::ToggleSiteBlocking => {
             let enabled = !state.active_site_blocking_enabled();
             state.set_active_site_blocking(enabled);
@@ -1957,6 +1978,7 @@ mod tests {
                                 | "Show History"
                                 | "Show Bookmarks Bar"
                                 | "Open Bookmarks Manager"
+                                | "Site Styles (your CSS)\u{2026}"
                         ),
                         "{} has the expected no-page gate",
                         item.label
@@ -2244,6 +2266,7 @@ mod tests {
             MenuAction::ToggleForceDark,
             MenuAction::ToggleReaderMode,
             MenuAction::ToggleUserScripts,
+            MenuAction::OpenSiteStyles,
             MenuAction::CheckSpelling,
             MenuAction::ReadAloud,
             MenuAction::TranslatePage,
@@ -2272,6 +2295,7 @@ mod tests {
             MenuAction::PromptNotificationsPermission,
             MenuAction::PromptClipboardPermission,
             MenuAction::ClearCurrentTabData,
+            MenuAction::ClearAllBrowsingData,
             MenuAction::ToggleSiteBlocking,
             MenuAction::ForgetSitePermissions,
             MenuAction::CopyUrl,

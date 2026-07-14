@@ -44,6 +44,17 @@ repository.workspace   = true
 name = "mde_web_preview_client"
 path = "src/lib.rs"
 
+# BROWSER verify — standalone wire-verification harness that spawns the browser
+# helper like the shell's WebSession and prints display/load callbacks as they
+# arrive over the session socket (no shell, no reboot). Off the hot path.
+[[bin]]
+name = "cef-verify"
+path = "src/bin/cef-verify.rs"
+# Uses `SpawnSpec`/`WebSession::spawn`, both gated behind `live-helper`. Without
+# this, `cargo build`/`cargo test` of the crate (feature off) would try to compile
+# the bin and fail — so gate the whole target on the feature.
+required-features = ["live-helper"]
+
 [features]
 default = []
 # The `testkit` module — an in-process fake helper (a socketpair peer that

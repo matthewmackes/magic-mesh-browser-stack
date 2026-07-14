@@ -22,12 +22,71 @@ pub(super) struct CupsPrinter {
     pub(super) is_default: bool,
 }
 
+/// Page orientation for a CUPS job (the `orientation-requested` IPP attribute).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum PrintOrientation {
+    #[default]
+    Portrait,
+    Landscape,
+}
+
+impl PrintOrientation {
+    /// The `-o` value, or `None` for portrait (the CUPS default — no arg needed).
+    pub(super) const fn lp_option(self) -> Option<&'static str> {
+        match self {
+            Self::Portrait => None,
+            // IPP orientation-requested: 3 = portrait, 4 = landscape.
+            Self::Landscape => Some("orientation-requested=4"),
+        }
+    }
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Portrait => "Portrait",
+            Self::Landscape => "Landscape",
+        }
+    }
+}
+
+/// Paper size for a CUPS job (the `media` IPP attribute); `Default` defers to the
+/// printer's own default so we never force a size the printer lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum PaperSize {
+    #[default]
+    Default,
+    A4,
+    Letter,
+    Legal,
+}
+
+impl PaperSize {
+    pub(super) const fn lp_option(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::A4 => Some("media=A4"),
+            Self::Letter => Some("media=Letter"),
+            Self::Legal => Some("media=Legal"),
+        }
+    }
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Printer default",
+            Self::A4 => "A4",
+            Self::Letter => "Letter",
+            Self::Legal => "Legal",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CupsPrintSettings {
     pub(super) destination: Option<String>,
     pub(super) copies: u16,
     pub(super) duplex: bool,
     pub(super) grayscale: bool,
+    pub(super) orientation: PrintOrientation,
+    pub(super) paper_size: PaperSize,
+    /// Page range like `1-5,8` — empty means all pages.
+    pub(super) page_ranges: String,
 }
 
 impl Default for CupsPrintSettings {
@@ -37,6 +96,9 @@ impl Default for CupsPrintSettings {
             copies: 1,
             duplex: false,
             grayscale: false,
+            orientation: PrintOrientation::Portrait,
+            paper_size: PaperSize::Default,
+            page_ranges: String::new(),
         }
     }
 }
@@ -130,24 +192,10 @@ fn parse_cups_default_destination(stdout: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-pub(super) fn submit_pdf_to_cups(
-    path: &Path,
-    title: &str,
-    settings: &CupsPrintSettings,
-) -> Result<String, String> {
-    submit_pdf_to_cups_with_runner(path, title, settings, run_process_with_timeout)
-}
-
-pub(super) fn submit_pdf_to_cups_with_runner(
-    path: &Path,
-    title: &str,
-    settings: &CupsPrintSettings,
-    runner: impl FnOnce(&str, &[String], Duration) -> Result<ProcessOutput, String>,
-) -> Result<String, String> {
-    if !path.is_file() {
-        return Err(format!("{} is not a file", path.display()));
-    }
-    let path_arg = path.to_string_lossy().into_owned();
+/// Build the `lp` argv for a job from its settings — the destination, copies,
+/// duplex/color, and the print-preview OPTIONS (orientation, paper size, page
+/// range). Pure so the argv is unit-tested without touching CUPS or the filesystem.
+fn cups_lp_args(path_arg: &str, title: &str, settings: &CupsPrintSettings) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(destination) = settings
         .destination
@@ -170,9 +218,44 @@ pub(super) fn submit_pdf_to_cups_with_runner(
         args.push("-o".to_owned());
         args.push("ColorModel=Gray".to_owned());
     }
+    if let Some(orientation) = settings.orientation.lp_option() {
+        args.push("-o".to_owned());
+        args.push(orientation.to_owned());
+    }
+    if let Some(media) = settings.paper_size.lp_option() {
+        args.push("-o".to_owned());
+        args.push(media.to_owned());
+    }
+    let ranges = settings.page_ranges.trim();
+    if !ranges.is_empty() {
+        args.push("-o".to_owned());
+        args.push(format!("page-ranges={ranges}"));
+    }
     args.push("-t".to_owned());
     args.push(title.to_owned());
-    args.push(path_arg.clone());
+    args.push(path_arg.to_owned());
+    args
+}
+
+pub(super) fn submit_pdf_to_cups(
+    path: &Path,
+    title: &str,
+    settings: &CupsPrintSettings,
+) -> Result<String, String> {
+    submit_pdf_to_cups_with_runner(path, title, settings, run_process_with_timeout)
+}
+
+pub(super) fn submit_pdf_to_cups_with_runner(
+    path: &Path,
+    title: &str,
+    settings: &CupsPrintSettings,
+    runner: impl FnOnce(&str, &[String], Duration) -> Result<ProcessOutput, String>,
+) -> Result<String, String> {
+    if !path.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    let path_arg = path.to_string_lossy().into_owned();
+    let args = cups_lp_args(&path_arg, title, settings);
     let output = runner("lp", &args, CUPS_PRINT_TIMEOUT)?;
     if output.success {
         let job = output.stdout.trim();
@@ -247,5 +330,34 @@ impl WebState {
             tab.session.save_pdf(key);
         }
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cups_lp_args_emits_orientation_paper_and_page_range_options() {
+        let settings = CupsPrintSettings {
+            orientation: PrintOrientation::Landscape,
+            paper_size: PaperSize::A4,
+            page_ranges: " 1-5,8 ".to_owned(),
+            copies: 3,
+            ..Default::default()
+        };
+        let args = cups_lp_args("/tmp/page.pdf", "Page", &settings);
+        // The print-preview OPTIONS reach `lp` as -o attributes.
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-o", "orientation-requested=4"]));
+        assert!(args.windows(2).any(|w| w == ["-o", "media=A4"]));
+        assert!(args.windows(2).any(|w| w == ["-o", "page-ranges=1-5,8"]));
+        assert!(args.windows(2).any(|w| w == ["-n", "3"]));
+        // Portrait + printer-default paper + no range emit NO extra -o attrs.
+        let plain = cups_lp_args("/tmp/page.pdf", "Page", &CupsPrintSettings::default());
+        assert!(!plain.iter().any(|a| a.starts_with("orientation-requested")));
+        assert!(!plain.iter().any(|a| a.starts_with("media=")));
+        assert!(!plain.iter().any(|a| a.starts_with("page-ranges")));
     }
 }

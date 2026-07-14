@@ -125,8 +125,18 @@ pub(super) static CURATED_USERSCRIPTS: &[CuratedUserscriptRule] = &[
     CuratedUserscriptRule { id: "edx-readable", hosts: &["edx.org"], css: DOCS_READABLE_CSS },
 ];
 
-pub(super) fn curated_userscript_bundle() -> String {
-    let rules = CURATED_USERSCRIPTS
+/// A user-authored site style — a host the rule applies to and a CSS body — the safe,
+/// non-gated slice of "userscripts": CSS injection only (what the curated engine
+/// already does), never arbitrary JS (which would be a threat-model change). Rendered
+/// alongside [`CURATED_USERSCRIPTS`] by [`curated_userscript_bundle`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct UserSiteStyle {
+    pub(super) host: String,
+    pub(super) css: String,
+}
+
+pub(super) fn curated_userscript_bundle(user_styles: &[UserSiteStyle]) -> String {
+    let mut rules = CURATED_USERSCRIPTS
         .iter()
         .map(|rule| {
             serde_json::json!({
@@ -136,6 +146,23 @@ pub(super) fn curated_userscript_bundle() -> String {
             })
         })
         .collect::<Vec<_>>();
+    // User-authored CSS rules render exactly like curated ones (host-matched CSS),
+    // with a `user:` id so they're distinguishable; a blank host or CSS is skipped.
+    for (i, style) in user_styles.iter().enumerate() {
+        let host = style
+            .host
+            .trim()
+            .trim_start_matches("www.")
+            .to_ascii_lowercase();
+        if host.is_empty() || style.css.trim().is_empty() {
+            continue;
+        }
+        rules.push(serde_json::json!({
+            "id": format!("user:{i}"),
+            "hosts": [host],
+            "css": style.css,
+        }));
+    }
     let rules_json = serde_json::to_string(&rules).expect("curated userscript rules encode");
     format!(
         r#"(function(){{

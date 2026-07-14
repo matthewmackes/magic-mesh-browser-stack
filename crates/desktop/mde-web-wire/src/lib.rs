@@ -1042,6 +1042,13 @@ pub enum EventMsg {
         /// The origin URL that raised the dialog.
         origin: String,
     },
+    /// The page entered or left HTML5 fullscreen (`element.requestFullscreen()` /
+    /// exit). The shell hides its chrome and shows the page edge-to-edge while
+    /// `enabled`, matching the F11 immersive mode.
+    Fullscreen {
+        /// Whether the page is now fullscreen.
+        enabled: bool,
+    },
 }
 
 impl EventMsg {
@@ -1158,6 +1165,10 @@ impl EventMsg {
                 put_str(&mut out, message);
                 put_str(&mut out, origin);
             }
+            Self::Fullscreen { enabled } => {
+                out.push(17);
+                out.push(u8::from(*enabled));
+            }
         }
         out
     }
@@ -1231,6 +1242,7 @@ impl EventMsg {
                 message: c.string()?,
                 origin: c.string()?,
             },
+            17 => Self::Fullscreen { enabled: c.bool()? },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1625,6 +1637,8 @@ mod tests {
             message: String::new(),
             origin: "https://prompt.example/".to_owned(),
         });
+        round_event(&EventMsg::Fullscreen { enabled: true });
+        round_event(&EventMsg::Fullscreen { enabled: false });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }

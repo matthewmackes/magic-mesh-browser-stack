@@ -108,6 +108,10 @@ pub const CEF_DISPLAY_HANDLER_ON_CURSOR_CHANGE_OFFSET: usize = 112;
 /// URLs changed (field 2, right after on_title_change=48). Signature
 /// `void(self, cef_browser_t*, cef_string_list_t icon_urls)`.
 pub const CEF_DISPLAY_HANDLER_ON_FAVICON_URLCHANGE_OFFSET: usize = 56;
+/// `offsetof(cef_display_handler_t, on_fullscreen_mode_change)` — field 3, right
+/// after on_favicon_urlchange=56 (base 40 + 3*8). Signature
+/// `void(self, cef_browser_t*, int fullscreen)`.
+pub const CEF_DISPLAY_HANDLER_ON_FULLSCREEN_MODE_CHANGE_OFFSET: usize = 64;
 /// `sizeof(cef_load_handler_t)` for pinned Linux CEF 149 (4 fn ptrs + 40-byte base).
 pub const CEF_LOAD_HANDLER_SIZE: usize = 72;
 /// `offsetof(cef_load_handler_t, on_loading_state_change)`.
@@ -1359,6 +1363,12 @@ impl CefBrowserCallbacks {
             CEF_DISPLAY_HANDLER_ON_FAVICON_URLCHANGE_OFFSET,
             fn_ptr(on_favicon_urlchange as *const ()),
         );
+        // HTML5 page fullscreen: the engine reports enter/leave; the shell hides its
+        // chrome (edge-to-edge page), matching the F11 immersive mode.
+        self.display.put_fn(
+            CEF_DISPLAY_HANDLER_ON_FULLSCREEN_MODE_CHANGE_OFFSET,
+            fn_ptr(on_fullscreen_mode_change as *const ()),
+        );
         self.load.put_fn(
             CEF_LOAD_HANDLER_ON_LOADING_STATE_CHANGE_OFFSET,
             fn_ptr(on_loading_state_change as *const ()),
@@ -1793,6 +1803,16 @@ impl CefBrowserState {
             return;
         }
         let event = EventMsg::CursorChanged { kind };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// Forward an HTML5 fullscreen enter/leave to the shell (it hides/shows chrome).
+    fn publish_fullscreen(&self, enabled: bool) {
+        let event = EventMsg::Fullscreen { enabled };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -2884,6 +2904,17 @@ unsafe extern "C" fn on_cursor_change(
     let kind = cursor_kind_for_cef_type(cef_type);
     let _ = with_state(self_, |state| state.publish_cursor(kind));
     1
+}
+
+/// CEF `on_fullscreen_mode_change(self, browser, fullscreen)` — the page entered or
+/// left HTML5 fullscreen (`element.requestFullscreen()` / exit). Forward the state so
+/// the shell hides its chrome and shows the page edge-to-edge.
+unsafe extern "C" fn on_fullscreen_mode_change(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    fullscreen: c_int,
+) {
+    let _ = with_state(self_, |state| state.publish_fullscreen(fullscreen != 0));
 }
 
 /// CEF `on_loading_state_change(self, browser, isLoading, canGoBack, canGoForward)`

@@ -177,6 +177,8 @@ pub struct WebSession {
     nav: NavState,
     title: String,
     cursor: CursorKind,
+    /// The page is in HTML5 fullscreen (the shell hides its chrome while true).
+    fullscreen: bool,
     /// The latest engine-fetched favicon (PNG bytes), if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     favicon: Option<Vec<u8>>,
@@ -185,6 +187,9 @@ pub struct WebSession {
     /// The latest TLS/certificate error that blocked a load (if any). Cleared on
     /// a fresh navigation; drives the shell's "Not secure — blocked" interstitial.
     cert_error: Option<CertError>,
+    /// A top-level navigation blocked by the mesh safe-browsing list — the URL drives
+    /// a full-page "unsafe site" interstitial (mirrors [`Self::cert_error`]).
+    safe_browsing_block: Option<String>,
     /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
     /// already auto-resolved it; this is a passive notice for the shell.
     pending_js_dialog: Option<JsDialog>,
@@ -223,9 +228,11 @@ impl WebSession {
             nav: NavState::default(),
             title: String::new(),
             cursor: CursorKind::default(),
+            fullscreen: false,
             favicon: None,
             find_result: None,
             cert_error: None,
+            safe_browsing_block: None,
             pending_js_dialog: None,
             last_seq: 0,
             pending: None,
@@ -259,6 +266,13 @@ impl WebSession {
     #[must_use]
     pub const fn blocked_count(&self) -> u32 {
         self.filter.blocked_count()
+    }
+
+    /// The per-page ad-filter block breakdown (by domain / by filter) behind the
+    /// "N blocked" shield's detail hover.
+    #[must_use]
+    pub const fn block_tally(&self) -> &mde_adblock::BlockTally {
+        self.filter.tally()
     }
 
     /// Drain pending helper events without blocking. Maps the frame fd on
@@ -397,10 +411,20 @@ impl WebSession {
             EventMsg::ResourceRequest { id, url, resource } => {
                 // The helper asks whether to fetch a subresource — judge it against
                 // the ad-filter engine and answer BEFORE it hits the network.
-                let decision = self
-                    .filter
-                    .decide(&url, filter::resource_from_wire(resource));
+                let resource_type = filter::resource_from_wire(resource);
+                let decision = self.filter.decide(&url, resource_type);
                 let allowed = !decision.is_block();
+                // A blocked TOP-LEVEL document from the safe-browsing list drives the
+                // full-page "unsafe site" interstitial (the block itself still drops
+                // the request; this adds the honest warning the audit found missing).
+                if !allowed
+                    && matches!(resource_type, mde_adblock::ResourceType::Document)
+                    && decision
+                        .blocked_by()
+                        .is_some_and(|filter| filter.starts_with("safe-browsing"))
+                {
+                    self.safe_browsing_block = Some(url.clone());
+                }
                 if self.recent_resource_requests.len() >= MAX_RECENT_RESOURCE_REQUESTS {
                     self.recent_resource_requests.pop_front();
                 }
@@ -448,6 +472,7 @@ impl WebSession {
                 self.popup_requests.push_back(PopupRequestStatus { url });
             }
             EventMsg::CursorChanged { kind } => self.cursor = kind,
+            EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
             EventMsg::Favicon { png } => self.favicon = Some(png),
             EventMsg::CertError { url, code, message } => {
                 self.cert_error = Some(CertError { url, code, message });
@@ -551,6 +576,12 @@ impl WebSession {
         self.cursor
     }
 
+    /// Whether the page is currently in HTML5 fullscreen (the shell hides its chrome).
+    #[must_use]
+    pub const fn fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
     /// The latest engine-fetched favicon as PNG bytes, if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     #[must_use]
@@ -562,6 +593,7 @@ impl WebSession {
     pub fn load(&mut self, url: impl Into<String>) {
         // A fresh navigation clears any interstitial from the prior page.
         self.cert_error = None;
+        self.safe_browsing_block = None;
         self.nav.loading = true;
         self.send(&ControlMsg::Load(url.into()));
     }
@@ -621,6 +653,13 @@ impl WebSession {
     #[must_use]
     pub const fn cert_error(&self) -> Option<&CertError> {
         self.cert_error.as_ref()
+    }
+
+    /// The URL of a top-level navigation blocked by the safe-browsing list, if any —
+    /// drives the shell's "unsafe site" interstitial. Cleared on a fresh navigation.
+    #[must_use]
+    pub fn safe_browsing_block(&self) -> Option<&str> {
+        self.safe_browsing_block.as_deref()
     }
 
     /// The latest JavaScript dialog (alert/confirm/prompt) a page raised. The
@@ -1031,6 +1070,62 @@ mod tests {
     fn read_control_after_poll(session: &mut WebSession, peer: &mut UnixStream) -> ControlMsg {
         session.poll();
         read_control(peer)
+    }
+
+    #[test]
+    fn a_fullscreen_event_flips_the_session_flag() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(!session.fullscreen());
+        send_event(&peer, &EventMsg::Fullscreen { enabled: true });
+        session.poll();
+        assert!(
+            session.fullscreen(),
+            "entering page fullscreen sets the flag"
+        );
+        send_event(&peer, &EventMsg::Fullscreen { enabled: false });
+        session.poll();
+        assert!(!session.fullscreen(), "leaving fullscreen clears it");
+    }
+
+    #[test]
+    fn a_top_level_safe_browsing_block_drives_the_interstitial_state() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.set_filter(
+            RequestFilter::empty()
+                .with_safe_browsing(filter::SafeBrowsingBlocklist::from_hosts(["malware.test"])),
+        );
+        assert!(session.safe_browsing_block().is_none());
+
+        // A TOP-LEVEL Document navigation to the unsafe host arms the interstitial.
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 1,
+                url: "https://malware.test/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        session.poll();
+        assert_eq!(session.safe_browsing_block(), Some("https://malware.test/"));
+
+        // A subresource block (not Document) does NOT arm the full-page interstitial.
+        session.load("https://ok.example/");
+        assert!(session.safe_browsing_block().is_none(), "nav clears it");
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 2,
+                url: "https://malware.test/pixel.gif".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Image),
+            },
+        );
+        session.poll();
+        assert!(
+            session.safe_browsing_block().is_none(),
+            "a blocked subresource is not a full-page interstitial"
+        );
     }
 
     #[test]
