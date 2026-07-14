@@ -294,8 +294,10 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_PACKET_OFFSET, 40 + 2 * 8);
     assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET, 40 + 3 * 8);
     assert_eq!(CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET, 40 + 4 * 8);
-    // cef_audio_parameters_t is three 4-byte ints (no ref-counted base).
-    assert_eq!(CEF_AUDIO_PARAMETERS_SIZE, 12);
+    // cef_audio_parameters_t = size_t size@0 + channel_layout@8 + sample_rate@12
+    // + frames_per_buffer@16 → 8 + 3*4 = 20, padded to size_t alignment → 24.
+    assert_eq!(CEF_AUDIO_PARAMETERS_SIZE, 8 + 3 * 4 + 4); // 20 body + 4 tail pad
+    assert_eq!(CEF_AUDIO_PARAMETERS_SIZE, 24);
     assert_eq!(size_of::<CefAudioParameters>(), CEF_AUDIO_PARAMETERS_SIZE);
     assert_eq!(CEF_LIFE_SPAN_HANDLER_SIZE, 88);
     assert_eq!(CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET, 64);
@@ -855,12 +857,16 @@ fn audio_handler_publishes_audible_state_on_stream_start_and_stop() {
         )
     };
     let mut params = CefAudioParameters {
+        size: 0,
         channel_layout: 0,
         sample_rate: 0,
         frames_per_buffer: 0,
     };
     let rv = unsafe { get_params(audio, ptr::null_mut(), &mut params) };
     assert_ne!(rv, 0, "get_audio_parameters must return true");
+    // `size` first: if the struct layout regressed to omit it, channel_layout
+    // would alias `size` and this equality would fail.
+    assert_eq!(params.size, CEF_AUDIO_PARAMETERS_SIZE);
     assert_eq!(params.channel_layout, CEF_CHANNEL_LAYOUT_STEREO);
     assert!(params.sample_rate > 0 && params.frames_per_buffer > 0);
 

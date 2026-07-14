@@ -139,10 +139,15 @@ pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_PACKET_OFFSET: usize = 56;
 pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_STOPPED_OFFSET: usize = 64;
 /// `offsetof(cef_audio_handler_t, on_audio_stream_error)` — index 4 (40 + 4*8).
 pub const CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET: usize = 72;
-/// `sizeof(cef_audio_parameters_t)` — three 4-byte ints, no ref-counted base:
-/// `channel_layout` (a `cef_channel_layout_t` enum = int), `sample_rate`,
-/// `frames_per_buffer`. POD out-param filled by `get_audio_parameters`.
-pub const CEF_AUDIO_PARAMETERS_SIZE: usize = 12;
+/// `sizeof(cef_audio_parameters_t)` for pinned Linux CEF 149. The struct leads
+/// with a `size_t size` (like every sized CEF POD), then three ints:
+/// `channel_layout` (a `cef_channel_layout_t` enum = int)@8, `sample_rate`@12,
+/// `frames_per_buffer`@16 — `8 + 3*4 = 20`, padded to `size_t` alignment → 24.
+/// Corrected from a stale 12 that omitted the leading `size`, which shifted every
+/// field write in `get_audio_parameters` by 8 bytes on live CEF (channel_layout
+/// landed in `size`, sample_rate/frames_per_buffer never reached their slots).
+/// Verified against pinned `internal/cef_types.h` `_cef_audio_parameters_t`.
+pub const CEF_AUDIO_PARAMETERS_SIZE: usize = 24;
 /// `CEF_CHANNEL_LAYOUT_STEREO` from the CEF 149 `cef_channel_layout_t` enum
 /// (NONE=0, UNSUPPORTED=1, MONO=2, STEREO=3) — the sane default we request so CEF
 /// actually spins up an audio stream and fires the started/stopped callbacks.
@@ -2727,11 +2732,15 @@ struct CefSize {
 }
 
 /// `cef_audio_parameters_t` — the POD struct CEF passes (by out-pointer to
-/// `get_audio_parameters`, by const-pointer to `on_audio_stream_started`). Three
-/// 4-byte ints, no ref-counted base; matches `CEF_AUDIO_PARAMETERS_SIZE` (12).
+/// `get_audio_parameters`, by const-pointer to `on_audio_stream_started`). Leads
+/// with a `size_t size` then three 4-byte ints; matches `CEF_AUDIO_PARAMETERS_SIZE`
+/// (24). The `size` field is what pins `channel_layout` to offset 8 — omitting it
+/// aliased `channel_layout` onto `size` and dropped `sample_rate`/`frames_per_buffer`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CefAudioParameters {
+    /// `size_t size` — CEF pre-fills this with `sizeof(cef_audio_parameters_t)`.
+    size: usize,
     /// A `cef_channel_layout_t` enum value (see `CEF_CHANNEL_LAYOUT_STEREO`).
     channel_layout: c_int,
     sample_rate: c_int,
@@ -3168,7 +3177,10 @@ unsafe extern "C" fn get_audio_parameters(
 ) -> c_int {
     if !params.is_null() {
         // SAFETY: CEF supplied a non-null, writable `cef_audio_parameters_t`.
+        // `size` leads the struct; keeping it correct pins channel_layout to
+        // offset 8, sample_rate to 12, frames_per_buffer to 16.
         unsafe {
+            (*params).size = CEF_AUDIO_PARAMETERS_SIZE;
             (*params).channel_layout = CEF_CHANNEL_LAYOUT_STEREO;
             (*params).sample_rate = 48_000;
             (*params).frames_per_buffer = 1024;
