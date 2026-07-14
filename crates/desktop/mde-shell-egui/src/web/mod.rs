@@ -4172,9 +4172,18 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     // Permission prompt: an origin's pending capability request renders a small bar
     // atop the page (Allow/Block). A capability granted earlier this session
     // auto-allows inside `pending_permission_prompt` and never reaches here.
-    if let Some((origin, kind)) = state.pending_permission_prompt() {
-        if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
-            state.answer_active_permission(&origin, kind, allow);
+    // Guard: NEVER paint the bar over a crash/cert interstitial that will replace the
+    // page below — a blocked/crashed page can't have raised the request, but keep the
+    // precedence honest defensively (safe-browsing already returned above).
+    let interstitial_below = state
+        .tabs
+        .get(active)
+        .is_some_and(|t| t.session.is_crashed() || t.session.cert_error().is_some());
+    if !interstitial_below {
+        if let Some((origin, kind)) = state.pending_permission_prompt() {
+            if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
+                state.answer_active_permission(&origin, kind, allow);
+            }
         }
     }
     let status = state.tabs.get(active).map(|t| {
@@ -12472,6 +12481,39 @@ mod tests {
         // The render pass paints the "unsafe site blocked" interstitial in place of
         // the frame and must not panic with the block present on the active tab.
         assert!(run_panel(&mut state), "the interstitial produced no draw");
+    }
+
+    #[test]
+    fn a_permission_prompt_is_suppressed_behind_a_cert_interstitial() {
+        // Defensive precedence: a tab that has BOTH a blocking cert error and a
+        // pending permission must show the cert interstitial with the permission bar
+        // suppressed — never paint a prompt over an interstitial, and never let the
+        // combination panic. (A cert-blocked page can't really raise a request; this
+        // guards the state anyway.)
+        let (mut session, peer) = raw_session_pair();
+        send_cert_error(&peer, "https://x.example/", -202, "bad cert");
+        write_helper_event(
+            &peer,
+            &mde_web_preview_client::EventMsg::PermissionRequest {
+                id: 3,
+                kind: 0,
+                origin: "https://x.example".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.cert_error().is_some());
+        assert!(session.pending_permission().is_some());
+
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(
+            run_panel(&mut state),
+            "the cert interstitial produced a draw"
+        );
+        assert!(
+            state.tabs[0].session.pending_permission().is_some(),
+            "the prompt is held behind the interstitial, not consumed by a stray bar"
+        );
     }
 
     #[test]
