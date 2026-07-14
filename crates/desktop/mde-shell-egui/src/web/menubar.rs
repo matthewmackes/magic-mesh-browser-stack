@@ -680,6 +680,10 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption("Session data: cleared on tab close".to_owned()),
                 Entry::Caption(s.site_data.clone()),
                 Entry::Caption("Filter lists: bundled seed + synced/custom rules".to_owned()),
+                Entry::Caption(
+                    "Extensions: v1 disabled; native blocker, passkeys, reader mode active"
+                        .to_owned(),
+                ),
                 Entry::Caption(s.safe_browsing.clone()),
                 Entry::Caption(s.managed_policy.clone()),
                 Entry::Caption(format!(
@@ -820,6 +824,11 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             .enabled(can_prompt_device_api),
                         ),
                         Entry::Separator,
+                        Entry::Caption(
+                            "WebExtensions are skipped for v1; native blocking, passkeys, \
+                             reader mode, userscripts, and site styles are the supported path."
+                                .to_owned(),
+                        ),
                         Entry::Caption(
                             "UA/device overrides change page-visible navigator, screen, and \
                              viewport metadata; native request-header and compositor emulation \
@@ -1496,6 +1505,10 @@ mod tests {
                 && i.label == "Prompt Clipboard Access"
                 && i.enabled
         )));
+        assert!(power.entries.iter().any(|e| matches!(
+            e,
+            Entry::Caption(c) if c.contains("WebExtensions are skipped for v1")
+        )));
         let chips = build_status(&snap);
         assert!(
             chips.iter().any(|chip| chip.text == "Power"),
@@ -2104,6 +2117,12 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("Filter lists: bundled seed + synced/custom rules")),
             "the filter-list policy source is visible"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Extensions: v1 disabled")),
+            "the v1 native-over-WebExtensions policy is visible"
         );
         assert!(
             captions

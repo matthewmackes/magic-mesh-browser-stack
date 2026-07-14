@@ -181,7 +181,8 @@ the pinned CEF-Alloy + OSR design — non-goals in the WebRTC category, not unfi
 - **B4 WebExtensions runtime — CONFIRMED NON-GOAL.** CEF 149's CAPI has NO WebExtensions load API
   (`cef_request_context_capi.h` has no `load_extension`/`get_extension`; only `cef_register_extension`
   for V8 native bindings + `cef_get_extensions_for_mime_type` remain). Extensions CANNOT execute on
-  this build — it needs a CEF Chrome-runtime build. Gate made honest: `CEF_EXTENSIONS_NO_RUNTIME` (`c0c0b772`).
+  this build — it needs a CEF Chrome-runtime build. Production v1 gate is now honest:
+  `CEF_EXTENSIONS_SKIPPED_V1`.
 - **In-shell PDF viewer — architecturally precluded on this runtime.** Chromium's PDF viewer is itself
   an internal extension; with no extension runtime (above), CEF Alloy can't render PDFs inline. Needs a
   standalone PDFium/Rust-PDF renderer, or a CEF Chrome-runtime switch.
@@ -215,8 +216,7 @@ operator-gated resource (not effort I'm choosing to skip):**
    offscreen; there is no native video window for `requestPictureInPicture`). Like WebRTC-removal, this needs an
    operator decision on whether to add a second OSR surface + floating shell window, or declare it a non-goal.
 3. **B4 WebExtensions runtime smoke** — the registry validates + allowlists, but the runtime is gated
-   (`CEF_EXTENSIONS_UNPROVEN … reason=live_extension_runtime_smoke_pending`). Proving it is a live-verify on the
-   `.15` seat, which needs an F44 rebuild+deploy — the F44 builder (`.131`) is an operator-gated RAM juggle.
+   (`CEF_EXTENSIONS_SKIPPED_V1 … reason=native_adblock_passkeys_reader_ship_for_v1`). Reopening it requires the explicit lab env `MDE_CEF_WEBEXTENSIONS_LAB` plus a CEF Chrome-runtime proof; it is no longer a production v1 gate.
 4. **In-shell PDF viewer** — no shell viewer exists (only save-to-PDF, now fixed). Chromium/CEF ships a native
    PDFium viewer, so navigating to a `.pdf` most likely already renders inline via the engine — but that is
    unverified on the current build and needs an eyes-on `.15` check (same F44-deploy gate) to confirm before

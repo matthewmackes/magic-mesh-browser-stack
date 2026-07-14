@@ -55,6 +55,13 @@ pub const CEF_BRIDGE_EXTENSION_REGISTRY_ENV: &str = "MDE_CEF_BRIDGE_EXTENSION_RE
 pub const CEF_EXTENSION_REGISTRY_ENV: &str = "MDE_CEF_EXTENSION_REGISTRY";
 /// Env toggle enabling Power Mode sideload entries from the curated registry.
 pub const CEF_EXTENSION_POWER_MODE_ENV: &str = "MDE_CEF_EXTENSION_POWER_MODE";
+/// Lab-only override that re-enables the experimental CEF WebExtensions handoff.
+///
+/// V1 intentionally skips WebExtensions: native ad/tracker blocking, passkeys,
+/// reader mode, userscripts, and site styles are the supported browser path.
+/// This override exists only so the packaged smoke fixture can keep probing a
+/// future Chrome-runtime/CEF build without making production launch depend on it.
+pub const CEF_WEBEXTENSIONS_LAB_ENV: &str = "MDE_CEF_WEBEXTENSIONS_LAB";
 /// Mesh-hosted curated `WebExtensions` registry path.
 pub const DEFAULT_CEF_EXTENSION_REGISTRY: &str =
     "/mnt/mesh-storage/browser/extensions/allowlist.env";
@@ -210,15 +217,14 @@ impl CefExtensionRegistry {
         }
     }
 
-    /// Honest runtime gate. The registry validates + allowlists extensions, but the
-    /// pinned CEF 149 CAPI exposes **no WebExtensions load API** — `cef_request_context_t`
-    /// has no `load_extension`/`get_extension` (removed upstream; the only "extension"
+    /// Honest v1 runtime gate. The registry validates + allowlists extensions, but
+    /// production v1 does not load them. The pinned CEF 149 CAPI exposes **no
+    /// WebExtensions load API** — `cef_request_context_t` has no
+    /// `load_extension`/`get_extension` (removed upstream; the only "extension"
     /// symbols left are `cef_register_extension` for V8 native bindings and
-    /// `cef_get_extensions_for_mime_type` for file-suffix lookup). So a validated
-    /// registry still cannot EXECUTE a WebExtension on this build; that would require a
-    /// CEF Chrome-runtime build with Chromium's own extension system. Verified against
-    /// `/opt/mde/cef/include/capi/cef_request_context_capi.h` (2026-07-13) — this is an
-    /// architectural boundary of the pinned runtime, not a pending smoke test.
+    /// `cef_get_extensions_for_mime_type` for file-suffix lookup). V1 therefore
+    /// ships native adblock/passkeys/reader/userscripts instead of making browser
+    /// operation depend on partial extension hosting.
     #[must_use]
     pub fn runtime_gate_line(&self) -> Option<String> {
         let Self::Available {
@@ -229,7 +235,7 @@ impl CefExtensionRegistry {
             return None;
         };
         Some(format!(
-            "CEF_EXTENSIONS_NO_RUNTIME registry={} allowed={} reason=pinned_cef149_capi_has_no_webextensions_load_api",
+            "CEF_EXTENSIONS_SKIPPED_V1 registry={} allowed={} reason=native_adblock_passkeys_reader_ship_for_v1 override_env={CEF_WEBEXTENSIONS_LAB_ENV}",
             registry.display(),
             extensions.len()
         ))
@@ -350,6 +356,15 @@ pub fn configured_extension_registry() -> PathBuf {
 #[must_use]
 pub fn extension_power_mode_enabled() -> bool {
     std::env::var(CEF_EXTENSION_POWER_MODE_ENV)
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false)
+}
+
+/// Whether experimental WebExtensions should be handed to CEF anyway.
+#[must_use]
+pub fn webextensions_lab_enabled() -> bool {
+    std::env::var(CEF_WEBEXTENSIONS_LAB_ENV)
         .ok()
         .and_then(|value| parse_bool(&value))
         .unwrap_or(false)
@@ -1002,6 +1017,26 @@ impl CefLaunchPlan {
         extension_power_mode: bool,
         bridge_bin: impl AsRef<Path>,
     ) -> Option<Self> {
+        Self::new_with_widevine_extensions_power_mode_and_lab(
+            runtime,
+            widevine,
+            extensions,
+            extension_power_mode,
+            webextensions_lab_enabled(),
+            bridge_bin,
+        )
+    }
+
+    /// Create a process launch plan with explicit extension Power Mode + lab gates.
+    #[must_use]
+    pub fn new_with_widevine_extensions_power_mode_and_lab(
+        runtime: &CefRuntime,
+        widevine: &WidevineCdm,
+        extensions: &CefExtensionRegistry,
+        extension_power_mode: bool,
+        webextensions_lab: bool,
+        bridge_bin: impl AsRef<Path>,
+    ) -> Option<Self> {
         let CefRuntime::Available {
             root,
             libcef,
@@ -1022,8 +1057,8 @@ impl CefLaunchPlan {
                 } => Some((root.clone(), libwidevine.clone())),
                 WidevineCdm::Missing { .. } => None,
             },
-            extensions: extension_dirs(extensions, extension_power_mode),
-            extension_registry: extension_registry_path(extensions),
+            extensions: extension_dirs(extensions, extension_power_mode, webextensions_lab),
+            extension_registry: extension_registry_path(extensions, webextensions_lab),
             extension_power_mode,
             bridge_bin: bridge_bin.as_ref().to_path_buf(),
             ld_library_path: release_dir.into_os_string(),
@@ -1117,7 +1152,14 @@ impl CefLaunchPlan {
     }
 }
 
-fn extension_dirs(registry: &CefExtensionRegistry, power_mode: bool) -> Vec<PathBuf> {
+fn extension_dirs(
+    registry: &CefExtensionRegistry,
+    power_mode: bool,
+    webextensions_lab: bool,
+) -> Vec<PathBuf> {
+    if !webextensions_lab {
+        return Vec::new();
+    }
     match registry {
         CefExtensionRegistry::Available { extensions, .. } => extensions
             .iter()
@@ -1128,7 +1170,13 @@ fn extension_dirs(registry: &CefExtensionRegistry, power_mode: bool) -> Vec<Path
     }
 }
 
-fn extension_registry_path(registry: &CefExtensionRegistry) -> Option<PathBuf> {
+fn extension_registry_path(
+    registry: &CefExtensionRegistry,
+    webextensions_lab: bool,
+) -> Option<PathBuf> {
+    if !webextensions_lab {
+        return None;
+    }
     match registry {
         CefExtensionRegistry::Available { registry, .. } => Some(registry.clone()),
         CefExtensionRegistry::Missing { .. } | CefExtensionRegistry::Invalid { .. } => None,
@@ -1314,8 +1362,8 @@ mod tests {
                 power_sideload: true,
             }],
         };
-        let plan = CefLaunchPlan::new_with_widevine_extensions_and_power_mode(
-            &rt, &widevine, &registry, true, &bridge,
+        let plan = CefLaunchPlan::new_with_widevine_extensions_power_mode_and_lab(
+            &rt, &widevine, &registry, true, true, &bridge,
         )
         .expect("launch plan");
         assert_eq!(plan.release_dir, dir.join(CEF_RELEASE_DIR));
@@ -1530,6 +1578,7 @@ mod tests {
         assert!(runner.contains("CEF_EXTENSION_AUTOFILL_SMOKE_READY"));
         assert!(runner.contains("CEF_EXTENSIONS_WINDOWLESS_ALLOY_GATED"));
         assert!(runner.contains("MDE_CEF_ALLOW_ALLOY_EXTENSION_SMOKE"));
+        assert!(runner.contains(CEF_WEBEXTENSIONS_LAB_ENV));
     }
 
     #[test]
@@ -1621,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn detected_webextension_registry_reports_ready_but_runtime_smoke_pending() {
+    fn detected_webextension_registry_reports_ready_but_v1_skips_runtime() {
         let dir = std::env::temp_dir().join(format!(
             "mde-web-cef-extension-detect-{}",
             std::process::id()
@@ -1648,13 +1697,14 @@ mod tests {
         let gate = detected
             .runtime_gate_line()
             .expect("available registry has a runtime gate");
-        assert!(gate.contains("CEF_EXTENSIONS_NO_RUNTIME"));
-        assert!(gate.contains("pinned_cef149_capi_has_no_webextensions_load_api"));
+        assert!(gate.contains("CEF_EXTENSIONS_SKIPPED_V1"));
+        assert!(gate.contains("native_adblock_passkeys_reader_ship_for_v1"));
+        assert!(gate.contains(CEF_WEBEXTENSIONS_LAB_ENV));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn extension_launch_plan_requires_power_mode_for_sideload_entries() {
+    fn extension_launch_plan_skips_webextensions_for_v1_unless_lab_enabled() {
         let dir = std::env::temp_dir().join(format!(
             "mde-web-cef-extension-power-mode-{}",
             std::process::id()
@@ -1696,30 +1746,51 @@ mod tests {
         let runtime = detect_runtime(&dir);
         let widevine = detect_widevine(dir.join("widevine"));
 
-        let gated = CefLaunchPlan::new_with_widevine_extensions_and_power_mode(
+        let v1_default = CefLaunchPlan::new_with_widevine_extensions_power_mode_and_lab(
             &runtime,
             &widevine,
             &registry,
             false,
+            false,
             dir.join("bridge"),
         )
         .expect("launch plan");
-        assert_eq!(gated.extensions, vec![normal.clone()]);
-        assert!(!gated.extension_power_mode);
+        assert!(
+            v1_default.extensions.is_empty(),
+            "normal v1 launch skips WebExtensions entirely"
+        );
+        assert_eq!(v1_default.extension_registry, None);
+        assert!(!v1_default
+            .bridge_env()
+            .iter()
+            .any(|(key, _)| *key == CEF_BRIDGE_EXTENSIONS_ENV));
         assert!(registry
             .power_mode_gate_line(false)
             .expect("power gate")
             .contains("CEF_EXTENSIONS_POWER_GATED"));
 
-        let power = CefLaunchPlan::new_with_widevine_extensions_and_power_mode(
+        let lab_gated = CefLaunchPlan::new_with_widevine_extensions_power_mode_and_lab(
             &runtime,
             &widevine,
             &registry,
+            false,
             true,
             dir.join("bridge"),
         )
         .expect("launch plan");
-        assert_eq!(power.extensions, vec![normal, sideload]);
+        assert_eq!(lab_gated.extensions, vec![normal.clone()]);
+        assert!(!lab_gated.extension_power_mode);
+
+        let lab_power = CefLaunchPlan::new_with_widevine_extensions_power_mode_and_lab(
+            &runtime,
+            &widevine,
+            &registry,
+            true,
+            true,
+            dir.join("bridge"),
+        )
+        .expect("launch plan");
+        assert_eq!(lab_power.extensions, vec![normal, sideload]);
         assert!(registry.power_mode_gate_line(true).is_none());
 
         let _ = std::fs::remove_dir_all(dir);

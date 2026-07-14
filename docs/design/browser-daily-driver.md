@@ -49,10 +49,11 @@ Q83) · reader mode (+ TTS) · **no** built-in password manager (external/OS sto
 **WebAuthn/passkeys + hardware keys + phone-as-authenticator** (Q77) · no form autofill ·
 force-dark on light sites (Quasar-tuned) (Q54).
 
-### Extensions (revised by the LastPass directive) (Q97–99)
-**Curated WebExtensions allowlist** (LastPass, uBlock, password managers, …) from a
-**mesh-hosted extension registry** (private, vetted; sideload in Power mode) · standard
-Chrome permission model · extensions run on the CEF engine only.
+### Extensions (v1 decision, Q97–99 revised 2026-07-14)
+V1 skips WebExtensions in production. Native ad/tracker blocking, reader mode, userscripts,
+site styles, and WebAuthn/passkeys are the supported first-cut path; the CEF extension
+registry remains a lab/future probe behind `MDE_CEF_WEBEXTENSIONS_LAB` until a Chrome-runtime
+CEF build can prove extension execution and permission semantics. No general extension store ships.
 
 ### Search & address bar (Q17–20)
 Unified URL+search omnibox · live suggestions · default **mesh-hosted SearXNG** + a
@@ -108,7 +109,7 @@ toolbar.
 ### Phase 1 MVP (Q100 — the operator marked ALL of these for the first cut)
 1. **CEF engine + tabs + omnibox + real-site compat** (the foundation).
 2. **Ad-block + the privacy posture + Widevine** (daily-driver essentials).
-3. **LastPass/WebExtensions (allowlist) + passkeys** (logins work end-to-end).
+3. **Native login path + passkeys; WebExtensions deferred for v1** (native blockers/reader/userscripts/site styles plus WebAuthn/passkeys work without LastPass extension runtime).
 4. **Mesh sync + follow-me tabs + send-tab** (the mesh differentiators).
 
 ## Architecture notes
@@ -133,8 +134,7 @@ toolbar.
 - **CEF on the airgapped Fedora farm** — vendoring ~200MB prebuilt CEF + Rust bindings
   (cef-rs) reproducibly; the release/RPM story (cf. [[rpm-cut-needs-servo-build]] — a second
   excluded heavy engine).
-- **CEF WebExtensions support is partial** — running LastPass/uBlock may need extra work
-  (an extension host) or the fuller Chromium; validate early (a Phase-1 gate).
+- **CEF WebExtensions support is not a v1 dependency** — the pinned CEF CAPI lacks the needed Chrome-runtime extension host, so production skips WebExtensions and keeps the registry only as a lab/future probe behind `MDE_CEF_WEBEXTENSIONS_LAB`.
 - **Widevine + our sandbox** — the CDM has its own process/sandbox expectations; reconcile
   with the out-of-process helper confinement.
 - **Mesh conferencing** — WebRTC needs signaling + (often) a TURN relay; doing it purely over
