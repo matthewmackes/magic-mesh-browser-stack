@@ -967,6 +967,7 @@ fn media_manifest_items(
                 "resource": offline_cache_resource_type_name(resource.resource),
                 "kind": kind,
                 "allowed": resource.allowed,
+                "blocked_by": resource.blocked_by.as_deref(),
                 "filename_hint": media_filename_hint(url),
             }))
         })
@@ -1058,6 +1059,7 @@ pub(super) fn active_page_media_asset_requests_with_selection(
             "resource": offline_cache_resource_type_name(resource.resource),
             "kind": kind,
             "allowed_by_page_filter": resource.allowed,
+            "blocked_by_page_filter": resource.blocked_by.as_deref(),
             "ignore_blocking": !resource.allowed,
             "suggested_filename": filename_hint,
             "rename_strategy": "auto_rename_by_url_hint",

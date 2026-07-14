@@ -28,14 +28,14 @@ pub(super) fn login_fill_script(username: &str, password: &str) -> String {
 }
 
 /// Page-side login-capture bridge (password-manager auto-capture): a capture-phase
-/// `submit` listener beacons `{origin, username, password}` for any form carrying a
-/// non-empty password field to the login-capture URL, which the engine intercepts +
-/// cancels before the network (the credential never leaves the sandbox — the same
-/// channel passkey ceremonies use). Idempotent per context. Injected with the other
-/// per-context security shims; the shell offers to save what it reports.
+/// `submit` listener beacons username/password for any form carrying a non-empty
+/// password field to the login-capture URL, which the engine intercepts + cancels
+/// before the network. The engine validates the separate `origin` query value
+/// against CEF's cached top-level URL before the shell sees the event. Idempotent
+/// per context.
 pub(super) fn login_capture_script() -> String {
     format!(
-        "(function(){{if(window.__mdeLoginCaptureInstalled)return;window.__mdeLoginCaptureInstalled=true;document.addEventListener('submit',function(e){{try{{var form=e.target;if(!form||!form.querySelector)return;var pw=form.querySelector('input[type=password]');if(!pw||!pw.value)return;var u=form.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');var body=JSON.stringify({{origin:location.origin,username:u?u.value:'',password:pw.value}});fetch('{prefix}?body='+encodeURIComponent(body),{{mode:'no-cors',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}}},true);}})();",
+        "(function(){{if(window.__mdeLoginCaptureInstalled)return;window.__mdeLoginCaptureInstalled=true;document.addEventListener('submit',function(e){{try{{var form=e.target;if(!form||!form.querySelector)return;var pw=form.querySelector('input[type=password]');if(!pw||!pw.value)return;var u=form.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');var body=JSON.stringify({{username:u?u.value:'',password:pw.value}});fetch('{prefix}?origin='+encodeURIComponent(location.origin)+'&body='+encodeURIComponent(body),{{mode:'no-cors',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}}},true);}})();",
         prefix = CEF_LOGIN_BEACON_PREFIX
     )
 }
@@ -98,6 +98,13 @@ html.mde-reader-mode img, html.mde-reader-mode video {
     format!(
         "(function(){{var id='mde-cef-reader-style';var root=document.head||document.documentElement;if(!root)return;var el=document.getElementById(id);if(!el){{el=document.createElement('style');el.id=id;root.appendChild(el);}}el.textContent={css};document.documentElement.classList.add('mde-reader-mode');}})();"
     )
+}
+
+pub(super) fn autoplay_block_script(blocked: bool) -> String {
+    if !blocked {
+        return r#"(function(){var s=window.__mdeAutoplayBlocker;if(s){try{if(s.observer)s.observer.disconnect();}catch(_e){}try{document.removeEventListener('pointerdown',s.allow,true);document.removeEventListener('keydown',s.allow,true);document.removeEventListener('touchstart',s.allow,true);document.removeEventListener('click',s.allow,true);}catch(_e){}try{if(s.originalPlay&&s.patchedPlay&&window.HTMLMediaElement&&HTMLMediaElement.prototype.play===s.patchedPlay){HTMLMediaElement.prototype.play=s.originalPlay;}}catch(_e){}}delete window.__mdeAutoplayBlocker;delete document.documentElement.dataset.mdeAutoplayBlocked;})();"#.to_owned();
+    }
+    r#"(function(){var root=document.documentElement;if(!root)return;root.dataset.mdeAutoplayBlocked='true';var s=window.__mdeAutoplayBlocker;if(s&&s.sweep){s.sweep(document);return;}s={allowed:false};window.__mdeAutoplayBlocker=s;s.allow=function(e){if(e&&e.isTrusted===false)return;s.allowed=true;};document.addEventListener('pointerdown',s.allow,true);document.addEventListener('keydown',s.allow,true);document.addEventListener('touchstart',s.allow,true);document.addEventListener('click',s.allow,true);s.blockedError=function(){try{return new DOMException('Autoplay blocked by MDE Browser','NotAllowedError');}catch(_e){var err=new Error('Autoplay blocked by MDE Browser');err.name='NotAllowedError';return err;}};s.sweep=function(scope){try{var base=scope&&scope.querySelectorAll?scope:document;var media=base.querySelectorAll('audio[autoplay],video[autoplay]');for(var i=0;i<media.length;i++){var el=media[i];if(s.allowed||el.dataset.mdeAutoplayAllowed==='true')continue;el.autoplay=false;el.removeAttribute('autoplay');try{el.pause();}catch(_e){}}}catch(_e){}};try{var proto=window.HTMLMediaElement&&HTMLMediaElement.prototype;if(proto&&proto.play&&!s.originalPlay){s.originalPlay=proto.play;s.patchedPlay=function(){if(s.allowed||this.dataset.mdeAutoplayAllowed==='true'||!document.documentElement.dataset.mdeAutoplayBlocked){return s.originalPlay.apply(this,arguments);}try{this.pause();}catch(_e){}return Promise.reject(s.blockedError());};try{Object.defineProperty(proto,'play',{value:s.patchedPlay,writable:true,configurable:true});}catch(_e){proto.play=s.patchedPlay;}}}catch(_e){}if(window.MutationObserver){s.observer=new MutationObserver(function(records){for(var i=0;i<records.length;i++){for(var j=0;j<records[i].addedNodes.length;j++){var n=records[i].addedNodes[j];if(n&&n.nodeType===1)s.sweep(n);}}});s.observer.observe(document.documentElement,{childList:true,subtree:true});}s.sweep(document);})();"#.to_owned()
 }
 
 pub(super) fn user_agent_override_script(user_agent: &str) -> String {

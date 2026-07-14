@@ -112,6 +112,7 @@ pub(super) struct OfflineCacheResource {
     pub(super) url: String,
     pub(super) resource: String,
     pub(super) allowed: bool,
+    pub(super) blocked_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

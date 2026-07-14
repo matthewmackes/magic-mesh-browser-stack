@@ -36,6 +36,8 @@ use crate::{input, wire};
 /// (a bound so a flooding helper can't spin the UI thread).
 const MAX_RECV_PER_POLL: usize = 64;
 const MAX_RECENT_RESOURCE_REQUESTS: usize = 128;
+const MAX_PENDING_JS_DIALOGS: usize = 16;
+const MAX_PENDING_BEFORE_UNLOADS: usize = 16;
 /// A generous cap on queued, not-yet-answered permission prompts. Real pages raise
 /// a handful at most; the bound stops a hostile page from growing the queue (and the
 /// engine's held-callback set) without limit. An overflow auto-denies the oldest.
@@ -78,7 +80,7 @@ pub struct PdfSaveStatus {
 }
 
 /// One page-text extraction result from the helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PageTextStatus {
     /// Request id originally supplied by the shell.
     pub id: u64,
@@ -86,8 +88,18 @@ pub struct PageTextStatus {
     pub text: String,
 }
 
+impl std::fmt::Debug for PageTextStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageTextStatus")
+            .field("id", &self.id)
+            .field("text", &"<redacted>")
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
+}
+
 /// One structured active-page scrape result from the helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PageScrapeStatus {
     /// Request id originally supplied by the shell.
     pub id: u64,
@@ -95,11 +107,30 @@ pub struct PageScrapeStatus {
     pub body: String,
 }
 
+impl std::fmt::Debug for PageScrapeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageScrapeStatus")
+            .field("id", &self.id)
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// One helper-observed passkey/WebAuthn ceremony request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PasskeyRequestStatus {
-    /// Bounded helper JSON body with public ceremony metadata.
+    /// Bounded helper JSON body with ceremony metadata and user/credential hints.
     pub body: String,
+}
+
+impl std::fmt::Debug for PasskeyRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyRequestStatus")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 /// A page-initiated request to open a new window/tab (window.open, target=_blank).
@@ -157,6 +188,33 @@ pub struct JsDialog {
     pub origin: String,
 }
 
+/// A page `beforeunload` prompt waiting for the user's leave/stay decision. The
+/// engine holds the CEF JS dialog callback open and awaits
+/// [`crate::ControlMsg::BeforeUnloadDecision`] carrying the same `id`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BeforeUnloadDialog {
+    /// Correlates the prompt with its decision.
+    pub id: u64,
+    /// Page-provided prompt text (possibly empty on modern browsers).
+    pub message: String,
+    /// The top-level page URL/origin available to the engine.
+    pub origin: String,
+    /// Whether the unload is caused by reload rather than leaving/closing.
+    pub is_reload: bool,
+}
+
+impl std::fmt::Debug for BeforeUnloadDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BeforeUnloadDialog")
+            .field("id", &self.id)
+            .field("message", &"<redacted>")
+            .field("message_bytes", &self.message.len())
+            .field("origin", &self.origin)
+            .field("is_reload", &self.is_reload)
+            .finish()
+    }
+}
+
 /// A page's pending request for a powerful capability (geolocation / notifications
 /// / clipboard). The engine holds the CEF permission callback open and awaits the
 /// shell's [`crate::ControlMsg::PermissionDecision`] carrying the same `id`; the
@@ -171,15 +229,40 @@ pub struct PermissionRequest {
     pub origin: String,
 }
 
+/// A submitted login reported by the engine after top-level origin binding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginCaptureStatus {
+    /// Engine-derived origin that owns the submitted login.
+    pub origin: String,
+    /// Bounded JSON body carrying username/password fields.
+    pub body: String,
+}
+
+impl std::fmt::Debug for LoginCaptureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginCaptureStatus")
+            .field("origin", &self.origin)
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
+    /// Shell-local monotonically increasing observation sequence for this session.
+    /// This is not part of the helper wire protocol; it lets the shell audit only
+    /// newly observed requests from the bounded recent-resource window.
+    pub seq: u64,
     /// Requested subresource URL.
     pub url: String,
     /// Compact resource-type discriminant from [`crate::resource_to_wire`].
     pub resource: u8,
     /// Whether the shell allowed the request to continue.
     pub allowed: bool,
+    /// The filter/policy that blocked the request, when [`Self::allowed`] is false.
+    pub blocked_by: Option<String>,
 }
 
 /// One driven browser session.
@@ -211,9 +294,19 @@ pub struct WebSession {
     /// A top-level navigation blocked by the mesh safe-browsing list — the URL drives
     /// a full-page "unsafe site" interstitial (mirrors [`Self::cert_error`]).
     safe_browsing_block: Option<String>,
+    /// A top-level navigation blocked by operator-managed Browser policy.
+    /// The shell paints a managed-policy interstitial from this state.
+    managed_policy_block: Option<String>,
     /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
     /// already auto-resolved it; this is a passive notice for the shell.
     pending_js_dialog: Option<JsDialog>,
+    /// Drainable JS dialog notices. The latest accessor above keeps compatibility
+    /// with existing callers; this queue lets the shell surface each event once.
+    js_dialog_events: VecDeque<JsDialog>,
+    /// Page beforeunload prompts awaiting a leave/stay decision, oldest first.
+    /// Bounded so a hostile page cannot grow the queue or CEF callback set without
+    /// limit; overflow answers the oldest with `proceed=false` (stay/cancel).
+    pending_before_unloads: VecDeque<BeforeUnloadDialog>,
     /// Page permission requests awaiting the user's allow/block, oldest first (the
     /// shell prompts for the FRONT). A queue, not a single slot: a page can raise
     /// several prompts in quick succession (e.g. geolocation + notifications), and
@@ -229,9 +322,11 @@ pub struct WebSession {
     passkey_events: VecDeque<PasskeyRequestStatus>,
     /// Bounded JSON bodies from submitted login forms (auto-capture); the shell
     /// drains these and offers to save the credential (session-only).
-    login_captures: VecDeque<String>,
+    login_captures: VecDeque<LoginCaptureStatus>,
     download_events: VecDeque<DownloadStatus>,
     popup_requests: VecDeque<PopupRequestStatus>,
+    /// Shell-local sequence assigned to observed resource requests.
+    resource_seq: u64,
     recent_resource_requests: VecDeque<ResourceRequestStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
@@ -265,7 +360,10 @@ impl WebSession {
             find_result: None,
             cert_error: None,
             safe_browsing_block: None,
+            managed_policy_block: None,
             pending_js_dialog: None,
+            js_dialog_events: VecDeque::new(),
+            pending_before_unloads: VecDeque::new(),
             pending_permissions: VecDeque::new(),
             last_seq: 0,
             pending: None,
@@ -276,6 +374,7 @@ impl WebSession {
             login_captures: VecDeque::new(),
             download_events: VecDeque::new(),
             popup_requests: VecDeque::new(),
+            resource_seq: 0,
             recent_resource_requests: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
@@ -448,25 +547,35 @@ impl WebSession {
                 let resource_type = filter::resource_from_wire(resource);
                 let decision = self.filter.decide(&url, resource_type);
                 let allowed = !decision.is_block();
-                // A blocked TOP-LEVEL document from the safe-browsing list drives the
-                // full-page "unsafe site" interstitial (the block itself still drops
-                // the request; this adds the honest warning the audit found missing).
-                if !allowed
-                    && matches!(resource_type, mde_adblock::ResourceType::Document)
-                    && decision
-                        .blocked_by()
+                let blocked_by = decision.blocked_by().map(str::to_owned);
+                // A blocked TOP-LEVEL document drives a full-page interstitial
+                // instead of silently leaving the old page frame visible. The
+                // block itself still drops the request before the network.
+                if !allowed && matches!(resource_type, mde_adblock::ResourceType::Document) {
+                    if blocked_by
+                        .as_deref()
                         .is_some_and(|filter| filter.starts_with("safe-browsing"))
-                {
-                    self.safe_browsing_block = Some(url.clone());
+                    {
+                        self.safe_browsing_block = Some(url.clone());
+                    } else if blocked_by
+                        .as_deref()
+                        .is_some_and(|filter| filter.starts_with("managed-policy"))
+                    {
+                        self.managed_policy_block = Some(url.clone());
+                    }
                 }
+                self.resource_seq = self.resource_seq.saturating_add(1);
+                let seq = self.resource_seq;
                 if self.recent_resource_requests.len() >= MAX_RECENT_RESOURCE_REQUESTS {
                     self.recent_resource_requests.pop_front();
                 }
                 self.recent_resource_requests
                     .push_back(ResourceRequestStatus {
+                        seq,
                         url,
                         resource,
                         allowed,
+                        blocked_by,
                     });
                 self.send(&ControlMsg::ResourceVerdict { id, allow: allowed });
             }
@@ -483,12 +592,13 @@ impl WebSession {
             EventMsg::PasskeyRequest { body } => {
                 self.passkey_events.push_back(PasskeyRequestStatus { body });
             }
-            EventMsg::LoginSubmitted { body } => {
+            EventMsg::LoginSubmitted { origin, body } => {
                 const MAX_PENDING_LOGIN_CAPTURES: usize = 16;
                 if self.login_captures.len() >= MAX_PENDING_LOGIN_CAPTURES {
                     self.login_captures.pop_front();
                 }
-                self.login_captures.push_back(body);
+                self.login_captures
+                    .push_back(LoginCaptureStatus { origin, body });
             }
             EventMsg::Download {
                 id,
@@ -538,10 +648,36 @@ impl WebSession {
                 message,
                 origin,
             } => {
-                self.pending_js_dialog = Some(JsDialog {
+                let dialog = JsDialog {
                     kind,
                     message,
                     origin,
+                };
+                self.pending_js_dialog = Some(dialog.clone());
+                if self.js_dialog_events.len() >= MAX_PENDING_JS_DIALOGS {
+                    self.js_dialog_events.pop_front();
+                }
+                self.js_dialog_events.push_back(dialog);
+            }
+            EventMsg::BeforeUnloadDialog {
+                id,
+                message,
+                origin,
+                is_reload,
+            } => {
+                if self.pending_before_unloads.len() >= MAX_PENDING_BEFORE_UNLOADS {
+                    if let Some(dropped) = self.pending_before_unloads.pop_front() {
+                        self.send(&ControlMsg::BeforeUnloadDecision {
+                            id: dropped.id,
+                            proceed: false,
+                        });
+                    }
+                }
+                self.pending_before_unloads.push_back(BeforeUnloadDialog {
+                    id,
+                    message,
+                    origin,
+                    is_reload,
                 });
             }
             EventMsg::FindResult { count, active, .. } => {
@@ -585,7 +721,7 @@ impl WebSession {
 
     /// Drain submitted-login JSON bodies (auto-capture) reported by the helper. The
     /// shell parses each and offers to save the credential (session-only).
-    pub fn drain_login_captures(&mut self) -> Vec<String> {
+    pub fn drain_login_captures(&mut self) -> Vec<LoginCaptureStatus> {
         self.login_captures.drain(..).collect()
     }
 
@@ -662,6 +798,9 @@ impl WebSession {
         // A fresh navigation clears any interstitial from the prior page.
         self.cert_error = None;
         self.safe_browsing_block = None;
+        self.managed_policy_block = None;
+        self.pending_js_dialog = None;
+        self.js_dialog_events.clear();
         self.nav.loading = true;
         self.send(&ControlMsg::Load(url.into()));
     }
@@ -712,17 +851,21 @@ impl WebSession {
 
     /// Autofill a user-chosen saved login into the page's first login form (the engine
     /// injects a fill script). User-initiated; session-only credentials.
-    pub fn fill_login(&mut self, username: String, password: String) {
-        self.send(&ControlMsg::FillLogin { username, password });
+    pub fn fill_login(&mut self, expected_host: String, username: String, password: String) {
+        self.send(&ControlMsg::FillLogin {
+            expected_host,
+            username,
+            password,
+        });
     }
 
-    /// Find text on the current page.
     /// Run a clipboard/editing command on the page's focused element (in-page
     /// context menu). Reuses the engine's native frame edit commands.
     pub fn edit_command(&mut self, command: crate::wire::EditCommand) {
         self.send(&ControlMsg::EditCommand { command });
     }
 
+    /// Find text on the current page.
     pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool, find_next: bool) {
         self.send(&ControlMsg::FindInPage {
             query: query.into(),
@@ -754,12 +897,48 @@ impl WebSession {
         self.safe_browsing_block.as_deref()
     }
 
+    /// The URL of a top-level navigation blocked by managed Browser policy, if any.
+    #[must_use]
+    pub fn managed_policy_block(&self) -> Option<&str> {
+        self.managed_policy_block.as_deref()
+    }
+
+    /// Clear the managed-policy interstitial after the shell has handled it.
+    pub fn clear_managed_policy_block(&mut self) {
+        self.managed_policy_block = None;
+    }
+
     /// The latest JavaScript dialog (alert/confirm/prompt) a page raised. The
     /// engine already auto-resolved it (the page did not block); the shell may
     /// surface this as a passive, non-blocking notice.
     #[must_use]
     pub const fn pending_js_dialog(&self) -> Option<&JsDialog> {
         self.pending_js_dialog.as_ref()
+    }
+
+    /// Drain JavaScript dialog notices the engine already auto-resolved. Each event
+    /// is surfaced at most once to the shell; [`Self::pending_js_dialog`] remains
+    /// the latest retained value for status accessors/tests.
+    pub fn drain_js_dialog_events(&mut self) -> Vec<JsDialog> {
+        self.js_dialog_events.drain(..).collect()
+    }
+
+    /// The oldest pending beforeunload prompt awaiting a leave/stay decision, if
+    /// any. The shell renders this and replies via [`Self::answer_before_unload`].
+    #[must_use]
+    pub fn pending_before_unload(&self) -> Option<&BeforeUnloadDialog> {
+        self.pending_before_unloads.front()
+    }
+
+    /// Answer the oldest pending beforeunload prompt: `proceed=true` leaves or
+    /// reloads the page, `false` stays. A no-op when no prompt is pending.
+    pub fn answer_before_unload(&mut self, proceed: bool) {
+        if let Some(dialog) = self.pending_before_unloads.pop_front() {
+            self.send(&ControlMsg::BeforeUnloadDecision {
+                id: dialog.id,
+                proceed,
+            });
+        }
     }
 
     /// The oldest pending permission request awaiting the user's allow/block, if any
@@ -791,6 +970,11 @@ impl WebSession {
     /// Set whether tab audio is muted.
     pub fn set_audio_muted(&mut self, muted: bool) {
         self.send(&ControlMsg::SetAudioMuted { muted });
+    }
+
+    /// Set whether page-initiated autoplay is blocked until user activation.
+    pub fn set_autoplay_blocked(&mut self, blocked: bool) {
+        self.send(&ControlMsg::SetAutoplayBlocked { blocked });
     }
 
     /// Set whether forced-dark styling is enabled for this tab.
@@ -1092,13 +1276,22 @@ mod tests {
             }
         );
         assert_eq!(session.blocked_count(), 1, "the blocked request is counted");
+        let recent = session.recent_resource_requests();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].seq, 1);
+        assert_eq!(recent[0].url, "https://www.google-analytics.com/collect");
         assert_eq!(
-            session.recent_resource_requests(),
-            vec![ResourceRequestStatus {
-                url: "https://www.google-analytics.com/collect".to_owned(),
-                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
-                allowed: false,
-            }]
+            recent[0].resource,
+            filter::resource_to_wire(mde_adblock::ResourceType::Script)
+        );
+        assert!(!recent[0].allowed);
+        assert!(
+            recent[0]
+                .blocked_by
+                .as_deref()
+                .is_some_and(|rule| rule.contains("google")),
+            "tracker block should retain the matched rule: {:?}",
+            recent[0].blocked_by
         );
     }
 
@@ -1129,6 +1322,52 @@ mod tests {
             ControlMsg::ResourceVerdict { id: 2, allow: true }
         );
         assert_eq!(session.blocked_count(), 0);
+    }
+
+    #[test]
+    fn mixed_content_subresource_is_blocked_over_the_seam() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/".to_owned(),
+            },
+        );
+        session.poll();
+        assert_no_control_pending(&peer);
+
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 7,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 7,
+                allow: false
+            }
+        );
+        assert_eq!(session.blocked_count(), 1);
+        assert_eq!(
+            session.recent_resource_requests(),
+            vec![ResourceRequestStatus {
+                seq: 1,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            }]
+        );
+        assert!(session.safe_browsing_block().is_none());
+        assert!(session.managed_policy_block().is_none());
     }
 
     #[test]
@@ -1250,6 +1489,80 @@ mod tests {
     }
 
     #[test]
+    fn a_before_unload_prompt_roundtrips_the_user_decision() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.pending_before_unload().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::BeforeUnloadDialog {
+                id: 42,
+                message: "You have unsaved changes".to_owned(),
+                origin: "https://editor.example/doc/1".to_owned(),
+                is_reload: false,
+            },
+        );
+        session.poll();
+        let pending = session
+            .pending_before_unload()
+            .expect("a pending beforeunload prompt");
+        assert_eq!(pending.id, 42);
+        assert_eq!(pending.message, "You have unsaved changes");
+        assert_eq!(pending.origin, "https://editor.example/doc/1");
+        assert!(!pending.is_reload);
+
+        session.answer_before_unload(false);
+        assert!(
+            session.pending_before_unload().is_none(),
+            "answering clears the pending prompt"
+        );
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 42,
+                proceed: false
+            }
+        );
+    }
+
+    #[test]
+    fn before_unload_queue_overflow_answers_stay_for_the_oldest() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        for id in 0..=MAX_PENDING_BEFORE_UNLOADS as u64 {
+            send_event(
+                &peer,
+                &EventMsg::BeforeUnloadDialog {
+                    id,
+                    message: format!("draft {id}"),
+                    origin: "https://editor.example".to_owned(),
+                    is_reload: false,
+                },
+            );
+        }
+
+        session.poll();
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 0,
+                proceed: false
+            }
+        );
+        assert_eq!(session.pending_before_unload().map(|p| p.id), Some(1));
+
+        session.answer_before_unload(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 1,
+                proceed: true
+            }
+        );
+    }
+
+    #[test]
     fn concurrent_permission_requests_queue_and_answer_oldest_first() {
         let (shell, mut peer) = UnixStream::pair().expect("socketpair");
         let mut session = WebSession::from_stream(shell, None).expect("session");
@@ -1350,6 +1663,38 @@ mod tests {
         assert!(
             session.safe_browsing_block().is_none(),
             "a blocked subresource is not a full-page interstitial"
+        );
+    }
+
+    #[test]
+    fn a_top_level_managed_policy_block_drives_the_interstitial_state() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.set_filter(
+            RequestFilter::empty()
+                .with_managed_policy(filter::ManagedUrlPolicy::from_rules(["blocked.example"])),
+        );
+        assert!(session.managed_policy_block().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 1,
+                url: "https://blocked.example/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.managed_policy_block(),
+            Some("https://blocked.example/")
+        );
+        assert!(session.safe_browsing_block().is_none());
+
+        session.load("https://ok.example/");
+        assert!(
+            session.managed_policy_block().is_none(),
+            "fresh navigations clear the managed-policy interstitial"
         );
     }
 
@@ -1477,6 +1822,22 @@ mod tests {
                 origin: "https://app.example/".to_owned(),
             })
         );
+        assert_eq!(
+            session.drain_js_dialog_events(),
+            vec![JsDialog {
+                kind: 1,
+                message: "Delete this item?".to_owned(),
+                origin: "https://app.example/".to_owned(),
+            }]
+        );
+        assert!(
+            session.drain_js_dialog_events().is_empty(),
+            "dialog notices are drained exactly once"
+        );
+        assert!(
+            session.pending_js_dialog().is_some(),
+            "the latest dialog accessor remains available after draining notices"
+        );
     }
 
     #[test]
@@ -1492,13 +1853,17 @@ mod tests {
 
         session.poll();
 
+        let events = session.drain_page_text_events();
         assert_eq!(
-            session.drain_page_text_events(),
+            events,
             vec![PageTextStatus {
                 id: 7,
                 text: "visible page words".to_owned(),
             }]
         );
+        let debug = format!("{events:?}");
+        assert!(!debug.contains("visible page words"));
+        assert!(debug.contains("<redacted>"));
         assert!(
             session.drain_page_text_events().is_empty(),
             "page-text events are drained exactly once"
@@ -1508,7 +1873,7 @@ mod tests {
     #[test]
     fn passkey_requests_are_queued_for_the_shell() {
         let (mut session, peer) = filtered_session();
-        let body = r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz"}"#;
+        let body = r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz","user_handle_b64url":"secret-handle"}"#;
         send_event(
             &peer,
             &EventMsg::PasskeyRequest {
@@ -1518,16 +1883,66 @@ mod tests {
 
         session.poll();
 
+        let events = session.drain_passkey_events();
         assert_eq!(
-            session.drain_passkey_events(),
+            events,
             vec![PasskeyRequestStatus {
                 body: body.to_owned(),
             }]
         );
+        let debug = format!("{events:?}");
+        assert!(!debug.contains("secret-handle"));
+        assert!(debug.contains("<redacted>"));
         assert!(
             session.drain_passkey_events().is_empty(),
             "passkey events are drained exactly once"
         );
+    }
+
+    #[test]
+    fn page_scrape_status_debug_redacts_the_dom_body() {
+        let event = PageScrapeStatus {
+            id: 11,
+            body: r#"{"text":"private page body","links":["https://example.test/private"]}"#
+                .to_owned(),
+        };
+
+        assert_eq!(event.id, 11);
+        assert!(event.body.contains("private page body"));
+        let debug = format!("{event:?}");
+        assert!(debug.contains("PageScrapeStatus"));
+        assert!(!debug.contains("private page body"));
+        assert!(!debug.contains("https://example.test/private"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn login_capture_status_debug_redacts_the_credential_body() {
+        let (mut session, peer) = filtered_session();
+        let body = r#"{"username":"alice@example.com","password":"hunter2"}"#;
+        send_event(
+            &peer,
+            &EventMsg::LoginSubmitted {
+                origin: "https://login.example".to_owned(),
+                body: body.to_owned(),
+            },
+        );
+
+        session.poll();
+
+        let captures = session.drain_login_captures();
+        assert_eq!(
+            captures,
+            vec![LoginCaptureStatus {
+                origin: "https://login.example".to_owned(),
+                body: body.to_owned(),
+            }]
+        );
+        let debug = format!("{captures:?}");
+        assert!(debug.contains("https://login.example"));
+        assert!(!debug.contains("alice@example.com"));
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]
@@ -1634,6 +2049,17 @@ mod tests {
         assert_eq!(
             read_control(&mut peer),
             ControlMsg::SetAudioMuted { muted: false }
+        );
+
+        session.set_autoplay_blocked(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAutoplayBlocked { blocked: true }
+        );
+        session.set_autoplay_blocked(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAutoplayBlocked { blocked: false }
         );
 
         session.set_force_dark(true);
@@ -2276,6 +2702,7 @@ mod tests {
         session.reload();
         session.ime_commit_text("x".to_owned());
         session.answer_permission(true);
+        session.answer_before_unload(true);
         session.set_zoom(150);
         assert_no_control_pending(&peer);
     }

@@ -36,8 +36,9 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    confusable_reason, host_of, CertError, ConfusableReason, EditCommand, FilterListSource,
-    FilterListStore, RequestFilter, SafeBrowsingBlocklist, SessionState, WebSession,
+    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, EditCommand,
+    FilterListSource, FilterListStore, JsDialog, ManagedUrlPolicy, RequestFilter,
+    SafeBrowsingBlocklist, SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -187,6 +188,9 @@ fn tab_group_color(index: usize) -> egui::Color32 {
 }
 
 struct Tab {
+    /// Stable shell-local identity for tab-scoped prompt state. Indices move when
+    /// tabs close or reorder; this id does not.
+    id: u64,
     /// The IPC + shm session driving one sandboxed helper.
     session: WebSession,
     /// Engine that owns this helper session.
@@ -208,6 +212,8 @@ struct Tab {
     pinned: bool,
     /// Per-tab audio mute state mirrored to the helper.
     muted: bool,
+    /// Per-tab autoplay-block state mirrored to the helper.
+    autoplay_blocked: bool,
     /// Per-tab forced dark rendering state mirrored to the helper.
     force_dark: bool,
     /// Per-tab reader-mode state mirrored to the helper.
@@ -236,6 +242,10 @@ struct Tab {
     /// full-resolution pixel deep copy, on every decoded frame (the same `Arc`
     /// is handed to the texture upload — `egui::ImageData` stores `Arc<ColorImage>`).
     last_frame: Option<std::sync::Arc<egui::ColorImage>>,
+    /// Last shell-local resource-request sequence audited from this tab's session.
+    /// `recent_resource_requests()` is a bounded snapshot, so this watermark keeps
+    /// pre-network resource-block audit events one-shot without changing helper wire.
+    last_audited_resource_seq: u64,
     /// Debounces panel-size changes into a single settled `session.resize` so a
     /// drag-resize drives the helper's CSS viewport once, not every frame
     /// (browser-1).
@@ -347,11 +357,79 @@ struct PendingDangerousDownload {
     filename: String,
 }
 
-/// One saved login in the SESSION-ONLY credential store. Keyed by origin host so a
-/// revisit offers it for autofill. In-memory only — never persisted to disk (the
-/// browser is private-by-default; the sandbox has no writable $HOME). The user adds
-/// these explicitly; auto-capture-on-submit is a separate, operator-reviewed feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedPolicyBlockTrigger {
+    ChromeLoad,
+    NewTab,
+    HttpContinue,
+    HttpsUpgrade,
+    HelperDocument,
+    LiveSpawn,
+    Download,
+}
+
+impl ManagedPolicyBlockTrigger {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::ChromeLoad => "chrome_load",
+            Self::NewTab => "new_tab",
+            Self::HttpContinue => "http_continue",
+            Self::HttpsUpgrade => "https_upgrade",
+            Self::HelperDocument => "helper_document",
+            Self::LiveSpawn => "live_spawn",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// Where a pending plain-HTTP navigation should resume after the user answers
+/// the Browser HTTPS prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InsecureNavigationTarget {
+    ActiveTab,
+    NewTab(BrowserEngine),
+}
+
+impl InsecureNavigationTarget {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::ActiveTab => "active_tab",
+            Self::NewTab(_) => "new_tab",
+        }
+    }
+
+    const fn engine_override(self) -> Option<BrowserEngine> {
+        match self {
+            Self::ActiveTab => None,
+            Self::NewTab(engine) => Some(engine),
+        }
+    }
+}
+
+/// A top-level navigation blocked by operator-managed Browser policy. Stored in
+/// shell state so chrome-originated loads (omnibox, bookmarks, send-tab, restore)
+/// can paint the same full-page interstitial as helper-originated page clicks.
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ManagedPolicyBlock {
+    url: String,
+    rule: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixedContentBlockAudit {
+    engine: BrowserEngine,
+    page_url: String,
+    title: String,
+    url: String,
+    resource: u8,
+}
+
+/// One saved login in the SESSION-ONLY credential store. Keyed by normalized host
+/// so a revisit offers it for autofill. In-memory only — never persisted to disk
+/// (the browser is private-by-default; the sandbox has no writable $HOME). The
+/// user adds these through the password menu or by accepting a host-bound
+/// auto-capture prompt after a submitted login.
+#[derive(Clone, PartialEq, Eq)]
 struct StoredLogin {
     /// Host the credential belongs to (e.g. `mail.example.com`).
     host: String,
@@ -359,6 +437,39 @@ struct StoredLogin {
     username: String,
     /// Password (session RAM only).
     password: String,
+}
+
+impl std::fmt::Debug for StoredLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredLogin")
+            .field("host", &self.host)
+            .field("username", &"<redacted>")
+            .field("username_bytes", &self.username.len())
+            .field("password", &"<redacted>")
+            .field("password_bytes", &self.password.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PendingLoginSave {
+    tab_id: u64,
+    host: String,
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for PendingLoginSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLoginSave")
+            .field("tab_id", &self.tab_id)
+            .field("host", &self.host)
+            .field("username", &"<redacted>")
+            .field("username_bytes", &self.username.len())
+            .field("password", &"<redacted>")
+            .field("password_bytes", &self.password.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -588,18 +699,65 @@ const DANGEROUS_DOWNLOAD_EXTENSIONS: &[&str] = &[
 /// Case-insensitive on the final extension — the one that actually decides how
 /// the OS opens the file — plus the second-to-last segment, so a masquerading
 /// double extension is caught from either side (`invoice.pdf.exe` *and*
-/// `invoice.exe.pdf` both flag, not just the visible-name trick). Paint-free
-/// and side-effect-free so it's directly unit-testable ([`submit_download_to_ledger`]
-/// is the only caller that acts on it).
+/// `invoice.exe.pdf` both flag, not just the visible-name trick). It also checks
+/// percent-decoded, path-leaf, Windows trailing-dot/space, and ADS-style variants
+/// so encoded or platform-normalized executable names cannot slip through.
+/// Paint-free and side-effect-free so it's directly unit-testable
+/// ([`submit_download_to_ledger`] is the only caller that acts on it).
 fn download_is_dangerous(filename: &str) -> bool {
-    fn is_dangerous_ext(part: &str) -> bool {
-        DANGEROUS_DOWNLOAD_EXTENSIONS.contains(&part.to_ascii_lowercase().as_str())
+    if download_name_variant_is_dangerous(filename) {
+        return true;
     }
-    let mut parts: Vec<&str> = filename.trim().split('.').collect();
+    let mut current = filename.to_owned();
+    for _ in 0..2 {
+        let Some(decoded) =
+            percent_decode_download_name(&current).filter(|decoded| decoded != &current)
+        else {
+            return false;
+        };
+        if download_name_variant_is_dangerous(&decoded) {
+            return true;
+        }
+        current = decoded;
+    }
+    false
+}
+
+fn download_name_variant_is_dangerous(filename: &str) -> bool {
+    fn is_dangerous_ext(part: &str) -> bool {
+        DANGEROUS_DOWNLOAD_EXTENSIONS.contains(&part.trim().to_ascii_lowercase().as_str())
+    }
+
+    let leaf = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim()
+        .trim_end_matches(|ch: char| ch == '.' || ch.is_ascii_whitespace());
+    if leaf.is_empty() {
+        return false;
+    }
+
+    if let Some((stream_owner, _)) = leaf.split_once(':') {
+        if download_extension_chain_is_dangerous(stream_owner, is_dangerous_ext) {
+            return true;
+        }
+    }
+    download_extension_chain_is_dangerous(leaf, is_dangerous_ext)
+}
+
+fn download_extension_chain_is_dangerous(
+    filename: &str,
+    is_dangerous_ext: impl Fn(&str) -> bool,
+) -> bool {
+    let mut parts: Vec<&str> = filename.split('.').map(str::trim).collect();
     // A leading empty segment is a dotfile's leading dot (`.bashrc`), not an
     // extension boundary.
-    if parts.first() == Some(&"") {
+    while parts.first() == Some(&"") {
         parts.remove(0);
+    }
+    while parts.last() == Some(&"") {
+        parts.pop();
     }
     if parts.len() < 2 {
         return false;
@@ -608,6 +766,54 @@ fn download_is_dangerous(filename: &str) -> bool {
         return true;
     }
     parts.len() >= 3 && is_dangerous_ext(parts[parts.len() - 2])
+}
+
+fn percent_decode_download_name(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut decoded_any = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (
+                    download_hex_value(bytes[i + 1]),
+                    download_hex_value(bytes[i + 2]),
+                ) {
+                    out.push((hi << 4) | lo);
+                    decoded_any = true;
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    decoded_any.then(|| String::from_utf8_lossy(&out).into_owned())
+}
+
+const fn download_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn download_url_path_is_dangerous(url: &str) -> bool {
+    let path_only = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path_only.split_once("://").map_or(path_only, |(_, rest)| {
+        rest.find('/').map_or("", |path_start| &rest[path_start..])
+    });
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .is_some_and(download_is_dangerous)
 }
 
 /// The filename a download should be saved under: the engine's suggested name
@@ -626,6 +832,231 @@ fn resolve_download_filename(url: &str, filename: &str) -> String {
         .find(|part| !part.is_empty())
         .unwrap_or("download")
         .to_owned()
+}
+
+trait DownloadOpener {
+    fn open_path(&self, path: &Path) -> Result<(), String>;
+    fn reveal_path(&self, path: &Path) -> Result<(), String>;
+}
+
+#[derive(Debug, Default)]
+struct XdgDownloadOpener;
+
+impl DownloadOpener for XdgDownloadOpener {
+    fn open_path(&self, path: &Path) -> Result<(), String> {
+        spawn_xdg_open(path)
+    }
+
+    fn reveal_path(&self, path: &Path) -> Result<(), String> {
+        spawn_xdg_open(path)
+    }
+}
+
+fn spawn_xdg_open(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("download path is empty".to_owned());
+    }
+    Command::new("xdg-open")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("xdg-open {} failed: {err}", path.display()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserDownloadTarget {
+    open: PathBuf,
+    reveal: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserDownloadManifest {
+    asset_url: String,
+    suggested_filename: String,
+    kind: Option<String>,
+}
+
+fn safe_browser_download_filename(raw: &str) -> String {
+    let leaf = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in leaf.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            last_dash = false;
+            Some(ch)
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+        if out.len() >= 128 {
+            break;
+        }
+    }
+    let out = out.trim_matches(['.', '-', '_']);
+    if out.is_empty() {
+        "browser-media".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn completed_browser_download_target(job: &TransferJob) -> Result<BrowserDownloadTarget, String> {
+    if job.method != TransferMethod::BrowserDownload {
+        return Err("Download action only supports browser downloads".to_owned());
+    }
+    if job.state != TransferState::Done {
+        return Err("Download is not complete yet".to_owned());
+    }
+    let source = PathBuf::from(job.source.trim());
+    let dest = PathBuf::from(job.dest.trim());
+    if source.as_os_str().is_empty() || dest.as_os_str().is_empty() {
+        return Err("Download output path unavailable".to_owned());
+    }
+    if let Some(manifest) = browser_download_manifest(&source)? {
+        return Ok(browser_manifest_target(&dest, &manifest));
+    }
+    let open = if dest.is_dir() {
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| "Download output path unavailable".to_owned())?;
+        dest.join(file_name)
+    } else {
+        dest
+    };
+    Ok(BrowserDownloadTarget {
+        reveal: reveal_target_for(&open),
+        open,
+    })
+}
+
+fn browser_download_manifest(source: &Path) -> Result<Option<BrowserDownloadManifest>, String> {
+    if source.extension().and_then(|ext| ext.to_str()) != Some("json")
+        || !source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".download.json"))
+    {
+        return Ok(None);
+    }
+    let body = std::fs::read(source)
+        .map_err(|err| format!("Download request {} is unreadable: {err}", source.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|err| format!("Download request {} is not JSON: {err}", source.display()))?;
+    if value.get("op").and_then(serde_json::Value::as_str) != Some("browser_media_download_request")
+    {
+        return Ok(None);
+    }
+    let asset_url = value
+        .get("asset_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .ok_or_else(|| "Download request is missing a valid asset URL".to_owned())?
+        .to_owned();
+    let suggested = value
+        .get("suggested_filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("browser-media");
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| kind.to_ascii_lowercase());
+    Ok(Some(BrowserDownloadManifest {
+        asset_url,
+        suggested_filename: safe_browser_download_filename(suggested),
+        kind,
+    }))
+}
+
+fn browser_manifest_target(
+    dest: &Path,
+    manifest: &BrowserDownloadManifest,
+) -> BrowserDownloadTarget {
+    if browser_manifest_is_hls(manifest) {
+        let (package_dir, manifest_filename) =
+            browser_package_destination(dest, &manifest.suggested_filename, "hls");
+        return BrowserDownloadTarget {
+            open: package_dir.join(manifest_filename),
+            reveal: package_dir,
+        };
+    }
+    if browser_manifest_is_dash(manifest) {
+        let (package_dir, manifest_filename) =
+            browser_package_destination(dest, &manifest.suggested_filename, "dash");
+        return BrowserDownloadTarget {
+            open: package_dir.join(manifest_filename),
+            reveal: package_dir,
+        };
+    }
+    let open = if dest.is_dir() {
+        dest.join(&manifest.suggested_filename)
+    } else {
+        dest.to_path_buf()
+    };
+    BrowserDownloadTarget {
+        reveal: reveal_target_for(&open),
+        open,
+    }
+}
+
+fn browser_package_destination(
+    dest: &Path,
+    suggested_filename: &str,
+    extension: &str,
+) -> (PathBuf, String) {
+    let manifest_filename = safe_browser_download_filename(suggested_filename);
+    let stem = Path::new(&manifest_filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "browser-media".to_string());
+    if dest.is_dir() {
+        return (dest.join(format!("{stem}.{extension}")), manifest_filename);
+    }
+    let package_dir = dest.with_extension(extension);
+    let filename = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_browser_download_filename)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(manifest_filename);
+    (package_dir, filename)
+}
+
+fn browser_manifest_is_hls(manifest: &BrowserDownloadManifest) -> bool {
+    manifest.kind.as_deref() == Some("hls") || url_path_ends_with(&manifest.asset_url, ".m3u8")
+}
+
+fn browser_manifest_is_dash(manifest: &BrowserDownloadManifest) -> bool {
+    manifest.kind.as_deref() == Some("dash") || url_path_ends_with(&manifest.asset_url, ".mpd")
+}
+
+fn url_path_ends_with(url: &str, suffix: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+        .ends_with(suffix)
+}
+
+fn reveal_target_for(open: &Path) -> PathBuf {
+    open.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| open.to_path_buf())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +1120,9 @@ impl BrowserEngine {
 /// The Browser surface's state: the open tabs, the active one, and the address-bar
 /// edit buffer.
 pub(crate) struct WebState {
+    /// Next shell-local tab id. Starts at 1 so id 0 remains available for tests
+    /// that exercise credential parsing without constructing a tab.
+    next_tab_id: u64,
     /// The open browser tabs (each an isolated session). Empty until a session
     /// attaches — spawning the live helper is the gated `live-helper` path.
     tabs: Vec<Tab>,
@@ -739,6 +1173,9 @@ pub(crate) struct WebState {
     /// HTTPS-only prompt latch. Explicit `http://` navigations pause here until
     /// the operator upgrades to HTTPS, continues over HTTP, or cancels.
     insecure_prompt: Option<String>,
+    /// Destination for the pending HTTPS prompt: active-tab load or a new-tab
+    /// open intent that must not bypass the same transport decision.
+    insecure_prompt_target: InsecureNavigationTarget,
     /// Quasar new-tab dashboard search draft. This is chrome state, not page
     /// content; submitted searches load the mesh SearXNG URL into the active tab.
     dashboard_query: String,
@@ -784,6 +1221,9 @@ pub(crate) struct WebState {
     /// Mesh-hosted safe-browsing host blocklists. The worker/file-sync half can
     /// replace these hosts; the Browser compiles them into every live session.
     safe_browsing_hosts: Vec<String>,
+    /// Operator-managed URL policy. Rules are read from the workgroup root and
+    /// enforced before chrome-initiated loads and helper resource fetches.
+    managed_url_policy: ManagedUrlPolicy,
     /// BROWSER-DD-3 per-site permission manager. The helpers enforce default-deny
     /// for sensitive prompts; the shell tracks sites the operator explicitly
     /// forgot so the menu has a real state transition without offering fake allow
@@ -803,6 +1243,9 @@ pub(crate) struct WebState {
     /// Shared Transfers client. Browser downloads are just `browser_download`
     /// rows in the daemon-owned ledger, so Files and Browser show one queue.
     transfers: Box<dyn TransfersClient>,
+    /// Platform opener for completed Browser downloads. Production uses
+    /// `xdg-open`; tests inject a recorder so farm gates never launch host apps.
+    download_opener: Box<dyn DownloadOpener>,
     /// Browser-originated transfers filtered from the shared ledger.
     download_jobs: Vec<TransferJob>,
     /// Browser transfer ids already announced to the mesh notification feed.
@@ -899,6 +1342,8 @@ pub(crate) struct WebState {
     download_source_urls: BTreeMap<String, String>,
     /// Last viewport-capture result, shown inline instead of being swallowed.
     capture_notice: Option<String>,
+    /// A chrome-originated top-level navigation blocked by managed URL policy.
+    managed_policy_block: Option<ManagedPolicyBlock>,
     /// Last successfully saved user PDF. CUPS spool PDFs are excluded; this feeds
     /// the CEF-backed built-in PDF viewer action and offline-cache PDF snapshots.
     last_saved_pdf: Option<SavedPdf>,
@@ -960,7 +1405,7 @@ pub(crate) struct WebState {
     login_pass_draft: String,
     /// An auto-captured login awaiting the user's "Save password?" decision (a form
     /// submit the engine beaconed). `None` when nothing is pending.
-    pending_login_save: Option<StoredLogin>,
+    pending_login_save: Option<PendingLoginSave>,
     /// Whether the Site Styles editor drawer is open, and its two input drafts.
     site_styles_open: bool,
     site_style_host_draft: String,
@@ -972,6 +1417,8 @@ pub(crate) struct WebState {
     bookmarks_collection_last_poll: Option<Instant>,
     /// Throttle for the operator-curated safe-browsing blocklist re-read.
     safe_browsing_last_poll: Option<Instant>,
+    /// Throttle for the operator-managed URL policy re-read.
+    managed_policy_last_poll: Option<Instant>,
     /// Region-capture mode is armed; the next drag over the page image writes a
     /// cropped PNG from the retained helper frame.
     capture_region_mode: bool,
@@ -1001,6 +1448,7 @@ pub(crate) struct WebState {
 impl Default for WebState {
     fn default() -> Self {
         Self {
+            next_tab_id: 1,
             tabs: Vec::new(),
             active: 0,
             engine: preferred_default_engine(),
@@ -1015,6 +1463,7 @@ impl Default for WebState {
             vertical_tabs: false,
             fullscreen: false,
             insecure_prompt: None,
+            insecure_prompt_target: InsecureNavigationTarget::ActiveTab,
             dashboard_query: String::new(),
             speed_dial: default_speed_dial(),
             find_query: String::new(),
@@ -1032,12 +1481,14 @@ impl Default for WebState {
             pending_offline_cache_requests: BTreeMap::new(),
             adfilter_store: FilterListStore::with_bundled(),
             safe_browsing_hosts: Vec::new(),
+            managed_url_policy: ManagedUrlPolicy::empty(),
             forgotten_permission_sites: Vec::new(),
             site_permission_prompts: Vec::new(),
             site_data: SiteDataManager::default(),
             history: HistoryStore::default(),
             history_open: false,
             transfers: Box::new(FileTransfers::from_env()),
+            download_opener: Box::<XdgDownloadOpener>::default(),
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
             power_mode: false,
@@ -1075,6 +1526,7 @@ impl Default for WebState {
             dismissed_download_ids: BTreeSet::new(),
             download_source_urls: BTreeMap::new(),
             capture_notice: None,
+            managed_policy_block: None,
             last_saved_pdf: None,
             pending_saved_pdfs: BTreeMap::new(),
             print_settings_open: false,
@@ -1102,6 +1554,7 @@ impl Default for WebState {
             site_style_css_draft: String::new(),
             bookmarks_collection_cursor: None,
             safe_browsing_last_poll: None,
+            managed_policy_last_poll: None,
             bookmarks_collection_last_poll: None,
             capture_region_mode: false,
             capture_region_start: None,
@@ -1134,6 +1587,12 @@ impl WebState {
     fn with_transfers(mut self, transfers: Box<dyn TransfersClient>) -> Self {
         self.transfers = transfers;
         self.refresh_downloads();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_download_opener(mut self, opener: Box<dyn DownloadOpener>) -> Self {
+        self.download_opener = opener;
         self
     }
 
@@ -1300,6 +1759,44 @@ impl WebState {
         }
     }
 
+    fn open_download(&mut self, id: &str) {
+        let target = self
+            .download_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or_else(|| "Download is no longer visible".to_owned())
+            .and_then(completed_browser_download_target);
+        match target {
+            Ok(target) => match self.download_opener.open_path(&target.open) {
+                Ok(()) => {
+                    self.download_notice = None;
+                    self.capture_notice = Some(format!("Opening {}", target.open.display()));
+                }
+                Err(err) => self.download_notice = Some(format!("Open failed: {err}")),
+            },
+            Err(err) => self.download_notice = Some(err),
+        }
+    }
+
+    fn reveal_download(&mut self, id: &str) {
+        let target = self
+            .download_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or_else(|| "Download is no longer visible".to_owned())
+            .and_then(completed_browser_download_target);
+        match target {
+            Ok(target) => match self.download_opener.reveal_path(&target.reveal) {
+                Ok(()) => {
+                    self.download_notice = None;
+                    self.capture_notice = Some(format!("Showing {}", target.reveal.display()));
+                }
+                Err(err) => self.download_notice = Some(format!("Show failed: {err}")),
+            },
+            Err(err) => self.download_notice = Some(err),
+        }
+    }
+
     /// Append a session as a new tab and make it active. The live helper-spawn open
     /// path (gated) and the tests both funnel through here; the default gated build
     /// opens no tabs and shows the honest `EmptyState`, so this is unused there.
@@ -1316,7 +1813,10 @@ impl WebState {
         let mut session = session;
         let url = session.nav().url.clone();
         session.set_filter(self.compiled_request_filter_for_url(&url));
+        let id = self.next_tab_id;
+        self.next_tab_id = self.next_tab_id.saturating_add(1);
         self.tabs.push(Tab {
+            id,
             session,
             engine,
             container: ContainerProfile::None,
@@ -1324,6 +1824,7 @@ impl WebState {
             group: None,
             pinned: false,
             muted: false,
+            autoplay_blocked: false,
             force_dark: false,
             reader_mode: false,
             user_scripts: false,
@@ -1334,6 +1835,7 @@ impl WebState {
             page_focused: false,
             texture: None,
             last_frame: None,
+            last_audited_resource_seq: 0,
             resizer: ViewportResizer::default(),
             favicon_cache: None,
         });
@@ -1350,6 +1852,37 @@ impl WebState {
     }
 
     fn request_new_tab_with_url(&mut self, engine: BrowserEngine, url: String) {
+        let prompt_plain_http = is_plain_http(&url) && !browser_internal_plain_http_new_tab(&url);
+        if prompt_plain_http {
+            if host_of(&url).is_some_and(|h| self.hsts_hosts.contains(&h)) {
+                let upgraded = https_upgrade(&url);
+                self.publish_insecure_navigation(
+                    engine,
+                    &url,
+                    "",
+                    "auto_upgrade",
+                    "new_tab",
+                    "session_hsts",
+                    Some(&upgraded),
+                    unix_ms(),
+                );
+                self.request_new_tab_with_url(engine, upgraded);
+                return;
+            }
+        }
+        if let Some(block) = self.managed_policy_block_for(&url) {
+            self.block_managed_navigation(block, ManagedPolicyBlockTrigger::NewTab, Some(engine));
+            return;
+        }
+        if prompt_plain_http {
+            self.prompt_insecure_navigation(url, InsecureNavigationTarget::NewTab(engine));
+            return;
+        }
+        self.managed_policy_block = None;
+        self.queue_new_tab_url(engine, url);
+    }
+
+    fn queue_new_tab_url(&mut self, engine: BrowserEngine, url: String) {
         self.open_requested
             .push_back(TabOpenIntent::NewForegroundUrl { engine, url });
     }
@@ -2041,8 +2574,16 @@ impl WebState {
         if index >= self.tabs.len() {
             return;
         }
+        let closing_tab_id = self.tabs[index].id;
         self.remember_closed_tab(index);
         self.tabs.remove(index);
+        if self
+            .pending_login_save
+            .as_ref()
+            .is_some_and(|pending| pending.tab_id == closing_tab_id)
+        {
+            self.pending_login_save = None;
+        }
         if self.tabs.is_empty() {
             self.active = 0;
             self.address.clear();
@@ -2234,18 +2775,45 @@ impl WebState {
             // (the one-shot recursion re-enters with an https URL, so is_plain_http
             // is false and it falls through to the normal load).
             if host_of(&url).is_some_and(|h| self.hsts_hosts.contains(&h)) {
-                self.load_target(https_upgrade(&url));
+                let upgraded = https_upgrade(&url);
+                let engine = self
+                    .tabs
+                    .get(self.active)
+                    .map_or(self.engine, |tab| tab.engine);
+                let title = self
+                    .tabs
+                    .get(self.active)
+                    .map_or(String::new(), |tab| tab.session.title().to_owned());
+                self.publish_insecure_navigation(
+                    engine,
+                    &url,
+                    &title,
+                    "auto_upgrade",
+                    "active_tab",
+                    "session_hsts",
+                    Some(&upgraded),
+                    unix_ms(),
+                );
+                self.load_target(upgraded);
                 return;
             }
-            self.insecure_prompt = Some(url);
+        }
+        if let Some(block) = self.managed_policy_block_for(&url) {
+            self.block_managed_navigation(block, ManagedPolicyBlockTrigger::ChromeLoad, None);
+            return;
+        }
+        if is_plain_http(&url) {
+            self.prompt_insecure_navigation(url, InsecureNavigationTarget::ActiveTab);
             return;
         }
         if let Some(protocol) = ExternalProtocol::from_url(&url) {
-            self.insecure_prompt = None;
+            self.clear_insecure_prompt();
+            self.managed_policy_block = None;
             self.publish_external_protocol(protocol, &url);
             return;
         }
-        self.insecure_prompt = None;
+        self.clear_insecure_prompt();
+        self.managed_policy_block = None;
         self.mark_active_tab_activity();
         if let Some(tab) = self.active_tab() {
             tab.session.load(url);
@@ -2303,19 +2871,93 @@ impl WebState {
         self.load_target(url);
     }
 
-    fn continue_insecure_load(&mut self) {
-        let Some(url) = self.insecure_prompt.take() else {
-            return;
-        };
-        self.address = url.clone();
-        self.mark_active_tab_activity();
-        if let Some(tab) = self.active_tab() {
-            tab.session.load(url);
+    fn prompt_insecure_navigation(&mut self, url: String, target: InsecureNavigationTarget) {
+        let (engine, title) = self.insecure_navigation_context(target);
+        let upgraded = https_upgrade(&url);
+        self.insecure_prompt = Some(url.clone());
+        self.insecure_prompt_target = target;
+        self.publish_insecure_navigation(
+            engine,
+            &url,
+            &title,
+            "prompt",
+            target.wire(),
+            "navigation_prompt",
+            Some(&upgraded),
+            unix_ms(),
+        );
+    }
+
+    fn clear_insecure_prompt(&mut self) {
+        self.insecure_prompt = None;
+        self.insecure_prompt_target = InsecureNavigationTarget::ActiveTab;
+    }
+
+    fn take_insecure_prompt(&mut self) -> Option<(String, InsecureNavigationTarget)> {
+        let url = self.insecure_prompt.take()?;
+        let target = self.insecure_prompt_target;
+        self.insecure_prompt_target = InsecureNavigationTarget::ActiveTab;
+        Some((url, target))
+    }
+
+    fn insecure_navigation_context(
+        &self,
+        target: InsecureNavigationTarget,
+    ) -> (BrowserEngine, String) {
+        if let Some(engine) = target.engine_override() {
+            return (engine, String::new());
+        }
+        self.tabs
+            .get(self.active)
+            .map_or((self.engine, String::new()), |tab| {
+                (tab.engine, tab.session.title().to_owned())
+            })
+    }
+
+    fn resume_insecure_navigation(&mut self, target: InsecureNavigationTarget, url: String) {
+        match target {
+            InsecureNavigationTarget::ActiveTab => {
+                self.address = url.clone();
+                self.mark_active_tab_activity();
+                if let Some(tab) = self.active_tab() {
+                    tab.session.load(url);
+                }
+            }
+            InsecureNavigationTarget::NewTab(engine) => {
+                self.queue_new_tab_url(engine, url);
+            }
         }
     }
 
+    fn continue_insecure_load(&mut self) {
+        let Some((url, target)) = self.take_insecure_prompt() else {
+            return;
+        };
+        if let Some(block) = self.managed_policy_block_for(&url) {
+            self.block_managed_navigation(
+                block,
+                ManagedPolicyBlockTrigger::HttpContinue,
+                target.engine_override(),
+            );
+            return;
+        }
+        let (engine, title) = self.insecure_navigation_context(target);
+        self.publish_insecure_navigation(
+            engine,
+            &url,
+            &title,
+            "continue",
+            target.wire(),
+            "navigation_prompt",
+            None,
+            unix_ms(),
+        );
+        self.managed_policy_block = None;
+        self.resume_insecure_navigation(target, url);
+    }
+
     fn upgrade_insecure_load(&mut self) {
-        let Some(url) = self.insecure_prompt.take() else {
+        let Some((url, target)) = self.take_insecure_prompt() else {
             return;
         };
         // Remember this host for the session so we auto-upgrade it next time (HSTS).
@@ -2323,15 +2965,44 @@ impl WebState {
             self.hsts_hosts.insert(host);
         }
         let upgraded = https_upgrade(&url);
-        self.address = upgraded.clone();
-        self.mark_active_tab_activity();
-        if let Some(tab) = self.active_tab() {
-            tab.session.load(upgraded);
+        if let Some(block) = self.managed_policy_block_for(&upgraded) {
+            self.block_managed_navigation(
+                block,
+                ManagedPolicyBlockTrigger::HttpsUpgrade,
+                target.engine_override(),
+            );
+            return;
         }
+        let (engine, title) = self.insecure_navigation_context(target);
+        self.publish_insecure_navigation(
+            engine,
+            &url,
+            &title,
+            "upgrade",
+            target.wire(),
+            "navigation_prompt",
+            Some(&upgraded),
+            unix_ms(),
+        );
+        self.managed_policy_block = None;
+        self.resume_insecure_navigation(target, upgraded);
     }
 
     fn cancel_insecure_load(&mut self) {
-        self.insecure_prompt = None;
+        let Some((url, target)) = self.take_insecure_prompt() else {
+            return;
+        };
+        let (engine, title) = self.insecure_navigation_context(target);
+        self.publish_insecure_navigation(
+            engine,
+            &url,
+            &title,
+            "cancel",
+            target.wire(),
+            "navigation_prompt",
+            None,
+            unix_ms(),
+        );
     }
 
     /// Clear ALL browsing data in one front-door action (Privacy → Clear all
@@ -2341,6 +3012,23 @@ impl WebState {
     /// is session-only by design (nothing was ever persisted — Q74/Q80), so this
     /// forgets in-memory state rather than wiping a disk profile.
     fn clear_all_browsing_data(&mut self) {
+        let counts = BrowserBrowsingDataClearCounts {
+            history_entries: self.history.visits().count(),
+            downloads: self.download_jobs.len(),
+            reopen_entries: self.closed_tabs.len(),
+            saved_logins: self.session_logins.len(),
+            permission_grants: self.granted_permissions.len(),
+        };
+        let (engine, active_url, active_title, active_host) =
+            self.tabs.get(self.active).map_or_else(
+                || (self.engine, String::new(), String::new(), String::new()),
+                |tab| {
+                    let url = tab.session.nav().url.trim().to_owned();
+                    let host = host_of(&url).unwrap_or_default();
+                    (tab.engine, url, tab.session.title().to_owned(), host)
+                },
+            );
+        let cleared_ms = unix_ms();
         self.history.clear();
         self.dismiss_all_downloads();
         self.closed_tabs.clear();
@@ -2350,13 +3038,28 @@ impl WebState {
         // security upgrade, and forgetting it would downgrade a site back to plain http.
         self.session_logins.clear();
         self.granted_permissions.clear();
+        self.login_user_draft.clear();
+        self.login_pass_draft.clear();
+        self.pending_login_save = None;
         self.clear_active_session_data();
+        self.publish_browsing_data_clear(
+            engine,
+            &active_url,
+            &active_title,
+            &active_host,
+            counts,
+            cleared_ms,
+        );
     }
 
     fn clear_active_session_data(&mut self) {
-        let cleared_host = self.active_first_party();
+        let cleared_site = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            let host = host_of(&url)?;
+            Some((host, tab.engine, url, tab.session.title().to_owned()))
+        });
         self.mark_active_tab_activity();
-        self.insecure_prompt = None;
+        self.clear_insecure_prompt();
         self.dashboard_query.clear();
         self.find_query.clear();
         self.find_open = false;
@@ -2367,6 +3070,7 @@ impl WebState {
             tab.texture = None;
             tab.last_frame = None;
             tab.muted = false;
+            tab.autoplay_blocked = false;
             tab.force_dark = false;
             tab.reader_mode = false;
             tab.user_scripts = false;
@@ -2376,6 +3080,7 @@ impl WebState {
             tab.session.set_zoom(self.page_zoom_percent);
             tab.session.clear_find();
             tab.session.set_audio_muted(false);
+            tab.session.set_autoplay_blocked(false);
             tab.session.set_force_dark(false);
             tab.session.set_reader_mode(false);
             tab.session.set_user_scripts(false, "");
@@ -2383,8 +3088,10 @@ impl WebState {
             tab.session
                 .set_device_profile(DeviceProfile::Default.wire(), 0, 0, 100, false);
         }
-        if let Some(host) = cleared_host {
-            self.site_data.mark_cleared(&host, unix_ms());
+        if let Some((host, engine, url, title)) = cleared_site {
+            let cleared_ms = unix_ms();
+            self.site_data.mark_cleared(&host, cleared_ms);
+            self.publish_site_data_clear(engine, &url, &title, &host, "current_tab", cleared_ms);
         }
     }
 
@@ -2595,11 +3302,27 @@ impl WebState {
             return Err(selection.empty_error().to_owned());
         }
         let mut sources = Vec::with_capacity(requests.len());
+        let mut blocked = 0usize;
         for (index, body) in requests.into_iter().enumerate() {
             let request_url = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v["asset_url"].as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| url.clone());
+            if let Some(block) = self.managed_policy_block_for(&request_url) {
+                blocked += 1;
+                self.block_managed_download(block);
+                continue;
+            }
+            if let Some(rule) = self.safe_browsing_download_block_for(&request_url) {
+                blocked += 1;
+                self.block_safe_browsing_download(&request_url, &rule);
+                continue;
+            }
+            if self.insecure_download_block_for(&request_url) {
+                blocked += 1;
+                self.block_insecure_download(&request_url);
+                continue;
+            }
             let path = spool_dir.join(media_asset_request_filename_for(
                 &url,
                 &title,
@@ -2610,6 +3333,12 @@ impl WebState {
             std::fs::write(&path, body)
                 .map_err(|err| format!("write media download request {}: {err}", path.display()))?;
             sources.push(path.to_string_lossy().to_string());
+        }
+        if sources.is_empty() {
+            let suffix = if blocked == 1 { "" } else { "s" };
+            return Err(format!(
+                "browser policy blocked {blocked} selected download{suffix}"
+            ));
         }
         enqueue_browser_output_batch(
             self.transfers.as_ref(),
@@ -2630,12 +3359,26 @@ impl WebState {
             return;
         }
         let filename = resolve_download_filename(url, filename);
-        if download_is_dangerous(&filename) {
-            self.pending_dangerous_download = Some(PendingDangerousDownload {
+        if let Some(block) = self.managed_policy_block_for(url) {
+            self.block_managed_download(block);
+            return;
+        }
+        if let Some(rule) = self.safe_browsing_download_block_for(url) {
+            self.block_safe_browsing_download(url, &rule);
+            return;
+        }
+        if self.insecure_download_block_for(url) {
+            self.block_insecure_download(url);
+            return;
+        }
+        if download_is_dangerous(&filename) || download_url_path_is_dangerous(url) {
+            let pending = PendingDangerousDownload {
                 id,
                 url: url.to_owned(),
                 filename,
-            });
+            };
+            self.publish_download_danger(&pending, "prompt", unix_ms());
+            self.pending_dangerous_download = Some(pending);
             self.downloads_open = true;
             return;
         }
@@ -2646,6 +3389,19 @@ impl WebState {
     /// exactly as a safe download would.
     fn keep_pending_dangerous_download(&mut self) {
         if let Some(pending) = self.pending_dangerous_download.take() {
+            self.publish_download_danger(&pending, "keep", unix_ms());
+            if let Some(block) = self.managed_policy_block_for(&pending.url) {
+                self.block_managed_download(block);
+                return;
+            }
+            if let Some(rule) = self.safe_browsing_download_block_for(&pending.url) {
+                self.block_safe_browsing_download(&pending.url, &rule);
+                return;
+            }
+            if self.insecure_download_block_for(&pending.url) {
+                self.block_insecure_download(&pending.url);
+                return;
+            }
             self.enqueue_download_to_ledger(pending.id, &pending.url, &pending.filename);
         }
     }
@@ -2653,7 +3409,9 @@ impl WebState {
     /// The user chose **Discard** on a dangerous-download warning — drop it
     /// with no ledger job ever created.
     fn discard_pending_dangerous_download(&mut self) {
-        self.pending_dangerous_download = None;
+        if let Some(pending) = self.pending_dangerous_download.take() {
+            self.publish_download_danger(&pending, "discard", unix_ms());
+        }
     }
 
     /// Write the `.download.json` manifest and enqueue the mesh Transfers job
@@ -3098,6 +3856,25 @@ impl WebState {
         self.set_active_tab_muted(!muted);
     }
 
+    fn set_active_tab_autoplay_blocked(&mut self, blocked: bool) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        if let Some(tab) = self.active_tab() {
+            tab.autoplay_blocked = blocked;
+            tab.session.set_autoplay_blocked(blocked);
+        }
+        self.publish_session_snapshot();
+    }
+
+    fn toggle_active_tab_autoplay_blocked(&mut self) {
+        let blocked = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.autoplay_blocked);
+        self.set_active_tab_autoplay_blocked(!blocked);
+    }
+
     fn set_active_tab_force_dark(&mut self, enabled: bool) {
         if !self.can_drive_page_tools() {
             return;
@@ -3326,6 +4103,14 @@ impl WebState {
         }
     }
 
+    fn handle_js_dialog_event(&mut self, tab_index: usize, dialog: &JsDialog) {
+        let mut notice = js_dialog_notice(dialog);
+        if tab_index != self.active {
+            notice = format!("Background tab: {notice}");
+        }
+        self.capture_notice = Some(notice);
+    }
+
     fn set_active_tab_container(&mut self, container: ContainerProfile) {
         if let Some(tab) = self.active_tab() {
             tab.container = container;
@@ -3525,6 +4310,7 @@ impl WebState {
             tab.engine = engine;
             tab.texture = None;
             tab.last_frame = None;
+            tab.last_audited_resource_seq = 0;
             tab.last_activity = Instant::now();
             tab.idle_suspended = false;
             // A fresh helper re-negotiates its viewport from scratch.
@@ -3535,6 +4321,7 @@ impl WebState {
 
     fn compiled_request_filter(&self) -> RequestFilter {
         RequestFilter::from_store(&self.adfilter_store)
+            .with_managed_policy(self.managed_url_policy.clone())
             .with_safe_browsing(SafeBrowsingBlocklist::from_hosts(&self.safe_browsing_hosts))
     }
 
@@ -3547,6 +4334,31 @@ impl WebState {
     fn is_permission_granted(&self, origin: &str, kind: u8) -> bool {
         self.granted_permissions
             .contains(&(origin.to_owned(), kind))
+    }
+
+    /// The active tab's oldest pending beforeunload prompt, if any. Cloned so the
+    /// UI can render without holding a mutable borrow into the tab/session.
+    fn pending_before_unload_prompt(&self) -> Option<BeforeUnloadDialog> {
+        self.tabs
+            .get(self.active)?
+            .session
+            .pending_before_unload()
+            .cloned()
+    }
+
+    /// Answer the active tab's pending beforeunload prompt, if it still matches
+    /// the prompt id the UI rendered.
+    fn answer_active_before_unload(&mut self, id: u64, proceed: bool) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab
+            .session
+            .pending_before_unload()
+            .is_some_and(|prompt| prompt.id == id)
+        {
+            tab.session.answer_before_unload(proceed);
+        }
     }
 
     /// Resolve the active tab's pending permission request, if any: a capability
@@ -3562,9 +4374,29 @@ impl WebState {
             .pending_permission()
             .map(|req| (req.origin.clone(), req.kind))?;
         if self.is_permission_granted(&origin, kind) {
+            let (engine, url, title) = self.tabs.get(self.active).map_or(
+                (self.engine, String::new(), String::new()),
+                |tab| {
+                    (
+                        tab.engine,
+                        tab.session.nav().url.clone(),
+                        tab.session.title().to_owned(),
+                    )
+                },
+            );
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.session.answer_permission(true);
             }
+            self.publish_permission_decision(
+                engine,
+                &origin,
+                kind,
+                true,
+                "session_grant_reuse",
+                &url,
+                &title,
+                unix_ms(),
+            );
             return None;
         }
         Some((origin, kind))
@@ -3573,35 +4405,84 @@ impl WebState {
     /// Answer the active tab's pending permission prompt; a grant is remembered for
     /// the session so the same origin+capability won't re-prompt.
     fn answer_active_permission(&mut self, origin: &str, kind: u8, allow: bool) {
+        let origin = origin.trim();
+        let Some((engine, url, title)) = self.tabs.get(self.active).and_then(|tab| {
+            tab.session
+                .pending_permission()
+                .is_some_and(|request| request.origin.trim() == origin && request.kind == kind)
+                .then(|| {
+                    (
+                        tab.engine,
+                        tab.session.nav().url.clone(),
+                        tab.session.title().to_owned(),
+                    )
+                })
+        }) else {
+            return;
+        };
         if allow {
             self.grant_permission(origin, kind);
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.session.answer_permission(allow);
         }
+        self.publish_permission_decision(
+            engine,
+            origin,
+            kind,
+            allow,
+            "helper_permission_prompt",
+            &url,
+            &title,
+            unix_ms(),
+        );
     }
 
     /// Save (or update) a session-only login for `host`; replaces an existing entry
     /// with the same host+username. Blank host/username/password is ignored.
     fn save_login(&mut self, host: &str, username: &str, password: &str) {
+        self.save_login_with_trigger(host, username, password, "password_menu");
+    }
+
+    fn save_login_with_trigger(
+        &mut self,
+        host: &str,
+        username: &str,
+        password: &str,
+        trigger: &str,
+    ) {
         let host = host.trim().to_ascii_lowercase();
         let username = username.trim().to_owned();
         if host.is_empty() || username.is_empty() || password.is_empty() {
             return;
         }
-        if let Some(existing) = self
+        let decision = if let Some(existing) = self
             .session_logins
             .iter_mut()
             .find(|l| l.host == host && l.username == username)
         {
             existing.password = password.to_owned();
+            "update"
         } else {
             self.session_logins.push(StoredLogin {
-                host,
+                host: host.clone(),
                 username,
                 password: password.to_owned(),
             });
-        }
+            "save"
+        };
+        let credential_count = self.credential_count_for_host(&host);
+        let (engine, url, title) = self.credential_context_for_host(&host);
+        self.publish_credential_event(
+            engine,
+            &url,
+            &title,
+            &host,
+            decision,
+            trigger,
+            credential_count,
+            unix_ms(),
+        );
     }
 
     /// The saved logins for `host` (lowercased), in save order.
@@ -3613,30 +4494,172 @@ impl WebState {
             .collect()
     }
 
+    fn credential_count_for_host(&self, host: &str) -> usize {
+        let host = host.trim().to_ascii_lowercase();
+        self.session_logins
+            .iter()
+            .filter(|l| l.host == host)
+            .count()
+    }
+
+    fn credential_context_for_host(&self, host: &str) -> (BrowserEngine, String, String) {
+        let host = host.trim().to_ascii_lowercase();
+        let context = |tab: &Tab| {
+            (
+                tab.engine,
+                tab.session.nav().url.trim().to_owned(),
+                tab.session.title().to_owned(),
+            )
+        };
+        if !host.is_empty() {
+            if let Some(tab) = self.tabs.get(self.active).filter(|tab| {
+                host_of(tab.session.nav().url.trim())
+                    .is_some_and(|candidate| candidate == host.as_str())
+            }) {
+                return context(tab);
+            }
+            if let Some(tab) = self.tabs.iter().find(|tab| {
+                host_of(tab.session.nav().url.trim())
+                    .is_some_and(|candidate| candidate == host.as_str())
+            }) {
+                return context(tab);
+            }
+        }
+        self.tabs
+            .get(self.active)
+            .map_or((self.engine, String::new(), String::new()), context)
+    }
+
     /// Remove the saved login at `index` (manager delete).
     fn remove_login(&mut self, index: usize) {
         if index < self.session_logins.len() {
-            self.session_logins.remove(index);
+            let removed = self.session_logins.remove(index);
+            let credential_count = self.credential_count_for_host(&removed.host);
+            let (engine, url, title) = self.credential_context_for_host(&removed.host);
+            self.publish_credential_event(
+                engine,
+                &url,
+                &title,
+                &removed.host,
+                "delete",
+                "password_menu",
+                credential_count,
+                unix_ms(),
+            );
         }
     }
 
     /// Autofill the active tab's login form with a chosen credential (the engine
     /// injects the fill script). User-initiated only.
-    fn fill_active_login(&mut self, username: String, password: String) {
+    fn fill_active_login(&mut self, expected_host: String, username: String, password: String) {
+        if self.active_first_party().as_deref() != Some(expected_host.as_str()) {
+            return;
+        }
+        let credential_count = self.credential_count_for_host(&expected_host);
+        let (engine, url, title) = self.credential_context_for_host(&expected_host);
         if let Some(tab) = self.active_tab() {
-            tab.session.fill_login(username, password);
+            tab.session
+                .fill_login(expected_host.clone(), username, password);
+        } else {
+            return;
         }
         self.mark_active_tab_activity();
+        self.publish_credential_event(
+            engine,
+            &url,
+            &title,
+            &expected_host,
+            "fill",
+            "password_menu",
+            credential_count,
+            unix_ms(),
+        );
     }
 
-    /// Fold an auto-captured login (engine-beaconed JSON `{origin, username,
-    /// password}`) into a pending "Save password?" offer. Skipped if the exact
-    /// credential is already stored, so a re-login never re-prompts.
-    fn handle_login_capture(&mut self, body: &str) {
+    fn active_pending_login_save(&self) -> Option<&PendingLoginSave> {
+        self.pending_login_save
+            .as_ref()
+            .filter(|pending| self.pending_login_save_is_active(pending))
+    }
+
+    fn pending_login_save_is_active(&self, pending: &PendingLoginSave) -> bool {
+        if pending.tab_id == 0 {
+            return true;
+        }
+        self.tabs.get(self.active).is_some_and(|tab| {
+            tab.id == pending.tab_id
+                && host_of(tab.session.nav().url.trim())
+                    .is_some_and(|host| host == pending.host.as_str())
+        })
+    }
+
+    fn accept_pending_login_save(&mut self) {
+        let Some(pending) = self.pending_login_save.take() else {
+            return;
+        };
+        if !self.pending_login_save_is_active(&pending) {
+            self.pending_login_save = Some(pending);
+            return;
+        }
+        self.save_login_with_trigger(
+            &pending.host,
+            &pending.username,
+            &pending.password,
+            "auto_capture_prompt",
+        );
+    }
+
+    fn dismiss_pending_login_save(&mut self) {
+        let Some(pending) = self.pending_login_save.take() else {
+            return;
+        };
+        if !self.pending_login_save_is_active(&pending) {
+            self.pending_login_save = Some(pending);
+            return;
+        }
+        let credential_count = self.credential_count_for_host(&pending.host);
+        let (engine, url, title) = self.credential_context_for_host(&pending.host);
+        self.publish_credential_event(
+            engine,
+            &url,
+            &title,
+            &pending.host,
+            "dismiss",
+            "auto_capture_prompt",
+            credential_count,
+            unix_ms(),
+        );
+    }
+
+    /// Fold an auto-captured login (engine-supplied `origin` + page JSON carrying
+    /// username/password) into a host-bound "Save password?" offer. Skipped if the
+    /// exact credential is already stored, so a re-login never re-prompts.
+    fn handle_login_capture(&mut self, origin: &str, body: &str) {
+        let tab_id = self.tabs.get(self.active).map_or(0, |tab| tab.id);
+        self.handle_login_capture_from_tab(tab_id, origin, body);
+    }
+
+    fn handle_login_capture_from_tab(&mut self, tab_id: u64, origin: &str, body: &str) {
+        let host = host_of(origin).unwrap_or_default();
+        if host.is_empty() {
+            return;
+        }
+        if tab_id != 0 {
+            let Some(source_host) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| host_of(tab.session.nav().url.trim()))
+            else {
+                return;
+            };
+            if source_host != host {
+                return;
+            }
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
             return;
         };
-        let origin = v.get("origin").and_then(|x| x.as_str()).unwrap_or_default();
         let username = v
             .get("username")
             .and_then(|x| x.as_str())
@@ -3648,8 +4671,7 @@ impl WebState {
             .and_then(|x| x.as_str())
             .unwrap_or_default()
             .to_owned();
-        let host = host_of(origin).unwrap_or_default();
-        if host.is_empty() || username.is_empty() || password.is_empty() {
+        if username.is_empty() || password.is_empty() {
             return;
         }
         if self
@@ -3659,7 +4681,8 @@ impl WebState {
         {
             return; // already saved — no offer
         }
-        self.pending_login_save = Some(StoredLogin {
+        self.pending_login_save = Some(PendingLoginSave {
+            tab_id,
             host,
             username,
             password,
@@ -3674,10 +4697,12 @@ impl WebState {
 
     fn apply_adfilter_to_open_tabs(&mut self) {
         let store = self.adfilter_store.clone();
+        let managed_policy = self.managed_url_policy.clone();
         let safe_browsing = SafeBrowsingBlocklist::from_hosts(&self.safe_browsing_hosts);
         for tab in &mut self.tabs {
-            let mut filter =
-                RequestFilter::from_store(&store).with_safe_browsing(safe_browsing.clone());
+            let mut filter = RequestFilter::from_store(&store)
+                .with_managed_policy(managed_policy.clone())
+                .with_safe_browsing(safe_browsing.clone());
             filter.set_page(&tab.session.nav().url);
             tab.session.set_filter(filter);
         }
@@ -3705,6 +4730,18 @@ impl WebState {
                 } else {
                     "s"
                 }
+            )
+        }
+    }
+
+    fn managed_policy_summary(&self) -> String {
+        if self.managed_url_policy.is_empty() {
+            "Managed policy: no URL blocks loaded".to_owned()
+        } else {
+            format!(
+                "Managed policy: {} URL block rule{} loaded",
+                self.managed_url_policy.len(),
+                plural(self.managed_url_policy.len())
             )
         }
     }
@@ -3742,6 +4779,16 @@ impl WebState {
         let Some(host) = self.active_first_party() else {
             return;
         };
+        let (engine, url, title) =
+            self.tabs
+                .get(self.active)
+                .map_or((self.engine, String::new(), String::new()), |tab| {
+                    (
+                        tab.engine,
+                        tab.session.nav().url.trim().to_owned(),
+                        tab.session.title().to_owned(),
+                    )
+                });
         let now = unix_ms();
         if enabled {
             self.adfilter_store
@@ -3753,6 +4800,7 @@ impl WebState {
             publish(ACTION_ADFILTER_ALLOW, &adfilter_domain_body(&host));
         }
         self.apply_adfilter_to_open_tabs();
+        self.publish_site_blocking(engine, &url, &title, &host, enabled, now);
     }
 
     #[cfg_attr(
@@ -3781,6 +4829,308 @@ impl WebState {
         self.apply_adfilter_to_open_tabs();
     }
 
+    fn set_managed_url_policy(&mut self, policy: ManagedUrlPolicy) {
+        self.managed_url_policy = policy;
+        self.apply_adfilter_to_open_tabs();
+    }
+
+    fn managed_policy_block_for(&self, url: &str) -> Option<ManagedPolicyBlock> {
+        self.managed_url_policy
+            .matches(url)
+            .map(|rule| ManagedPolicyBlock {
+                url: url.to_owned(),
+                rule,
+            })
+    }
+
+    fn safe_browsing_download_block_for(&self, url: &str) -> Option<String> {
+        if self.safe_browsing_hosts.is_empty() {
+            return None;
+        }
+        let mut filter = RequestFilter::empty()
+            .with_safe_browsing(SafeBrowsingBlocklist::from_hosts(&self.safe_browsing_hosts));
+        let decision = filter.decide(url, mde_web_preview_client::ResourceType::Document);
+        decision
+            .blocked_by()
+            .and_then(|rule| rule.strip_prefix("safe-browsing:"))
+            .map(str::to_owned)
+    }
+
+    fn insecure_download_block_for(&self, url: &str) -> bool {
+        is_plain_http(url) && !plain_http_download_host_is_trusted(url)
+    }
+
+    fn block_managed_navigation(
+        &mut self,
+        block: ManagedPolicyBlock,
+        trigger: ManagedPolicyBlockTrigger,
+        engine_override: Option<BrowserEngine>,
+    ) {
+        self.clear_insecure_prompt();
+        self.publish_managed_policy_block(&block, trigger, engine_override);
+        self.managed_policy_block = Some(block.clone());
+        let host = host_of(&block.url).unwrap_or_else(|| block.url.clone());
+        self.capture_notice = Some(format!("Blocked by managed policy: {host}"));
+        self.mark_active_tab_activity();
+    }
+
+    fn block_managed_download(&mut self, block: ManagedPolicyBlock) {
+        self.publish_managed_policy_block(&block, ManagedPolicyBlockTrigger::Download, None);
+        let host = host_of(&block.url).unwrap_or_else(|| block.url.clone());
+        let notice = format!("Download blocked by managed policy: {host}");
+        self.download_notice = Some(notice.clone());
+        self.capture_notice = Some(notice);
+        self.downloads_open = true;
+    }
+
+    fn block_safe_browsing_download(&mut self, url: &str, rule: &str) {
+        self.publish_safe_browsing_block(url, rule, "download", unix_ms());
+        let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
+        let notice = format!("Download blocked by safe browsing: {host}");
+        self.download_notice = Some(notice.clone());
+        self.capture_notice = Some(notice);
+        self.downloads_open = true;
+    }
+
+    fn block_insecure_download(&mut self, url: &str) {
+        self.publish_insecure_download_block(url, "download", unix_ms());
+        let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
+        let notice = format!("Download blocked: insecure HTTP from {host}");
+        self.download_notice = Some(notice.clone());
+        self.capture_notice = Some(notice);
+        self.downloads_open = true;
+    }
+
+    fn publish_managed_policy_block(
+        &self,
+        block: &ManagedPolicyBlock,
+        trigger: ManagedPolicyBlockTrigger,
+        engine_override: Option<BrowserEngine>,
+    ) {
+        let (engine, title) = if let Some(engine) = engine_override {
+            (engine, String::new())
+        } else {
+            self.tabs
+                .get(self.active)
+                .map_or((self.engine, String::new()), |tab| {
+                    (tab.engine, tab.session.title().to_owned())
+                })
+        };
+        let body = browser_policy_block_body(
+            engine,
+            &block.url,
+            &title,
+            &block.rule,
+            trigger.wire(),
+            unix_ms(),
+        );
+        publish_to_bus(self.bus_root.as_deref(), EVENT_BROWSER_POLICY_BLOCK, &body);
+    }
+
+    fn publish_safe_browsing_block(&self, url: &str, rule: &str, trigger: &str, blocked_ms: u64) {
+        let (engine, title) = self
+            .tabs
+            .get(self.active)
+            .map_or((self.engine, String::new()), |tab| {
+                (tab.engine, tab.session.title().to_owned())
+            });
+        let body = browser_safe_browsing_block_body(engine, url, &title, rule, trigger, blocked_ms);
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_SAFE_BROWSING_BLOCK,
+            &body,
+        );
+    }
+
+    fn publish_insecure_download_block(&self, url: &str, trigger: &str, blocked_ms: u64) {
+        let (engine, title) = self
+            .tabs
+            .get(self.active)
+            .map_or((self.engine, String::new()), |tab| {
+                (tab.engine, tab.session.title().to_owned())
+            });
+        let body = browser_insecure_download_block_body(engine, url, &title, trigger, blocked_ms);
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_INSECURE_DOWNLOAD_BLOCK,
+            &body,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_insecure_navigation(
+        &self,
+        engine: BrowserEngine,
+        url: &str,
+        title: &str,
+        decision: &str,
+        trigger: &str,
+        enforcement: &str,
+        upgraded_url: Option<&str>,
+        decided_ms: u64,
+    ) {
+        let body = browser_insecure_navigation_body(
+            engine,
+            url,
+            title,
+            decision,
+            trigger,
+            enforcement,
+            upgraded_url,
+            decided_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_INSECURE_NAVIGATION,
+            &body,
+        );
+    }
+
+    fn publish_mixed_content_block(&self, block: &MixedContentBlockAudit, blocked_ms: u64) {
+        let body = browser_mixed_content_block_body(
+            block.engine,
+            &block.page_url,
+            &block.url,
+            &block.title,
+            block.resource,
+            "subresource",
+            blocked_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_MIXED_CONTENT_BLOCK,
+            &body,
+        );
+    }
+
+    fn publish_site_blocking(
+        &self,
+        engine: BrowserEngine,
+        url: &str,
+        title: &str,
+        host: &str,
+        enabled: bool,
+        updated_ms: u64,
+    ) {
+        let body = browser_site_blocking_body(engine, url, title, host, enabled, updated_ms);
+        publish_to_bus(self.bus_root.as_deref(), EVENT_BROWSER_SITE_BLOCKING, &body);
+    }
+
+    fn publish_site_data_clear(
+        &self,
+        engine: BrowserEngine,
+        url: &str,
+        title: &str,
+        host: &str,
+        scope: &str,
+        cleared_ms: u64,
+    ) {
+        let body = browser_site_data_clear_body(engine, url, title, host, scope, cleared_ms);
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_SITE_DATA_CLEAR,
+            &body,
+        );
+    }
+
+    fn publish_browsing_data_clear(
+        &self,
+        engine: BrowserEngine,
+        active_url: &str,
+        active_title: &str,
+        active_host: &str,
+        counts: BrowserBrowsingDataClearCounts,
+        cleared_ms: u64,
+    ) {
+        let body = browser_browsing_data_clear_body(
+            engine,
+            active_url,
+            active_title,
+            active_host,
+            counts,
+            cleared_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_BROWSING_DATA_CLEAR,
+            &body,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_permission_decision(
+        &self,
+        engine: BrowserEngine,
+        origin: &str,
+        kind: u8,
+        allow: bool,
+        enforcement: &str,
+        url: &str,
+        title: &str,
+        decided_ms: u64,
+    ) {
+        let body = browser_permission_decision_body(
+            engine,
+            origin,
+            kind,
+            allow,
+            enforcement,
+            url,
+            title,
+            decided_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_PERMISSION_DECISION,
+            &body,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_credential_event(
+        &self,
+        engine: BrowserEngine,
+        url: &str,
+        title: &str,
+        host: &str,
+        decision: &str,
+        trigger: &str,
+        credential_count: usize,
+        updated_ms: u64,
+    ) {
+        let body = browser_credential_body(
+            engine,
+            url,
+            title,
+            host,
+            decision,
+            trigger,
+            credential_count,
+            updated_ms,
+        );
+        publish_to_bus(self.bus_root.as_deref(), EVENT_BROWSER_CREDENTIAL, &body);
+    }
+
+    fn publish_download_danger(
+        &self,
+        pending: &PendingDangerousDownload,
+        decision: &str,
+        updated_ms: u64,
+    ) {
+        let body = browser_download_danger_body(
+            pending.id,
+            &pending.url,
+            &pending.filename,
+            decision,
+            updated_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_DOWNLOAD_DANGER,
+            &body,
+        );
+    }
+
     /// Populate the safe-browsing blocklist from the operator-curated mesh policy
     /// file (`browser/safe-browsing-hosts.txt` under the workgroup root — the mackesd
     /// sync/operator writes it). Throttled; re-applies to open tabs only on a real
@@ -3802,10 +5152,33 @@ impl WebState {
             self.set_safe_browsing_hosts(hosts);
         }
     }
+
+    /// Populate the operator-managed URL policy from
+    /// `browser/managed-url-policy.txt` under the workgroup root. Lines are host
+    /// suffixes or URL prefixes; changes are applied to all open tabs.
+    fn poll_managed_url_policy(&mut self) {
+        if self
+            .managed_policy_last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.managed_policy_last_poll = Some(Instant::now());
+        let path = default_workgroup_root().join(MANAGED_URL_POLICY_PATH);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let policy = parse_managed_url_policy(&text);
+        if policy != self.managed_url_policy {
+            self.set_managed_url_policy(policy);
+        }
+    }
 }
 
 /// The operator-curated safe-browsing blocklist path, relative to the workgroup root.
 const SAFE_BROWSING_HOSTS_PATH: &str = "browser/safe-browsing-hosts.txt";
+/// The operator-managed URL policy path, relative to the workgroup root.
+const MANAGED_URL_POLICY_PATH: &str = "browser/managed-url-policy.txt";
 
 /// Parse the safe-browsing blocklist file: one host per line, `#` comments and blank
 /// lines skipped, hosts trimmed + lowercased. Pure so the parse is unit-tested.
@@ -3815,6 +5188,36 @@ fn parse_safe_browsing_hosts(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+/// Parse managed URL policy: one host suffix or URL prefix per line, `#` comments
+/// and blanks skipped. Pure so unit tests cover the operator-facing format.
+fn parse_managed_url_policy(text: &str) -> ManagedUrlPolicy {
+    ManagedUrlPolicy::from_rules(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#')),
+    )
+}
+
+fn plain_http_download_host_is_trusted(url: &str) -> bool {
+    let Some(host) = host_of(url) else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "mesh"
+        || host.ends_with(".mesh")
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.octets()[0] == 10 && ip.octets()[1] == 42)
+}
+
+fn browser_internal_plain_http_new_tab(url: &str) -> bool {
+    url.trim_start()
+        .get(..CEF_DEVTOOLS_URL.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(CEF_DEVTOOLS_URL))
 }
 
 /// The `live-helper` spawn glue: creating live [`WebSession`]s by launching the
@@ -3936,6 +5339,14 @@ impl WebState {
         helper_bin: std::path::PathBuf,
         spawn: impl FnOnce(&SpawnSpec) -> std::io::Result<WebSession>,
     ) {
+        if let Some(block) = self.managed_policy_block_for(&url) {
+            self.block_managed_navigation(
+                block,
+                ManagedPolicyBlockTrigger::LiveSpawn,
+                Some(engine),
+            );
+            return;
+        }
         if let Some(session) = self.make_session(seat_present, engine, url, helper_bin, spawn) {
             self.push_session_with_engine(session, engine);
         }
@@ -4099,6 +5510,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_security_update_status();
     state.poll_bookmarks_collection();
     state.poll_safe_browsing_hosts();
+    state.poll_managed_url_policy();
     state.suspend_idle_tabs(Instant::now());
 
     // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
@@ -4107,14 +5519,34 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let mut page_text_events = Vec::new();
     let mut page_scrape_events = Vec::new();
     let mut passkey_events = Vec::new();
+    let mut js_dialog_events = Vec::new();
     let mut popup_opens = Vec::new();
     let mut download_submits = Vec::new();
     let mut login_captures = Vec::new();
+    let mut mixed_content_blocks = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
         }
         tab.session.poll();
+        let resources = tab.session.recent_resource_requests();
+        let mut max_resource_seq = tab.last_audited_resource_seq;
+        for resource in resources
+            .iter()
+            .filter(|resource| resource.seq > tab.last_audited_resource_seq)
+        {
+            max_resource_seq = max_resource_seq.max(resource.seq);
+            if resource.blocked_by.as_deref() == Some("mixed-content:http") {
+                mixed_content_blocks.push(MixedContentBlockAudit {
+                    engine: tab.engine,
+                    page_url: tab.session.nav().url.clone(),
+                    title: tab.session.title().to_owned(),
+                    url: resource.url.clone(),
+                    resource: resource.resource,
+                });
+            }
+        }
+        tab.last_audited_resource_seq = max_resource_seq;
         for event in tab.session.drain_pdf_events() {
             pdf_events.push((event.path, event.ok));
         }
@@ -4138,8 +5570,13 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             download_submits.push((event.id, event.url, event.filename));
         }
         // A submitted login (auto-capture) → offer to save it (session-only).
-        for body in tab.session.drain_login_captures() {
-            login_captures.push(body);
+        for capture in tab.session.drain_login_captures() {
+            login_captures.push((tab.id, capture));
+        }
+        // JavaScript dialogs were auto-resolved by the engine; surface them as
+        // passive Browser notices so pages do not silently surprise the user.
+        for dialog in tab.session.drain_js_dialog_events() {
+            js_dialog_events.push((idx, dialog));
         }
     }
     for (engine, url) in popup_opens {
@@ -4164,8 +5601,14 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     for (tab_index, engine, body) in passkey_events {
         state.handle_passkey_event(tab_index, engine, &body);
     }
-    for body in login_captures {
-        state.handle_login_capture(&body);
+    for (tab_index, dialog) in js_dialog_events {
+        state.handle_js_dialog_event(tab_index, &dialog);
+    }
+    for (tab_id, capture) in login_captures {
+        state.handle_login_capture_from_tab(tab_id, &capture.origin, &capture.body);
+    }
+    for block in mixed_content_blocks {
+        state.publish_mixed_content_block(&block, unix_ms());
     }
     state.poll_spellcheck();
     // Engine-driven navigations (redirects, page scripts) land in the address
@@ -4279,6 +5722,32 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     // mutate `state` (respawn flag, back/close) without holding a `&mut Tab`
     // borrow of it.
     let active = state.active;
+    if state.managed_policy_block.is_none() {
+        let helper_block = state.tabs.get(active).and_then(|tab| {
+            tab.session.managed_policy_block().map(|url| {
+                state
+                    .managed_policy_block_for(url)
+                    .unwrap_or_else(|| ManagedPolicyBlock {
+                        url: url.to_owned(),
+                        rule: "managed-policy".to_owned(),
+                    })
+            })
+        });
+        if let Some(block) = helper_block {
+            state.block_managed_navigation(block, ManagedPolicyBlockTrigger::HelperDocument, None);
+        }
+    }
+    if let Some(block) = state.managed_policy_block.clone() {
+        if managed_policy_interstitial_body(ui, &block) {
+            state.managed_policy_block = None;
+            if let Some(tab) = state.active_tab() {
+                tab.session.clear_managed_policy_block();
+                tab.session.go_back();
+            }
+            state.mark_active_tab_activity();
+        }
+        return;
+    }
     // Safe-browsing: a top-level navigation to an unsafe host shows a full-page
     // "unsafe site" interstitial (the request was already dropped upstream). Taken
     // before the normal body, mirroring the cert-error precedence.
@@ -4306,19 +5775,19 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         .get(active)
         .is_some_and(|t| t.session.is_crashed() || t.session.cert_error().is_some());
     if !interstitial_below {
-        if let Some((origin, kind)) = state.pending_permission_prompt() {
+        if let Some(prompt) = state.pending_before_unload_prompt() {
+            if let Some(proceed) = before_unload_prompt_bar(ui, &prompt) {
+                state.answer_active_before_unload(prompt.id, proceed);
+            }
+        } else if let Some((origin, kind)) = state.pending_permission_prompt() {
             if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
                 state.answer_active_permission(&origin, kind, allow);
             }
-        }
-        // "Save password?" offer for an auto-captured login submit.
-        if let Some(pending) = state.pending_login_save.clone() {
+        } else if let Some(pending) = state.active_pending_login_save().cloned() {
+            // "Save password?" offer for an auto-captured login submit.
             match login_save_prompt_bar(ui, &pending.host, &pending.username) {
-                Some(true) => {
-                    state.save_login(&pending.host, &pending.username, &pending.password);
-                    state.pending_login_save = None;
-                }
-                Some(false) => state.pending_login_save = None,
+                Some(true) => state.accept_pending_login_save(),
+                Some(false) => state.dismiss_pending_login_save(),
                 None => {}
             }
         }
@@ -4406,6 +5875,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut group_tab: Option<usize> = None;
     let mut ungroup_tab_idx: Option<usize> = None;
     let mut mute_tab: Option<(usize, bool)> = None;
+    let mut autoplay_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
     let mut user_scripts_tab: Option<(usize, bool)> = None;
@@ -4557,6 +6027,15 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 mute_tab = Some((idx, !tab.muted));
                                 ui.close_menu();
                             }
+                            let autoplay_label = if tab.autoplay_blocked {
+                                "Allow autoplay"
+                            } else {
+                                "Block autoplay"
+                            };
+                            if ui.add(compact_menu_item(autoplay_label)).clicked() {
+                                autoplay_tab = Some((idx, !tab.autoplay_blocked));
+                                ui.close_menu();
+                            }
                             let dark_label = if tab.force_dark {
                                 "Disable force dark"
                             } else {
@@ -4654,6 +6133,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some((idx, muted)) = mute_tab {
         state.select_tab(idx);
         state.set_active_tab_muted(muted);
+    } else if let Some((idx, blocked)) = autoplay_tab {
+        state.select_tab(idx);
+        state.set_active_tab_autoplay_blocked(blocked);
     } else if let Some((idx, enabled)) = force_dark_tab {
         state.select_tab(idx);
         state.set_active_tab_force_dark(enabled);
@@ -4697,6 +6179,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut group_tab: Option<usize> = None;
     let mut ungroup_tab_idx: Option<usize> = None;
     let mut mute_tab: Option<(usize, bool)> = None;
+    let mut autoplay_tab: Option<(usize, bool)> = None;
     let mut force_dark_tab: Option<(usize, bool)> = None;
     let mut reader_tab: Option<(usize, bool)> = None;
     let mut user_scripts_tab: Option<(usize, bool)> = None;
@@ -4839,6 +6322,15 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     mute_tab = Some((idx, !tab.muted));
                                     ui.close_menu();
                                 }
+                                let autoplay_label = if tab.autoplay_blocked {
+                                    "Allow autoplay"
+                                } else {
+                                    "Block autoplay"
+                                };
+                                if ui.add(compact_menu_item(autoplay_label)).clicked() {
+                                    autoplay_tab = Some((idx, !tab.autoplay_blocked));
+                                    ui.close_menu();
+                                }
                                 let dark_label = if tab.force_dark {
                                     "Disable force dark"
                                 } else {
@@ -4935,6 +6427,9 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some((idx, muted)) = mute_tab {
         state.select_tab(idx);
         state.set_active_tab_muted(muted);
+    } else if let Some((idx, blocked)) = autoplay_tab {
+        state.select_tab(idx);
+        state.set_active_tab_autoplay_blocked(blocked);
     } else if let Some((idx, enabled)) = force_dark_tab {
         state.select_tab(idx);
         state.set_active_tab_force_dark(enabled);
@@ -5230,13 +6725,14 @@ fn tab_label(tab: &Tab) -> String {
     let container = tab.container.marker();
     let display = tab.display_target.marker();
     let muted = if tab.muted { "M " } else { "" };
+    let autoplay = if tab.autoplay_blocked { "A " } else { "" };
     let force_dark = if tab.force_dark { "D " } else { "" };
     let reader = if tab.reader_mode { "R " } else { "" };
     let user_scripts = if tab.user_scripts { "S " } else { "" };
     let user_agent = tab.user_agent.marker();
     let device_profile = tab.device_profile.marker();
     format!(
-        "{state} {container}{display}{muted}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
+        "{state} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
         ellipsize(base, 24)
     )
 }
@@ -5261,6 +6757,11 @@ fn tab_hover(tab: &Tab) -> String {
         target => format!(" - Display target: {}", target.label()),
     };
     let audio = if tab.muted { " - Muted" } else { "" };
+    let autoplay = if tab.autoplay_blocked {
+        " - Autoplay blocked"
+    } else {
+        ""
+    };
     let force_dark = if tab.force_dark { " - Force dark" } else { "" };
     let reader = if tab.reader_mode { " - Reader" } else { "" };
     let user_scripts = if tab.user_scripts {
@@ -5278,11 +6779,11 @@ fn tab_hover(tab: &Tab) -> String {
     };
     if url.is_empty() {
         format!(
-            "{state}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state}{container}{display}{audio}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     } else {
         format!(
-            "{state} - {url}{container}{display}{audio}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state} - {url}{container}{display}{audio}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     }
 }
@@ -5547,6 +7048,55 @@ const EVENT_BROWSER_OFFLINE_CACHE_PREFIX: &str = "event/browser-offline-cache/";
 
 /// Browser CEF security-update status prefix, owned by the daemon updater worker.
 const STATE_BROWSER_SECURITY_UPDATE_PREFIX: &str = "state/browser-security-update/";
+
+/// Browser managed-policy block audit event. Operators/admin tooling can consume
+/// this without scraping UI notices.
+const EVENT_BROWSER_POLICY_BLOCK: &str = "event/browser/policy-block";
+
+/// Browser safe-browsing block audit event. Operators/admin tooling can consume
+/// unsafe-host blocks without scraping interstitials or download notices.
+const EVENT_BROWSER_SAFE_BROWSING_BLOCK: &str = "event/browser/safe-browsing-block";
+
+/// Browser insecure-download block audit event. Operators/admin tooling can
+/// distinguish transport hard-blocks from content/policy blocks.
+const EVENT_BROWSER_INSECURE_DOWNLOAD_BLOCK: &str = "event/browser/insecure-download-block";
+
+/// Browser plain-HTTP top-level navigation audit event. Operators/admin tooling
+/// can distinguish prompts, user continues, upgrades, cancels, and session-HSTS
+/// auto-upgrades.
+const EVENT_BROWSER_INSECURE_NAVIGATION: &str = "event/browser/insecure-navigation";
+
+/// Browser mixed-content block audit event. Operators/admin tooling can consume
+/// secure-page downgrade blocks without scraping resource manifests.
+const EVENT_BROWSER_MIXED_CONTENT_BLOCK: &str = "event/browser/mixed-content-block";
+
+/// Browser per-site blocker toggle audit event. Operators/admin tooling can
+/// distinguish user privacy overrides from synced filter-list policy.
+const EVENT_BROWSER_SITE_BLOCKING: &str = "event/browser/site-blocking";
+
+/// Browser current-site data clear audit event. This records the session-memory
+/// reset that actually happened under the no-persistent-cookie threat model.
+const EVENT_BROWSER_SITE_DATA_CLEAR: &str = "event/browser/site-data-clear";
+
+/// Browser all-session browsing-data clear audit event. Operators/admin tooling can
+/// distinguish a full in-memory session wipe from a single-site reset.
+const EVENT_BROWSER_BROWSING_DATA_CLEAR: &str = "event/browser/browsing-data-clear";
+
+/// Browser runtime permission decision audit event. This records actual page
+/// capability decisions, including session-grant reuse auto-allows.
+const EVENT_BROWSER_PERMISSION_DECISION: &str = "event/browser/permission-decision";
+
+/// Browser permission revocation audit event. This records explicit current-site
+/// permission forgetting, including session-grant removal.
+const EVENT_BROWSER_PERMISSION_REVOKE: &str = "event/browser/permission-revoke";
+
+/// Browser session credential action audit event. This records save/update/delete
+/// and fill decisions without username, password, or per-credential identifiers.
+const EVENT_BROWSER_CREDENTIAL: &str = "event/browser/credential";
+
+/// Browser dangerous-download audit event. Operators/admin tooling can distinguish
+/// the warning prompt from the user's eventual Keep or Discard decision.
+const EVENT_BROWSER_DOWNLOAD_DANGER: &str = "event/browser/download-danger";
 
 /// Browser follow-me session snapshot. The sync owner drains this stream into the
 /// Nebula+Syncthing session store and later drives startup restore; Browser only
@@ -6118,6 +7668,24 @@ fn inline_top_hit(ordered: &[String], draft: &str) -> Option<usize> {
     (top.to_lowercase().starts_with(&d) && top.trim().len() > d.len()).then_some(0)
 }
 
+/// The grey inline-completion tail painted inside the focused omnibox. This is
+/// stricter than [`inline_top_hit`]: the keyboard preselect can tolerate
+/// whitespace/case oddities, but a visual overlay must line up with the exact
+/// draft buffer TextEdit is painting, so only no-trim, char-boundary prefixes
+/// get a visible tail.
+fn inline_completion_tail(ordered: &[String], draft: &str) -> Option<String> {
+    if draft.is_empty() || draft.trim() != draft {
+        return None;
+    }
+    let top = ordered.first()?;
+    if !top.to_lowercase().starts_with(&draft.to_lowercase()) {
+        return None;
+    }
+    top.get(draft.len()..)
+        .filter(|tail| !tail.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 impl SuggestionState {
     fn clear(&mut self) {
         self.draft.clear();
@@ -6164,6 +7732,14 @@ impl SuggestionState {
     fn selected_value(&self) -> Option<String> {
         self.selected
             .and_then(|i| self.ordered_commit_values().into_iter().nth(i))
+    }
+
+    /// The visible inline completion tail for the current draft, if the current
+    /// selected suggestion is the top-hit preselect.
+    fn inline_completion_tail(&self) -> Option<String> {
+        (self.selected == Some(0))
+            .then(|| self.ordered_commit_values())
+            .and_then(|ordered| inline_completion_tail(&ordered, &self.draft))
     }
 
     fn poll(&mut self) {
@@ -6610,7 +8186,13 @@ fn page_actions_menu(
 /// save a new credential for it. Session-only store, user-initiated fill (the engine
 /// injects the fill script). Deferred actions are applied after the popup closure so
 /// the store borrow ends before the save-form's mutable draft edit.
-fn password_menu(ui: &mut egui::Ui, state: &mut WebState, page_url: &str, has_page: bool) {
+fn password_menu(
+    ui: &mut egui::Ui,
+    state: &mut WebState,
+    page_url: &str,
+    has_page: bool,
+    can_fill: bool,
+) {
     let host = host_of(page_url).unwrap_or_default();
     let mut fill: Option<(String, String)> = None;
     let mut remove: Option<usize> = None;
@@ -6650,7 +8232,7 @@ fn password_menu(ui: &mut egui::Ui, state: &mut WebState, page_url: &str, has_pa
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
-                                has_page,
+                                has_page && can_fill,
                                 egui::Button::new(
                                     RichText::new(format!("Fill {username}")).size(CHROME_FONT),
                                 ),
@@ -6696,7 +8278,7 @@ fn password_menu(ui: &mut egui::Ui, state: &mut WebState, page_url: &str, has_pa
         },
     );
     if let Some((user, pass)) = fill {
-        state.fill_active_login(user, pass);
+        state.fill_active_login(host.clone(), user, pass);
     }
     if let Some(idx) = remove {
         state.remove_login(idx);
@@ -6957,6 +8539,20 @@ fn omnibox_layout_job(url: &str, font_id: egui::FontId) -> egui::text::LayoutJob
     job
 }
 
+fn paint_omnibox_inline_completion(ui: &mut egui::Ui, rect: egui::Rect, draft: &str, tail: &str) {
+    if draft.is_empty() || tail.is_empty() {
+        return;
+    }
+    let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+    let typed = ui.fonts(|f| f.layout_no_wrap(draft.to_owned(), font_id.clone(), Style::TEXT));
+    let ghost = ui.fonts(|f| f.layout_no_wrap(tail.to_owned(), font_id, Style::TEXT_DIM));
+    let text_pos = egui::pos2(
+        rect.left() + 4.0 + typed.size().x,
+        rect.center().y - ghost.size().y / 2.0,
+    );
+    ui.painter().galley(text_pos, ghost, Style::TEXT_DIM);
+}
+
 /// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`], shown
 /// at the top of the [`site_info_panel`]. Pure and paint-free so the copy is
 /// directly unit-testable without driving a frame.
@@ -6991,6 +8587,26 @@ struct SiteInfoSummary {
     confusable: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SiteInfoResourceSummary {
+    mixed_content_blocks: usize,
+    mixed_content_hosts: Vec<String>,
+    tracker_blocks: usize,
+    tracker_hosts: Vec<String>,
+    safe_browsing_blocks: usize,
+    safe_browsing_hosts: Vec<String>,
+    managed_policy_blocks: usize,
+    managed_policy_rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SiteInfoPermissionSummary {
+    host: String,
+    forgotten: bool,
+    session_grants: Vec<String>,
+    denied_prompts: Vec<String>,
+}
+
 /// Human-readable IDN homograph/spoofing warning for `host`, or `None` when it is
 /// not a confusable/punycode risk. Wires mde-adblock's [`confusable_reason`]
 /// detector into the site-info panel — the place users click to confirm identity,
@@ -7009,6 +8625,92 @@ fn confusable_warning(host: &str) -> Option<String> {
             }
         }
         .to_owned()
+    })
+}
+
+fn site_info_resource_summary(
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> SiteInfoResourceSummary {
+    let mut mixed_content_blocks = 0usize;
+    let mut mixed_content_hosts = BTreeSet::new();
+    let mut tracker_blocks = 0usize;
+    let mut tracker_hosts = BTreeSet::new();
+    let mut safe_browsing_blocks = 0usize;
+    let mut safe_browsing_hosts = BTreeSet::new();
+    let mut managed_policy_blocks = 0usize;
+    let mut managed_policy_rules = BTreeSet::new();
+    for resource in recent.iter().filter(|resource| !resource.allowed) {
+        let Some(blocked_by) = resource.blocked_by.as_deref() else {
+            continue;
+        };
+        if blocked_by == "mixed-content:http" {
+            mixed_content_blocks = mixed_content_blocks.saturating_add(1);
+            if let Some(host) = host_of(&resource.url) {
+                mixed_content_hosts.insert(host);
+            }
+        } else if let Some(rule) = blocked_by.strip_prefix("safe-browsing:") {
+            safe_browsing_blocks = safe_browsing_blocks.saturating_add(1);
+            safe_browsing_hosts.insert(rule.to_owned());
+        } else if let Some(rule) = blocked_by.strip_prefix("managed-policy:") {
+            managed_policy_blocks = managed_policy_blocks.saturating_add(1);
+            managed_policy_rules.insert(rule.to_owned());
+        } else {
+            tracker_blocks = tracker_blocks.saturating_add(1);
+            if let Some(host) = host_of(&resource.url) {
+                tracker_hosts.insert(host);
+            }
+        }
+    }
+    SiteInfoResourceSummary {
+        mixed_content_blocks,
+        mixed_content_hosts: mixed_content_hosts.into_iter().take(4).collect(),
+        tracker_blocks,
+        tracker_hosts: tracker_hosts.into_iter().take(4).collect(),
+        safe_browsing_blocks,
+        safe_browsing_hosts: safe_browsing_hosts.into_iter().take(4).collect(),
+        managed_policy_blocks,
+        managed_policy_rules: managed_policy_rules.into_iter().take(4).collect(),
+    }
+}
+
+fn permission_kind_site_info_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "geolocation",
+        1 => "notifications",
+        2 => "clipboard",
+        _ => "device capability",
+    }
+}
+
+fn site_info_permission_summary(state: &WebState) -> Option<SiteInfoPermissionSummary> {
+    let host = state.active_first_party()?;
+    let forgotten = state
+        .forgotten_permission_sites
+        .iter()
+        .any(|site| site == &host);
+    let session_grants = state
+        .granted_permissions
+        .iter()
+        .filter(|(origin, _)| host_of(origin).as_deref() == Some(host.as_str()))
+        .map(|(_, kind)| permission_kind_site_info_label(*kind).to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(4)
+        .collect();
+    let denied_prompts = state
+        .site_permission_prompts
+        .iter()
+        .filter(|prompt| prompt.host == host)
+        .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(4)
+        .collect();
+    Some(SiteInfoPermissionSummary {
+        host,
+        forgotten,
+        session_grants,
+        denied_prompts,
     })
 }
 
@@ -7038,12 +8740,19 @@ fn security_chip_popup_id() -> egui::Id {
 /// SECURITY-INFO — the Chrome-style "site information" popup opened by
 /// clicking the omnibox's [`security_chip`]: the security headline, the
 /// page's host (registrable domain emphasized, matching the omnibox), an
-/// `https` cert-validity line, and the browser's session-only privacy note
-/// (B3/Q74 — cookies and site data are never persisted past the browser
-/// closing, so this stays a static fact rather than a live count).
-fn site_info_panel(ui: &mut egui::Ui, page_url: &str) {
+/// `https` cert-validity line, active-page resource blocks, current-site
+/// permission posture, and the browser's session-only privacy note (B3/Q74 —
+/// cookies and site data are never persisted past the browser closing, so this
+/// stays a static fact rather than a live count).
+fn site_info_panel(
+    ui: &mut egui::Ui,
+    page_url: &str,
+    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
+    permissions: Option<&SiteInfoPermissionSummary>,
+) {
     let summary = site_info_summary(page_url);
-    ui.set_max_width(260.0);
+    let resources = site_info_resource_summary(recent_resources);
+    ui.set_max_width(300.0);
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(summary.security.glyph())
@@ -7091,6 +8800,169 @@ fn site_info_panel(ui: &mut egui::Ui, page_url: &str) {
     if let Some(cert_line) = summary.cert_line {
         ui.label(RichText::new(cert_line).small().color(Style::TEXT_DIM));
     }
+    if resources.managed_policy_blocks > 0 {
+        let suffix = if resources.managed_policy_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            RichText::new(format!(
+                "\u{26A0} Managed policy blocked: {} resource{suffix}",
+                resources.managed_policy_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.managed_policy_rules.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Matched policy: {}",
+                        resources.managed_policy_rules.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.safe_browsing_blocks > 0 {
+        let suffix = if resources.safe_browsing_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            RichText::new(format!(
+                "\u{26A0} Unsafe content blocked: {} resource{suffix}",
+                resources.safe_browsing_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.safe_browsing_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Unsafe hosts: {}",
+                        resources.safe_browsing_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.mixed_content_blocks > 0 {
+        let suffix = if resources.mixed_content_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            RichText::new(format!(
+                "\u{26A0} Insecure content blocked: {} public HTTP subresource{suffix}",
+                resources.mixed_content_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.mixed_content_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Blocked content hosts: {}",
+                        resources.mixed_content_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.tracker_blocks > 0 {
+        let suffix = if resources.tracker_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            RichText::new(format!(
+                "Privacy protection blocked: {} tracker/filter resource{suffix}",
+                resources.tracker_blocks
+            ))
+            .small()
+            .color(Style::TEXT_DIM),
+        );
+        if !resources.tracker_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Blocked tracker hosts: {}",
+                        resources.tracker_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if let Some(permissions) = permissions {
+        ui.separator();
+        ui.label(RichText::new("Permissions").small().strong());
+        ui.add(
+            egui::Label::new(
+                RichText::new("Sensitive capabilities default to deny")
+                    .small()
+                    .color(Style::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        if !permissions.session_grants.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Allowed this session: {}",
+                        permissions.session_grants.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+        if !permissions.denied_prompts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Denied prompts: {}",
+                        permissions.denied_prompts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+        if permissions.forgotten {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{} permissions were forgotten; future requests re-prompt under default deny",
+                        permissions.host
+                    ))
+                    .small()
+                    .color(Style::WARN),
+                )
+                .wrap(),
+            );
+        }
+    }
     ui.separator();
     ui.label(
         RichText::new("Cookies & site data clear when you close the browser")
@@ -7103,7 +8975,12 @@ fn site_info_panel(ui: &mut egui::Ui, page_url: &str) {
 /// (committed) page URL's scheme, not the in-progress edit draft. Clicking it
 /// opens the SECURITY-INFO [`site_info_panel`] below it, dismissed on
 /// click-away or Esc (egui's built-in popup close behavior).
-fn security_chip(ui: &mut egui::Ui, page_url: &str) {
+fn security_chip(
+    ui: &mut egui::Ui,
+    page_url: &str,
+    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
+    permissions: Option<&SiteInfoPermissionSummary>,
+) {
     let security = omnibox_display(page_url).security;
     let popup_id = security_chip_popup_id();
     let resp = ui
@@ -7124,7 +9001,7 @@ fn security_chip(ui: &mut egui::Ui, page_url: &str) {
         popup_id,
         &resp,
         egui::PopupCloseBehavior::CloseOnClickOutside,
-        |ui| site_info_panel(ui, page_url),
+        |ui| site_info_panel(ui, page_url, recent_resources, permissions),
     );
 }
 
@@ -7161,6 +9038,11 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         .get(state.active)
         .map(|t| t.session.title().to_string())
         .unwrap_or_default();
+    let recent_resources = state
+        .tabs
+        .get(state.active)
+        .map_or_else(Vec::new, |t| t.session.recent_resource_requests());
+    let permission_summary = site_info_permission_summary(state);
     let has_page = has_tab && !crashed && !page_url.trim().is_empty();
 
     let mut accepted_suggestion: Option<String> = None;
@@ -7221,7 +9103,13 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             &page_url,
             &page_title,
         );
-        password_menu(ui, state, &page_url, has_page);
+        password_menu(
+            ui,
+            state,
+            &page_url,
+            has_page,
+            active_engine == Some(BrowserEngine::Cef),
+        );
 
         if nav_button(
             ui,
@@ -7307,7 +9195,12 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
         // OMNIBOX-STYLE — the leading security chip reflects the CURRENT
         // (committed) page URL's scheme, never the in-progress edit draft.
-        security_chip(ui, &page_url);
+        security_chip(
+            ui,
+            &page_url,
+            &recent_resources,
+            permission_summary.as_ref(),
+        );
         ui.add_space(CHROME_GAP);
 
         // The address bar fills the rest of the row.
@@ -7327,12 +9220,19 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // idiom) on the primary keyboard target, so keyboard-only users get a clear,
         // consistent focus indicator instead of egui's faint default outline (a11y).
         mde_egui::focus::paint_focus_ring(ui.painter(), resp.rect, resp.has_focus());
+        if resp.changed() && has_tab && !crashed {
+            state.update_suggestions_for_address();
+        }
         // OMNIBOX-STYLE — when the omnibox is NOT being edited, paint the
         // Chrome-style elided/emphasized read-out ON TOP of the TextEdit
         // (never touching its own layouter/cursor logic, so click-to-edit
         // cursor placement stays exactly as correct as it is today). Focused
         // editing always shows the full, unmodified draft underneath.
-        if has_tab && !crashed && !resp.has_focus() && !state.address.trim().is_empty() {
+        if has_tab && !crashed && resp.has_focus() {
+            if let Some(tail) = state.suggestions.inline_completion_tail() {
+                paint_omnibox_inline_completion(ui, resp.rect, &state.address, &tail);
+            }
+        } else if has_tab && !crashed && !state.address.trim().is_empty() {
             let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
             let job = omnibox_layout_job(&state.address, font_id);
             if !job.is_empty() {
@@ -7346,9 +9246,6 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 );
                 ui.painter().galley(text_pos, galley, Style::TEXT);
             }
-        }
-        if resp.changed() && has_tab && !crashed {
-            state.update_suggestions_for_address();
         }
         // Keyboard-navigate the suggestion dropdown: a single-line TextEdit ignores
         // vertical arrows, so intercepting Up/Down here (while the omnibox has focus)
@@ -8310,6 +10207,9 @@ fn tab_accessibility_tools(tab: &Tab) -> String {
     if tab.muted {
         tools.push("muted");
     }
+    if tab.autoplay_blocked {
+        tools.push("autoplay blocked");
+    }
     if tab.force_dark {
         tools.push("force dark");
     }
@@ -8553,6 +10453,91 @@ fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
     back
 }
 
+/// Full-page interstitial for an operator-managed URL policy block. The request
+/// was already denied before network; this names the rule instead of leaving the
+/// previous page frame visible.
+fn managed_policy_interstitial_body(ui: &mut egui::Ui, block: &ManagedPolicyBlock) -> bool {
+    let host = host_of(&block.url).unwrap_or_else(|| block.url.trim().to_owned());
+    let mut back = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("\u{26D4} Blocked by policy")
+                .size(Style::HEADING)
+                .color(Style::DANGER),
+        );
+        ui.add_space(Style::SP_M);
+        ui.label(
+            RichText::new(format!(
+                "{host} is blocked by managed Browser policy. Rule: {}",
+                block.rule
+            ))
+            .color(Style::TEXT),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Back to safety").color(Style::TEXT),
+            ))
+            .clicked()
+        {
+            back = true;
+        }
+    });
+    back
+}
+
+fn js_dialog_action_label(kind: u8) -> (&'static str, &'static str) {
+    match kind {
+        0 => ("alert", "accepted"),
+        1 => ("confirm", "cancelled"),
+        2 => ("prompt", "cancelled"),
+        _ => ("dialog", "dismissed"),
+    }
+}
+
+fn js_dialog_notice(dialog: &JsDialog) -> String {
+    let (kind, action) = js_dialog_action_label(dialog.kind);
+    let origin = origin_label(&dialog.origin);
+    let message = dialog.message.trim();
+    let message = if message.is_empty() {
+        "(empty message)".to_owned()
+    } else {
+        ellipsize(message, 96)
+    };
+    format!("Page {kind} from {origin} was {action}: {message}")
+}
+
+fn origin_label(origin: &str) -> String {
+    host_of(origin).unwrap_or_else(|| {
+        let origin = origin.trim();
+        if origin.is_empty() {
+            "unknown origin".to_owned()
+        } else {
+            origin.to_owned()
+        }
+    })
+}
+
+fn before_unload_prompt_text(prompt: &BeforeUnloadDialog) -> String {
+    let origin = origin_label(&prompt.origin);
+    let action = if prompt.is_reload { "reload" } else { "leave" };
+    let message = prompt.message.trim();
+    let message = if message.is_empty() {
+        "(empty message)".to_owned()
+    } else {
+        ellipsize(message, 96)
+    };
+    format!("{origin} wants to {action} this page: {message}")
+}
+
+fn before_unload_primary_label(prompt: &BeforeUnloadDialog) -> &'static str {
+    if prompt.is_reload {
+        "Reload"
+    } else {
+        "Leave"
+    }
+}
+
 /// Human label for an engine-neutral permission kind (matches
 /// `EventMsg::PermissionRequest`: 0 geolocation, 1 notifications, 2 clipboard).
 fn permission_kind_label(kind: u8) -> &'static str {
@@ -8587,6 +10572,35 @@ fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bo
                 }
                 if ui
                     .add(egui::Button::new(RichText::new("Block").color(Style::TEXT)))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
+/// A blocking beforeunload prompt shown atop the page. Returns `Some(true)` for
+/// Leave/Reload and `Some(false)` for Stay.
+fn before_unload_prompt_bar(ui: &mut egui::Ui, prompt: &BeforeUnloadDialog) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(Style::SURFACE_HI)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(before_unload_prompt_text(prompt)).color(Style::TEXT));
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(before_unload_primary_label(prompt)).color(Style::TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Stay").color(Style::TEXT)))
                     .clicked()
                 {
                     decision = Some(false);
@@ -8869,6 +10883,27 @@ mod tests {
             .expect("accesskit update")
             .nodes
             .clone()
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.fallback_color));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 
     #[test]
@@ -10038,6 +12073,10 @@ mod tests {
         assert!(state.tabs[state.active].muted);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAudioMute);
         assert!(!state.tabs[state.active].muted);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
+        assert!(state.tabs[state.active].autoplay_blocked);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
+        assert!(!state.tabs[state.active].autoplay_blocked);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleForceDark);
         assert!(state.tabs[state.active].force_dark);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleForceDark);
@@ -10143,6 +12182,20 @@ mod tests {
                 mde_web_preview_client::ControlMsg::SetAudioMuted { muted: false }
             )),
             "unmuting the tab must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetAutoplayBlocked { blocked: true }
+            )),
+            "blocking autoplay must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetAutoplayBlocked { blocked: false }
+            )),
+            "allowing autoplay must reach the helper: {controls:?}"
         );
         assert!(
             controls.iter().any(|msg| matches!(
@@ -11179,6 +13232,189 @@ mod tests {
     }
 
     #[test]
+    fn runtime_permission_decisions_are_audited_and_sent_to_helper() {
+        use mde_web_preview_client::{ControlMsg, EventMsg};
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://app.example/dashboard".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("App Dashboard".to_owned()));
+        state.tabs[0].session.poll();
+
+        send_permission_request(&helper, 7, 0, "https://maps.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://maps.example".to_owned(), 0))
+        );
+        state.answer_active_permission("https://maps.example", 0, true);
+        assert!(state.is_permission_granted("https://maps.example", 0));
+
+        send_permission_request(&helper, 8, 0, "https://maps.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            None,
+            "a remembered grant auto-allows but is still audited"
+        );
+
+        send_permission_request(&helper, 9, 2, "https://clip.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://clip.example".to_owned(), 2))
+        );
+        state.answer_active_permission("https://clip.example", 2, false);
+        assert!(!state.is_permission_granted("https://clip.example", 2));
+
+        let permission_decisions = drain_control_messages(&helper)
+            .into_iter()
+            .filter(|msg| matches!(msg, ControlMsg::PermissionDecision { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            permission_decisions,
+            vec![
+                ControlMsg::PermissionDecision { id: 7, allow: true },
+                ControlMsg::PermissionDecision { id: 8, allow: true },
+                ControlMsg::PermissionDecision {
+                    id: 9,
+                    allow: false,
+                },
+            ]
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_PERMISSION_DECISION, None)
+            .expect("list permission decision events");
+        assert_eq!(msgs.len(), 3);
+        let events = msgs
+            .iter()
+            .map(|msg| {
+                serde_json::from_str::<serde_json::Value>(
+                    msg.body.as_deref().expect("permission-decision body"),
+                )
+                .expect("permission-decision JSON")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(events[0]["op"], "browser_permission_decision");
+        assert_eq!(events[0]["permission"], "geolocation");
+        assert_eq!(events[0]["permission_kind"], 0);
+        assert_eq!(events[0]["decision"], "allow");
+        assert_eq!(events[0]["grant_scope"], "session");
+        assert_eq!(events[0]["enforcement"], "helper_permission_prompt");
+        assert_eq!(events[0]["engine"], "servo");
+        assert_eq!(events[0]["origin"], "https://maps.example");
+        assert_eq!(events[0]["origin_host"], "maps.example");
+        assert_eq!(events[0]["url"], "https://app.example/dashboard");
+        assert_eq!(events[0]["title"], "App Dashboard");
+        assert_eq!(events[0]["source"], "browser");
+        assert_eq!(events[0]["node"], local_hostname());
+        assert!(events[0]["decided_ms"].as_u64().is_some());
+
+        assert_eq!(events[1]["permission"], "geolocation");
+        assert_eq!(events[1]["decision"], "allow");
+        assert_eq!(events[1]["enforcement"], "session_grant_reuse");
+
+        assert_eq!(events[2]["permission"], "clipboard");
+        assert_eq!(events[2]["permission_kind"], 2);
+        assert_eq!(events[2]["decision"], "deny");
+        assert_eq!(events[2]["grant_scope"], "none");
+        assert_eq!(events[2]["enforcement"], "helper_permission_prompt");
+        assert_eq!(events[2]["origin_host"], "clip.example");
+    }
+
+    #[test]
+    fn forgetting_site_permissions_revokes_runtime_grants_and_is_audited() {
+        use mde_web_preview_client::EventMsg;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://app.example/dashboard".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("App Dashboard".to_owned()));
+        state.tabs[0].session.poll();
+        state.grant_permission("https://app.example", 0);
+        state.grant_permission("https://other.example", 0);
+        state.site_permission_prompts.push(SitePermissionPrompt {
+            host: "app.example".to_owned(),
+            kind: DevicePermissionKind::Camera,
+            decision: "denied",
+            updated_ms: 123,
+        });
+        assert!(state.is_permission_granted("https://app.example", 0));
+
+        state.forget_active_site_permissions();
+
+        assert!(
+            !state.is_permission_granted("https://app.example", 0),
+            "forgetting this site must revoke its session grant"
+        );
+        assert!(
+            state.is_permission_granted("https://other.example", 0),
+            "other-site grants are untouched"
+        );
+        assert!(
+            state
+                .active_site_permission_summary()
+                .is_some_and(|summary| summary.contains("app.example: forgotten")),
+            "the visible permission summary reflects the forgotten state"
+        );
+
+        send_permission_request(&helper, 44, 0, "https://app.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://app.example".to_owned(), 0)),
+            "a revoked grant must not auto-allow the next request"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_PERMISSION_REVOKE, None)
+            .expect("list permission revoke events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("permission revoke body"))
+                .expect("permission revoke JSON");
+        assert_eq!(event["op"], "browser_permission_revoke");
+        assert_eq!(event["decision"], "revoke");
+        assert_eq!(event["enforcement"], "session_permission_store");
+        assert_eq!(event["permission_policy"], "default_deny");
+        assert_eq!(event["scope"], "current_site");
+        assert_eq!(event["engine"], "servo");
+        assert_eq!(event["url"], "https://app.example/dashboard");
+        assert_eq!(event["host"], "app.example");
+        assert_eq!(event["title"], "App Dashboard");
+        assert_eq!(event["revoked_grants"], 1);
+        assert_eq!(event["cleared_prompt_decisions"], 1);
+        assert_eq!(event["source"], "browser");
+        assert_eq!(event["node"], local_hostname());
+        assert!(event["updated_ms"].as_u64().is_some());
+    }
+
+    #[test]
     fn session_login_store_matches_by_host_updates_and_removes() {
         let mut state = WebState::default();
         state.save_login("Mail.Example.com", " alice ", "pw1"); // host lowercased, user trimmed
@@ -11212,19 +13448,217 @@ mod tests {
     }
 
     #[test]
+    fn stored_login_debug_redacts_session_credentials() {
+        let login = StoredLogin {
+            host: "mail.example.com".to_owned(),
+            username: "alice@example.com".to_owned(),
+            password: "hunter2".to_owned(),
+        };
+        let debug = format!("{login:?}");
+        assert!(debug.contains("mail.example.com"));
+        assert!(!debug.contains("alice@example.com"));
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn pending_login_save_debug_redacts_session_credentials() {
+        let pending = PendingLoginSave {
+            tab_id: 7,
+            host: "mail.example.com".to_owned(),
+            username: "alice@example.com".to_owned(),
+            password: "hunter2".to_owned(),
+        };
+        let debug = format!("{pending:?}");
+        assert!(debug.contains("mail.example.com"));
+        assert!(debug.contains("tab_id"));
+        assert!(!debug.contains("alice@example.com"));
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn filling_a_login_sends_the_credential_to_the_helper() {
         let (session, helper, _writer) = live_page_session();
         let mut state = WebState::default();
         state.push_session(session);
-        state.fill_active_login("alice@example.com".to_owned(), "hunter2".to_owned());
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://mail.example.com/login".to_owned(),
+            },
+        );
+        state.tabs[state.active].session.poll();
+        state.fill_active_login(
+            "mail.example.com".to_owned(),
+            "alice@example.com".to_owned(),
+            "hunter2".to_owned(),
+        );
         let controls = drain_control_messages(&helper);
         assert!(
             controls.iter().any(|m| matches!(
                 m,
-                mde_web_preview_client::ControlMsg::FillLogin { username, password }
-                    if username == "alice@example.com" && password == "hunter2"
+                mde_web_preview_client::ControlMsg::FillLogin { expected_host, username, password }
+                    if expected_host == "mail.example.com"
+                        && username == "alice@example.com"
+                        && password == "hunter2"
             )),
             "fill_active_login sends the chosen credential to the page: {controls:?}"
+        );
+
+        state.fill_active_login(
+            "other.example".to_owned(),
+            "alice@example.com".to_owned(),
+            "hunter2".to_owned(),
+        );
+        assert!(
+            drain_control_messages(&helper).is_empty(),
+            "a stale host-scoped fill must not leave the shell"
+        );
+    }
+
+    #[test]
+    fn auto_captured_login_prompt_is_scoped_to_the_source_tab() {
+        use mde_web_preview_client::EventMsg;
+
+        let (mail_session, mail_helper) = raw_session_pair();
+        let (work_session, work_helper) = raw_session_pair();
+        let mut state = WebState::default();
+
+        state.push_session(mail_session);
+        write_helper_event(
+            &mail_helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://mail.example.com/login".to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        let mail_tab_id = state.tabs[0].id;
+
+        state.push_session(work_session);
+        write_helper_event(
+            &work_helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://work.example.com/".to_owned(),
+            },
+        );
+        state.tabs[1].session.poll();
+        assert_eq!(state.active, 1, "second push makes the work tab active");
+
+        state.handle_login_capture_from_tab(
+            mail_tab_id,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw"}"#,
+        );
+        assert!(
+            state.pending_login_save.is_some(),
+            "the source tab keeps a pending save"
+        );
+        assert!(
+            state.active_pending_login_save().is_none(),
+            "the work tab must not show the mail tab's save prompt"
+        );
+
+        state.accept_pending_login_save();
+        assert!(
+            state.logins_for_host("mail.example.com").is_empty(),
+            "a stale prompt accept must not save from the wrong active tab"
+        );
+        assert!(
+            state.pending_login_save.is_some(),
+            "the prompt is retained for when the user returns to the source tab"
+        );
+
+        state.select_tab(0);
+        assert!(
+            state.active_pending_login_save().is_some(),
+            "returning to the source tab re-exposes the save prompt"
+        );
+        state.accept_pending_login_save();
+        assert_eq!(state.logins_for_host("mail.example.com").len(), 1);
+        assert!(state.pending_login_save.is_none());
+    }
+
+    #[test]
+    fn auto_captured_login_origin_must_match_the_source_tab_host() {
+        use mde_web_preview_client::EventMsg;
+
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default();
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://mail.example.com/login".to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        let tab_id = state.tabs[0].id;
+
+        state.handle_login_capture_from_tab(
+            tab_id,
+            "https://forged.example",
+            r#"{"username":"alice","password":"pw"}"#,
+        );
+        assert!(
+            state.pending_login_save.is_none(),
+            "the shell rejects a capture whose origin host does not match the source tab"
+        );
+
+        state.handle_login_capture_from_tab(
+            tab_id,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw"}"#,
+        );
+        assert_eq!(
+            state.pending_login_save.as_ref().map(|p| p.host.as_str()),
+            Some("mail.example.com"),
+            "matching source-tab origin hosts can still offer to save"
+        );
+    }
+
+    #[test]
+    fn closing_the_source_tab_clears_a_pending_login_save() {
+        use mde_web_preview_client::EventMsg;
+
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default();
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://mail.example.com/login".to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        let tab_id = state.tabs[0].id;
+
+        state.handle_login_capture_from_tab(
+            tab_id,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw"}"#,
+        );
+        assert!(state.pending_login_save.is_some());
+
+        state.close_tab(0);
+        assert!(
+            state.pending_login_save.is_none(),
+            "closing the source tab drops its pending save prompt"
         );
     }
 
@@ -11233,20 +13667,23 @@ mod tests {
         let mut state = WebState::default();
         // A captured submit (engine-beaconed JSON) → a pending save offer.
         state.handle_login_capture(
-            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw"}"#,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw"}"#,
         );
         let pending = state.pending_login_save.clone().expect("a save offer");
+        assert_eq!(pending.tab_id, 0);
         assert_eq!(pending.host, "mail.example.com");
         assert_eq!(pending.username, "alice");
 
         // Accept → save + clear.
-        state.save_login(&pending.host, &pending.username, &pending.password);
-        state.pending_login_save = None;
+        state.accept_pending_login_save();
         assert_eq!(state.logins_for_host("mail.example.com").len(), 1);
+        assert!(state.pending_login_save.is_none());
 
         // The SAME credential again does NOT re-offer (dedup).
         state.handle_login_capture(
-            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw"}"#,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw"}"#,
         );
         assert!(
             state.pending_login_save.is_none(),
@@ -11255,7 +13692,8 @@ mod tests {
 
         // A CHANGED password DOES re-offer (to update).
         state.handle_login_capture(
-            r#"{"origin":"https://mail.example.com","username":"alice","password":"pw2"}"#,
+            "https://mail.example.com",
+            r#"{"username":"alice","password":"pw2"}"#,
         );
         assert!(
             state.pending_login_save.is_some(),
@@ -11264,9 +13702,262 @@ mod tests {
 
         // Malformed / blank captures are ignored.
         state.pending_login_save = None;
-        state.handle_login_capture("not json at all");
-        state.handle_login_capture(r#"{"origin":"https://x","username":"","password":"p"}"#);
+        state.handle_login_capture("https://x", "not json at all");
+        state.handle_login_capture("https://x", r#"{"username":"","password":"p"}"#);
         assert!(state.pending_login_save.is_none());
+
+        // A page-supplied origin inside the JSON is ignored; only the engine-supplied
+        // event origin is reduced to the host that scopes the stored credential.
+        state.handle_login_capture(
+            "https://real.example",
+            r#"{"origin":"https://forged.example","username":"alice","password":"pw"}"#,
+        );
+        assert_eq!(
+            state.pending_login_save.as_ref().map(|p| p.host.as_str()),
+            Some("real.example")
+        );
+    }
+
+    #[test]
+    fn credential_actions_publish_redacted_audit_events() {
+        use mde_web_preview_client::EventMsg;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://mail.example.com/login".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("Mail Login".to_owned()));
+        state.tabs[state.active].session.poll();
+
+        state.save_login_with_trigger(
+            "mail.example.com",
+            "alice@example.com",
+            "hunter2",
+            "password_menu",
+        );
+        state.save_login_with_trigger(
+            "mail.example.com",
+            "alice@example.com",
+            "better-secret",
+            "auto_capture_prompt",
+        );
+        state.fill_active_login(
+            "mail.example.com".to_owned(),
+            "alice@example.com".to_owned(),
+            "better-secret".to_owned(),
+        );
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|m| matches!(
+                m,
+                mde_web_preview_client::ControlMsg::FillLogin { expected_host, username, password }
+                    if expected_host == "mail.example.com"
+                        && username == "alice@example.com"
+                        && password == "better-secret"
+            )),
+            "fill still sends the chosen credential to the helper: {controls:?}"
+        );
+        state.remove_login(0);
+        let tab_id = state.tabs[state.active].id;
+        state.pending_login_save = Some(PendingLoginSave {
+            tab_id,
+            host: "mail.example.com".to_owned(),
+            username: "dismiss-user".to_owned(),
+            password: "dismiss-secret".to_owned(),
+        });
+        state.dismiss_pending_login_save();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_CREDENTIAL, None)
+            .expect("list credential events");
+        assert_eq!(msgs.len(), 5);
+
+        let events = msgs
+            .iter()
+            .map(|msg| {
+                let body = msg.body.as_deref().expect("credential body");
+                assert!(!body.contains("alice@example.com"));
+                assert!(!body.contains("hunter2"));
+                assert!(!body.contains("better-secret"));
+                assert!(!body.contains("dismiss-user"));
+                assert!(!body.contains("dismiss-secret"));
+                serde_json::from_str::<serde_json::Value>(body).expect("credential JSON")
+            })
+            .collect::<Vec<_>>();
+        let decisions = events
+            .iter()
+            .map(|event| event["decision"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(decisions, ["save", "update", "fill", "delete", "dismiss"]);
+        let counts = events
+            .iter()
+            .map(|event| event["credential_count"].as_u64().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [1, 1, 1, 0, 0]);
+        let triggers = events
+            .iter()
+            .map(|event| event["trigger"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            triggers,
+            [
+                "password_menu",
+                "auto_capture_prompt",
+                "password_menu",
+                "password_menu",
+                "auto_capture_prompt"
+            ]
+        );
+        for event in events {
+            assert_eq!(event["op"], "browser_credential");
+            assert_eq!(event["enforcement"], "session_credential_store");
+            assert_eq!(event["privacy"], "redacted");
+            assert_eq!(event["scope"], "session_only");
+            assert_eq!(event["engine"], "servo");
+            assert_eq!(event["url"], "https://mail.example.com/login");
+            assert_eq!(event["host"], "mail.example.com");
+            assert_eq!(event["title"], "Mail Login");
+            assert_eq!(event["source"], "browser");
+            assert_eq!(event["node"], local_hostname());
+            assert!(event["updated_ms"].as_u64().is_some());
+            assert!(event.get("username").is_none());
+            assert!(event.get("password").is_none());
+        }
+    }
+
+    #[test]
+    fn js_dialog_notice_names_the_engine_auto_resolution() {
+        let confirm = JsDialog {
+            kind: 1,
+            message: "Delete this item?".to_owned(),
+            origin: "https://app.example/settings".to_owned(),
+        };
+        assert_eq!(
+            js_dialog_notice(&confirm),
+            "Page confirm from app.example was cancelled: Delete this item?"
+        );
+
+        let alert = JsDialog {
+            kind: 0,
+            message: "Saved".to_owned(),
+            origin: String::new(),
+        };
+        assert_eq!(
+            js_dialog_notice(&alert),
+            "Page alert from unknown origin was accepted: Saved"
+        );
+
+        let prompt = JsDialog {
+            kind: 2,
+            message: "   ".to_owned(),
+            origin: "not-a-url".to_owned(),
+        };
+        assert_eq!(
+            js_dialog_notice(&prompt),
+            "Page prompt from not-a-url was cancelled: (empty message)"
+        );
+    }
+
+    #[test]
+    fn js_dialog_events_surface_as_browser_notices() {
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default();
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::JsDialog {
+                kind: 1,
+                message: "Delete this item?".to_owned(),
+                origin: "https://app.example/settings".to_owned(),
+            },
+        );
+
+        assert!(run_panel(&mut state));
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Page confirm from app.example was cancelled: Delete this item?")
+        );
+        assert!(
+            state.tabs[state.active]
+                .session
+                .drain_js_dialog_events()
+                .is_empty(),
+            "web_panel drains JS dialog notices exactly once"
+        );
+    }
+
+    #[test]
+    fn before_unload_prompt_text_names_the_action_and_origin() {
+        let leave = BeforeUnloadDialog {
+            id: 1,
+            message: "You have unsaved changes".to_owned(),
+            origin: "https://editor.example/doc/1".to_owned(),
+            is_reload: false,
+        };
+        assert_eq!(
+            before_unload_prompt_text(&leave),
+            "editor.example wants to leave this page: You have unsaved changes"
+        );
+        assert_eq!(before_unload_primary_label(&leave), "Leave");
+
+        let reload = BeforeUnloadDialog {
+            id: 2,
+            message: "   ".to_owned(),
+            origin: String::new(),
+            is_reload: true,
+        };
+        assert_eq!(
+            before_unload_prompt_text(&reload),
+            "unknown origin wants to reload this page: (empty message)"
+        );
+        assert_eq!(before_unload_primary_label(&reload), "Reload");
+    }
+
+    #[test]
+    fn before_unload_prompt_answers_the_active_session() {
+        let (session, helper) = raw_session_pair();
+        helper.set_nonblocking(true).expect("nonblocking helper");
+        let mut state = WebState::default();
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::BeforeUnloadDialog {
+                id: 7,
+                message: "Draft changed".to_owned(),
+                origin: "https://editor.example/doc/1".to_owned(),
+                is_reload: false,
+            },
+        );
+
+        assert!(run_panel(&mut state));
+        assert_eq!(
+            state.pending_before_unload_prompt().map(|prompt| prompt.id),
+            Some(7)
+        );
+
+        state.answer_active_before_unload(7, true);
+        assert_eq!(
+            drain_control_messages(&helper),
+            vec![mde_web_preview_client::ControlMsg::BeforeUnloadDecision {
+                id: 7,
+                proceed: true,
+            }]
+        );
+        assert!(
+            state.pending_before_unload_prompt().is_none(),
+            "answering clears the prompt"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -12653,6 +15344,102 @@ mod tests {
     }
 
     #[test]
+    fn insecure_navigation_prompt_upgrade_and_hsts_are_audited() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        assert!(run_until_texture(&mut state));
+
+        state.address = "http://plain.example/path".to_owned();
+        state.submit_address();
+        state.upgrade_insecure_load();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_INSECURE_NAVIGATION, None)
+            .expect("list insecure navigation events");
+        assert_eq!(msgs.len(), 2);
+        let prompt: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("prompt body"))
+                .expect("valid prompt JSON");
+        assert_eq!(prompt["op"], "browser_insecure_navigation");
+        assert_eq!(prompt["decision"], "prompt");
+        assert_eq!(prompt["trigger"], "active_tab");
+        assert_eq!(prompt["enforcement"], "navigation_prompt");
+        assert_eq!(prompt["url"], "http://plain.example/path");
+        assert_eq!(prompt["upgraded_url"], "https://plain.example/path");
+        let upgrade: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("upgrade body"))
+                .expect("valid upgrade JSON");
+        assert_eq!(upgrade["decision"], "upgrade");
+        assert_eq!(upgrade["trigger"], "active_tab");
+        assert_eq!(upgrade["upgraded_url"], "https://plain.example/path");
+
+        state.address = "http://plain.example/again".to_owned();
+        state.submit_address();
+        let msgs = persist
+            .list_since(EVENT_BROWSER_INSECURE_NAVIGATION, None)
+            .expect("list insecure navigation events after hsts");
+        assert_eq!(msgs.len(), 3);
+        let hsts: serde_json::Value =
+            serde_json::from_str(msgs[2].body.as_deref().expect("hsts body"))
+                .expect("valid hsts JSON");
+        assert_eq!(hsts["decision"], "auto_upgrade");
+        assert_eq!(hsts["enforcement"], "session_hsts");
+        assert_eq!(hsts["trigger"], "active_tab");
+        assert_eq!(hsts["url"], "http://plain.example/again");
+        assert_eq!(hsts["upgraded_url"], "https://plain.example/again");
+    }
+
+    #[test]
+    fn new_tab_http_url_prompts_before_spawn_intent_and_audits_continue() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+
+        state.request_new_tab_with_url(BrowserEngine::Cef, "http://plain.example/new".to_owned());
+
+        assert_eq!(
+            state.insecure_prompt.as_deref(),
+            Some("http://plain.example/new")
+        );
+        assert!(
+            state.open_requested.is_empty(),
+            "plain HTTP new-tab URL must not spawn before the prompt is answered"
+        );
+
+        state.continue_insecure_load();
+
+        assert_eq!(state.insecure_prompt, None);
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: "http://plain.example/new".to_owned(),
+            })
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_INSECURE_NAVIGATION, None)
+            .expect("list insecure navigation events");
+        assert_eq!(msgs.len(), 2);
+        let prompt: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("prompt body"))
+                .expect("valid prompt JSON");
+        assert_eq!(prompt["decision"], "prompt");
+        assert_eq!(prompt["trigger"], "new_tab");
+        assert_eq!(prompt["engine"], "cef");
+        assert_eq!(prompt["upgraded_url"], "https://plain.example/new");
+        let continued: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("continue body"))
+                .expect("valid continue JSON");
+        assert_eq!(continued["decision"], "continue");
+        assert_eq!(continued["trigger"], "new_tab");
+        assert!(continued["upgraded_url"].is_null());
+    }
+
+    #[test]
     fn session_hsts_auto_upgrades_a_host_the_user_previously_upgraded() {
         let (session, _helper) = testkit::connect().expect("connect");
         let mut state = WebState::default();
@@ -12684,6 +15471,195 @@ mod tests {
             state.insecure_prompt.as_deref(),
             Some("http://other.example/")
         );
+    }
+
+    #[test]
+    fn parse_managed_url_policy_accepts_hosts_and_url_prefixes() {
+        let policy = parse_managed_url_policy(
+            r#"
+            # enterprise policy
+            blocked.example
+            *.wild.example
+            url:https://docs.example/private/
+            https://audit.example/internal/
+            "#,
+        );
+
+        assert_eq!(policy.len(), 4);
+        assert_eq!(
+            policy.matches("https://cdn.blocked.example/").as_deref(),
+            Some("host:blocked.example")
+        );
+        assert_eq!(
+            policy.matches("https://news.wild.example/").as_deref(),
+            Some("host:wild.example")
+        );
+        assert_eq!(
+            policy
+                .matches("https://docs.example/private/audit")
+                .as_deref(),
+            Some("url:https://docs.example/private/")
+        );
+        assert_eq!(
+            policy
+                .matches("https://audit.example/internal/report")
+                .as_deref(),
+            Some("url:https://audit.example/internal/")
+        );
+        assert!(policy.matches("https://docs.example/public/").is_none());
+    }
+
+    #[test]
+    fn managed_policy_blocks_chrome_loads_before_the_helper() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.set_managed_url_policy(parse_managed_url_policy("blocked.example\n"));
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        state.address = "https://blocked.example/path".to_owned();
+
+        state.submit_address();
+
+        let block = state
+            .managed_policy_block
+            .as_ref()
+            .expect("blocked navigation");
+        assert_eq!(block.url, "https://blocked.example/path");
+        assert_eq!(block.rule, "host:blocked.example");
+        assert!(
+            !state.tabs[0].session.nav().loading,
+            "managed policy blocks before sending Load to the helper"
+        );
+        assert!(run_panel(&mut state), "managed policy interstitial paints");
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_POLICY_BLOCK, None)
+            .expect("list policy block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("policy body"))
+                .expect("valid JSON");
+        assert_eq!(event["op"], "browser_policy_block");
+        assert_eq!(event["policy"], "managed_url");
+        assert_eq!(event["trigger"], "chrome_load");
+        assert_eq!(event["url"], "https://blocked.example/path");
+        assert_eq!(event["rule"], "host:blocked.example");
+    }
+
+    #[test]
+    fn managed_policy_url_prefix_default_ports_block_chrome_loads_before_the_helper() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.set_managed_url_policy(parse_managed_url_policy(
+            "url:https://portal.example:443/admin/\nurl:https://docs.example\n",
+        ));
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        state.address = "https://portal.example:443/admin/users".to_owned();
+        state.submit_address();
+
+        let block = state
+            .managed_policy_block
+            .as_ref()
+            .expect("default-port URL-prefix navigation is blocked");
+        assert_eq!(block.url, "https://portal.example:443/admin/users");
+        assert_eq!(block.rule, "url:https://portal.example/admin/");
+        assert!(
+            !state.tabs[0].session.nav().loading,
+            "managed policy blocks before sending Load to the helper"
+        );
+
+        state.managed_policy_block = None;
+        state.address = "https://alice@portal.example/admin/users".to_owned();
+        state.submit_address();
+        let block = state
+            .managed_policy_block
+            .as_ref()
+            .expect("userinfo URL-prefix navigation is blocked");
+        assert_eq!(block.url, "https://alice@portal.example/admin/users");
+        assert_eq!(block.rule, "url:https://portal.example/admin/");
+
+        state.managed_policy_block = None;
+        state.address = "https://docs.example.evil/private".to_owned();
+        state.submit_address();
+        assert!(
+            state.managed_policy_block.is_none(),
+            "an authority-only URL prefix must not raw-prefix match another host"
+        );
+    }
+
+    #[test]
+    fn managed_policy_blocks_queued_new_tabs() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.set_managed_url_policy(parse_managed_url_policy("blocked.example\n"));
+
+        state.request_new_tab_with_url(BrowserEngine::Cef, "https://blocked.example/".to_owned());
+
+        assert!(
+            state.open_requested.is_empty(),
+            "blocked new-tab opens must not reach the live-helper spawn queue"
+        );
+        assert_eq!(
+            state.managed_policy_block.as_ref().map(|b| b.rule.as_str()),
+            Some("host:blocked.example")
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_POLICY_BLOCK, None)
+            .expect("list policy block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("policy body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "new_tab");
+        assert_eq!(event["engine"], "cef");
+    }
+
+    #[test]
+    fn managed_policy_helper_document_blocks_paint_the_interstitial() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, peer) = raw_session_pair();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.set_managed_url_policy(parse_managed_url_policy("blocked.example\n"));
+        state.push_session(session);
+
+        write_helper_event(
+            &peer,
+            &mde_web_preview_client::EventMsg::ResourceRequest {
+                id: 9,
+                url: "https://blocked.example/".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Document,
+                ),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            state.tabs[0].session.managed_policy_block(),
+            Some("https://blocked.example/")
+        );
+        assert!(run_panel(&mut state), "managed policy interstitial paints");
+        assert!(
+            run_panel(&mut state),
+            "repainting the same interstitial stays stable"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_POLICY_BLOCK, None)
+            .expect("list policy block events");
+        assert_eq!(msgs.len(), 1, "the interstitial is audited once");
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("policy body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "helper_document");
+        assert_eq!(event["url"], "https://blocked.example/");
+        assert_eq!(event["rule"], "host:blocked.example");
     }
 
     #[test]
@@ -12847,6 +15823,70 @@ mod tests {
     }
 
     #[test]
+    fn mixed_content_resource_blocks_are_audited_once() {
+        use mde_web_preview_client::{ControlMsg, EventMsg, ResourceType};
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/dashboard".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("Portal".to_owned()));
+        write_helper_event(
+            &helper,
+            &EventMsg::ResourceRequest {
+                id: 41,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Script),
+            },
+        );
+
+        assert!(run_panel(&mut state), "panel polls the helper session");
+        assert!(
+            drain_control_messages(&helper)
+                .into_iter()
+                .any(|msg| matches!(
+                    msg,
+                    ControlMsg::ResourceVerdict {
+                        id: 41,
+                        allow: false
+                    }
+                )),
+            "mixed-content script is denied before network"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_MIXED_CONTENT_BLOCK, None)
+            .expect("list mixed-content events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("mixed-content body"))
+                .expect("valid JSON");
+        assert_eq!(event["op"], "browser_mixed_content_block");
+        assert_eq!(event["page_url"], "https://portal.example/dashboard");
+        assert_eq!(event["url"], "http://cdn.example.test/app.js");
+        assert_eq!(event["resource"], "script");
+        assert_eq!(event["title"], "Portal");
+
+        assert!(run_panel(&mut state), "repaint stays stable");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_MIXED_CONTENT_BLOCK, None)
+            .expect("list mixed-content events after repaint");
+        assert_eq!(msgs.len(), 1, "resource block audit is one-shot");
+    }
+
+    #[test]
     fn a_permission_prompt_is_suppressed_behind_a_cert_interstitial() {
         // Defensive precedence: a tab that has BOTH a blocking cert error and a
         // pending permission must show the cert interstitial with the permission bar
@@ -12973,6 +16013,7 @@ mod tests {
 
         let mut state = WebState::default();
         state.tabs.push(Tab {
+            id: 1,
             session,
             engine: BrowserEngine::Servo,
             container: ContainerProfile::None,
@@ -12980,6 +16021,7 @@ mod tests {
             group: None,
             pinned: false,
             muted: false,
+            autoplay_blocked: false,
             force_dark: false,
             reader_mode: false,
             user_scripts: false,
@@ -12990,6 +16032,7 @@ mod tests {
             page_focused: false,
             texture: None,
             last_frame: None,
+            last_audited_resource_seq: 0,
             resizer: ViewportResizer::default(),
             favicon_cache: None,
         });
@@ -13082,6 +16125,62 @@ mod tests {
                 )),
             "re-enabling site blocking restores the block verdict"
         );
+    }
+
+    #[test]
+    fn per_site_privacy_toggle_publishes_site_blocking_audit_events() {
+        use mde_web_preview_client::EventMsg;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/story".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("News Desk".to_owned()));
+        state.tabs[0].session.poll();
+
+        state.set_active_site_blocking(false);
+        state.set_active_site_blocking(true);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_SITE_BLOCKING, None)
+            .expect("list site-blocking events");
+        assert_eq!(msgs.len(), 2);
+        let events = msgs
+            .iter()
+            .map(|msg| {
+                serde_json::from_str::<serde_json::Value>(
+                    msg.body.as_deref().expect("site-blocking body"),
+                )
+                .expect("site-blocking JSON")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(events[0]["op"], "browser_site_blocking");
+        assert_eq!(events[0]["policy"], "adfilter_site_override");
+        assert_eq!(events[0]["decision"], "disable");
+        assert_eq!(events[0]["site_blocking"], "disabled");
+        assert_eq!(events[0]["enforcement"], "request_filter");
+        assert_eq!(events[0]["engine"], "servo");
+        assert_eq!(events[0]["url"], "https://news.example.com/story");
+        assert_eq!(events[0]["host"], "news.example.com");
+        assert_eq!(events[0]["title"], "News Desk");
+        assert_eq!(events[0]["source"], "browser");
+        assert_eq!(events[0]["node"], local_hostname());
+        assert!(events[0]["updated_ms"].as_u64().is_some());
+
+        assert_eq!(events[1]["decision"], "enable");
+        assert_eq!(events[1]["site_blocking"], "enabled");
+        assert_eq!(events[1]["host"], "news.example.com");
     }
 
     #[test]
@@ -13241,6 +16340,48 @@ mod tests {
             summary.contains("news.example.com cleared 1 time"),
             "summary = {summary}"
         );
+    }
+
+    #[test]
+    fn clearing_current_tab_publishes_site_data_clear_audit_event() {
+        use mde_web_preview_client::EventMsg;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/admin".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("Admin Portal".to_owned()));
+        state.tabs[0].session.poll();
+
+        state.clear_active_session_data();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_SITE_DATA_CLEAR, None)
+            .expect("list site-data clear events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("site-data body"))
+                .expect("valid JSON");
+        assert_eq!(event["op"], "browser_site_data_clear");
+        assert_eq!(event["decision"], "clear");
+        assert_eq!(event["enforcement"], "session_memory_only");
+        assert_eq!(event["scope"], "current_tab");
+        assert_eq!(event["engine"], "servo");
+        assert_eq!(event["url"], "https://portal.example/admin");
+        assert_eq!(event["host"], "portal.example");
+        assert_eq!(event["title"], "Admin Portal");
+        assert_eq!(event["source"], "browser");
+        assert!(event["cleared_ms"].as_u64().is_some());
     }
 
     #[test]
@@ -13419,10 +16560,19 @@ mod tests {
         });
         // Site data: a saved login + a permission grant must also be forgotten.
         state.save_login("saved.example", "alice", "pw");
+        state.login_user_draft = "draft-user".to_owned();
+        state.login_pass_draft = "draft-pass".to_owned();
+        state.pending_login_save = Some(PendingLoginSave {
+            tab_id: 0,
+            host: "pending.example".to_owned(),
+            username: "pending-user".to_owned(),
+            password: "pending-pass".to_owned(),
+        });
         state.grant_permission("https://granted.example", 0);
         assert!(!state.history.is_empty());
         assert_eq!(state.closed_tabs.len(), 1);
         assert_eq!(state.session_logins.len(), 1);
+        assert!(state.pending_login_save.is_some());
         assert!(state.is_permission_granted("https://granted.example", 0));
 
         // Drive it through the real Privacy-menu action, not the private method.
@@ -13437,10 +16587,85 @@ mod tests {
         assert!(state.closed_tabs.is_empty(), "reopen stack forgotten");
         assert!(state.session_logins.is_empty(), "saved logins forgotten");
         assert!(
+            state.login_user_draft.is_empty(),
+            "login user draft forgotten"
+        );
+        assert!(
+            state.login_pass_draft.is_empty(),
+            "login password draft forgotten"
+        );
+        assert!(
+            state.pending_login_save.is_none(),
+            "pending captured login forgotten"
+        );
+        assert!(
             !state.is_permission_granted("https://granted.example", 0),
             "permission grants forgotten"
         );
         assert_eq!(state.address, NEW_TAB_URL, "returns to the new-tab surface");
+    }
+
+    #[test]
+    fn clear_all_browsing_data_publishes_full_session_audit_event() {
+        use mde_web_preview_client::EventMsg;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/admin".to_owned(),
+            },
+        );
+        write_helper_event(&helper, &EventMsg::Title("Admin Portal".to_owned()));
+        state.tabs[0].session.poll();
+        state
+            .history
+            .record("https://visited.example/", "Visited", 1000);
+        state.download_jobs.push(transfer_fixture(
+            "browser-audit",
+            TransferMethod::BrowserDownload,
+            TransferState::Done,
+            1010,
+        ));
+        state.closed_tabs.push(ClosedTab {
+            url: "https://closed.example/".into(),
+            title: "Closed".into(),
+            engine: BrowserEngine::Servo,
+        });
+        state.save_login("saved.example", "alice", "pw");
+        state.grant_permission("https://granted.example", 0);
+
+        state.clear_all_browsing_data();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_BROWSING_DATA_CLEAR, None)
+            .expect("list browsing-data clear events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("clear-all body"))
+                .expect("valid JSON");
+        assert_eq!(event["op"], "browser_browsing_data_clear");
+        assert_eq!(event["decision"], "clear");
+        assert_eq!(event["enforcement"], "session_memory_only");
+        assert_eq!(event["scope"], "all_session");
+        assert_eq!(event["engine"], "servo");
+        assert_eq!(event["active_url"], "https://portal.example/admin");
+        assert_eq!(event["active_host"], "portal.example");
+        assert_eq!(event["active_title"], "Admin Portal");
+        assert_eq!(event["history_entries"], 1);
+        assert_eq!(event["downloads"], 1);
+        assert_eq!(event["reopen_entries"], 1);
+        assert_eq!(event["saved_logins"], 1);
+        assert_eq!(event["permission_grants"], 1);
+        assert_eq!(event["source"], "browser");
+        assert!(event["cleared_ms"].as_u64().is_some());
     }
 
     #[test]
@@ -13481,6 +16706,32 @@ mod tests {
         let body = adfilter_domain_body(" news.example.com ");
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(v["domain"], "news.example.com");
+    }
+
+    #[test]
+    fn browser_site_blocking_body_is_the_audit_event_shape() {
+        assert_eq!(EVENT_BROWSER_SITE_BLOCKING, "event/browser/site-blocking");
+        let body = browser_site_blocking_body(
+            BrowserEngine::Cef,
+            "https://news.example.com/story",
+            "News Desk",
+            "news.example.com",
+            false,
+            123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_site_blocking");
+        assert_eq!(v["policy"], "adfilter_site_override");
+        assert_eq!(v["decision"], "disable");
+        assert_eq!(v["site_blocking"], "disabled");
+        assert_eq!(v["enforcement"], "request_filter");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://news.example.com/story");
+        assert_eq!(v["host"], "news.example.com");
+        assert_eq!(v["title"], "News Desk");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["updated_ms"], 123);
     }
 
     #[test]
@@ -13591,6 +16842,352 @@ mod tests {
         assert_eq!(v["title"], "Meeting");
         assert_eq!(v["site"], "meet.example");
         assert_eq!(v["source"], "browser");
+        assert_eq!(v["updated_ms"], 123);
+    }
+
+    #[test]
+    fn browser_permission_decision_body_records_runtime_decision() {
+        assert_eq!(
+            EVENT_BROWSER_PERMISSION_DECISION,
+            "event/browser/permission-decision"
+        );
+        let body = browser_permission_decision_body(
+            BrowserEngine::Cef,
+            "https://maps.example",
+            0,
+            true,
+            "helper_permission_prompt",
+            "https://app.example/dashboard",
+            "Dashboard",
+            123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_permission_decision");
+        assert_eq!(v["permission"], "geolocation");
+        assert_eq!(v["permission_kind"], 0);
+        assert_eq!(v["decision"], "allow");
+        assert_eq!(v["grant_scope"], "session");
+        assert_eq!(v["enforcement"], "helper_permission_prompt");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["origin"], "https://maps.example");
+        assert_eq!(v["origin_host"], "maps.example");
+        assert_eq!(v["url"], "https://app.example/dashboard");
+        assert_eq!(v["title"], "Dashboard");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["decided_ms"], 123);
+    }
+
+    #[test]
+    fn browser_permission_revoke_body_records_current_site_revocation() {
+        assert_eq!(
+            EVENT_BROWSER_PERMISSION_REVOKE,
+            "event/browser/permission-revoke"
+        );
+        let body = browser_permission_revoke_body(
+            BrowserEngine::Cef,
+            "https://app.example/dashboard",
+            "App Dashboard",
+            "app.example",
+            2,
+            3,
+            456,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_permission_revoke");
+        assert_eq!(v["decision"], "revoke");
+        assert_eq!(v["enforcement"], "session_permission_store");
+        assert_eq!(v["permission_policy"], "default_deny");
+        assert_eq!(v["scope"], "current_site");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://app.example/dashboard");
+        assert_eq!(v["host"], "app.example");
+        assert_eq!(v["title"], "App Dashboard");
+        assert_eq!(v["revoked_grants"], 2);
+        assert_eq!(v["cleared_prompt_decisions"], 3);
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["updated_ms"], 456);
+    }
+
+    #[test]
+    fn browser_credential_body_records_redacted_session_action() {
+        assert_eq!(EVENT_BROWSER_CREDENTIAL, "event/browser/credential");
+        let body = browser_credential_body(
+            BrowserEngine::Cef,
+            "https://mail.example.com/login",
+            "Mail Login",
+            "mail.example.com",
+            "fill",
+            "password_menu",
+            2,
+            789,
+        );
+        assert!(!body.contains("alice@example.com"));
+        assert!(!body.contains("hunter2"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_credential");
+        assert_eq!(v["decision"], "fill");
+        assert_eq!(v["enforcement"], "session_credential_store");
+        assert_eq!(v["privacy"], "redacted");
+        assert_eq!(v["scope"], "session_only");
+        assert_eq!(v["trigger"], "password_menu");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://mail.example.com/login");
+        assert_eq!(v["host"], "mail.example.com");
+        assert_eq!(v["title"], "Mail Login");
+        assert_eq!(v["credential_count"], 2);
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["updated_ms"], 789);
+        assert!(v.get("username").is_none());
+        assert!(v.get("password").is_none());
+    }
+
+    #[test]
+    fn browser_policy_block_body_is_the_audit_event_shape() {
+        assert_eq!(EVENT_BROWSER_POLICY_BLOCK, "event/browser/policy-block");
+        let body = browser_policy_block_body(
+            BrowserEngine::Cef,
+            "https://blocked.example/private",
+            "Blocked",
+            "host:blocked.example",
+            "chrome_load",
+            123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_policy_block");
+        assert_eq!(v["policy"], "managed_url");
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["enforcement"], "pre_network");
+        assert_eq!(v["trigger"], "chrome_load");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://blocked.example/private");
+        assert_eq!(v["host"], "blocked.example");
+        assert_eq!(v["title"], "Blocked");
+        assert_eq!(v["rule"], "host:blocked.example");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["blocked_ms"], 123);
+    }
+
+    #[test]
+    fn browser_safe_browsing_block_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_SAFE_BROWSING_BLOCK,
+            "event/browser/safe-browsing-block"
+        );
+        let body = browser_safe_browsing_block_body(
+            BrowserEngine::Cef,
+            "https://cdn.malware.test/payload",
+            "Blocked",
+            "malware.test",
+            "download",
+            456,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_safe_browsing_block");
+        assert_eq!(v["policy"], "safe_browsing");
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["enforcement"], "pre_network");
+        assert_eq!(v["trigger"], "download");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://cdn.malware.test/payload");
+        assert_eq!(v["host"], "cdn.malware.test");
+        assert_eq!(v["title"], "Blocked");
+        assert_eq!(v["rule"], "malware.test");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["blocked_ms"], 456);
+    }
+
+    #[test]
+    fn browser_insecure_download_block_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_INSECURE_DOWNLOAD_BLOCK,
+            "event/browser/insecure-download-block"
+        );
+        let body = browser_insecure_download_block_body(
+            BrowserEngine::Cef,
+            "http://cdn.example.test/payload",
+            "Downloads",
+            "download",
+            789,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_insecure_download_block");
+        assert_eq!(v["policy"], "insecure_transport");
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["enforcement"], "pre_network");
+        assert_eq!(v["reason"], "plain_http_download");
+        assert_eq!(v["trigger"], "download");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "http://cdn.example.test/payload");
+        assert_eq!(v["host"], "cdn.example.test");
+        assert_eq!(v["title"], "Downloads");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["blocked_ms"], 789);
+    }
+
+    #[test]
+    fn browser_insecure_navigation_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_INSECURE_NAVIGATION,
+            "event/browser/insecure-navigation"
+        );
+        let body = browser_insecure_navigation_body(
+            BrowserEngine::Cef,
+            "http://portal.example/login",
+            "Portal",
+            "upgrade",
+            "active_tab",
+            "navigation_prompt",
+            Some("https://portal.example/login"),
+            790,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_insecure_navigation");
+        assert_eq!(v["policy"], "insecure_transport");
+        assert_eq!(v["decision"], "upgrade");
+        assert_eq!(v["enforcement"], "navigation_prompt");
+        assert_eq!(v["reason"], "plain_http_navigation");
+        assert_eq!(v["trigger"], "active_tab");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "http://portal.example/login");
+        assert_eq!(v["host"], "portal.example");
+        assert_eq!(v["upgraded_url"], "https://portal.example/login");
+        assert_eq!(v["title"], "Portal");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["decided_ms"], 790);
+    }
+
+    #[test]
+    fn browser_mixed_content_block_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_MIXED_CONTENT_BLOCK,
+            "event/browser/mixed-content-block"
+        );
+        let body = browser_mixed_content_block_body(
+            BrowserEngine::Cef,
+            "https://portal.example/dashboard",
+            "http://cdn.example.test/app.js",
+            "Portal",
+            mde_web_preview_client::resource_to_wire(mde_web_preview_client::ResourceType::Script),
+            "subresource",
+            987,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_mixed_content_block");
+        assert_eq!(v["policy"], "mixed_content");
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["enforcement"], "pre_network");
+        assert_eq!(v["reason"], "plain_http_subresource");
+        assert_eq!(v["trigger"], "subresource");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["page_url"], "https://portal.example/dashboard");
+        assert_eq!(v["page_host"], "portal.example");
+        assert_eq!(v["url"], "http://cdn.example.test/app.js");
+        assert_eq!(v["host"], "cdn.example.test");
+        assert_eq!(v["title"], "Portal");
+        assert_eq!(v["resource"], "script");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["blocked_ms"], 987);
+    }
+
+    #[test]
+    fn browser_site_data_clear_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_SITE_DATA_CLEAR,
+            "event/browser/site-data-clear"
+        );
+        let body = browser_site_data_clear_body(
+            BrowserEngine::Cef,
+            "https://portal.example/admin",
+            "Admin Portal",
+            "portal.example",
+            "current_tab",
+            456,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_site_data_clear");
+        assert_eq!(v["decision"], "clear");
+        assert_eq!(v["enforcement"], "session_memory_only");
+        assert_eq!(v["scope"], "current_tab");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://portal.example/admin");
+        assert_eq!(v["host"], "portal.example");
+        assert_eq!(v["title"], "Admin Portal");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["cleared_ms"], 456);
+    }
+
+    #[test]
+    fn browser_browsing_data_clear_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_BROWSING_DATA_CLEAR,
+            "event/browser/browsing-data-clear"
+        );
+        let body = browser_browsing_data_clear_body(
+            BrowserEngine::Cef,
+            "https://portal.example/admin",
+            "Admin Portal",
+            "portal.example",
+            BrowserBrowsingDataClearCounts {
+                history_entries: 2,
+                downloads: 3,
+                reopen_entries: 4,
+                saved_logins: 5,
+                permission_grants: 6,
+            },
+            789,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_browsing_data_clear");
+        assert_eq!(v["decision"], "clear");
+        assert_eq!(v["enforcement"], "session_memory_only");
+        assert_eq!(v["scope"], "all_session");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["active_url"], "https://portal.example/admin");
+        assert_eq!(v["active_host"], "portal.example");
+        assert_eq!(v["active_title"], "Admin Portal");
+        assert_eq!(v["history_entries"], 2);
+        assert_eq!(v["downloads"], 3);
+        assert_eq!(v["reopen_entries"], 4);
+        assert_eq!(v["saved_logins"], 5);
+        assert_eq!(v["permission_grants"], 6);
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["cleared_ms"], 789);
+    }
+
+    #[test]
+    fn browser_download_danger_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_DOWNLOAD_DANGER,
+            "event/browser/download-danger"
+        );
+        let body = browser_download_danger_body(
+            42,
+            "https://files.example.test/setup.exe",
+            "setup.exe",
+            "discard",
+            123,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_download_danger");
+        assert_eq!(v["decision"], "discard");
+        assert_eq!(v["enforcement"], "dangerous_file_gate");
+        assert_eq!(v["reason"], "dangerous_extension");
+        assert_eq!(v["download_id"], 42);
+        assert_eq!(v["url"], "https://files.example.test/setup.exe");
+        assert_eq!(v["host"], "files.example.test");
+        assert_eq!(v["filename"], "setup.exe");
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
         assert_eq!(v["updated_ms"], 123);
     }
 
@@ -13803,6 +17400,7 @@ mod tests {
         state.tabs[state.active].container = ContainerProfile::Work;
         state.tabs[state.active].display_target = DisplayTarget::Secondary;
         state.tabs[state.active].muted = true;
+        state.tabs[state.active].autoplay_blocked = true;
         state.tabs[state.active].force_dark = true;
         state.tabs[state.active].user_scripts = true;
         state.tabs[state.active].user_agent = UserAgentOverride::AndroidChrome;
@@ -13841,6 +17439,7 @@ mod tests {
         assert_eq!(v["tabs"][0]["display_target"], "secondary");
         assert_eq!(v["tabs"][0]["url"], "https://example.test/");
         assert_eq!(v["tabs"][0]["muted"], true);
+        assert_eq!(v["tabs"][0]["autoplay_blocked"], true);
         assert_eq!(v["tabs"][0]["force_dark"], true);
         assert_eq!(v["tabs"][0]["user_scripts"], true);
         assert_eq!(v["tabs"][0]["user_agent"], "android_chrome");
@@ -14286,6 +17885,133 @@ mod tests {
     }
 
     #[test]
+    fn site_info_resource_summary_groups_active_page_resource_blocks() {
+        let recent = vec![
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 1,
+                url: "https://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: true,
+                blocked_by: None,
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 2,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 3,
+                url: "http://media.example.test/poster.jpg".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 4,
+                url: "https://tracker.example.test/pixel.gif".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: false,
+                blocked_by: Some("google-analytics.com".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 5,
+                url: "https://cdn.malware.test/payload.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("safe-browsing:malware.test".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 6,
+                url: "https://admin.example.test/private/audit.json".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+                allowed: false,
+                blocked_by: Some(
+                    "managed-policy:url:https://admin.example.test/private/".to_owned(),
+                ),
+            },
+        ];
+
+        let summary = site_info_resource_summary(&recent);
+
+        assert_eq!(summary.mixed_content_blocks, 2);
+        assert_eq!(
+            summary.mixed_content_hosts,
+            vec![
+                "cdn.example.test".to_owned(),
+                "media.example.test".to_owned()
+            ]
+        );
+        assert_eq!(summary.tracker_blocks, 1);
+        assert_eq!(
+            summary.tracker_hosts,
+            vec!["tracker.example.test".to_owned()]
+        );
+        assert_eq!(summary.safe_browsing_blocks, 1);
+        assert_eq!(summary.safe_browsing_hosts, vec!["malware.test".to_owned()]);
+        assert_eq!(summary.managed_policy_blocks, 1);
+        assert_eq!(
+            summary.managed_policy_rules,
+            vec!["url:https://admin.example.test/private/".to_owned()]
+        );
+    }
+
+    #[test]
+    fn site_info_permission_summary_surfaces_active_site_permission_posture() {
+        let (mut session, _helper, _writer) = live_page_session();
+        session.poll();
+        let mut state = WebState::default();
+        state.push_session(session);
+        state.grant_permission("https://example.test", 0);
+        state.grant_permission("https://example.test", 2);
+        state.grant_permission("https://other.example", 0);
+        state.site_permission_prompts.push(SitePermissionPrompt {
+            host: "example.test".to_owned(),
+            kind: DevicePermissionKind::Camera,
+            decision: "denied",
+            updated_ms: 7,
+        });
+        state.site_permission_prompts.push(SitePermissionPrompt {
+            host: "other.example".to_owned(),
+            kind: DevicePermissionKind::Microphone,
+            decision: "denied",
+            updated_ms: 8,
+        });
+
+        let summary = site_info_permission_summary(&state).expect("active site permissions");
+
+        assert_eq!(summary.host, "example.test");
+        assert!(!summary.forgotten);
+        assert_eq!(
+            summary.session_grants,
+            vec!["clipboard".to_owned(), "geolocation".to_owned()]
+        );
+        assert_eq!(summary.denied_prompts, vec!["camera denied".to_owned()]);
+
+        state
+            .forgotten_permission_sites
+            .push("example.test".to_owned());
+        assert!(
+            site_info_permission_summary(&state)
+                .expect("active site permissions")
+                .forgotten
+        );
+    }
+
+    #[test]
     fn site_info_panel_opens_from_the_security_chip_and_renders_without_panicking() {
         let (session, _helper, _writer) = live_page_session();
         let mut state = WebState::default();
@@ -14301,6 +18027,71 @@ mod tests {
         // A second frame with the panel open must still paint, not panic.
         assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
         assert!(ctx.memory(|mem| mem.is_popup_open(security_chip_popup_id())));
+    }
+
+    #[test]
+    fn site_info_panel_renders_with_active_page_resource_and_permission_state() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let recent = vec![
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 1,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 2,
+                url: "https://tracker.example.test/pixel.gif".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: false,
+                blocked_by: Some("google-analytics.com".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 3,
+                url: "https://cdn.malware.test/payload.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("safe-browsing:malware.test".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 4,
+                url: "https://admin.example.test/private/audit.json".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+                allowed: false,
+                blocked_by: Some(
+                    "managed-policy:url:https://admin.example.test/private/".to_owned(),
+                ),
+            },
+        ];
+        let permissions = SiteInfoPermissionSummary {
+            host: "portal.example.test".to_owned(),
+            forgotten: true,
+            session_grants: vec!["geolocation".to_owned()],
+            denied_prompts: vec!["camera denied".to_owned()],
+        };
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                site_info_panel(
+                    ui,
+                    "https://portal.example.test/",
+                    &recent,
+                    Some(&permissions),
+                );
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty());
     }
 
     #[test]
@@ -14845,12 +18636,20 @@ mod tests {
         assert_eq!(resources[0]["url"], "https://example.test/app.js");
         assert_eq!(resources[0]["resource"], "script");
         assert_eq!(resources[0]["allowed"], true);
+        assert!(resources[0]["blocked_by"].is_null());
         assert_eq!(
             resources[1]["url"],
             "https://www.google-analytics.com/collect"
         );
         assert_eq!(resources[1]["resource"], "script");
         assert_eq!(resources[1]["allowed"], false);
+        assert!(
+            resources[1]["blocked_by"]
+                .as_str()
+                .is_some_and(|rule| rule.contains("google")),
+            "blocked resource keeps the matching rule: {:?}",
+            resources[1]["blocked_by"]
+        );
     }
 
     #[test]
@@ -16309,6 +20108,50 @@ mod tests {
     }
 
     #[test]
+    fn inline_completion_tail_is_only_visible_when_it_can_align_with_the_draft() {
+        let list = vec!["https://example.com/".to_string()];
+
+        assert_eq!(
+            inline_completion_tail(&list, "https://exa").as_deref(),
+            Some("mple.com/")
+        );
+        assert_eq!(
+            inline_completion_tail(&list, "HTTPS://EXA").as_deref(),
+            Some("mple.com/")
+        );
+        assert_eq!(inline_completion_tail(&list, " https://exa"), None);
+        assert_eq!(inline_completion_tail(&list, "https://exa "), None);
+        assert_eq!(inline_completion_tail(&list, "https://example.com/"), None);
+        assert_eq!(inline_completion_tail(&list, "https://other"), None);
+    }
+
+    #[test]
+    fn focused_omnibox_paints_the_inline_completion_tail() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        state.address = "https://exa".to_owned();
+        state.omnibox_focused = true;
+        state.suggestions.draft = state.address.clone();
+        state.suggestions.history = vec!["https://example.com/".to_owned()];
+        state.suggestions.selected = Some(0);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.memory_mut(|mem| mem.request_focus(omnibox_widget_id()));
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let texts = painted_text(&out.shapes);
+
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "mple.com/" && *color == Style::TEXT_DIM),
+            "focused omnibox should paint the grey inline completion tail: {texts:?}"
+        );
+    }
+
+    #[test]
     fn keyword_search_target_routes_configured_shortcuts() {
         let engines = default_search_engines();
         // "img sunset" → the mesh image-category search.
@@ -16436,6 +20279,73 @@ mod tests {
             self.verbs.lock().unwrap().push(verb.clone());
             Ok(())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingDownloadOpener {
+        opened: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        revealed: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    }
+
+    impl RecordingDownloadOpener {
+        fn opened(&self) -> Vec<PathBuf> {
+            self.opened.lock().unwrap().clone()
+        }
+
+        fn revealed(&self) -> Vec<PathBuf> {
+            self.revealed.lock().unwrap().clone()
+        }
+    }
+
+    impl DownloadOpener for RecordingDownloadOpener {
+        fn open_path(&self, path: &Path) -> Result<(), String> {
+            self.opened.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+
+        fn reveal_path(&self, path: &Path) -> Result<(), String> {
+            self.revealed.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    fn browser_download_fixture(
+        id: &str,
+        source: &Path,
+        dest: &Path,
+        state: TransferState,
+    ) -> TransferJob {
+        let mut job = TransferJob::new(
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+            TransferMethod::BrowserDownload,
+            TransferPolicy {
+                bwlimit: None,
+                verify: true,
+            },
+        );
+        job.id = id.to_owned();
+        job.state = state;
+        job
+    }
+
+    fn write_browser_download_manifest(
+        dir: &Path,
+        asset_url: &str,
+        suggested_filename: &str,
+        kind: Option<&str>,
+    ) -> PathBuf {
+        let path = dir.join("asset.download.json");
+        let mut body = serde_json::json!({
+            "op": "browser_media_download_request",
+            "asset_url": asset_url,
+            "suggested_filename": suggested_filename,
+        });
+        if let Some(kind) = kind {
+            body["kind"] = serde_json::Value::String(kind.to_owned());
+        }
+        std::fs::write(&path, body.to_string()).expect("write browser download manifest");
+        path
     }
 
     #[test]
@@ -16941,18 +20851,22 @@ mod tests {
     fn media_asset_request_marks_blocked_resources_for_ignore_blocking() {
         let recent = vec![
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 1,
                 url: "https://cdn.example.test/app.js".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::Script,
                 ),
                 allowed: true,
+                blocked_by: None,
             },
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 2,
                 url: "https://video.example.test/master.m3u8".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::XmlHttpRequest,
                 ),
                 allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
             },
         ];
 
@@ -16972,6 +20886,7 @@ mod tests {
         assert_eq!(v["asset_url"], "https://video.example.test/master.m3u8");
         assert_eq!(v["kind"], "hls");
         assert_eq!(v["allowed_by_page_filter"], false);
+        assert_eq!(v["blocked_by_page_filter"], "mixed-content:http");
         assert_eq!(v["ignore_blocking"], true);
         assert_eq!(v["suggested_filename"], "master.m3u8");
         assert_eq!(v["rename_strategy"], "auto_rename_by_url_hint");
@@ -16981,32 +20896,40 @@ mod tests {
     fn media_asset_request_selection_batches_only_observed_images() {
         let recent = vec![
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 1,
                 url: "https://cdn.example.test/app.js".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::Script,
                 ),
                 allowed: true,
+                blocked_by: None,
             },
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 2,
                 url: "https://cdn.example.test/hero.png".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::Image,
                 ),
                 allowed: true,
+                blocked_by: None,
             },
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 3,
                 url: "https://cdn.example.test/photo".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::Image,
                 ),
                 allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
             },
             mde_web_preview_client::ResourceRequestStatus {
+                seq: 4,
                 url: "https://video.example.test/clip.mp4".to_owned(),
                 resource: mde_web_preview_client::resource_to_wire(
                     mde_web_preview_client::ResourceType::Media,
                 ),
                 allowed: true,
+                blocked_by: None,
             },
         ];
 
@@ -17182,6 +21105,144 @@ mod tests {
     }
 
     #[test]
+    fn completed_media_download_target_matches_worker_destination_and_sanitizes_name() {
+        let tmp = tempfile::tempdir().expect("download target tempdir");
+        let dest = tmp.path().join("downloads");
+        std::fs::create_dir_all(&dest).expect("download dest");
+        let manifest = write_browser_download_manifest(
+            tmp.path(),
+            "https://media.example.test/video/poster image.jpg",
+            "../poster image.jpg",
+            None,
+        );
+        let job = browser_download_fixture("browser-media", &manifest, &dest, TransferState::Done);
+
+        let target = completed_browser_download_target(&job).expect("completed target");
+
+        assert_eq!(target.open, dest.join("poster-image.jpg"));
+        assert_eq!(target.reveal, dest);
+    }
+
+    #[test]
+    fn completed_hls_and_dash_download_targets_open_rewritten_manifests() {
+        let hls_tmp = tempfile::tempdir().expect("hls target tempdir");
+        let hls_dest = hls_tmp.path().join("downloads");
+        std::fs::create_dir_all(&hls_dest).expect("hls dest");
+        let hls_manifest = write_browser_download_manifest(
+            hls_tmp.path(),
+            "https://media.example.test/video/master.m3u8",
+            "../master playlist.m3u8",
+            Some("hls"),
+        );
+        let hls_job =
+            browser_download_fixture("browser-hls", &hls_manifest, &hls_dest, TransferState::Done);
+
+        let hls_target = completed_browser_download_target(&hls_job).expect("hls target");
+
+        assert_eq!(
+            hls_target.open,
+            hls_dest.join("master-playlist.hls/master-playlist.m3u8")
+        );
+        assert_eq!(hls_target.reveal, hls_dest.join("master-playlist.hls"));
+
+        let dash_tmp = tempfile::tempdir().expect("dash target tempdir");
+        let dash_dest = dash_tmp.path().join("downloads");
+        std::fs::create_dir_all(&dash_dest).expect("dash dest");
+        let dash_manifest = write_browser_download_manifest(
+            dash_tmp.path(),
+            "https://media.example.test/video/manifest.mpd?token=x",
+            "../dash manifest.mpd",
+            None,
+        );
+        let dash_job = browser_download_fixture(
+            "browser-dash",
+            &dash_manifest,
+            &dash_dest,
+            TransferState::Done,
+        );
+
+        let dash_target = completed_browser_download_target(&dash_job).expect("dash target");
+
+        assert_eq!(
+            dash_target.open,
+            dash_dest.join("dash-manifest.dash/dash-manifest.mpd")
+        );
+        assert_eq!(dash_target.reveal, dash_dest.join("dash-manifest.dash"));
+    }
+
+    #[test]
+    fn completed_materialized_browser_output_target_matches_copy_lane() {
+        let tmp = tempfile::tempdir().expect("browser output tempdir");
+        let source = tmp.path().join("capture.png");
+        let dest = tmp.path().join("exports");
+        std::fs::write(&source, b"png").expect("source");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let job = browser_download_fixture("browser-output", &source, &dest, TransferState::Done);
+
+        let target = completed_browser_download_target(&job).expect("output target");
+
+        assert_eq!(target.open, dest.join("capture.png"));
+        assert_eq!(target.reveal, dest);
+    }
+
+    #[test]
+    fn completed_download_open_and_reveal_use_the_resolved_output_target() {
+        let tmp = tempfile::tempdir().expect("download opener tempdir");
+        let dest = tmp.path().join("downloads");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let manifest = write_browser_download_manifest(
+            tmp.path(),
+            "https://files.example.test/report.pdf",
+            "report.pdf",
+            None,
+        );
+        let job = browser_download_fixture("browser-done", &manifest, &dest, TransferState::Done);
+        let transfers = RecordingTransfers::with_jobs(vec![job]);
+        let opener = RecordingDownloadOpener::default();
+        let mut state = WebState::default()
+            .with_transfers(Box::new(transfers))
+            .with_download_opener(Box::new(opener.clone()));
+
+        state.open_download("browser-done");
+        state.reveal_download("browser-done");
+
+        assert_eq!(opener.opened(), vec![dest.join("report.pdf")]);
+        assert_eq!(opener.revealed(), vec![dest.clone()]);
+        assert_eq!(state.download_notice, None);
+        let expected_notice = format!("Showing {}", dest.display());
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some(expected_notice.as_str())
+        );
+    }
+
+    #[test]
+    fn incomplete_download_does_not_launch_the_platform_opener() {
+        let tmp = tempfile::tempdir().expect("incomplete download tempdir");
+        let source = tmp.path().join("capture.png");
+        let dest = tmp.path().join("exports");
+        std::fs::write(&source, b"png").expect("source");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let job =
+            browser_download_fixture("browser-running", &source, &dest, TransferState::Running);
+        let transfers = RecordingTransfers::with_jobs(vec![job]);
+        let opener = RecordingDownloadOpener::default();
+        let mut state = WebState::default()
+            .with_transfers(Box::new(transfers))
+            .with_download_opener(Box::new(opener.clone()));
+
+        state.open_download("browser-running");
+        state.reveal_download("browser-running");
+
+        assert!(opener.opened().is_empty());
+        assert!(opener.revealed().is_empty());
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download is not complete yet")
+        );
+    }
+
+    #[test]
     fn download_is_dangerous_flags_executable_and_script_extensions() {
         for filename in [
             "setup.exe",
@@ -17224,6 +21285,26 @@ mod tests {
     }
 
     #[test]
+    fn download_is_dangerous_normalizes_encoded_and_platform_filename_tricks() {
+        for filename in [
+            "setup%2Eexe",
+            "setup%252Eexe",
+            "nested%2Fsetup.exe",
+            "C:\\Users\\me\\setup.exe",
+            "setup.exe...",
+            "setup.exe ",
+            "notes.exe .pdf",
+            "setup.exe:Zone.Identifier",
+            "safe.txt:evil.exe",
+        ] {
+            assert!(
+                download_is_dangerous(filename),
+                "{filename} should be flagged dangerous after normalization"
+            );
+        }
+    }
+
+    #[test]
     fn download_is_dangerous_allows_ordinary_files() {
         for filename in [
             "photo.jpg",
@@ -17242,6 +21323,272 @@ mod tests {
                 "{filename} should NOT be flagged dangerous"
             );
         }
+    }
+
+    #[test]
+    fn safe_suggested_name_still_parks_when_url_leaf_is_dangerous() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(
+            10,
+            "https://files.example.test/releases/setup%2Eexe?token=x",
+            "report.pdf",
+        );
+
+        assert!(
+            transfers.verbs().is_empty(),
+            "a dangerous URL leaf must not touch the ledger before Keep/Discard"
+        );
+        let pending = state
+            .pending_dangerous_download
+            .clone()
+            .expect("dangerous URL download parked pending confirmation");
+        assert_eq!(pending.id, 10);
+        assert_eq!(
+            pending.url,
+            "https://files.example.test/releases/setup%2Eexe?token=x"
+        );
+        assert_eq!(pending.filename, "report.pdf");
+        assert!(state.downloads_open);
+    }
+
+    #[test]
+    fn managed_policy_blocks_intercepted_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+        state.set_managed_url_policy(parse_managed_url_policy(
+            "url:https://files.example.test/private/\n",
+        ));
+
+        state.submit_download_to_ledger(
+            15,
+            "https://files.example.test/private/report.pdf",
+            "report.pdf",
+        );
+
+        assert!(
+            transfers.verbs().is_empty(),
+            "managed policy must block the daemon transfer before any ledger job"
+        );
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "managed policy is final; it must not become a user-overridable danger prompt"
+        );
+        assert!(
+            state.managed_policy_block.is_none(),
+            "download blocks should not replace the active page with a navigation interstitial"
+        );
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download blocked by managed policy: files.example.test")
+        );
+        assert!(state.downloads_open);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_POLICY_BLOCK, None)
+            .expect("list policy block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("policy body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(
+            event["url"],
+            "https://files.example.test/private/report.pdf"
+        );
+        assert_eq!(event["rule"], "url:https://files.example.test/private/");
+    }
+
+    #[test]
+    fn managed_policy_rechecks_pending_dangerous_download_on_keep() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(16, "https://files.example.test/setup.exe", "setup.exe");
+        assert!(state.pending_dangerous_download.is_some());
+
+        state.set_managed_url_policy(parse_managed_url_policy("files.example.test\n"));
+        state.keep_pending_dangerous_download();
+
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "Keep resolves the dangerous prompt even when later policy blocks it"
+        );
+        assert!(
+            transfers.verbs().is_empty(),
+            "a policy change after the prompt must still stop the transfer"
+        );
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download blocked by managed policy: files.example.test")
+        );
+    }
+
+    #[test]
+    fn safe_browsing_blocks_intercepted_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+        state.set_safe_browsing_hosts(["malware.test"]);
+
+        state.submit_download_to_ledger(18, "https://cdn.malware.test/payload.pdf", "payload.pdf");
+
+        assert!(
+            transfers.verbs().is_empty(),
+            "safe browsing must block the daemon transfer before any ledger job"
+        );
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "safe-browsing blocks must not become a user-overridable danger prompt"
+        );
+        assert!(
+            state.managed_policy_block.is_none(),
+            "download blocks should not replace the active page with a navigation interstitial"
+        );
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download blocked by safe browsing: cdn.malware.test")
+        );
+        assert!(state.downloads_open);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_SAFE_BROWSING_BLOCK, None)
+            .expect("list safe-browsing block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("safe-browsing body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(event["url"], "https://cdn.malware.test/payload.pdf");
+        assert_eq!(event["rule"], "malware.test");
+    }
+
+    #[test]
+    fn safe_browsing_rechecks_pending_dangerous_download_on_keep() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
+        state.submit_download_to_ledger(19, "https://files.example.test/setup.exe", "setup.exe");
+        assert!(state.pending_dangerous_download.is_some());
+
+        state.set_safe_browsing_hosts(["files.example.test"]);
+        state.keep_pending_dangerous_download();
+
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "Keep resolves the dangerous prompt even when safe browsing later blocks it"
+        );
+        assert!(
+            transfers.verbs().is_empty(),
+            "a safe-browsing update after the prompt must still stop the transfer"
+        );
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download blocked by safe browsing: files.example.test")
+        );
+    }
+
+    #[test]
+    fn safe_browsing_download_gate_keeps_mesh_overlay_exempt() {
+        let mut state = WebState::default();
+        state.set_safe_browsing_hosts(["media.mesh", "10.42.0.9"]);
+
+        assert!(
+            state
+                .safe_browsing_download_block_for("https://media.mesh/payload.pdf")
+                .is_none(),
+            "safe browsing mirrors request-filter mesh host exemptions"
+        );
+        assert!(
+            state
+                .safe_browsing_download_block_for("https://10.42.0.9/payload.pdf")
+                .is_none(),
+            "safe browsing mirrors request-filter Nebula overlay exemptions"
+        );
+    }
+
+    #[test]
+    fn insecure_http_blocks_intercepted_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+
+        state.submit_download_to_ledger(20, "http://cdn.example.test/payload.pdf", "payload.pdf");
+
+        assert!(
+            transfers.verbs().is_empty(),
+            "insecure downloads must block before the daemon fetches public HTTP"
+        );
+        assert!(
+            state.pending_dangerous_download.is_none(),
+            "transport hard-blocks must not become user-overridable danger prompts"
+        );
+        assert!(
+            state.managed_policy_block.is_none(),
+            "download blocks should not replace the active page with a navigation interstitial"
+        );
+        assert_eq!(
+            state.download_notice.as_deref(),
+            Some("Download blocked: insecure HTTP from cdn.example.test")
+        );
+        assert!(state.downloads_open);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_INSECURE_DOWNLOAD_BLOCK, None)
+            .expect("list insecure-download block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("insecure-download body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(event["url"], "http://cdn.example.test/payload.pdf");
+        assert_eq!(event["reason"], "plain_http_download");
+    }
+
+    #[test]
+    fn insecure_download_gate_keeps_mesh_overlay_exempt() {
+        let state = WebState::default();
+
+        assert!(
+            !state.insecure_download_block_for("http://media.mesh/payload.pdf"),
+            "mesh HTTP services are trusted overlay traffic, not public-web HTTP"
+        );
+        assert!(
+            !state.insecure_download_block_for("http://10.42.0.9/payload.pdf"),
+            "Nebula overlay HTTP services are trusted mesh traffic"
+        );
+        assert!(
+            !state.insecure_download_block_for("http://localhost:8080/payload.pdf"),
+            "localhost development/service downloads stay local"
+        );
+        assert!(
+            state.insecure_download_block_for("http://cdn.example.test/payload.pdf"),
+            "public HTTP downloads are blocked before transfer submission"
+        );
+        assert!(
+            state.insecure_download_block_for("HTTP://cdn.example.test/payload.pdf"),
+            "URL schemes are case-insensitive"
+        );
+        assert!(
+            !state.insecure_download_block_for("https://cdn.example.test/payload.pdf"),
+            "HTTPS downloads are unaffected"
+        );
+    }
+
+    #[test]
+    fn dangerous_url_path_check_ignores_authority_without_a_path_leaf() {
+        assert!(!download_url_path_is_dangerous("https://downloads.exe"));
+        assert!(download_url_path_is_dangerous(
+            "https://downloads.example.test/releases/setup.exe"
+        ));
     }
 
     #[test]
@@ -17308,6 +21655,61 @@ mod tests {
             transfers.verbs().is_empty(),
             "Discard must never create a ledger job"
         );
+    }
+
+    #[test]
+    fn dangerous_download_prompt_and_decisions_are_audited() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+
+        state.submit_download_to_ledger(21, "https://files.example.test/setup.exe", "setup.exe");
+        state.keep_pending_dangerous_download();
+        state.submit_download_to_ledger(22, "https://files.example.test/drop.ps1", "drop.ps1");
+        state.discard_pending_dangerous_download();
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1, "only the kept download is submitted");
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected a Submit verb");
+        };
+        let _ = std::fs::remove_file(&job.source);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_DOWNLOAD_DANGER, None)
+            .expect("list dangerous-download events");
+        assert_eq!(msgs.len(), 4);
+        let events = msgs
+            .iter()
+            .map(|msg| {
+                serde_json::from_str::<serde_json::Value>(
+                    msg.body.as_deref().expect("download-danger body"),
+                )
+                .expect("download-danger JSON")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(events[0]["op"], "browser_download_danger");
+        assert_eq!(events[0]["decision"], "prompt");
+        assert_eq!(events[0]["enforcement"], "dangerous_file_gate");
+        assert_eq!(events[0]["reason"], "dangerous_extension");
+        assert_eq!(events[0]["download_id"], 21);
+        assert_eq!(events[0]["url"], "https://files.example.test/setup.exe");
+        assert_eq!(events[0]["host"], "files.example.test");
+        assert_eq!(events[0]["filename"], "setup.exe");
+        assert_eq!(events[0]["source"], "browser");
+        assert_eq!(events[0]["node"], local_hostname());
+        assert!(events[0]["updated_ms"].as_u64().is_some());
+
+        assert_eq!(events[1]["download_id"], 21);
+        assert_eq!(events[1]["decision"], "keep");
+        assert_eq!(events[2]["download_id"], 22);
+        assert_eq!(events[2]["decision"], "prompt");
+        assert_eq!(events[3]["download_id"], 22);
+        assert_eq!(events[3]["decision"], "discard");
     }
 
     #[test]
@@ -17475,6 +21877,232 @@ mod tests {
             assert!(job.source.ends_with(".download.json"));
             assert!(job.policy.verify);
         }
+    }
+
+    #[test]
+    fn managed_policy_filters_observed_media_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        state.set_managed_url_policy(parse_managed_url_policy(
+            "url:https://blocked.example.test/media/\n",
+        ));
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            101,
+            "https://blocked.example.test/media/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        resource(
+            102,
+            "https://cdn.example.test/allowed.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("media download spool dir");
+        let dest = tempfile::tempdir().expect("media download destination dir");
+
+        let ids = state
+            .download_observed_media_assets_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("queue only policy-allowed media downloads");
+
+        assert_eq!(ids.len(), 1);
+        let files = std::fs::read_dir(spool.path())
+            .expect("read media download spool")
+            .map(|entry| entry.expect("media request file").path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(&files[0]).expect("read request file");
+        let request: serde_json::Value = serde_json::from_str(&body).expect("request JSON");
+        assert_eq!(request["asset_url"], "https://cdn.example.test/allowed.mp4");
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1);
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected submit");
+        };
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+        assert!(job.policy.verify);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_POLICY_BLOCK, None)
+            .expect("list policy block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("policy body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(event["url"], "https://blocked.example.test/media/clip.mp4");
+        assert_eq!(event["rule"], "url:https://blocked.example.test/media/");
+    }
+
+    #[test]
+    fn safe_browsing_filters_observed_media_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        state.set_safe_browsing_hosts(["malware.test"]);
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            111,
+            "https://cdn.malware.test/media/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        resource(
+            112,
+            "https://cdn.example.test/allowed.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("media download spool dir");
+        let dest = tempfile::tempdir().expect("media download destination dir");
+
+        let ids = state
+            .download_observed_media_assets_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("queue only safe-browsing-allowed media downloads");
+
+        assert_eq!(ids.len(), 1);
+        let files = std::fs::read_dir(spool.path())
+            .expect("read media download spool")
+            .map(|entry| entry.expect("media request file").path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(&files[0]).expect("read request file");
+        let request: serde_json::Value = serde_json::from_str(&body).expect("request JSON");
+        assert_eq!(request["asset_url"], "https://cdn.example.test/allowed.mp4");
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1);
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected submit");
+        };
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+        assert!(job.policy.verify);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_SAFE_BROWSING_BLOCK, None)
+            .expect("list safe-browsing block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("safe-browsing body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(event["url"], "https://cdn.malware.test/media/clip.mp4");
+        assert_eq!(event["rule"], "malware.test");
+    }
+
+    #[test]
+    fn insecure_http_filters_observed_media_downloads_before_transfer_ledger() {
+        let transfers = RecordingTransfers::default();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_transfers(Box::new(transfers.clone()));
+        let (session, helper, _writer) = live_page_session();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let resource = |id, url: &str, ty| {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ty),
+                },
+            );
+        };
+        resource(
+            121,
+            "http://cdn.example.test/media/clip.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        resource(
+            122,
+            "https://cdn.example.test/allowed.mp4",
+            mde_web_preview_client::ResourceType::Media,
+        );
+        run_panel(&mut state);
+        let _ = drain_control_messages(&helper);
+        let spool = tempfile::tempdir().expect("media download spool dir");
+        let dest = tempfile::tempdir().expect("media download destination dir");
+
+        let ids = state
+            .download_observed_media_assets_to_dirs(
+                spool.path().to_path_buf(),
+                dest.path().to_path_buf(),
+            )
+            .expect("queue only HTTPS media downloads");
+
+        assert_eq!(ids.len(), 1);
+        let files = std::fs::read_dir(spool.path())
+            .expect("read media download spool")
+            .map(|entry| entry.expect("media request file").path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(&files[0]).expect("read request file");
+        let request: serde_json::Value = serde_json::from_str(&body).expect("request JSON");
+        assert_eq!(request["asset_url"], "https://cdn.example.test/allowed.mp4");
+
+        let verbs = transfers.verbs();
+        assert_eq!(verbs.len(), 1);
+        let TransferVerb::Submit(job) = &verbs[0] else {
+            panic!("expected submit");
+        };
+        assert_eq!(job.method, TransferMethod::BrowserDownload);
+        assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
+        assert!(job.policy.verify);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_INSECURE_DOWNLOAD_BLOCK, None)
+            .expect("list insecure-download block events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("insecure-download body"))
+                .expect("valid JSON");
+        assert_eq!(event["trigger"], "download");
+        assert_eq!(event["url"], "http://cdn.example.test/media/clip.mp4");
+        assert_eq!(event["reason"], "plain_http_download");
     }
 
     fn transfer_fixture(

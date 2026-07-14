@@ -33,6 +33,108 @@ memory `cef-handler-lookup-peer-null-bug`.
   - ✅ *omnibox focus ring* — the branded 2px `mde_egui::focus` accent ring on the primary keyboard
     target (a11y), matching the dock/Console/Start idiom.
 
+- **Follow-on delivered 2026-07-14:** completed `browser_download` ledger rows now expose
+  Open + Show actions in the Browser downloads drawer. The shell resolves daemon-written output
+  paths for single-file media, HLS/DASH packages, and materialized browser outputs, mirrors the
+  worker filename sanitizer, and launches through an injectable `xdg-open` seam covered by unit
+  tests. No new `mackesd` verb was needed.
+
+- **Follow-on delivered 2026-07-14:** the focused omnibox now paints the visible grey
+  inline-completion tail for a genuine top-hit completion, while preserving the existing
+  TextEdit buffer/cursor mapping and Enter-to-accept preselect behavior.
+
+- **Follow-on delivered 2026-07-14:** JavaScript dialogs now complete their engine-to-shell
+  loop: CEF handles `alert`/`confirm`/`prompt` without blocking the page, the client keeps a
+  drainable bounded notice queue, and Browser chrome surfaces the origin + auto-resolution
+  decision as a dismissible passive notice.
+
+- **Follow-on delivered 2026-07-14:** page `beforeunload` handlers now use a real
+  leave/stay round-trip instead of falling through the null CEF slot. The CEF bridge registers
+  `on_before_unload_dialog`, retains the `cef_jsdialog_callback_t` by a bridge-minted id, the
+  preview client queues bounded prompts with safe stay-on-overflow behavior, and Browser chrome
+  answers the active prompt with Leave/Reload or Stay.
+
+- **Follow-on delivered 2026-07-14:** per-tab autoplay blocking is now a first-class Browser tool.
+  The shell exposes Block/Allow Autoplay in the View menu and both tab context menus, syncs the bit
+  through session JSON, and sends `ControlMsg::SetAutoplayBlocked` to both CEF and Servo helpers.
+  Helpers install a bounded page shim that strips autoplay media and rejects page-initiated
+  `HTMLMediaElement.play()` until trusted user activation, then cleanly restore the original media
+  API when disabled. CEF also remembers the tab policy and reapplies the blocker from its existing
+  navigation shim injector for fresh documents.
+
+- **Follow-on delivered 2026-07-14:** the credential wire protocol is now fail-closed for
+  mixed-version helpers. Host-bound `FillLogin` and origin-bound `LoginSubmitted` moved to fresh
+  tags, legacy payloads decode with no trusted host/origin, and the wire decoder rejects trailing
+  bytes so added fields cannot be silently reinterpreted by older payload shapes.
+
+- **Follow-on delivered 2026-07-14:** Browser now has an operator-managed URL policy gate.
+  `browser/managed-url-policy.txt` under the workgroup root accepts host suffix and URL-prefix
+  rules, the shell blocks omnibox/bookmark/send-tab/session-restore/new-tab opens before helper
+  load, and the shared request filter blocks helper-originated top-level document navigations
+  and subresources before network. Blocks paint a full-page managed-policy interstitial naming
+  the matched rule, publish `event/browser/policy-block` audit records carrying trigger, engine,
+  URL, host, rule, node, and timestamp metadata, and the Privacy menu reports the active managed
+  rule count. URL-prefix policy matching canonicalizes default HTTP(S) ports, strips authority
+  userinfo, and keeps authority-only prefixes host-bound, so
+  `https://portal.example:443/admin/` and `https://alice@portal.example/admin/` cannot bypass
+  `https://portal.example/admin/`, while `https://docs.example` does not overmatch
+  `https://docs.example.evil/`. The same managed policy is rechecked before Browser-created
+  download manifests enter the daemon Transfers lane, including CEF-intercepted downloads and
+  Power Mode observed-media downloads, with `event/browser/policy-block` records using
+  `trigger: "download"`.
+
+- **Follow-on delivered 2026-07-14:** CEF one-shot callback retention is bounded for favicon and
+  Save PDF flows. Completed `download_image` and `print_to_pdf` callbacks are removed from the
+  bridge registry on completion, finished callback boxes are purged on the next lifecycle touch,
+  and the `cef_binary_value_t` returned by `get_as_png` is released after its bytes are copied.
+  Resource-verdict, permission-prompt, and beforeunload callbacks are also capped; if the shell
+  stops answering, the engine denies/cancels new requests fail-closed instead of growing the held
+  CEF callback set without bound.
+
+- **Follow-on delivered 2026-07-14:** current-tab site-data clears now have an operator-consumable
+  audit event. `Clear Current Tab Data` records the pre-clear URL, title, host, engine, scope, node,
+  and timestamp to `event/browser/site-data-clear` while preserving the private-by-default,
+  session-memory-only cookie/site-data model. `Clear All Browsing Data` also publishes
+  `event/browser/browsing-data-clear` with all-session scope plus before-clear counts for history,
+  downloads, reopen entries, saved logins, and permission grants. Runtime page permission decisions
+  now publish `event/browser/permission-decision` for explicit allow/deny prompts and session-grant
+  reuse auto-allows, including origin, permission kind, grant scope, active-tab context, node, and
+  timestamp metadata. `Forget Site Permissions` now revokes matching session runtime grants instead
+  of only clearing prompt history, and publishes `event/browser/permission-revoke` with active-site
+  context plus revoked-grant/prompt counts. Dangerous download gates now publish
+  `event/browser/download-danger` for the warning prompt and the user's eventual Keep/Discard
+  decision, with source URL, host, filename, helper download id, node, and timestamp metadata.
+  Dangerous download classification now evaluates the suggested filename and the source URL path leaf
+  after percent-decoding, trailing Windows dot/space normalization, and ADS-style suffix handling, so
+  a benign suggested name cannot hide an executable URL leaf. Safe-browsing host blocks are also
+  rechecked before Browser-created download manifests enter the daemon Transfers lane, preserve the
+  same mesh/overlay exemption as page requests, and publish `event/browser/safe-browsing-block`
+  records for hard download blocks. Public plain-HTTP downloads are also blocked before transfer
+  manifest creation, while mesh/overlay HTTP endpoints remain trusted, and the shell publishes
+  `event/browser/insecure-download-block` records for those transport hard-blocks. Secure pages now
+  also hard-block public plain-HTTP subresources in the shared helper request filter as
+  `mixed-content:http`, preserving mesh/overlay HTTP exemptions and leaving top-level HTTP
+  navigations with the existing shell navigation prompt; those subresource transport blocks publish
+  `event/browser/mixed-content-block` audit records and carry their `blocked_by` reason through
+  offline-cache/media resource manifests. Top-level public plain-HTTP navigation decisions now publish
+  `event/browser/insecure-navigation` records for prompt, Continue, Upgrade, Cancel, and session-HSTS
+  auto-upgrade decisions; new-tab URL opens also pause at the same HTTPS prompt instead of bypassing
+  it before helper spawn. The site-info/security popup now also surfaces live managed-policy,
+  safe-browsing, mixed-content, and tracker/filter block counts plus representative rules/hosts
+  from the active page's observed resource log, and shows current-site permission posture
+  (default-deny, session grants, denied prompts, and forgotten-site state). Per-site
+  privacy/adfilter toggles now publish
+  `event/browser/site-blocking` with the active URL/title/host, engine, enable/disable decision,
+  node, and timestamp so local user overrides are
+  auditable separately from synced filter policy. Session-only credential actions now publish
+  redacted `event/browser/credential` records for save, update, delete, fill, and prompt-dismiss
+  decisions with host, active URL/title, engine, trigger, per-host count, node, and timestamp
+  metadata, but never username or password material. Auto-captured "Save password?" prompts are
+  also scoped to the tab that submitted the login, so a background-tab capture cannot be accepted
+  from an unrelated active page; closing the source tab drops its pending prompt. The shell now
+  revalidates the capture origin against the source tab's committed host before staging the prompt,
+  even though the CEF bridge already performs the same host check.
+
 - **AUDIT CORRECTION:** *middle-click-to-close-tab* was marked "missing" by the audit but is in fact
   SHIPPED (`mod.rs` `tab_response.middle_clicked() => close`). The audit (subagents over a 13K-line
   god-module) carries false-negatives, so the raw "gap" count is an OVER-count — re-verify a
@@ -40,16 +142,15 @@ memory `cef-handler-lookup-peer-null-bug`.
 
 - **Genuinely remaining, by category (NOT "a few more clean gaps" — categorically different work):**
   - *Engine / CEF-handler (ABI-offset risk, needs live-CEF verify):* audible indicator, HTML5
-    fullscreen (`on_fullscreen_mode_change`), IME preedit, UA HTTP-header override, autoplay policy.
+    fullscreen (`on_fullscreen_mode_change`), IME preedit, UA HTTP-header override.
   - *Threat-model-GATED (do NOT do autonomously — see [[browser-privacy-locks]]):* per-site permission
     ALLOW path, safe-browsing host population, HSTS, B5 password manager, B4 extensions-runtime proof.
   - *Large (multi-session each):* tab groups, configurable search engines, PiP, real userscript
     engine, in-shell PDF UI, print-preview options.
   - *Data-plumbing / OS-coupled:* ✅ adblock breakdown DELIVERED 2026-07-13 (filter accumulates a
     `BlockTally` → `session.block_tally()` → shield hover shows top blocked domains; filter test +
-    client 48/0 + shell 1165/0) — the plumbing regime is deliverable, not just display. Remaining:
-    downloads Open/reveal (needs a new mackesd `TransferVerb` + OS integration), inline-autocomplete
-    grey top-hit.
+    client 48/0 + shell 1165/0) — the plumbing regime is deliverable, not just display. Browser
+    download Open/Show and omnibox inline grey top-hit were delivered 2026-07-14.
 
 ### Wave B STARTED — first engine round-trip live-verified 2026-07-13
 
@@ -86,17 +187,18 @@ the pinned CEF-Alloy + OSR design — non-goals in the WebRTC category, not unfi
 - **Password manager — ✅ COMPLETE (session-only, industry-standard).** Store + user-initiated autofill
   (🔑 menu) + **auto-capture-on-submit** + manage + Clear-All integration. The capture half was NOT built
   via the render-process bridge I first assumed — instead it REUSES the proven passkey beacon channel:
-  the page-side `login_capture_script` beacons `{origin,username,password}` to
+  the page-side `login_capture_script` beacons `{origin=<location.origin>, body={username,password}}` to
   `https://mde-login.invalid/capture/`, which the resource-request handler intercepts + CANCELS before the
-  network (the credential never leaves the sandbox — identical safety to passkey ceremony data). So it's
-  both safe AND complete, no operator review needed. Persistence + auto-fill-on-load stay deliberate
-  non-goals (private-by-default). Only on-glass e2e verification (real form submit) is F44-deploy-gated,
-  like the other engine round-trips.
+  network. The engine verifies that origin's host against CEF's cached top-level URL before the shell offers
+  to save, so page-supplied JSON cannot spoof another saved-login host (the credential never leaves the
+  sandbox — identical safety to passkey ceremony data). Persistence + auto-fill-on-load stay deliberate
+  non-goals (private-by-default). Only on-glass e2e verification (real form submit) is F44-deploy-gated, like
+  the other engine round-trips.
 
 **Operator decisions that would change this:** switch to the CEF **Chrome runtime** (unblocks B4 +
-native PDF in one move); authorize the password capture bridge (with a security review); decide PiP
-(build the OSR video-surface or accept non-goal). None are "finish the feature" — they are
-platform-architecture calls.
+native PDF in one move); authorize password persistence or auto-fill-on-load beyond the current
+session-only/private-by-default model; decide PiP (build the OSR video-surface or accept non-goal).
+None are "finish the feature" — they are platform-architecture calls.
 
 **(Earlier framing, superseded by the above; kept for history.) The 4 genuinely-remaining features are NOT clean gaps — each is blocked on infrastructure, architecture, or an
 operator-gated resource (not effort I'm choosing to skip):**
@@ -188,7 +290,7 @@ print options, tab groups) were delivered autonomously this session — "large" 
   NOT autonomously deliverable — [[browser-privacy-locks]] forbids changing the permission/persistence
   posture without the operator. These are operator decisions, permanently.
 - *Engine-handlers firing on user-gesture events (HTML5 fullscreen, audible indicator):* the callback
-  fires only on a gesture-gated page action (requestFullscreen / autoplay), which cannot be triggered
+  fires only on a gesture-gated page action (requestFullscreen / page media playback), which cannot be triggered
   headlessly — so even the `cef-verify` harness can't confirm them; they need an on-glass seat.
 - *Large multi-session epics (tab groups, configurable search engines, PiP, userscript engine, in-shell
   PDF UI, print-preview options):* each is a feature program, not a gap.
@@ -225,7 +327,9 @@ Engine (Track E) is now un-blocked: CEF paints real frames on the F44 seat after
 - **Security:** cert-error interstitial, clickable page-info/site-info panel, per-site permission
   grants (camera/mic/location), safe-browsing blocked-page gating navigation. *(security lane)*
 - **Bookmarks:** a bookmarks bar in the chrome; the star reflects state + is a toggle + add editor. *(downloads lane)*
-- **Downloads UX:** Open / Show-in-folder on completed items; dangerous-file warnings. *(downloads lane)*
+- **Downloads UX:** Open / Show-in-folder on completed items and dangerous-file warnings are now
+  shipped in the reconciled browser code; this line is retained only as original backlog context.
+  *(downloads lane)*
 
 ## Tier 2 — medium (polish toward parity)
 - Omnibox: robust search-vs-navigate router, scheme elision + domain emphasis, configurable search
@@ -246,4 +350,4 @@ Engine (Track E) is now un-blocked: CEF paints real frames on the F44 seat after
 
 ## Strengths (already above default Chrome)
 - Every engine runs in a robust OS sandbox (userns + seccomp + dropped caps + pivot_root RO rootfs).
-- Rich tab context menu (mute, force-dark, reader, containers, display target).
+- Rich tab context menu (mute, autoplay blocking, force-dark, reader, containers, display target).

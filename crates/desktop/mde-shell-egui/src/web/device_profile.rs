@@ -334,13 +334,43 @@ impl WebState {
     }
 
     pub(super) fn forget_active_site_permissions(&mut self) {
-        let Some(host) = self.active_first_party() else {
+        let Some((host, engine, url, title)) = self.tabs.get(self.active).and_then(|tab| {
+            let url = tab.session.nav().url.trim().to_owned();
+            host_of(&url).map(|host| (host, tab.engine, url, tab.session.title().to_owned()))
+        }) else {
             return;
         };
+        let revoked_grants = self
+            .granted_permissions
+            .iter()
+            .filter(|(origin, _)| host_of(origin).as_deref() == Some(host.as_str()))
+            .count();
+        let cleared_prompt_decisions = self
+            .site_permission_prompts
+            .iter()
+            .filter(|prompt| prompt.host == host)
+            .count();
+        let now = unix_ms();
+        self.granted_permissions
+            .retain(|(origin, _)| host_of(origin).as_deref() != Some(host.as_str()));
         self.forgotten_permission_sites.retain(|site| site != &host);
         self.site_permission_prompts
             .retain(|prompt| prompt.host != host);
-        self.forgotten_permission_sites.push(host);
+        self.forgotten_permission_sites.push(host.clone());
+        let body = browser_permission_revoke_body(
+            engine,
+            &url,
+            &title,
+            &host,
+            revoked_grants,
+            cleared_prompt_decisions,
+            now,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_PERMISSION_REVOKE,
+            &body,
+        );
     }
 
     pub(super) fn prompt_active_device_permission(&mut self, kind: DevicePermissionKind) {

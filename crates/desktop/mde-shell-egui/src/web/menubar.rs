@@ -88,6 +88,8 @@ pub(super) enum MenuAction {
     OpenFind,
     /// Toggle the active tab's audio mute state.
     ToggleAudioMute,
+    /// Toggle autoplay blocking for the active tab.
+    ToggleAutoplayBlock,
     /// Toggle forced dark styling for the active tab.
     ToggleForceDark,
     /// Toggle reader-mode styling for the active tab.
@@ -235,6 +237,8 @@ struct Snapshot {
     power_mode: bool,
     /// Active tab audio is muted.
     audio_muted: bool,
+    /// Active tab blocks page-initiated autoplay until user activation.
+    autoplay_blocked: bool,
     /// Active tab force-dark styling is enabled.
     force_dark: bool,
     /// Active tab reader-mode styling is enabled.
@@ -265,6 +269,8 @@ struct Snapshot {
     site_blocking_enabled: bool,
     /// Safe-browsing mesh blocklist status.
     safe_browsing: String,
+    /// Operator-managed URL policy status.
+    managed_policy: String,
     /// Per-site data manager status.
     site_data: String,
     /// The committed URL.
@@ -315,6 +321,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 current_site_permissions: state.active_site_permission_summary(),
                 site_blocking_enabled: state.active_site_blocking_enabled(),
                 safe_browsing: state.safe_browsing_summary(),
+                managed_policy: state.managed_policy_summary(),
                 site_data: state.site_data_summary(),
                 url: nav.url.clone(),
                 state: Some(tab.session.state().clone()),
@@ -330,6 +337,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 total_downloads,
                 power_mode: state.power_mode,
                 audio_muted: tab.muted,
+                autoplay_blocked: tab.autoplay_blocked,
                 force_dark: tab.force_dark,
                 reader_mode: tab.reader_mode,
                 user_scripts: tab.user_scripts,
@@ -364,6 +372,7 @@ fn snapshot(state: &WebState) -> Snapshot {
     snap.active_downloads = active_downloads;
     snap.total_downloads = total_downloads;
     snap.safe_browsing = state.safe_browsing_summary();
+    snap.managed_policy = state.managed_policy_summary();
     snap.site_data = state.site_data_summary();
     snap.read_aloud_status = state.latest_read_aloud_status.clone();
     snap.voice_command_status = state.latest_voice_command_status.clone();
@@ -523,6 +532,17 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 ),
                 Entry::Item(
                     Item::new(
+                        MenuAction::ToggleAutoplayBlock,
+                        if s.autoplay_blocked {
+                            "Allow Autoplay"
+                        } else {
+                            "Block Autoplay"
+                        },
+                    )
+                    .enabled(can_tools),
+                ),
+                Entry::Item(
+                    Item::new(
                         MenuAction::ToggleForceDark,
                         if s.force_dark {
                             "Disable Force Dark"
@@ -661,6 +681,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption(s.site_data.clone()),
                 Entry::Caption("Filter lists: bundled seed + synced/custom rules".to_owned()),
                 Entry::Caption(s.safe_browsing.clone()),
+                Entry::Caption(s.managed_policy.clone()),
                 Entry::Caption(format!(
                     "Permissions: default deny ({DEFAULT_DENIED_PERMISSIONS})"
                 )),
@@ -936,6 +957,9 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
     if s.has_tab && s.audio_muted {
         chips.push(StatusChip::new("Muted", ChipTone::Warn));
     }
+    if s.has_tab && s.autoplay_blocked {
+        chips.push(StatusChip::new("Autoplay", ChipTone::Warn));
+    }
     if s.has_tab && s.force_dark {
         chips.push(StatusChip::new("Dark", ChipTone::Info));
     }
@@ -1087,6 +1111,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
         MenuAction::ResetZoom => state.reset_zoom(),
         MenuAction::OpenFind => state.open_find_bar(),
         MenuAction::ToggleAudioMute => state.toggle_active_tab_mute(),
+        MenuAction::ToggleAutoplayBlock => state.toggle_active_tab_autoplay_blocked(),
         MenuAction::ToggleForceDark => state.toggle_active_tab_force_dark(),
         MenuAction::ToggleReaderMode => state.toggle_active_tab_reader_mode(),
         MenuAction::ToggleUserScripts => state.toggle_active_tab_user_scripts(),
@@ -1289,6 +1314,7 @@ mod tests {
             total_downloads: 0,
             power_mode: false,
             audio_muted: false,
+            autoplay_blocked: false,
             force_dark: false,
             reader_mode: false,
             user_scripts: false,
@@ -1306,6 +1332,7 @@ mod tests {
             ),
             site_blocking_enabled: true,
             safe_browsing: "Safe browsing: 2 mesh-hosted unsafe hosts loaded".to_owned(),
+            managed_policy: "Managed policy: 3 URL block rules loaded".to_owned(),
             site_data: "Site data: 1 tracked site · 1 open tab · example.com cleared 0 times"
                 .to_owned(),
             url: "https://example.com/path".to_owned(),
@@ -1534,6 +1561,11 @@ mod tests {
         assert!(item(MenuAction::TogglePowerMode).enabled);
         assert_eq!(item(MenuAction::ToggleAudioMute).label, "Mute Tab");
         assert!(item(MenuAction::ToggleAudioMute).enabled);
+        assert_eq!(
+            item(MenuAction::ToggleAutoplayBlock).label,
+            "Block Autoplay"
+        );
+        assert!(item(MenuAction::ToggleAutoplayBlock).enabled);
         assert_eq!(item(MenuAction::ToggleForceDark).label, "Enable Force Dark");
         assert!(item(MenuAction::ToggleForceDark).enabled);
         assert_eq!(
@@ -1592,6 +1624,7 @@ mod tests {
             active_downloads: 2,
             total_downloads: 3,
             audio_muted: true,
+            autoplay_blocked: true,
             force_dark: true,
             reader_mode: true,
             user_scripts: true,
@@ -1607,12 +1640,14 @@ mod tests {
         assert!(texts.contains(&"Find".to_owned()));
         assert!(texts.contains(&"2".to_owned()));
         assert!(texts.contains(&"Muted".to_owned()));
+        assert!(texts.contains(&"Autoplay".to_owned()));
         assert!(texts.contains(&"Dark".to_owned()));
         assert!(texts.contains(&"Reader".to_owned()));
         assert!(texts.contains(&"Userscripts".to_owned()));
 
         let muted = Snapshot {
             audio_muted: true,
+            autoplay_blocked: true,
             force_dark: true,
             reader_mode: true,
             user_scripts: true,
@@ -1631,6 +1666,15 @@ mod tests {
             })
             .expect("mute item present");
         assert_eq!(unmute.label, "Unmute Tab");
+        let allow_autoplay = view
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Item(i) if i.id == MenuAction::ToggleAutoplayBlock => Some(i),
+                _ => None,
+            })
+            .expect("autoplay item present");
+        assert_eq!(allow_autoplay.label, "Allow Autoplay");
         let disable_dark = view
             .entries
             .iter()
@@ -2070,6 +2114,12 @@ mod tests {
         assert!(
             captions
                 .iter()
+                .any(|c| c.contains("Managed policy: 3 URL block rules loaded")),
+            "the managed URL policy status is visible"
+        );
+        assert!(
+            captions
+                .iter()
                 .any(|c| c.contains("Permissions: default deny")),
             "the default-deny permission manager policy is visible"
         );
@@ -2263,6 +2313,7 @@ mod tests {
             MenuAction::ResetZoom,
             MenuAction::OpenFind,
             MenuAction::ToggleAudioMute,
+            MenuAction::ToggleAutoplayBlock,
             MenuAction::ToggleForceDark,
             MenuAction::ToggleReaderMode,
             MenuAction::ToggleUserScripts,

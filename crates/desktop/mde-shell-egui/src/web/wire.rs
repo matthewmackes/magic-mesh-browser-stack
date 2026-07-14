@@ -35,6 +35,31 @@ pub(super) fn adfilter_domain_body(domain: &str) -> String {
     serde_json::json!({ "domain": domain.trim() }).to_string()
 }
 
+pub(super) fn browser_site_blocking_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    enabled: bool,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_site_blocking",
+        "policy": "adfilter_site_override",
+        "decision": if enabled { "enable" } else { "disable" },
+        "site_blocking": if enabled { "enabled" } else { "disabled" },
+        "enforcement": "request_filter",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
 pub(super) fn browser_display_target_body(
     tab_index: usize,
     tab: &Tab,
@@ -266,6 +291,339 @@ pub(super) fn browser_permission_prompt_body(
     .to_string()
 }
 
+fn browser_runtime_permission_wire(kind: u8) -> &'static str {
+    match kind {
+        0 => "geolocation",
+        1 => "notifications",
+        2 => "clipboard",
+        _ => "unknown",
+    }
+}
+
+pub(super) fn browser_permission_decision_body(
+    engine: BrowserEngine,
+    origin: &str,
+    kind: u8,
+    allow: bool,
+    enforcement: &str,
+    url: &str,
+    title: &str,
+    decided_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_permission_decision",
+        "permission": browser_runtime_permission_wire(kind),
+        "permission_kind": kind,
+        "decision": if allow { "allow" } else { "deny" },
+        "grant_scope": if allow { "session" } else { "none" },
+        "enforcement": enforcement.trim(),
+        "engine": engine.wire(),
+        "origin": origin.trim(),
+        "origin_host": host_of(origin).unwrap_or_else(|| origin.trim().to_owned()),
+        "url": url.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "decided_ms": decided_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_permission_revoke_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    revoked_grants: usize,
+    cleared_prompt_decisions: usize,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_permission_revoke",
+        "decision": "revoke",
+        "enforcement": "session_permission_store",
+        "permission_policy": "default_deny",
+        "scope": "current_site",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "revoked_grants": revoked_grants,
+        "cleared_prompt_decisions": cleared_prompt_decisions,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_credential_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    decision: &str,
+    trigger: &str,
+    credential_count: usize,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_credential",
+        "decision": decision.trim(),
+        "enforcement": "session_credential_store",
+        "privacy": "redacted",
+        "scope": "session_only",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "credential_count": credential_count,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_policy_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    rule: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_policy_block",
+        "policy": "managed_url",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "trigger": trigger,
+        "engine": engine.wire(),
+        "url": url,
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "rule": rule.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_safe_browsing_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    rule: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_safe_browsing_block",
+        "policy": "safe_browsing",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "rule": rule.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_insecure_download_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_insecure_download_block",
+        "policy": "insecure_transport",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "reason": "plain_http_download",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_insecure_navigation_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    decision: &str,
+    trigger: &str,
+    enforcement: &str,
+    upgraded_url: Option<&str>,
+    decided_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_insecure_navigation",
+        "policy": "insecure_transport",
+        "decision": decision.trim(),
+        "enforcement": enforcement.trim(),
+        "reason": "plain_http_navigation",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "upgraded_url": upgraded_url.map(str::trim),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "decided_ms": decided_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_mixed_content_block_body(
+    engine: BrowserEngine,
+    page_url: &str,
+    url: &str,
+    title: &str,
+    resource: u8,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_mixed_content_block",
+        "policy": "mixed_content",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "reason": "plain_http_subresource",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "page_url": page_url.trim(),
+        "page_host": host_of(page_url).unwrap_or_else(|| page_url.trim().to_owned()),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "resource": browser_resource_type_name(resource),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+fn browser_resource_type_name(resource: u8) -> &'static str {
+    match mde_web_preview_client::resource_from_wire(resource) {
+        mde_web_preview_client::ResourceType::Document => "document",
+        mde_web_preview_client::ResourceType::Subdocument => "subdocument",
+        mde_web_preview_client::ResourceType::Stylesheet => "stylesheet",
+        mde_web_preview_client::ResourceType::Script => "script",
+        mde_web_preview_client::ResourceType::Image => "image",
+        mde_web_preview_client::ResourceType::Font => "font",
+        mde_web_preview_client::ResourceType::Media => "media",
+        mde_web_preview_client::ResourceType::Object => "object",
+        mde_web_preview_client::ResourceType::XmlHttpRequest => "xmlhttprequest",
+        mde_web_preview_client::ResourceType::Ping => "ping",
+        mde_web_preview_client::ResourceType::WebSocket => "websocket",
+        mde_web_preview_client::ResourceType::Other => "other",
+    }
+}
+
+pub(super) fn browser_site_data_clear_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    scope: &str,
+    cleared_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_site_data_clear",
+        "decision": "clear",
+        "enforcement": "session_memory_only",
+        "scope": scope,
+        "engine": engine.wire(),
+        "url": url,
+        "host": host.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "cleared_ms": cleared_ms,
+    })
+    .to_string()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct BrowserBrowsingDataClearCounts {
+    pub(super) history_entries: usize,
+    pub(super) downloads: usize,
+    pub(super) reopen_entries: usize,
+    pub(super) saved_logins: usize,
+    pub(super) permission_grants: usize,
+}
+
+pub(super) fn browser_browsing_data_clear_body(
+    engine: BrowserEngine,
+    active_url: &str,
+    active_title: &str,
+    active_host: &str,
+    counts: BrowserBrowsingDataClearCounts,
+    cleared_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_browsing_data_clear",
+        "decision": "clear",
+        "enforcement": "session_memory_only",
+        "scope": "all_session",
+        "engine": engine.wire(),
+        "active_url": active_url.trim(),
+        "active_host": active_host.trim(),
+        "active_title": active_title.trim(),
+        "history_entries": counts.history_entries,
+        "downloads": counts.downloads,
+        "reopen_entries": counts.reopen_entries,
+        "saved_logins": counts.saved_logins,
+        "permission_grants": counts.permission_grants,
+        "source": "browser",
+        "node": local_hostname(),
+        "cleared_ms": cleared_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_download_danger_body(
+    download_id: u64,
+    url: &str,
+    filename: &str,
+    decision: &str,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_download_danger",
+        "decision": decision.trim(),
+        "enforcement": "dangerous_file_gate",
+        "reason": "dangerous_extension",
+        "download_id": download_id,
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "filename": filename.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
 pub(super) fn browser_passkey_body(
     engine: BrowserEngine,
     helper_body: &str,
@@ -446,6 +804,7 @@ pub(super) fn browser_offline_cache_body(request: &OfflineCacheRequest, text: &s
                         "url": &resource.url,
                         "resource": &resource.resource,
                         "allowed": resource.allowed,
+                        "blocked_by": &resource.blocked_by,
                     })
                 })
                 .collect(),
@@ -534,6 +893,10 @@ pub(super) fn offline_cache_resource_manifest(
                 url: clamp_chars(url, OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS),
                 resource: offline_cache_resource_type_name(resource.resource).to_owned(),
                 allowed: resource.allowed,
+                blocked_by: resource
+                    .blocked_by
+                    .as_deref()
+                    .map(|rule| clamp_chars(rule.trim(), OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS)),
             })
         })
         .collect::<Vec<_>>()
@@ -1011,10 +1374,17 @@ fn parse_offline_cache_resource(v: &serde_json::Value) -> Result<OfflineCacheRes
         .get("allowed")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "offline-cache resource allowed flag is missing".to_owned())?;
+    let blocked_by = v
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| clamp_chars(rule, OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS));
     Ok(OfflineCacheResource {
         url: url.to_owned(),
         resource: resource.to_owned(),
         allowed,
+        blocked_by,
     })
 }
 
@@ -1545,6 +1915,7 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
                 "can_back": nav.can_back,
                 "can_forward": nav.can_forward,
                 "muted": tab.muted,
+                "autoplay_blocked": tab.autoplay_blocked,
                 "force_dark": tab.force_dark,
                 "reader_mode": tab.reader_mode,
                 "user_scripts": tab.user_scripts,
@@ -1924,7 +2295,9 @@ pub(super) fn percent_encode_query(s: &str) -> String {
 }
 
 pub(super) fn is_plain_http(url: &str) -> bool {
-    url.trim_start().starts_with("http://")
+    url.trim_start()
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
 }
 
 pub(super) fn is_new_tab_url(url: &str) -> bool {

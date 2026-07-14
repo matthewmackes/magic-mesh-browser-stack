@@ -47,6 +47,8 @@ pub enum WireError {
     TooLong(usize),
     /// A string field was not valid UTF-8.
     BadUtf8,
+    /// The payload carried extra bytes after a complete message.
+    TrailingBytes(usize),
 }
 
 impl fmt::Display for WireError {
@@ -56,6 +58,7 @@ impl fmt::Display for WireError {
             Self::BadTag(t) => write!(f, "unknown wire tag {t}"),
             Self::TooLong(n) => write!(f, "wire length {n} exceeds the cap"),
             Self::BadUtf8 => f.write_str("wire string was not valid UTF-8"),
+            Self::TrailingBytes(n) => write!(f, "wire message has {n} trailing bytes"),
         }
     }
 }
@@ -369,9 +372,11 @@ impl KeyCode {
     }
 }
 
+const REDACTED: &str = "<redacted>";
+
 /// One forwarded input event, in the helper's **device pixels** (the shell has
 /// already multiplied logical coordinates by `pixels_per_point`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum InputEvent {
     /// The pointer moved to `(x, y)` device pixels.
     PointerMoved {
@@ -417,6 +422,58 @@ pub enum InputEvent {
     },
     /// Committed text (IME / typed characters).
     Text(String),
+}
+
+impl std::fmt::Debug for InputEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PointerMoved { x, y } => f
+                .debug_struct("PointerMoved")
+                .field("x", x)
+                .field("y", y)
+                .finish(),
+            Self::PointerButton {
+                x,
+                y,
+                button,
+                pressed,
+                modifiers,
+            } => f
+                .debug_struct("PointerButton")
+                .field("x", x)
+                .field("y", y)
+                .field("button", button)
+                .field("pressed", pressed)
+                .field("modifiers", modifiers)
+                .finish(),
+            Self::PointerGone => f.write_str("PointerGone"),
+            Self::Scroll {
+                delta_x,
+                delta_y,
+                modifiers,
+            } => f
+                .debug_struct("Scroll")
+                .field("delta_x", delta_x)
+                .field("delta_y", delta_y)
+                .field("modifiers", modifiers)
+                .finish(),
+            Self::Key {
+                key,
+                pressed,
+                modifiers,
+            } => f
+                .debug_struct("Key")
+                .field("key", key)
+                .field("pressed", pressed)
+                .field("modifiers", modifiers)
+                .finish(),
+            Self::Text(text) => f
+                .debug_struct("Text")
+                .field("value", &REDACTED)
+                .field("bytes", &text.len())
+                .finish(),
+        }
+    }
 }
 
 impl InputEvent {
@@ -500,7 +557,7 @@ impl InputEvent {
 }
 
 /// A message the shell sends to drive the helper.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum ControlMsg {
     /// Navigate to `url`.
     Load(String),
@@ -558,6 +615,11 @@ pub enum ControlMsg {
     SetAudioMuted {
         /// `true` to mute audio, `false` to unmute.
         muted: bool,
+    },
+    /// Set whether page-initiated autoplay is blocked until user activation.
+    SetAutoplayBlocked {
+        /// `true` to block autoplay attempts, `false` to restore page defaults.
+        blocked: bool,
     },
     /// Set whether the helper should force a dark page treatment for this tab.
     SetForceDark {
@@ -638,6 +700,16 @@ pub enum ControlMsg {
         /// Whether the user allowed the capability.
         allow: bool,
     },
+    /// The user's answer to a page `beforeunload` prompt (see
+    /// [`EventMsg::BeforeUnloadDialog`]). `proceed = true` leaves/reloads the page;
+    /// `false` stays on the current page. The helper holds CEF's
+    /// `cef_jsdialog_callback_t` open only until this decision arrives.
+    BeforeUnloadDecision {
+        /// The `id` from the originating [`EventMsg::BeforeUnloadDialog`].
+        id: u64,
+        /// `true` to proceed with the unload, `false` to cancel/stay.
+        proceed: bool,
+    },
     /// IME preedit: set the focused editable's in-progress composition string
     /// (CJK/dead-key input). The engine calls `cef_browser_host::ime_set_composition`
     /// with the caret at the end. Empty `text` clears/cancels the composition.
@@ -656,11 +728,13 @@ pub enum ControlMsg {
     /// (`ime_finish_composing_text`). Driven by egui `ImeEvent::Disable`.
     ImeFinishComposition,
     /// Autofill a saved login into the page's first login form. The user EXPLICITLY
-    /// picks a stored credential; the engine injects a fill script (no auto-fill on
-    /// load, no page-reading). Session-only creds — the shell keeps no persistent
-    /// password store (private-by-default). Capture-on-submit is a separate,
-    /// operator-security-reviewed feature (needs a JS↔native bridge).
+    /// picks a stored credential; the engine injects a fill script only when its
+    /// current top-level host still matches `expected_host` (no navigation-race
+    /// credential spray). Session-only creds — the shell keeps no persistent
+    /// password store (private-by-default).
     FillLogin {
+        /// Lowercased host the credential is scoped to.
+        expected_host: String,
         /// Username to fill.
         username: String,
         /// Password to fill.
@@ -706,6 +780,171 @@ pub enum ControlMsg {
         /// Bounded daemon completion JSON.
         body: String,
     },
+}
+
+impl std::fmt::Debug for ControlMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(url) => f.debug_tuple("Load").field(url).finish(),
+            Self::Reload => f.write_str("Reload"),
+            Self::Stop => f.write_str("Stop"),
+            Self::Back => f.write_str("Back"),
+            Self::Forward => f.write_str("Forward"),
+            Self::Resize { width, height } => f
+                .debug_struct("Resize")
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+            Self::Input(event) => f.debug_tuple("Input").field(event).finish(),
+            Self::ResourceVerdict { id, allow } => f
+                .debug_struct("ResourceVerdict")
+                .field("id", id)
+                .field("allow", allow)
+                .finish(),
+            Self::CosmeticFilters(css) => f
+                .debug_struct("CosmeticFilters")
+                .field("bytes", &css.len())
+                .finish(),
+            Self::SetZoom { percent } => {
+                f.debug_struct("SetZoom").field("percent", percent).finish()
+            }
+            Self::FindInPage {
+                query,
+                backwards,
+                find_next,
+            } => f
+                .debug_struct("FindInPage")
+                .field("query", query)
+                .field("backwards", backwards)
+                .field("find_next", find_next)
+                .finish(),
+            Self::ClearFind => f.write_str("ClearFind"),
+            Self::SetAudioMuted { muted } => f
+                .debug_struct("SetAudioMuted")
+                .field("muted", muted)
+                .finish(),
+            Self::SetAutoplayBlocked { blocked } => f
+                .debug_struct("SetAutoplayBlocked")
+                .field("blocked", blocked)
+                .finish(),
+            Self::SetForceDark { enabled } => f
+                .debug_struct("SetForceDark")
+                .field("enabled", enabled)
+                .finish(),
+            Self::SetReaderMode { enabled } => f
+                .debug_struct("SetReaderMode")
+                .field("enabled", enabled)
+                .finish(),
+            Self::SetUserScripts { enabled, bundle } => f
+                .debug_struct("SetUserScripts")
+                .field("enabled", enabled)
+                .field("bundle_bytes", &bundle.len())
+                .finish(),
+            Self::SetUserAgent { user_agent } => f
+                .debug_struct("SetUserAgent")
+                .field("user_agent", user_agent)
+                .finish(),
+            Self::SetDeviceProfile {
+                profile,
+                width,
+                height,
+                scale_percent,
+                touch,
+            } => f
+                .debug_struct("SetDeviceProfile")
+                .field("profile", profile)
+                .field("width", width)
+                .field("height", height)
+                .field("scale_percent", scale_percent)
+                .field("touch", touch)
+                .finish(),
+            Self::PrintPage => f.write_str("PrintPage"),
+            Self::SavePdf { path } => f.debug_struct("SavePdf").field("path", path).finish(),
+            Self::RequestPageText { id, max_bytes } => f
+                .debug_struct("RequestPageText")
+                .field("id", id)
+                .field("max_bytes", max_bytes)
+                .finish(),
+            Self::RequestPageScrape {
+                id,
+                max_bytes,
+                max_links,
+                max_headings,
+            } => f
+                .debug_struct("RequestPageScrape")
+                .field("id", id)
+                .field("max_bytes", max_bytes)
+                .field("max_links", max_links)
+                .field("max_headings", max_headings)
+                .finish(),
+            Self::EditCommand { command } => f
+                .debug_struct("EditCommand")
+                .field("command", command)
+                .finish(),
+            Self::PermissionDecision { id, allow } => f
+                .debug_struct("PermissionDecision")
+                .field("id", id)
+                .field("allow", allow)
+                .finish(),
+            Self::BeforeUnloadDecision { id, proceed } => f
+                .debug_struct("BeforeUnloadDecision")
+                .field("id", id)
+                .field("proceed", proceed)
+                .finish(),
+            Self::ImeSetComposition { text } => f
+                .debug_struct("ImeSetComposition")
+                .field("text", &REDACTED)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::ImeCommitText { text } => f
+                .debug_struct("ImeCommitText")
+                .field("text", &REDACTED)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::ImeFinishComposition => f.write_str("ImeFinishComposition"),
+            Self::FillLogin {
+                expected_host,
+                username,
+                password,
+            } => f
+                .debug_struct("FillLogin")
+                .field("expected_host", expected_host)
+                .field("username", &REDACTED)
+                .field("username_bytes", &username.len())
+                .field("password", &REDACTED)
+                .field("password_bytes", &password.len())
+                .finish(),
+            Self::SetSpellcheckHighlights { words } => f
+                .debug_struct("SetSpellcheckHighlights")
+                .field("word_count", &words.len())
+                .finish(),
+            Self::ApplySpellcheckCorrection { word, replacement } => f
+                .debug_struct("ApplySpellcheckCorrection")
+                .field("word", word)
+                .field("replacement", replacement)
+                .finish(),
+            Self::ApplySpellcheckCorrectionAll { word, replacement } => f
+                .debug_struct("ApplySpellcheckCorrectionAll")
+                .field("word", word)
+                .field("replacement", replacement)
+                .finish(),
+            Self::ApplySpellcheckCorrectionAt {
+                word,
+                replacement,
+                occurrence,
+            } => f
+                .debug_struct("ApplySpellcheckCorrectionAt")
+                .field("word", word)
+                .field("replacement", replacement)
+                .field("occurrence", occurrence)
+                .finish(),
+            Self::CompletePasskey { body } => f
+                .debug_struct("CompletePasskey")
+                .field("body", &REDACTED)
+                .field("bytes", &body.len())
+                .finish(),
+        }
+    }
 }
 
 impl ControlMsg {
@@ -758,6 +997,10 @@ impl ControlMsg {
             Self::SetAudioMuted { muted } => {
                 out.push(12);
                 out.push(u8::from(*muted));
+            }
+            Self::SetAutoplayBlocked { blocked } => {
+                out.push(34);
+                out.push(u8::from(*blocked));
             }
             Self::SetForceDark { enabled } => {
                 out.push(13);
@@ -858,10 +1101,20 @@ impl ControlMsg {
                 put_str(&mut out, text);
             }
             Self::ImeFinishComposition => out.push(31),
-            Self::FillLogin { username, password } => {
-                out.push(32);
+            Self::FillLogin {
+                expected_host,
+                username,
+                password,
+            } => {
+                out.push(35);
+                put_str(&mut out, expected_host);
                 put_str(&mut out, username);
                 put_str(&mut out, password);
+            }
+            Self::BeforeUnloadDecision { id, proceed } => {
+                out.push(33);
+                put_u64(&mut out, *id);
+                out.push(u8::from(*proceed));
             }
         }
         out
@@ -953,18 +1206,33 @@ impl ControlMsg {
             29 => Self::ImeSetComposition { text: c.string()? },
             30 => Self::ImeCommitText { text: c.string()? },
             31 => Self::ImeFinishComposition,
+            // Legacy, pre-host-binding FillLogin payload. Decode it into an empty
+            // expected host so modern helpers drop it instead of spraying
+            // credentials into a page after a navigation race.
             32 => Self::FillLogin {
+                expected_host: String::new(),
+                username: c.string()?,
+                password: c.string()?,
+            },
+            33 => Self::BeforeUnloadDecision {
+                id: c.u64()?,
+                proceed: c.bool()?,
+            },
+            34 => Self::SetAutoplayBlocked { blocked: c.bool()? },
+            35 => Self::FillLogin {
+                expected_host: c.string()?,
                 username: c.string()?,
                 password: c.string()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
+        c.finish()?;
         Ok(msg)
     }
 }
 
 /// A message the helper sends back to the shell.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EventMsg {
     /// The shm frame region's fd is attached to THIS message via `SCM_RIGHTS`.
     /// Sent once, before the first [`Self::PaintReady`]; the receiver maps the
@@ -1110,6 +1378,21 @@ pub enum EventMsg {
         /// The origin URL that raised the dialog.
         origin: String,
     },
+    /// A page with a `beforeunload` handler asked whether navigation/reload should
+    /// proceed. Unlike `alert`/`confirm`/`prompt`, this is a blocking decision: the
+    /// helper holds CEF's callback and waits for
+    /// [`ControlMsg::BeforeUnloadDecision`]. `message` is page-provided text and
+    /// should be treated as untrusted page content.
+    BeforeUnloadDialog {
+        /// Correlates this dialog with its [`ControlMsg::BeforeUnloadDecision`].
+        id: u64,
+        /// Page-provided prompt text (possibly empty on modern browsers).
+        message: String,
+        /// The top-level page URL/origin available to the engine.
+        origin: String,
+        /// Whether the unload is caused by reload rather than leaving/closing.
+        is_reload: bool,
+    },
     /// The page entered or left HTML5 fullscreen (`element.requestFullscreen()` /
     /// exit). The shell hides its chrome and shows the page edge-to-edge while
     /// `enabled`, matching the F11 immersive mode.
@@ -1143,15 +1426,155 @@ pub enum EventMsg {
         origin: String,
     },
     /// A login form was submitted — the shell may offer to save the credential
-    /// (session-only password manager, auto-capture). `body` is a bounded JSON object
-    /// `{"origin":..,"username":..,"password":..}` the page beaconed to the engine over
-    /// the SAME intercepted-`invalid`-URL channel passkey ceremonies use (the request
-    /// never hits the network; creds stay in the sandbox). The shell parses it, so the
-    /// wire stays engine-neutral, mirroring [`Self::PasskeyRequest`].
+    /// (session-only password manager, auto-capture). `origin` is engine-derived
+    /// and checked against the current top-level page before this event is emitted;
+    /// `body` is bounded page-supplied JSON carrying the username/password.
     LoginSubmitted {
-        /// Bounded JSON `{origin, username, password}`.
+        /// Origin that owns the submitted login, after engine host binding.
+        origin: String,
+        /// Bounded JSON `{username, password}` (older helpers may include `origin`,
+        /// but consumers must ignore that untrusted page-supplied field).
         body: String,
     },
+}
+
+impl std::fmt::Debug for EventMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AttachFrame => f.write_str("AttachFrame"),
+            Self::PaintReady { seq } => f.debug_struct("PaintReady").field("seq", seq).finish(),
+            Self::Title(title) => f.debug_tuple("Title").field(title).finish(),
+            Self::NavState {
+                can_back,
+                can_forward,
+                loading,
+                url,
+            } => f
+                .debug_struct("NavState")
+                .field("can_back", can_back)
+                .field("can_forward", can_forward)
+                .field("loading", loading)
+                .field("url", url)
+                .finish(),
+            Self::Crashed { reason } => f.debug_struct("Crashed").field("reason", reason).finish(),
+            Self::ResourceRequest { id, url, resource } => f
+                .debug_struct("ResourceRequest")
+                .field("id", id)
+                .field("url", url)
+                .field("resource", resource)
+                .finish(),
+            Self::PdfSaved { path, ok } => f
+                .debug_struct("PdfSaved")
+                .field("path", path)
+                .field("ok", ok)
+                .finish(),
+            Self::PageText { id, text } => f
+                .debug_struct("PageText")
+                .field("id", id)
+                .field("text", &REDACTED)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::PageScrape { id, body } => f
+                .debug_struct("PageScrape")
+                .field("id", id)
+                .field("body", &REDACTED)
+                .field("bytes", &body.len())
+                .finish(),
+            Self::PasskeyRequest { body } => f
+                .debug_struct("PasskeyRequest")
+                .field("body", &REDACTED)
+                .field("bytes", &body.len())
+                .finish(),
+            Self::Download {
+                id,
+                url,
+                filename,
+                received,
+                total,
+                done,
+                canceled,
+            } => f
+                .debug_struct("Download")
+                .field("id", id)
+                .field("url", url)
+                .field("filename", filename)
+                .field("received", received)
+                .field("total", total)
+                .field("done", done)
+                .field("canceled", canceled)
+                .finish(),
+            Self::PopupRequested { url } => {
+                f.debug_struct("PopupRequested").field("url", url).finish()
+            }
+            Self::CursorChanged { kind } => {
+                f.debug_struct("CursorChanged").field("kind", kind).finish()
+            }
+            Self::FindResult {
+                count,
+                active,
+                final_update,
+            } => f
+                .debug_struct("FindResult")
+                .field("count", count)
+                .field("active", active)
+                .field("final_update", final_update)
+                .finish(),
+            Self::Favicon { png } => f
+                .debug_struct("Favicon")
+                .field("png_bytes", &png.len())
+                .finish(),
+            Self::CertError { url, code, message } => f
+                .debug_struct("CertError")
+                .field("url", url)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            Self::JsDialog {
+                kind,
+                message,
+                origin,
+            } => f
+                .debug_struct("JsDialog")
+                .field("kind", kind)
+                .field("message", &REDACTED)
+                .field("message_bytes", &message.len())
+                .field("origin", origin)
+                .finish(),
+            Self::BeforeUnloadDialog {
+                id,
+                message,
+                origin,
+                is_reload,
+            } => f
+                .debug_struct("BeforeUnloadDialog")
+                .field("id", id)
+                .field("message", &REDACTED)
+                .field("message_bytes", &message.len())
+                .field("origin", origin)
+                .field("is_reload", is_reload)
+                .finish(),
+            Self::Fullscreen { enabled } => f
+                .debug_struct("Fullscreen")
+                .field("enabled", enabled)
+                .finish(),
+            Self::AudioState { audible } => f
+                .debug_struct("AudioState")
+                .field("audible", audible)
+                .finish(),
+            Self::PermissionRequest { id, kind, origin } => f
+                .debug_struct("PermissionRequest")
+                .field("id", id)
+                .field("kind", kind)
+                .field("origin", origin)
+                .finish(),
+            Self::LoginSubmitted { origin, body } => f
+                .debug_struct("LoginSubmitted")
+                .field("origin", origin)
+                .field("body", &REDACTED)
+                .field("bytes", &body.len())
+                .finish(),
+        }
+    }
 }
 
 impl EventMsg {
@@ -1282,9 +1705,22 @@ impl EventMsg {
                 out.push(*kind);
                 put_str(&mut out, origin);
             }
-            Self::LoginSubmitted { body } => {
-                out.push(20);
+            Self::LoginSubmitted { origin, body } => {
+                out.push(22);
+                put_str(&mut out, origin);
                 put_str(&mut out, body);
+            }
+            Self::BeforeUnloadDialog {
+                id,
+                message,
+                origin,
+                is_reload,
+            } => {
+                out.push(21);
+                put_u64(&mut out, *id);
+                put_str(&mut out, message);
+                put_str(&mut out, origin);
+                out.push(u8::from(*is_reload));
             }
         }
         out
@@ -1366,9 +1802,26 @@ impl EventMsg {
                 kind: c.u8()?,
                 origin: c.string()?,
             },
-            20 => Self::LoginSubmitted { body: c.string()? },
+            // Legacy login-capture payload carried only page-supplied JSON. Keep
+            // decoding it, but leave origin empty so modern shells ignore it
+            // instead of trusting a page-provided `origin` field.
+            20 => Self::LoginSubmitted {
+                origin: String::new(),
+                body: c.string()?,
+            },
+            21 => Self::BeforeUnloadDialog {
+                id: c.u64()?,
+                message: c.string()?,
+                origin: c.string()?,
+                is_reload: c.bool()?,
+            },
+            22 => Self::LoginSubmitted {
+                origin: c.string()?,
+                body: c.string()?,
+            },
             t => return Err(WireError::BadTag(t)),
         };
+        c.finish()?;
         Ok(msg)
     }
 }
@@ -1520,6 +1973,14 @@ impl<'a> Cursor<'a> {
         }
         Ok(values)
     }
+    fn finish(&self) -> Result<(), WireError> {
+        let trailing = self.bytes.len().saturating_sub(self.pos);
+        if trailing == 0 {
+            Ok(())
+        } else {
+            Err(WireError::TrailingBytes(trailing))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1599,6 +2060,8 @@ mod tests {
         round_control(&ControlMsg::ClearFind);
         round_control(&ControlMsg::SetAudioMuted { muted: true });
         round_control(&ControlMsg::SetAudioMuted { muted: false });
+        round_control(&ControlMsg::SetAutoplayBlocked { blocked: true });
+        round_control(&ControlMsg::SetAutoplayBlocked { blocked: false });
         round_control(&ControlMsg::SetForceDark { enabled: true });
         round_control(&ControlMsg::SetForceDark { enabled: false });
         round_control(&ControlMsg::SetReaderMode { enabled: true });
@@ -1656,6 +2119,14 @@ mod tests {
             id: 78,
             allow: false,
         });
+        round_control(&ControlMsg::BeforeUnloadDecision {
+            id: 79,
+            proceed: true,
+        });
+        round_control(&ControlMsg::BeforeUnloadDecision {
+            id: 80,
+            proceed: false,
+        });
         round_control(&ControlMsg::ImeSetComposition {
             text: "\u{4f60}\u{597d}".to_owned(),
         });
@@ -1667,6 +2138,7 @@ mod tests {
         });
         round_control(&ControlMsg::ImeFinishComposition);
         round_control(&ControlMsg::FillLogin {
+            expected_host: "login.example".to_owned(),
             username: "alice@example.com".to_owned(),
             password: "hunter2".to_owned(),
         });
@@ -1732,7 +2204,8 @@ mod tests {
             body: r#"{"text":"hello","links":[],"headings":[]}"#.to_owned(),
         });
         round_event(&EventMsg::LoginSubmitted {
-            body: "{\"origin\":\"https://x\",\"username\":\"a\",\"password\":\"b\"}".to_owned(),
+            origin: "https://x".to_owned(),
+            body: "{\"username\":\"a\",\"password\":\"b\"}".to_owned(),
         });
         round_event(&EventMsg::PasskeyRequest {
             body: r#"{"ceremony":"create","origin":"https://login.example"}"#.to_owned(),
@@ -1786,6 +2259,18 @@ mod tests {
             message: String::new(),
             origin: "https://prompt.example/".to_owned(),
         });
+        round_event(&EventMsg::BeforeUnloadDialog {
+            id: 88,
+            message: "You have unsaved changes".to_owned(),
+            origin: "https://editor.example/doc/1".to_owned(),
+            is_reload: false,
+        });
+        round_event(&EventMsg::BeforeUnloadDialog {
+            id: 89,
+            message: String::new(),
+            origin: "https://editor.example/doc/1".to_owned(),
+            is_reload: true,
+        });
         round_event(&EventMsg::Fullscreen { enabled: true });
         round_event(&EventMsg::Fullscreen { enabled: false });
         round_event(&EventMsg::AudioState { audible: true });
@@ -1797,6 +2282,155 @@ mod tests {
         });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
+    }
+
+    #[test]
+    fn debug_output_redacts_browser_secrets() {
+        let login_fill = format!(
+            "{:?}",
+            ControlMsg::FillLogin {
+                expected_host: "login.example".to_owned(),
+                username: "alice@example.com".to_owned(),
+                password: "hunter2".to_owned(),
+            }
+        );
+        assert!(login_fill.contains("login.example"));
+        assert!(!login_fill.contains("alice@example.com"));
+        assert!(!login_fill.contains("hunter2"));
+        assert!(login_fill.contains("<redacted>"));
+
+        let login_capture = format!(
+            "{:?}",
+            EventMsg::LoginSubmitted {
+                origin: "https://login.example".to_owned(),
+                body: r#"{"username":"alice@example.com","password":"hunter2"}"#.to_owned(),
+            }
+        );
+        assert!(login_capture.contains("https://login.example"));
+        assert!(!login_capture.contains("alice@example.com"));
+        assert!(!login_capture.contains("hunter2"));
+
+        let text_input = format!("{:?}", InputEvent::Text("typed-secret".to_owned()));
+        assert!(!text_input.contains("typed-secret"));
+        assert!(text_input.contains("<redacted>"));
+
+        let ime_commit = format!(
+            "{:?}",
+            ControlMsg::ImeCommitText {
+                text: "ime-secret".to_owned(),
+            }
+        );
+        assert!(!ime_commit.contains("ime-secret"));
+
+        let passkey_completion = format!(
+            "{:?}",
+            ControlMsg::CompletePasskey {
+                body: r#"{"signature":"secret-sig","credential":"secret-credential"}"#.to_owned(),
+            }
+        );
+        assert!(!passkey_completion.contains("secret-sig"));
+        assert!(!passkey_completion.contains("secret-credential"));
+
+        let passkey_request = format!(
+            "{:?}",
+            EventMsg::PasskeyRequest {
+                body: r#"{"user_handle_b64url":"secret-handle","user_name":"MDE User"}"#.to_owned(),
+            }
+        );
+        assert!(!passkey_request.contains("secret-handle"));
+        assert!(!passkey_request.contains("MDE User"));
+        assert!(passkey_request.contains("<redacted>"));
+
+        let page_text = format!(
+            "{:?}",
+            EventMsg::PageText {
+                id: 9,
+                text: "private page text".to_owned(),
+            }
+        );
+        assert!(!page_text.contains("private page text"));
+
+        let js_dialog = format!(
+            "{:?}",
+            EventMsg::JsDialog {
+                kind: 1,
+                message: "private dialog text".to_owned(),
+                origin: "https://app.example".to_owned(),
+            }
+        );
+        assert!(!js_dialog.contains("private dialog text"));
+
+        let before_unload = format!(
+            "{:?}",
+            EventMsg::BeforeUnloadDialog {
+                id: 10,
+                message: "private unload text".to_owned(),
+                origin: "https://app.example".to_owned(),
+                is_reload: false,
+            }
+        );
+        assert!(!before_unload.contains("private unload text"));
+    }
+
+    #[test]
+    fn host_bound_login_wire_uses_new_tags_and_legacy_payloads_fail_closed() {
+        let fill = ControlMsg::FillLogin {
+            expected_host: "login.example".to_owned(),
+            username: "alice@example.com".to_owned(),
+            password: "hunter2".to_owned(),
+        }
+        .encode();
+        assert_eq!(fill[0], 35, "host-bound FillLogin must not reuse tag 32");
+
+        let mut legacy_fill = vec![32];
+        put_str(&mut legacy_fill, "alice@example.com");
+        put_str(&mut legacy_fill, "hunter2");
+        assert_eq!(
+            ControlMsg::decode(&legacy_fill),
+            Ok(ControlMsg::FillLogin {
+                expected_host: String::new(),
+                username: "alice@example.com".to_owned(),
+                password: "hunter2".to_owned(),
+            }),
+            "legacy FillLogin decodes with an empty host so the helper no-ops it"
+        );
+
+        let submitted = EventMsg::LoginSubmitted {
+            origin: "https://login.example".to_owned(),
+            body: r#"{"username":"alice@example.com","password":"hunter2"}"#.to_owned(),
+        }
+        .encode();
+        assert_eq!(
+            submitted[0], 22,
+            "origin-bound LoginSubmitted must not reuse legacy tag 20"
+        );
+
+        let legacy_body =
+            r#"{"origin":"https://forged.example","username":"alice","password":"pw"}"#;
+        let mut legacy_submitted = vec![20];
+        put_str(&mut legacy_submitted, legacy_body);
+        assert_eq!(
+            EventMsg::decode(&legacy_submitted),
+            Ok(EventMsg::LoginSubmitted {
+                origin: String::new(),
+                body: legacy_body.to_owned(),
+            }),
+            "legacy login capture keeps the page JSON but clears trusted origin"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_after_a_complete_payload() {
+        let mut control = ControlMsg::SetAudioMuted { muted: true }.encode();
+        control.push(0xAA);
+        assert_eq!(
+            ControlMsg::decode(&control),
+            Err(WireError::TrailingBytes(1))
+        );
+
+        let mut event = EventMsg::AudioState { audible: true }.encode();
+        event.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(EventMsg::decode(&event), Err(WireError::TrailingBytes(2)));
     }
 
     #[test]

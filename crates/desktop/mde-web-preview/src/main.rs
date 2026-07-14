@@ -234,8 +234,8 @@ fn run_tab(args: &[String]) -> Result<()> {
 }
 
 /// Apply one control frame from the shell to the engine. Navigation is wired to the
-/// engine's existing methods; zoom/find/force-dark/audio-mute use the helper's
-/// DOM script seam. `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters` are
+/// engine's existing methods; zoom/find/force-dark/audio-mute/autoplay-block use
+/// the helper's DOM script seam. `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters` are
 /// decoded (so the framed stream stays in sync) but not yet acted on — Servo
 /// currently exposes no live-resize, input-injection, or helper-side ad-filter
 /// hook here; these remain future work, not investigated limitations.
@@ -275,6 +275,7 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         } => engine.find_in_page(query, *backwards),
         ControlMsg::ClearFind => engine.clear_find(),
         ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
+        ControlMsg::SetAutoplayBlocked { blocked } => engine.set_autoplay_blocked(*blocked),
         ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
         ControlMsg::SetReaderMode { enabled } => engine.set_reader_mode(*enabled),
         ControlMsg::SetUserScripts { enabled, bundle } => {
@@ -341,12 +342,13 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         | ControlMsg::CosmeticFilters(_)
         | ControlMsg::SavePdf { .. }
         // No-ops on the Servo fallback: EditCommand (in-page edit menu),
-        // PermissionDecision (Servo has no permission-prompt round-trip), and the
-        // IME preedit controls (IME is wired for CEF only) all have no Servo path.
+        // PermissionDecision/BeforeUnloadDecision (Servo has no prompt round-trip),
+        // and the IME preedit controls (IME is wired for CEF only) all have no Servo path.
         // Listed explicitly rather than `_ =>` so a NEW wire control forces a
         // conscious Servo decision instead of silently no-op'ing.
         | ControlMsg::EditCommand { .. }
         | ControlMsg::PermissionDecision { .. }
+        | ControlMsg::BeforeUnloadDecision { .. }
         | ControlMsg::ImeSetComposition { .. }
         | ControlMsg::ImeCommitText { .. }
         | ControlMsg::ImeFinishComposition
