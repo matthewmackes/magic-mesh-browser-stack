@@ -211,6 +211,8 @@ const PERMISSION_KIND_CLIPBOARD: u8 = 2;
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
 pub const CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET: usize = 64;
+/// `offsetof(cef_life_span_handler_t, on_before_close)`.
+pub const CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET: usize = 80;
 /// `offsetof(cef_life_span_handler_t, on_before_popup)` — window.open /
 /// target=_blank interception (field 0; on_after_created=64 pins field 3).
 pub const CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET: usize = 40;
@@ -656,26 +658,17 @@ pub fn run_windowless_browser_probe_with_stream(
                 last_paint_width: callbacks.last_paint_width(),
                 last_paint_height: callbacks.last_paint_height(),
             };
-            // Close the browser and drain the loop BEFORE cef_shutdown, exactly
-            // like run_windowless_tab — shutting down with a live browser races
-            // the multi-process teardown and intermittently segfaults (observed
-            // ~1/6 probe runs exiting 139 after a correct result).
-            close_browser(browser);
-            for _ in 0..8 {
-                abi.do_message_loop_work();
-                thread::sleep(Duration::from_millis(4));
-            }
+            // Close the browser and wait for CEF's on_before_close signal before
+            // cef_shutdown. A fixed short drain still left render-once racing
+            // teardown after a correct paint on the farm.
+            close_browser_and_wait(abi, browser, &callbacks);
             abi.shutdown();
             return Ok(probe);
         }
         thread::sleep(Duration::from_millis(10));
     }
 
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Err(CefBrowserError::TimedOut {
         created: callbacks.created(),
@@ -791,11 +784,7 @@ pub fn run_windowless_text_probe(
     }
 
     // Same live-browser-before-shutdown discipline as the success path.
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Err(CefBrowserError::TextProbeMissing {
         created: callbacks.created(),
@@ -1043,11 +1032,7 @@ pub fn run_windowless_tab(
         last_paint_width: callbacks.last_paint_width(),
         last_paint_height: callbacks.last_paint_height(),
     });
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Ok(probe)
 }
@@ -1460,6 +1445,10 @@ impl CefBrowserCallbacks {
             CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET,
             fn_ptr(on_after_created as *const ()),
         );
+        self.life_span.put_fn(
+            CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET,
+            fn_ptr(on_before_close as *const ()),
+        );
         // window.open / target=_blank → cancel the native popup (windowless CEF
         // cannot host one) and hand the URL to the shell as a new-tab request.
         self.life_span.put_fn(
@@ -1691,6 +1680,10 @@ impl CefBrowserCallbacks {
         self.state.created.load(Ordering::SeqCst)
     }
 
+    fn closed(&self) -> usize {
+        self.state.closed.load(Ordering::SeqCst)
+    }
+
     fn paints(&self) -> usize {
         self.state.paints.load(Ordering::SeqCst)
     }
@@ -1919,6 +1912,7 @@ struct CefBrowserState {
     width: AtomicI32,
     height: AtomicI32,
     created: AtomicUsize,
+    closed: AtomicUsize,
     paints: AtomicUsize,
     /// Monotonic count of main/sub-frame navigations, bumped from the resource
     /// handler's `is_navigation` flag (browser-8). Drives per-context shim
@@ -2045,6 +2039,7 @@ impl CefBrowserState {
             width: AtomicI32::new(i32::try_from(width).unwrap_or(i32::MAX)),
             height: AtomicI32::new(i32::try_from(height).unwrap_or(i32::MAX)),
             created: AtomicUsize::new(0),
+            closed: AtomicUsize::new(0),
             paints: AtomicUsize::new(0),
             nav_seq: AtomicU64::new(0),
             last_paint_width: AtomicUsize::new(0),
@@ -3175,6 +3170,12 @@ unsafe extern "C" fn on_after_created(self_: *mut c_void, _browser: *mut c_void)
     });
 }
 
+unsafe extern "C" fn on_before_close(self_: *mut c_void, _browser: *mut c_void) {
+    let _ = with_state(self_, |state| {
+        state.closed.fetch_add(1, Ordering::SeqCst);
+    });
+}
+
 /// CEF `on_before_popup(...)` — the page asked for a new window (window.open,
 /// target=_blank). A windowless offscreen browser cannot host a native popup, so
 /// cancel it (return 1) and forward the target URL for the shell to open as a
@@ -4063,6 +4064,23 @@ fn close_browser(browser: *mut c_void) {
     // SAFETY: `host` came from `cef_browser_t::get_host`; force close avoids
     // unload-dialog waits during socket teardown.
     unsafe { callback(host, 1) };
+}
+
+fn close_browser_and_wait(abi: &CefAbi, browser: *mut c_void, callbacks: &CefBrowserCallbacks) {
+    let closed_before = callbacks.closed();
+    close_browser(browser);
+    let deadline = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < deadline {
+        abi.do_message_loop_work();
+        if callbacks.closed() > closed_before {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for _ in 0..4 {
+        abi.do_message_loop_work();
+        thread::sleep(Duration::from_millis(4));
+    }
 }
 
 fn browser_host(browser: *mut c_void) -> Option<*mut c_void> {

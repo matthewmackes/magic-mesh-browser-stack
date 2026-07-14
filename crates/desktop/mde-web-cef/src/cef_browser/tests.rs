@@ -83,9 +83,11 @@ fn popup_compose_needs_both_a_view_and_popup_pixels() {
 #[test]
 fn before_popup_offset_reconciles_with_the_life_span_layout() {
     // cef_life_span_handler_t (CEF 149): on_before_popup is field 0; the proven
-    // on_after_created=64 pins field 3, and the handler size 88 pins 6 fields.
+    // on_after_created=64 pins field 3, on_before_close is field 5, and the
+    // handler size 88 pins 6 fields.
     assert_eq!(CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET, 40);
     assert_eq!(CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET, 40 + 3 * 8);
+    assert_eq!(CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET, 40 + 5 * 8);
     assert_eq!(CEF_LIFE_SPAN_HANDLER_SIZE, 40 + 6 * 8);
 }
 
