@@ -116,6 +116,11 @@ const NEW_TAB_URL: &str = "about:blank";
 #[cfg(feature = "live-helper")]
 const START_URL: &str = NEW_TAB_URL;
 
+/// DD-9's browser media policy is block-all autoplay by default. The helpers own
+/// the engine-specific shim; the shell owns the per-tab policy bit and mirrors it
+/// into every fresh helper session.
+const DEFAULT_AUTOPLAY_BLOCKED: bool = true;
+
 /// Front-door privacy explainer shown on the new-tab dashboard — the browser is
 /// private by design (no persistent profile: the sandbox has no writable `$HOME`),
 /// so history and cookies never outlive the session.
@@ -2027,6 +2032,7 @@ impl WebState {
         let mut session = session;
         let url = session.nav().url.clone();
         session.set_filter(self.compiled_request_filter_for_url(&url));
+        session.set_autoplay_blocked(DEFAULT_AUTOPLAY_BLOCKED);
         let id = self.next_tab_id;
         self.next_tab_id = self.next_tab_id.saturating_add(1);
         self.tabs.push(Tab {
@@ -2038,7 +2044,7 @@ impl WebState {
             group: None,
             pinned: false,
             muted: false,
-            autoplay_blocked: false,
+            autoplay_blocked: DEFAULT_AUTOPLAY_BLOCKED,
             force_dark: false,
             reader_mode: false,
             user_scripts: false,
@@ -3295,7 +3301,7 @@ impl WebState {
             tab.texture = None;
             tab.last_frame = None;
             tab.muted = false;
-            tab.autoplay_blocked = false;
+            tab.autoplay_blocked = DEFAULT_AUTOPLAY_BLOCKED;
             tab.force_dark = false;
             tab.reader_mode = false;
             tab.user_scripts = false;
@@ -3305,7 +3311,7 @@ impl WebState {
             tab.session.set_zoom(self.page_zoom_percent);
             tab.session.clear_find();
             tab.session.set_audio_muted(false);
-            tab.session.set_autoplay_blocked(false);
+            tab.session.set_autoplay_blocked(DEFAULT_AUTOPLAY_BLOCKED);
             tab.session.set_force_dark(false);
             tab.session.set_reader_mode(false);
             tab.session.set_user_scripts(false, "");
@@ -4530,6 +4536,11 @@ impl WebState {
         let mut session = session;
         let url = session.nav().url.clone();
         session.set_filter(self.compiled_request_filter_for_url(&url));
+        let autoplay_blocked = self
+            .tabs
+            .get(self.active)
+            .map_or(DEFAULT_AUTOPLAY_BLOCKED, |tab| tab.autoplay_blocked);
+        session.set_autoplay_blocked(autoplay_blocked);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.session = session;
             tab.engine = engine;
@@ -12439,6 +12450,10 @@ mod tests {
         let (session, helper, _writer) = live_page_session();
         let mut state = WebState::default();
         state.push_session(session);
+        assert!(
+            state.tabs[state.active].autoplay_blocked,
+            "new browser tabs block autoplay by default"
+        );
         let ctx = egui::Context::default();
 
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ZoomIn);
@@ -12457,9 +12472,9 @@ mod tests {
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAudioMute);
         assert!(!state.tabs[state.active].muted);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
-        assert!(state.tabs[state.active].autoplay_blocked);
-        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
         assert!(!state.tabs[state.active].autoplay_blocked);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
+        assert!(state.tabs[state.active].autoplay_blocked);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleForceDark);
         assert!(state.tabs[state.active].force_dark);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleForceDark);
@@ -12571,7 +12586,7 @@ mod tests {
                 msg,
                 mde_web_preview_client::ControlMsg::SetAutoplayBlocked { blocked: true }
             )),
-            "blocking autoplay must reach the helper: {controls:?}"
+            "default/blocking autoplay must reach the helper: {controls:?}"
         );
         assert!(
             controls.iter().any(|msg| matches!(
@@ -14333,6 +14348,10 @@ mod tests {
         helper.set_nonblocking(true).expect("nonblocking helper");
         let mut state = WebState::default();
         state.push_session(session);
+        assert_eq!(
+            drain_control_messages(&helper),
+            vec![mde_web_preview_client::ControlMsg::SetAutoplayBlocked { blocked: true }]
+        );
         write_helper_event(
             &helper,
             &mde_web_preview_client::EventMsg::BeforeUnloadDialog {
@@ -17045,17 +17064,29 @@ mod tests {
         let (session, helper) = testkit::connect().expect("connect");
         let mut state = WebState::default();
         state.push_session(session);
+        state.set_active_tab_autoplay_blocked(false);
         run_until_texture(&mut state);
         helper.crash();
         run_panel(&mut state);
         assert!(state.tabs[0].session.is_crashed());
 
         // The Reload button on a crashed tab requests a respawn; the shell swaps in
-        // a fresh session (here a new fake helper) and the new page flows again.
+        // a fresh session and the new page flows again.
         state.respawn_requested = true;
         assert!(state.take_respawn_request());
-        let (fresh, _helper2) = testkit::connect().expect("respawn connect");
+        let (fresh, helper2, _writer2) = live_page_session();
         state.respawn_active_with(fresh);
+        assert!(
+            !state.tabs[0].autoplay_blocked,
+            "respawn preserves the tab's allow-autoplay override"
+        );
+        assert!(
+            drain_control_messages(&helper2).iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::SetAutoplayBlocked { blocked: false }
+            )),
+            "respawned helper must receive the preserved autoplay policy"
+        );
         assert!(
             !state.tabs[0].session.is_crashed(),
             "respawned session is live-ish"
@@ -17147,6 +17178,10 @@ mod tests {
         assert_eq!(state.address, NEW_TAB_URL);
         assert!(state.dashboard_query.is_empty());
         assert_eq!(state.insecure_prompt, None);
+        assert!(
+            state.tabs[0].autoplay_blocked,
+            "clearing tab data returns the tab to the block-all autoplay default"
+        );
         assert!(
             wait_for_fresh_frame(&mut state),
             "clear action loaded about:blank into the helper"
