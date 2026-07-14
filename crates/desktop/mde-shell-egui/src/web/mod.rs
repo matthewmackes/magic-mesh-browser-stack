@@ -10805,6 +10805,440 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Adversarial stress tests (2026-07-13): try to BREAK the pinned-cluster,
+    // active-session-tracking, close-set, duplicate, and permission
+    // invariants. Each tab-op test asserts the ACTIVE session's *identity*
+    // (its container tag) is unchanged and the pinned-first invariant holds.
+    // ----------------------------------------------------------------------
+
+    /// The pinned-first invariant: no unpinned tab may precede any pinned tab.
+    fn assert_pinned_first(state: &WebState) {
+        let boundary = state.tabs.iter().take_while(|t| t.pinned).count();
+        assert!(
+            state.tabs.iter().skip(boundary).all(|t| !t.pinned),
+            "pinned tabs must all precede unpinned tabs, got {:?}",
+            state
+                .tabs
+                .iter()
+                .map(|t| (t.container, t.pinned))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The container tag of whatever session is currently active.
+    fn active_container(state: &WebState) -> ContainerProfile {
+        state.tabs[state.active].container
+    }
+
+    /// A `WebState` with one *live-peer* session plus the retained peer end (so
+    /// the session never crash-detects). Frames written to the peer are visible
+    /// after `state.tabs[0].session.poll()`.
+    fn live_single_tab() -> (WebState, std::os::unix::net::UnixStream) {
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default();
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        (state, helper)
+    }
+
+    /// Push a `PermissionRequest` event onto the helper wire.
+    fn send_permission_request(peer: &UnixStream, id: u64, kind: u8, origin: &str) {
+        let mut p: &UnixStream = peer;
+        p.write_all(&wire::frame(
+            &mde_web_preview_client::EventMsg::PermissionRequest {
+                id,
+                kind,
+                origin: origin.to_owned(),
+            }
+            .encode(),
+        ))
+        .expect("permission request frame");
+    }
+
+    // --- Target 1: sort_pinned_stable / set_tab_pinned ---
+
+    #[test]
+    fn pinning_the_active_tab_keeps_it_active_at_the_front() {
+        let mut state = tagged_tabs(4); // [Personal, Work, Banking, Research]
+        state.select_tab(1); // active = Work
+        assert_eq!(active_container(&state), ContainerProfile::Work);
+        state.set_tab_pinned(1, true); // pin the ACTIVE (Work) tab
+        assert_pinned_first(&state);
+        assert!(state.tabs[0].pinned && state.tabs[0].container == ContainerProfile::Work);
+        assert_eq!(
+            active_container(&state),
+            ContainerProfile::Work,
+            "the active session is still Work after it reclustered to the front"
+        );
+    }
+
+    #[test]
+    fn pinning_last_then_first_preserves_active_identity() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.select_tab(2); // active = Banking
+        state.set_tab_pinned(3, true); // pin Research (last) -> reclusters
+        assert_pinned_first(&state);
+        assert_eq!(active_container(&state), ContainerProfile::Banking);
+        // Then pin whatever unpinned tab now leads the tail (Personal).
+        let personal = state
+            .tabs
+            .iter()
+            .position(|t| t.container == ContainerProfile::Personal)
+            .expect("personal");
+        state.set_tab_pinned(personal, true);
+        assert_pinned_first(&state);
+        assert_eq!(
+            active_container(&state),
+            ContainerProfile::Banking,
+            "active stays Banking through two pins that reordered the strip",
+        );
+    }
+
+    #[test]
+    fn unpinning_the_middle_of_three_pinned_keeps_the_invariant() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true);
+        state.set_tab_pinned(2, true); // pinned [P, W, B], unpinned [R]
+        state.select_tab(3); // active = Research (unpinned)
+        state.set_tab_pinned(1, false); // unpin the MIDDLE pinned tab (Work)
+        assert_pinned_first(&state);
+        // Work rejoins the FRONT of the unpinned cluster, ahead of Research.
+        let work = state
+            .tabs
+            .iter()
+            .position(|t| t.container == ContainerProfile::Work)
+            .expect("work");
+        let research = state
+            .tabs
+            .iter()
+            .position(|t| t.container == ContainerProfile::Research)
+            .expect("research");
+        assert!(!state.tabs[work].pinned && work < research);
+        assert_eq!(active_container(&state), ContainerProfile::Research);
+    }
+
+    #[test]
+    fn pinning_all_in_place_then_unpinning_all_tracks_active() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.select_tab(1); // active = Work
+        for i in 0..4 {
+            state.set_tab_pinned(i, true);
+        }
+        assert!(state.tabs.iter().all(|t| t.pinned));
+        // Pinning an already-front-clustered strip must NOT reorder it.
+        assert_eq!(
+            state.tabs.iter().map(|t| t.container).collect::<Vec<_>>(),
+            vec![
+                ContainerProfile::Personal,
+                ContainerProfile::Work,
+                ContainerProfile::Banking,
+                ContainerProfile::Research,
+            ],
+        );
+        assert_eq!(active_container(&state), ContainerProfile::Work);
+        // Unpin every tab (drain the pinned cluster from the front).
+        while let Some(i) = state.tabs.iter().position(|t| t.pinned) {
+            state.set_tab_pinned(i, false);
+        }
+        assert!(state.tabs.iter().all(|t| !t.pinned));
+        assert_eq!(
+            active_container(&state),
+            ContainerProfile::Work,
+            "active stays Work across pin-all then unpin-all",
+        );
+    }
+
+    // --- Target 2: move_tab with pinned tabs ---
+
+    #[test]
+    fn dragging_an_unpinned_tab_to_the_front_snaps_behind_the_pins() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true); // pinned [P, W], unpinned [B, R]
+        state.select_tab(3); // active = Research
+        state.move_tab(3, 0); // drag Research to the very front — can't leap pins
+        assert_pinned_first(&state);
+        assert!(
+            state.tabs[0].pinned && state.tabs[1].pinned,
+            "both pins still lead the strip"
+        );
+        assert_eq!(
+            active_container(&state),
+            ContainerProfile::Research,
+            "the dragged Research tab stays the active session",
+        );
+        assert_eq!(
+            state.tabs[2].container,
+            ContainerProfile::Research,
+            "Research landed at the FRONT of the unpinned cluster",
+        );
+    }
+
+    #[test]
+    fn dragging_a_pinned_tab_to_the_end_snaps_back_to_the_front() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.set_tab_pinned(0, true); // Personal pinned at the front
+        state.select_tab(0); // active = the pinned Personal tab
+        state.move_tab(0, 3); // drag the pinned tab to the very end
+        assert_pinned_first(&state);
+        assert!(state.tabs[0].pinned && state.tabs[0].container == ContainerProfile::Personal);
+        assert_eq!(active_container(&state), ContainerProfile::Personal);
+    }
+
+    #[test]
+    fn moving_a_tab_across_the_active_index_preserves_the_active_session() {
+        // Right-of-active to left-of-active (crosses active).
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.select_tab(1); // active = Work
+        state.move_tab(3, 0); // Research jumps to the front, crossing Work
+        assert_eq!(active_container(&state), ContainerProfile::Work);
+        // The mirror: left-of-active to right-of-active.
+        let mut state = tagged_tabs(4);
+        state.select_tab(2); // active = Banking
+        state.move_tab(0, 3); // Personal moves to the end, crossing Banking
+        assert_eq!(active_container(&state), ContainerProfile::Banking);
+    }
+
+    // --- Target 3: close_other_tabs(keep) ---
+
+    #[test]
+    fn close_other_tabs_spares_pins_on_both_sides_of_the_kept_tab() {
+        // Deliberately construct a NON-front-clustered pin layout (pins straddling
+        // an unpinned tab) to stress the right-to-left index math directly.
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.tabs[0].pinned = true; // Personal pinned (before keep)
+        state.tabs[2].pinned = true; // Banking pinned (after keep)
+        state.close_other_tabs(1); // keep the unpinned Work tab at index 1
+        assert_eq!(state.tabs.len(), 3);
+        let survivors: Vec<_> = state.tabs.iter().map(|t| t.container).collect();
+        assert!(survivors.contains(&ContainerProfile::Personal));
+        assert!(survivors.contains(&ContainerProfile::Work));
+        assert!(survivors.contains(&ContainerProfile::Banking));
+        assert!(!survivors.contains(&ContainerProfile::Research));
+        assert_eq!(
+            active_container(&state),
+            ContainerProfile::Work,
+            "the explicitly-kept tab ends active even with pins on both sides",
+        );
+    }
+
+    #[test]
+    fn close_other_tabs_keeping_a_pinned_tab_survives_all_pins() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true); // pinned [P, W], unpinned [B, R]
+        let work = state
+            .tabs
+            .iter()
+            .position(|t| t.container == ContainerProfile::Work)
+            .expect("work");
+        state.close_other_tabs(work); // keep a PINNED tab
+        assert_eq!(state.tabs.len(), 2);
+        assert!(state.tabs.iter().all(|t| t.pinned));
+        assert_eq!(active_container(&state), ContainerProfile::Work);
+    }
+
+    #[test]
+    fn close_other_tabs_keep_first_and_keep_last_leave_one_tab() {
+        let mut state = tagged_tabs(4);
+        state.close_other_tabs(0); // keep index 0 (Personal)
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(active_container(&state), ContainerProfile::Personal);
+
+        let mut state = tagged_tabs(4);
+        state.close_other_tabs(3); // keep the last (Research)
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(active_container(&state), ContainerProfile::Research);
+    }
+
+    // --- Target 4: close_tabs_to_the_right(from) ---
+
+    #[test]
+    fn close_tabs_to_the_right_spares_a_pin_in_the_middle() {
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.tabs[1].pinned = true; // Work pinned at index 1 (non-front layout)
+        state.close_tabs_to_the_right(0);
+        let survivors: Vec<_> = state.tabs.iter().map(|t| t.container).collect();
+        assert!(survivors.contains(&ContainerProfile::Personal)); // index 0, untouched
+        assert!(survivors.contains(&ContainerProfile::Work)); // pinned → spared
+        assert!(!survivors.contains(&ContainerProfile::Banking));
+        assert!(!survivors.contains(&ContainerProfile::Research));
+    }
+
+    #[test]
+    fn close_tabs_to_the_right_from_boundary_and_noop_cases() {
+        // From past the pinned boundary: only the unpinned tail to the right closes.
+        let mut state = tagged_tabs(4); // [P, W, B, R]
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true); // pinned [P, W], unpinned [B, R]
+        state.close_tabs_to_the_right(2); // from Banking (first unpinned)
+        assert_eq!(state.tabs.len(), 3);
+        assert!(!state
+            .tabs
+            .iter()
+            .any(|t| t.container == ContainerProfile::Research));
+
+        // from == last index is a no-op.
+        let mut state = tagged_tabs(4);
+        state.close_tabs_to_the_right(3);
+        assert_eq!(state.tabs.len(), 4);
+
+        // from past the end is a no-op (early return, no panic).
+        let mut state = tagged_tabs(4);
+        state.close_tabs_to_the_right(99);
+        assert_eq!(state.tabs.len(), 4);
+    }
+
+    // --- Target 5: duplicate_tab ---
+
+    #[test]
+    fn duplicating_enqueues_at_the_back_of_the_open_queue() {
+        let (mut state, peer) = live_single_tab();
+        // A prior queued open, so we can prove duplicate lands at the BACK.
+        let engine = state.engine;
+        state.request_new_tab(engine);
+        let mut p: &UnixStream = &peer;
+        p.write_all(&wire::frame(
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://dup.example/".to_owned(),
+            }
+            .encode(),
+        ))
+        .expect("nav");
+        state.tabs[0].session.poll();
+        state.duplicate_tab(0);
+        assert!(
+            matches!(
+                state.open_requested.back(),
+                Some(TabOpenIntent::NewForegroundUrl { url, .. }) if url == "https://dup.example/"
+            ),
+            "duplicate lands a same-URL open at the BACK of the queue, got {:?}",
+            state.open_requested.back(),
+        );
+    }
+
+    #[test]
+    fn duplicating_a_blank_tab_enqueues_a_blank_new_tab() {
+        let (mut state, _peer) = live_single_tab();
+        // A fresh session has no committed URL yet.
+        assert!(state.tabs[0].session.nav().url.trim().is_empty());
+        state.duplicate_tab(0);
+        assert!(
+            matches!(
+                state.open_requested.back(),
+                Some(TabOpenIntent::NewForeground(_))
+            ),
+            "a blank tab duplicates to a blank foreground tab, got {:?}",
+            state.open_requested.back(),
+        );
+    }
+
+    // --- Target 6: permission grant/answer/prompt ---
+
+    #[test]
+    fn a_grant_does_not_auto_allow_a_different_capability_kind() {
+        let (mut state, peer) = live_single_tab();
+        // Grant (origin A, kind 0 = geolocation).
+        send_permission_request(&peer, 1, 0, "https://a.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://a.example".to_owned(), 0))
+        );
+        state.answer_active_permission("https://a.example", 0, true);
+        assert!(state.is_permission_granted("https://a.example", 0));
+
+        // Same origin, DIFFERENT kind (1 = notifications) must STILL prompt.
+        send_permission_request(&peer, 2, 1, "https://a.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://a.example".to_owned(), 1)),
+            "a geolocation grant must not silently allow notifications",
+        );
+        assert!(
+            state.tabs[0].session.pending_permission().is_some(),
+            "the different-kind request was NOT auto-answered",
+        );
+    }
+
+    #[test]
+    fn a_grant_does_not_auto_allow_a_different_origin() {
+        let (mut state, peer) = live_single_tab();
+        send_permission_request(&peer, 1, 0, "https://a.example");
+        state.tabs[0].session.poll();
+        state.answer_active_permission("https://a.example", 0, true);
+        assert!(state.is_permission_granted("https://a.example", 0));
+
+        // DIFFERENT origin, SAME kind must still prompt.
+        send_permission_request(&peer, 2, 0, "https://b.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://b.example".to_owned(), 0)),
+            "a grant to a.example must not silently allow b.example",
+        );
+    }
+
+    #[test]
+    fn a_blocked_capability_is_not_remembered_and_reprompts() {
+        let (mut state, peer) = live_single_tab();
+        send_permission_request(&peer, 1, 2, "https://c.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://c.example".to_owned(), 2))
+        );
+        // BLOCK it.
+        state.answer_active_permission("https://c.example", 2, false);
+        assert!(
+            !state.is_permission_granted("https://c.example", 2),
+            "a block is not a grant",
+        );
+        assert!(
+            state.tabs[0].session.pending_permission().is_none(),
+            "the block answered and cleared the request",
+        );
+
+        // The very same request must prompt AGAIN (blocks are not sticky).
+        send_permission_request(&peer, 2, 2, "https://c.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://c.example".to_owned(), 2)),
+            "a previously-blocked capability re-prompts",
+        );
+    }
+
+    // --- Robustness: out-of-range tab ops must be safe no-ops ---
+
+    #[test]
+    fn out_of_range_tab_ops_are_no_ops() {
+        let mut state = tagged_tabs(2); // [Personal, Work]
+        let before: Vec<_> = state.tabs.iter().map(|t| t.container).collect();
+        state.set_tab_pinned(9, true);
+        state.move_tab(9, 0);
+        state.move_tab(0, 9);
+        state.move_tab(1, 1); // from == to
+        state.close_tabs_to_the_right(9);
+        state.close_other_tabs(9);
+        state.duplicate_tab(9);
+        assert_eq!(
+            state.tabs.iter().map(|t| t.container).collect::<Vec<_>>(),
+            before,
+        );
+        assert!(
+            state.open_requested.is_empty(),
+            "an out-of-range duplicate enqueues nothing",
+        );
+        assert!(state.tabs.iter().all(|t| !t.pinned));
+    }
+
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
     /// panel's polling), mirroring `middle_clicking_a_tab_pill_closes_that_tab`.
     fn run_tab_strip_frame(ctx: &egui::Context, state: &mut WebState, input: egui::RawInput) {
