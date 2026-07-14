@@ -62,6 +62,41 @@ confirms `CEF_INITIALIZE_OK` + display block resolves/fires + `paints=1` (no reg
 `requestFullscreen()` gesture-trigger is eyes-on. **TEMPLATE for the rest of Wave B: extend a
 verified vtable block (display/load/request) rather than mint a new handler struct.**
 
+### Wave-B engine round-trips COMPLETE + tab-management sweep — 2026-07-13 (drive 3)
+
+Nine more features, all farm-green + pushed (`mde-shell-egui` 1174→1186/0, `mde-web-cef`
+116→117/0, `mde-web-preview-client` 50→52/0, wire 7/0, 0 style-leaks). The engine round-trips
+used a **collision-free file-partition**: the coordinator freezes the wire seam (EventMsg/ControlMsg
+tag + client accessor) and pushes it, then a farm agent owns `cef_browser/mod.rs` (engine) while the
+coordinator owns `web/mod.rs` (shell) — disjoint files, clean parallel merge. Each agent derived its
+CEF ABI offsets from in-repo anchors (never the SDK header, absent airgapped) with a fake-vtable unit
+test and dedicated cached ptrs (no `lookup_peer`).
+
+- **safe-browsing interstitial (#19)** — a top-level Document block whose filter label starts
+  `safe-browsing` paints a full-page "unsafe site blocked" interstitial (mirrors the cert spine).
+- **UA HTTP-header override (engine)** — `SetUserAgent` now also stamps the real `User-Agent:`
+  request header (was JS-`navigator.userAgent`-only); request-handler `on_before_resource_load`,
+  offset 144 cross-checked. Server-side sniffers now see the spoof too.
+- **audible tab indicator (full round-trip)** — `cef_audio_handler` (client getter offset 40,
+  9-anchor cross-check) publishes `EventMsg::AudioState` → shell renders 🔊 / 🔇 (mute wins),
+  click-to-mute. The 🔇 mute half is live now; 🔊 lights on real playback (on-glass gesture).
+- **pinned tabs** — compact favicon-only pills clustered front via a stable partition; drag snaps
+  back across the boundary; both strips; no ×, close via middle-click/menu.
+- **Duplicate tab / Close other tabs / Close tabs to the right** — both strips, pinned-sparing.
+- **tab-search dropdown** — Chrome's 🔍 "Search tabs" over a live title/URL filter, both strips.
+- **permission ALLOW path (wire seam + client answer landed; engine handler in flight)** —
+  `EventMsg::PermissionRequest`/`ControlMsg::PermissionDecision` (tags 19/28) + `answer_permission`;
+  the `cef_permission_handler` engine leg (holds the async prompt callback open across the round-trip,
+  ref-counted) is a farm agent in progress. Shell prompt gated on engine success.
+
+**Honest remaining tail (genuinely engine-coupled / on-glass / multi-session, NOT clean gaps):**
+per-site permission engine leg (in flight) + its shell prompt, IME preedit (host-method round-trip),
+password manager (session store + engine form fill/capture), PiP (video-element engine detection),
+in-shell PDF viewer (needs a PDF renderer). The pure-shell industry surface is now essentially
+COMPLETE — verified this drive: bookmarks bar, tab groups, drag-reorder, reopen-closed, configurable
+search engines, print options, site styles, find-in-page (match tally), zoom controls all already
+shipped.
+
 ### Session tally 2026-07-13 — POST-UNBLOCK addendum
 
 Operator lifted the gated set via a 7-Q survey (see [[browser-gated-features-unblocked]]). Delivered
