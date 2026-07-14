@@ -656,6 +656,24 @@ impl WebSession {
         self.send(&ControlMsg::SetZoom { percent });
     }
 
+    /// IME preedit: push the in-progress composition string to the focused editable
+    /// (empty clears it). Driven by egui `ImeEvent::Preedit`.
+    pub fn ime_set_composition(&mut self, text: String) {
+        self.send(&ControlMsg::ImeSetComposition { text });
+    }
+
+    /// IME commit: finalize the composition by inserting `text`. Driven by egui
+    /// `ImeEvent::Commit`.
+    pub fn ime_commit_text(&mut self, text: String) {
+        self.send(&ControlMsg::ImeCommitText { text });
+    }
+
+    /// IME finish: finalize any pending composition in place. Driven by egui
+    /// `ImeEvent::Disable`.
+    pub fn ime_finish_composition(&mut self) {
+        self.send(&ControlMsg::ImeFinishComposition);
+    }
+
     /// Find text on the current page.
     /// Run a clipboard/editing command on the page's focused element (in-page
     /// context menu). Reuses the engine's native frame edit commands.

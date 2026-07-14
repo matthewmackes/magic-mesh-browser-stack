@@ -638,6 +638,23 @@ pub enum ControlMsg {
         /// Whether the user allowed the capability.
         allow: bool,
     },
+    /// IME preedit: set the focused editable's in-progress composition string
+    /// (CJK/dead-key input). The engine calls `cef_browser_host::ime_set_composition`
+    /// with the caret at the end. Empty `text` clears/cancels the composition.
+    /// Driven by egui `ImeEvent::Preedit`.
+    ImeSetComposition {
+        /// The current composition (preedit) text.
+        text: String,
+    },
+    /// IME commit: finalize the composition by inserting `text`
+    /// (`ime_commit_text`). Driven by egui `ImeEvent::Commit`.
+    ImeCommitText {
+        /// The committed text.
+        text: String,
+    },
+    /// IME finish: finalize any pending composition in place without new text
+    /// (`ime_finish_composing_text`). Driven by egui `ImeEvent::Disable`.
+    ImeFinishComposition,
     /// Apply shell-owned spellcheck highlights to visible page text. Empty words
     /// clear prior highlights.
     SetSpellcheckHighlights {
@@ -821,6 +838,15 @@ impl ControlMsg {
                 put_u64(&mut out, *id);
                 out.push(u8::from(*allow));
             }
+            Self::ImeSetComposition { text } => {
+                out.push(29);
+                put_str(&mut out, text);
+            }
+            Self::ImeCommitText { text } => {
+                out.push(30);
+                put_str(&mut out, text);
+            }
+            Self::ImeFinishComposition => out.push(31),
         }
         out
     }
@@ -908,6 +934,9 @@ impl ControlMsg {
                 id: c.u64()?,
                 allow: c.bool()?,
             },
+            29 => Self::ImeSetComposition { text: c.string()? },
+            30 => Self::ImeCommitText { text: c.string()? },
+            31 => Self::ImeFinishComposition,
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1592,6 +1621,16 @@ mod tests {
             id: 78,
             allow: false,
         });
+        round_control(&ControlMsg::ImeSetComposition {
+            text: "\u{4f60}\u{597d}".to_owned(),
+        });
+        round_control(&ControlMsg::ImeSetComposition {
+            text: String::new(),
+        });
+        round_control(&ControlMsg::ImeCommitText {
+            text: "\u{4f60}\u{597d}".to_owned(),
+        });
+        round_control(&ControlMsg::ImeFinishComposition);
         round_control(&ControlMsg::EditCommand {
             command: EditCommand::SelectAll,
         });
