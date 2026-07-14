@@ -36,6 +36,10 @@ use crate::{input, wire};
 /// (a bound so a flooding helper can't spin the UI thread).
 const MAX_RECV_PER_POLL: usize = 64;
 const MAX_RECENT_RESOURCE_REQUESTS: usize = 128;
+/// A generous cap on queued, not-yet-answered permission prompts. Real pages raise
+/// a handful at most; the bound stops a hostile page from growing the queue (and the
+/// engine's held-callback set) without limit. An overflow auto-denies the oldest.
+const MAX_PENDING_PERMISSIONS: usize = 16;
 
 /// A session's live status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,9 +214,13 @@ pub struct WebSession {
     /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
     /// already auto-resolved it; this is a passive notice for the shell.
     pending_js_dialog: Option<JsDialog>,
-    /// A page's pending permission request awaiting the user's allow/block. The
-    /// engine holds the CEF callback open until [`Self::answer_permission`] replies.
-    pending_permission: Option<PermissionRequest>,
+    /// Page permission requests awaiting the user's allow/block, oldest first (the
+    /// shell prompts for the FRONT). A queue, not a single slot: a page can raise
+    /// several prompts in quick succession (e.g. geolocation + notifications), and
+    /// the engine holds a distinct CEF callback open for EACH — dropping one would
+    /// orphan its callback. Bounded ([`MAX_PENDING_PERMISSIONS`]); an overflow
+    /// auto-denies the oldest so its callback still resolves.
+    pending_permissions: VecDeque<PermissionRequest>,
     last_seq: u64,
     pending: Option<ColorImage>,
     pdf_events: VecDeque<PdfSaveStatus>,
@@ -255,7 +263,7 @@ impl WebSession {
             cert_error: None,
             safe_browsing_block: None,
             pending_js_dialog: None,
-            pending_permission: None,
+            pending_permissions: VecDeque::new(),
             last_seq: 0,
             pending: None,
             pdf_events: VecDeque::new(),
@@ -497,7 +505,18 @@ impl WebSession {
             EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
             EventMsg::AudioState { audible } => self.audible = audible,
             EventMsg::PermissionRequest { id, kind, origin } => {
-                self.pending_permission = Some(PermissionRequest { id, kind, origin });
+                if self.pending_permissions.len() >= MAX_PENDING_PERMISSIONS {
+                    // Overflow: deny the oldest so the engine releases its held CEF
+                    // callback (never silently drop it), then enqueue the newcomer.
+                    if let Some(dropped) = self.pending_permissions.pop_front() {
+                        self.send(&ControlMsg::PermissionDecision {
+                            id: dropped.id,
+                            allow: false,
+                        });
+                    }
+                }
+                self.pending_permissions
+                    .push_back(PermissionRequest { id, kind, origin });
             }
             EventMsg::Favicon { png } => self.favicon = Some(png),
             EventMsg::CertError { url, code, message } => {
@@ -720,20 +739,20 @@ impl WebSession {
         self.pending_js_dialog.as_ref()
     }
 
-    /// The page's pending permission request awaiting the user's allow/block, if
-    /// any. The shell renders a prompt from this and replies via
-    /// [`Self::answer_permission`].
+    /// The oldest pending permission request awaiting the user's allow/block, if any
+    /// (the FRONT of the queue). The shell renders a prompt from this and replies via
+    /// [`Self::answer_permission`]; answering reveals the next queued request.
     #[must_use]
-    pub const fn pending_permission(&self) -> Option<&PermissionRequest> {
-        self.pending_permission.as_ref()
+    pub fn pending_permission(&self) -> Option<&PermissionRequest> {
+        self.pending_permissions.front()
     }
 
-    /// Answer the pending permission request: send the engine a
-    /// [`ControlMsg::PermissionDecision`] carrying the request's `id`, then clear it
-    /// (the engine continues the held CEF callback with accept/deny). A no-op when
-    /// nothing is pending. Session-only — the client persists no permission state.
+    /// Answer the oldest pending permission request: pop it and send the engine a
+    /// [`ControlMsg::PermissionDecision`] carrying its `id` (the engine continues the
+    /// held CEF callback with accept/deny). A no-op when the queue is empty.
+    /// Session-only — the client persists no permission state.
     pub fn answer_permission(&mut self, allow: bool) {
-        if let Some(request) = self.pending_permission.take() {
+        if let Some(request) = self.pending_permissions.pop_front() {
             self.send(&ControlMsg::PermissionDecision {
                 id: request.id,
                 allow,
@@ -1205,6 +1224,70 @@ mod tests {
                 allow: true
             }
         );
+    }
+
+    #[test]
+    fn concurrent_permission_requests_queue_and_answer_oldest_first() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        // Two prompts in quick succession — the engine holds a callback for EACH, so
+        // BOTH must be retained (not overwritten), oldest surfaced first.
+        for (id, kind) in [(1u64, 0u8), (2, 1)] {
+            send_event(
+                &peer,
+                &EventMsg::PermissionRequest {
+                    id,
+                    kind,
+                    origin: "https://x.example".to_owned(),
+                },
+            );
+        }
+        session.poll();
+        assert_eq!(session.pending_permission().map(|r| r.id), Some(1));
+        session.answer_permission(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision { id: 1, allow: true }
+        );
+        // Answering the first REVEALS the second (it was not lost).
+        assert_eq!(session.pending_permission().map(|r| r.id), Some(2));
+        session.answer_permission(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision {
+                id: 2,
+                allow: false
+            }
+        );
+        assert!(session.pending_permission().is_none());
+    }
+
+    #[test]
+    fn permission_queue_overflow_auto_denies_the_oldest_so_no_callback_leaks() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        // One past the cap: the oldest (id 0) is auto-DENIED (not silently dropped)
+        // so the engine releases its held callback; the rest stay queued.
+        for id in 0..=(MAX_PENDING_PERMISSIONS as u64) {
+            send_event(
+                &peer,
+                &EventMsg::PermissionRequest {
+                    id,
+                    kind: 0,
+                    origin: "https://x.example".to_owned(),
+                },
+            );
+        }
+        session.poll();
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision {
+                id: 0,
+                allow: false
+            },
+            "the displaced oldest request is auto-denied, not orphaned"
+        );
+        assert_eq!(session.pending_permission().map(|r| r.id), Some(1));
     }
 
     #[test]
