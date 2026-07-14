@@ -335,6 +335,15 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET, 512);
     assert_eq!(CEF_BROWSER_HOST_SET_AUDIO_MUTED_OFFSET, 520);
     assert_eq!(CEF_BROWSER_HOST_IS_AUDIO_MUTED_OFFSET, 528);
+    // IME slots: fields 47/48/49 of the cef_browser_host_t vtable, confirmed via
+    // `offsetof` against the pinned CEF 149 header and bounded by set_audio_muted
+    // (field 60 = 520). base 40 + idx*8.
+    assert_eq!(CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET, 40 + 47 * 8);
+    assert_eq!(CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET, 40 + 48 * 8);
+    assert_eq!(CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET, 40 + 49 * 8);
+    assert_eq!(CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET, 416);
+    assert_eq!(CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET, 424);
+    assert_eq!(CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET, 432);
     assert_eq!(CEF_FRAME_SIZE, 248);
     assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 144);
     assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 152);
@@ -647,6 +656,157 @@ fn audio_mute_control_uses_cef_host_audio_slot() {
 
     assert_eq!(AUDIO_MUTED_CALLS.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(AUDIO_MUTED_LAST.load(AtomicOrdering::SeqCst), 0);
+}
+
+static IME_SET_COMP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static IME_SET_COMP_TEXT: Mutex<String> = Mutex::new(String::new());
+static IME_SET_COMP_SEL_FROM: AtomicI32 = AtomicI32::new(-1);
+static IME_SET_COMP_SEL_TO: AtomicI32 = AtomicI32::new(-1);
+static IME_SET_COMP_UNDERLINES: AtomicI32 = AtomicI32::new(-1);
+static IME_SET_COMP_UNDERLINES_NULL: AtomicI32 = AtomicI32::new(-1);
+static IME_SET_COMP_REPLACEMENT_NULL: AtomicI32 = AtomicI32::new(-1);
+static IME_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static IME_COMMIT_TEXT: Mutex<String> = Mutex::new(String::new());
+static IME_COMMIT_CURSOR: AtomicI32 = AtomicI32::new(i32::MIN);
+static IME_COMMIT_REPLACEMENT_NULL: AtomicI32 = AtomicI32::new(-1);
+static IME_FINISH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static IME_FINISH_KEEP: AtomicI32 = AtomicI32::new(-1);
+
+/// Fake `cef_browser_host_t::ime_set_composition`: captures the composition text,
+/// the underline count / NULL-ness, the NULL replacement range and the selection
+/// range so the control path can be asserted without live CEF.
+unsafe extern "C" fn record_ime_set_composition(
+    _host: *mut c_void,
+    text: *const c_void,
+    underlines_count: usize,
+    underlines: *const c_void,
+    replacement_range: *const CefRange,
+    selection_range: *const CefRange,
+) {
+    IME_SET_COMP_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    IME_SET_COMP_UNDERLINES.store(underlines_count as i32, AtomicOrdering::SeqCst);
+    IME_SET_COMP_UNDERLINES_NULL.store(underlines.is_null() as i32, AtomicOrdering::SeqCst);
+    IME_SET_COMP_REPLACEMENT_NULL.store(replacement_range.is_null() as i32, AtomicOrdering::SeqCst);
+    if let Ok(mut guard) = IME_SET_COMP_TEXT.lock() {
+        *guard = cef_string_to_string(text.cast::<CefString>());
+    }
+    // SAFETY: `ime_set_composition` always passes a live selection range for the
+    // duration of the synchronous call.
+    if !selection_range.is_null() {
+        let range = unsafe { &*selection_range };
+        IME_SET_COMP_SEL_FROM.store(range.from as i32, AtomicOrdering::SeqCst);
+        IME_SET_COMP_SEL_TO.store(range.to as i32, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Fake `cef_browser_host_t::ime_commit_text`: captures the committed text, the
+/// NULL replacement range and the relative cursor position.
+unsafe extern "C" fn record_ime_commit_text(
+    _host: *mut c_void,
+    text: *const c_void,
+    replacement_range: *const CefRange,
+    relative_cursor_pos: c_int,
+) {
+    IME_COMMIT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    IME_COMMIT_CURSOR.store(relative_cursor_pos, AtomicOrdering::SeqCst);
+    IME_COMMIT_REPLACEMENT_NULL.store(replacement_range.is_null() as i32, AtomicOrdering::SeqCst);
+    if let Ok(mut guard) = IME_COMMIT_TEXT.lock() {
+        *guard = cef_string_to_string(text.cast::<CefString>());
+    }
+}
+
+/// Fake `cef_browser_host_t::ime_finish_composing_text`: captures `keep_selection`.
+unsafe extern "C" fn record_ime_finish_composing(_host: *mut c_void, keep_selection: c_int) {
+    IME_FINISH_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    IME_FINISH_KEEP.store(keep_selection, AtomicOrdering::SeqCst);
+}
+
+#[test]
+fn ime_controls_drive_cef_host_ime_slots() {
+    IME_SET_COMP_CALLS.store(0, AtomicOrdering::SeqCst);
+    IME_COMMIT_CALLS.store(0, AtomicOrdering::SeqCst);
+    IME_FINISH_CALLS.store(0, AtomicOrdering::SeqCst);
+
+    // Install the three IME fn-ptrs at their pinned host-vtable offsets.
+    let mut host = vec![0u8; CEF_BROWSER_HOST_SIZE];
+    host[CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET
+        ..CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_ime_set_composition as *const () as usize).to_ne_bytes());
+    host[CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET
+        ..CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_ime_commit_text as *const () as usize).to_ne_bytes());
+    host[CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET
+        ..CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_ime_finish_composing as *const () as usize).to_ne_bytes());
+    TEST_HOST_PTR.store(host.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser[CEF_BROWSER_GET_HOST_OFFSET..CEF_BROWSER_GET_HOST_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_browser_host as *const () as usize).to_ne_bytes());
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let browser_ptr: *mut c_void = browser.as_mut_ptr().cast();
+
+    // A preedit sets the composition with the caret at the end, zero underline
+    // runs, a NULL underline array and a NULL replacement range. "かん" is two
+    // UTF-16 code units, so the caret range is {2, 2}.
+    apply_control_frame(
+        browser_ptr,
+        &callbacks,
+        &ControlMsg::ImeSetComposition {
+            text: "かん".into(),
+        },
+    );
+    assert_eq!(IME_SET_COMP_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(*IME_SET_COMP_TEXT.lock().unwrap(), "かん");
+    assert_eq!(IME_SET_COMP_SEL_FROM.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(IME_SET_COMP_SEL_TO.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(IME_SET_COMP_UNDERLINES.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(IME_SET_COMP_UNDERLINES_NULL.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        IME_SET_COMP_REPLACEMENT_NULL.load(AtomicOrdering::SeqCst),
+        1
+    );
+
+    // An empty preedit STILL calls ime_set_composition (this is how a preedit is
+    // cleared), with the caret collapsed to {0, 0}.
+    apply_control_frame(
+        browser_ptr,
+        &callbacks,
+        &ControlMsg::ImeSetComposition {
+            text: String::new(),
+        },
+    );
+    assert_eq!(IME_SET_COMP_CALLS.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(*IME_SET_COMP_TEXT.lock().unwrap(), "");
+    assert_eq!(IME_SET_COMP_SEL_FROM.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(IME_SET_COMP_SEL_TO.load(AtomicOrdering::SeqCst), 0);
+
+    // Commit routes to ime_commit_text with the text, a NULL replacement range and
+    // a zero relative cursor position.
+    apply_control_frame(
+        browser_ptr,
+        &callbacks,
+        &ControlMsg::ImeCommitText {
+            text: "漢字".into(),
+        },
+    );
+    assert_eq!(IME_COMMIT_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(*IME_COMMIT_TEXT.lock().unwrap(), "漢字");
+    assert_eq!(IME_COMMIT_CURSOR.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(IME_COMMIT_REPLACEMENT_NULL.load(AtomicOrdering::SeqCst), 1);
+
+    // Finish routes to ime_finish_composing_text keeping the selection.
+    apply_control_frame(browser_ptr, &callbacks, &ControlMsg::ImeFinishComposition);
+    assert_eq!(IME_FINISH_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(IME_FINISH_KEEP.load(AtomicOrdering::SeqCst), 1);
 }
 
 #[test]

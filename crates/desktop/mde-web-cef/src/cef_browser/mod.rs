@@ -320,6 +320,22 @@ pub const CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET: usize = 512;
 pub const CEF_BROWSER_HOST_SET_AUDIO_MUTED_OFFSET: usize = 520;
 /// `offsetof(cef_browser_host_t, is_audio_muted)`.
 pub const CEF_BROWSER_HOST_IS_AUDIO_MUTED_OFFSET: usize = 528;
+/// `offsetof(cef_browser_host_t, ime_set_composition)` — field 47 of the pinned
+/// CEF 149 vtable (base 40 + 47*8 = 416). Confirmed via `offsetof` against the
+/// pinned header `149.0.6+g0d0eeb6+chromium-149.0.7827.201`, cross-checked by the
+/// bracketing anchors `find`=208 (field 21) and `set_audio_muted`=520 (field 60).
+/// Signature `void(self, const cef_string_t* text, size_t underlines_count,
+/// const cef_composition_underline_t* underlines,
+/// const cef_range_t* replacement_range, const cef_range_t* selection_range)`.
+pub const CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET: usize = 416;
+/// `offsetof(cef_browser_host_t, ime_commit_text)` — field 48 (40 + 48*8 = 424),
+/// confirmed via `offsetof`. Signature `void(self, const cef_string_t* text,
+/// const cef_range_t* replacement_range, int relative_cursor_pos)`.
+pub const CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET: usize = 424;
+/// `offsetof(cef_browser_host_t, ime_finish_composing_text)` — field 49
+/// (40 + 49*8 = 432), confirmed via `offsetof`. Signature
+/// `void(self, int keep_selection)`.
+pub const CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET: usize = 432;
 /// `sizeof(cef_frame_t)` for pinned Linux CEF 149.
 pub const CEF_FRAME_SIZE: usize = 248;
 /// `offsetof(cef_frame_t, load_url)`.
@@ -1133,6 +1149,9 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::PermissionDecision { id, allow } => {
             callbacks.apply_permission_decision(*id, *allow);
         }
+        ControlMsg::ImeSetComposition { text } => ime_set_composition(browser, text),
+        ControlMsg::ImeCommitText { text } => ime_commit_text(browser, text),
+        ControlMsg::ImeFinishComposition => ime_finish_composing(browser),
     }
 }
 
@@ -1316,6 +1335,15 @@ struct CefString {
     str_: *const u16,
     length: usize,
     dtor: usize,
+}
+
+/// `cef_range_t` — two `uint32_t` (`from`, `to`); `sizeof == 8` confirmed against
+/// the pinned CEF 149 `internal/cef_types.h`. Used for IME composition/selection
+/// ranges on `cef_browser_host_t::ime_*`.
+#[repr(C)]
+struct CefRange {
+    from: u32,
+    to: u32,
 }
 
 struct CefBrowserCallbacks {
@@ -3685,6 +3713,98 @@ fn set_audio_muted(browser: *mut c_void, muted: bool) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF and the mute flag is the CEF boolean int.
     unsafe { callback(host, if muted { 1 } else { 0 }) };
+}
+
+/// Push an IME preedit into the windowless browser via
+/// `cef_browser_host_t::ime_set_composition`. We pass no underline runs and no
+/// replacement range; the selection range places the caret at the end of the
+/// preedit. An empty `text` clears the active composition (CEF treats a
+/// zero-length composition string as a cancel).
+fn ime_set_composition(browser: *mut c_void, text: &str) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Ok(composition) = CefStringOwned::new(text) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_IME_SET_COMPOSITION_OFFSET) else {
+        return;
+    };
+    // CEF composition ranges are measured in UTF-16 code units, matching
+    // `cef_string_t::length`; the caret sits at the end of the preedit.
+    let caret = text.encode_utf16().count() as u32;
+    let selection_range = CefRange {
+        from: caret,
+        to: caret,
+    };
+    // SAFETY: `callback` is read from `cef_browser_host_t::ime_set_composition`,
+    // whose pinned C signature is `(cef_browser_host_t*, const cef_string_t*
+    // text, size_t underlines_count, const cef_composition_underline_t*
+    // underlines, const cef_range_t* replacement_range, const cef_range_t*
+    // selection_range)`.
+    let callback: unsafe extern "C" fn(
+        *mut c_void,
+        *const c_void,
+        usize,
+        *const c_void,
+        *const CefRange,
+        *const CefRange,
+    ) = unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF; `composition` is a live `cef_string_t` for
+    // this call; zero underline runs / NULL underline array; NULL
+    // replacement_range; `selection_range` outlives the synchronous call.
+    unsafe {
+        callback(
+            host,
+            composition.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            &selection_range as *const CefRange,
+        )
+    };
+}
+
+/// Commit finalized IME text into the browser via
+/// `cef_browser_host_t::ime_commit_text` (no replacement range, cursor left at
+/// the default position).
+fn ime_commit_text(browser: *mut c_void, text: &str) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Ok(commit) = CefStringOwned::new(text) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_IME_COMMIT_TEXT_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is read from `cef_browser_host_t::ime_commit_text`, whose
+    // pinned C signature is `(cef_browser_host_t*, const cef_string_t* text,
+    // const cef_range_t* replacement_range, int relative_cursor_pos)`.
+    let callback: unsafe extern "C" fn(*mut c_void, *const c_void, *const CefRange, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF; `commit` is a live `cef_string_t` for this
+    // call; NULL replacement_range and a zero relative cursor position.
+    unsafe { callback(host, commit.as_ptr(), ptr::null(), 0) };
+}
+
+/// Finish the active IME composition via
+/// `cef_browser_host_t::ime_finish_composing_text`, keeping the current
+/// selection (`keep_selection = 1`).
+fn ime_finish_composing(browser: *mut c_void) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_IME_FINISH_COMPOSING_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is read from
+    // `cef_browser_host_t::ime_finish_composing_text`, whose pinned C signature
+    // is `(cef_browser_host_t*, int keep_selection)`.
+    let callback: unsafe extern "C" fn(*mut c_void, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF; keep the current selection after finishing.
+    unsafe { callback(host, 1) };
 }
 
 fn print_page(browser: *mut c_void) {
