@@ -438,6 +438,34 @@ pub(super) fn browser_safe_browsing_block_body(
     .to_string()
 }
 
+pub(super) fn browser_certificate_error_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    code: i32,
+    message: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_certificate_error",
+        "policy": "tls_certificate",
+        "decision": "block",
+        "enforcement": "engine_certificate_validation",
+        "reason": "certificate_error",
+        "trigger": "top_level_navigation",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "code": code,
+        "message": message.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
 pub(super) fn browser_insecure_download_block_body(
     engine: BrowserEngine,
     url: &str,

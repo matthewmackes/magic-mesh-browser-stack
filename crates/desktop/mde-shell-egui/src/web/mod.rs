@@ -246,6 +246,10 @@ struct Tab {
     /// `recent_resource_requests()` is a bounded snapshot, so this watermark keeps
     /// pre-network resource-block audit events one-shot without changing helper wire.
     last_audited_resource_seq: u64,
+    /// Last TLS/certificate block audited for this tab. The engine stores the
+    /// current cert error until a fresh load clears it, so this prevents per-frame
+    /// duplicate Bus events while still auditing a repeated block after navigation.
+    last_audited_cert_error: Option<CertError>,
     /// Debounces panel-size changes into a single settled `session.resize` so a
     /// drag-resize drives the helper's CSS viewport once, not every frame
     /// (browser-1).
@@ -422,6 +426,13 @@ struct MixedContentBlockAudit {
     title: String,
     url: String,
     resource: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CertificateErrorAudit {
+    engine: BrowserEngine,
+    title: String,
+    error: CertError,
 }
 
 /// One saved login in the SESSION-ONLY credential store. Keyed by normalized host
@@ -1836,6 +1847,7 @@ impl WebState {
             texture: None,
             last_frame: None,
             last_audited_resource_seq: 0,
+            last_audited_cert_error: None,
             resizer: ViewportResizer::default(),
             favicon_cache: None,
         });
@@ -4311,6 +4323,7 @@ impl WebState {
             tab.texture = None;
             tab.last_frame = None;
             tab.last_audited_resource_seq = 0;
+            tab.last_audited_cert_error = None;
             tab.last_activity = Instant::now();
             tab.idle_suspended = false;
             // A fresh helper re-negotiates its viewport from scratch.
@@ -4942,6 +4955,22 @@ impl WebState {
         );
     }
 
+    fn publish_certificate_error(&self, audit: &CertificateErrorAudit, blocked_ms: u64) {
+        let body = browser_certificate_error_body(
+            audit.engine,
+            &audit.error.url,
+            &audit.title,
+            audit.error.code,
+            &audit.error.message,
+            blocked_ms,
+        );
+        publish_to_bus(
+            self.bus_root.as_deref(),
+            EVENT_BROWSER_CERTIFICATE_ERROR,
+            &body,
+        );
+    }
+
     fn publish_insecure_download_block(&self, url: &str, trigger: &str, blocked_ms: u64) {
         let (engine, title) = self
             .tabs
@@ -5524,11 +5553,24 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let mut download_submits = Vec::new();
     let mut login_captures = Vec::new();
     let mut mixed_content_blocks = Vec::new();
+    let mut certificate_errors = Vec::new();
     for (idx, tab) in state.tabs.iter_mut().enumerate() {
         if tab.idle_suspended && idx != state.active {
             continue;
         }
         tab.session.poll();
+        if let Some(error) = tab.session.cert_error().cloned() {
+            if tab.last_audited_cert_error.as_ref() != Some(&error) {
+                certificate_errors.push(CertificateErrorAudit {
+                    engine: tab.engine,
+                    title: tab.session.title().to_owned(),
+                    error: error.clone(),
+                });
+                tab.last_audited_cert_error = Some(error);
+            }
+        } else {
+            tab.last_audited_cert_error = None;
+        }
         let resources = tab.session.recent_resource_requests();
         let mut max_resource_seq = tab.last_audited_resource_seq;
         for resource in resources
@@ -5609,6 +5651,9 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     }
     for block in mixed_content_blocks {
         state.publish_mixed_content_block(&block, unix_ms());
+    }
+    for audit in certificate_errors {
+        state.publish_certificate_error(&audit, unix_ms());
     }
     state.poll_spellcheck();
     // Engine-driven navigations (redirects, page scripts) land in the address
@@ -7056,6 +7101,10 @@ const EVENT_BROWSER_POLICY_BLOCK: &str = "event/browser/policy-block";
 /// Browser safe-browsing block audit event. Operators/admin tooling can consume
 /// unsafe-host blocks without scraping interstitials or download notices.
 const EVENT_BROWSER_SAFE_BROWSING_BLOCK: &str = "event/browser/safe-browsing-block";
+
+/// Browser TLS/certificate-error block audit event. Operators/admin tooling can
+/// consume top-level certificate failures without scraping interstitials.
+const EVENT_BROWSER_CERTIFICATE_ERROR: &str = "event/browser/certificate-error";
 
 /// Browser insecure-download block audit event. Operators/admin tooling can
 /// distinguish transport hard-blocks from content/policy blocks.
@@ -15776,6 +15825,51 @@ mod tests {
     }
 
     #[test]
+    fn certificate_errors_are_audited_once() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::Title("Bad Site".to_owned()),
+        );
+        send_cert_error(
+            &helper,
+            "https://bad.example.test/login",
+            -202,
+            "The certificate is not trusted (unknown authority)",
+        );
+
+        assert!(run_panel(&mut state), "panel polls the cert error");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_CERTIFICATE_ERROR, None)
+            .expect("list certificate-error events");
+        assert_eq!(msgs.len(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("certificate body"))
+                .expect("valid JSON");
+        assert_eq!(event["op"], "browser_certificate_error");
+        assert_eq!(event["url"], "https://bad.example.test/login");
+        assert_eq!(event["host"], "bad.example.test");
+        assert_eq!(event["title"], "Bad Site");
+        assert_eq!(event["code"], -202);
+        assert_eq!(
+            event["message"],
+            "The certificate is not trusted (unknown authority)"
+        );
+
+        assert!(run_panel(&mut state), "repaint stays stable");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_CERTIFICATE_ERROR, None)
+            .expect("list certificate-error events after repaint");
+        assert_eq!(msgs.len(), 1, "cert-error audit is one-shot");
+    }
+
+    #[test]
     fn a_safe_browsing_block_paints_the_interstitial_instead_of_a_panic() {
         use mde_web_preview_client::{EventMsg, ResourceType};
 
@@ -16033,6 +16127,7 @@ mod tests {
             texture: None,
             last_frame: None,
             last_audited_resource_seq: 0,
+            last_audited_cert_error: None,
             resizer: ViewportResizer::default(),
             favicon_cache: None,
         });
@@ -16999,6 +17094,41 @@ mod tests {
         assert_eq!(v["source"], "browser");
         assert_eq!(v["node"], local_hostname());
         assert_eq!(v["blocked_ms"], 456);
+    }
+
+    #[test]
+    fn browser_certificate_error_body_is_the_audit_event_shape() {
+        assert_eq!(
+            EVENT_BROWSER_CERTIFICATE_ERROR,
+            "event/browser/certificate-error"
+        );
+        let body = browser_certificate_error_body(
+            BrowserEngine::Cef,
+            "https://bad.example.test/login",
+            "Bad Site",
+            -202,
+            "The certificate is not trusted (unknown authority)",
+            567,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_certificate_error");
+        assert_eq!(v["policy"], "tls_certificate");
+        assert_eq!(v["decision"], "block");
+        assert_eq!(v["enforcement"], "engine_certificate_validation");
+        assert_eq!(v["reason"], "certificate_error");
+        assert_eq!(v["trigger"], "top_level_navigation");
+        assert_eq!(v["engine"], "cef");
+        assert_eq!(v["url"], "https://bad.example.test/login");
+        assert_eq!(v["host"], "bad.example.test");
+        assert_eq!(v["title"], "Bad Site");
+        assert_eq!(v["code"], -202);
+        assert_eq!(
+            v["message"],
+            "The certificate is not trusted (unknown authority)"
+        );
+        assert_eq!(v["source"], "browser");
+        assert_eq!(v["node"], local_hostname());
+        assert_eq!(v["blocked_ms"], 567);
     }
 
     #[test]

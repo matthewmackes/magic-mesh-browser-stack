@@ -119,7 +119,10 @@ memory `cef-handler-lookup-peer-null-bug`.
   offline-cache/media resource manifests. Top-level public plain-HTTP navigation decisions now publish
   `event/browser/insecure-navigation` records for prompt, Continue, Upgrade, Cancel, and session-HSTS
   auto-upgrade decisions; new-tab URL opens also pause at the same HTTPS prompt instead of bypassing
-  it before helper spawn. The site-info/security popup now also surfaces live managed-policy,
+  it before helper spawn. Engine-blocked TLS/certificate failures now publish
+  `event/browser/certificate-error` records with URL, host, error code/message, engine, node, and
+  timestamp metadata, so operators can consume top-level certificate blocks without scraping the
+  interstitial. The site-info/security popup now also surfaces live managed-policy,
   safe-browsing, mixed-content, and tracker/filter block counts plus representative rules/hosts
   from the active page's observed resource log, and shows current-site permission posture
   (default-deny, session grants, denied prompts, and forgotten-site state). Per-site
