@@ -1971,4 +1971,333 @@ mod tests {
         let session = WebSession::from_stream(shell, None).expect("session");
         drop(session);
     }
+
+    // ── Adversarial event-fold + accessor robustness (audio / permission /
+    //    safe-browsing / fullscreen / crash-precedence / IME) ──
+
+    /// Assert the session wrote NO control frame back — a no-op sender or an
+    /// already-cleared answer must be silent. Flips the peer non-blocking, reads,
+    /// and requires an empty socket (`WouldBlock`); any buffered bytes are a stray
+    /// frame the caller did not expect.
+    fn assert_no_control_pending(peer: &UnixStream) {
+        peer.set_nonblocking(true).expect("peer non-blocking");
+        let mut s: &UnixStream = peer;
+        let mut buf = [0u8; 64];
+        let outcome = s.read(&mut buf);
+        peer.set_nonblocking(false).expect("peer blocking");
+        match outcome {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => {}
+            other => panic!("expected no control frame pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_state_rapid_toggles_fold_to_the_last_value() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        for audible in [true, true, false, true] {
+            send_event(&peer, &EventMsg::AudioState { audible });
+        }
+        session.poll();
+        assert!(
+            session.audible(),
+            "a burst of toggles must fold to the LAST value (true)"
+        );
+        // A trailing stop still wins over the earlier starts.
+        send_event(&peer, &EventMsg::AudioState { audible: false });
+        session.poll();
+        assert!(!session.audible(), "the final stop clears the flag");
+    }
+
+    #[test]
+    fn answer_permission_with_nothing_pending_is_a_silent_no_op() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.pending_permission().is_none());
+        // Nothing is pending — answering (either way) must not send a control frame.
+        session.answer_permission(true);
+        session.answer_permission(false);
+        assert_no_control_pending(&peer);
+        assert!(session.pending_permission().is_none());
+    }
+
+    #[test]
+    fn answering_a_permission_twice_sends_exactly_one_decision() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::PermissionRequest {
+                id: 7,
+                kind: 2,
+                origin: "https://clip.example".to_owned(),
+            },
+        );
+        session.poll();
+        session.answer_permission(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision { id: 7, allow: true }
+        );
+        // The prompt is already cleared; a second answer must be a silent no-op.
+        session.answer_permission(true);
+        assert_no_control_pending(&peer);
+    }
+
+    #[test]
+    fn a_second_permission_request_queues_behind_the_first_no_leak() {
+        // Regression guard: a second prompt used to OVERWRITE the first, orphaning
+        // the first's held engine callback. It must now QUEUE behind it so both
+        // resolve.
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::PermissionRequest {
+                id: 1,
+                kind: 0,
+                origin: "https://first.example".to_owned(),
+            },
+        );
+        session.poll();
+        send_event(
+            &peer,
+            &EventMsg::PermissionRequest {
+                id: 2,
+                kind: 1,
+                origin: "https://second.example".to_owned(),
+            },
+        );
+        session.poll();
+        // BOTH survive; the FIRST surfaces first (not overwritten).
+        assert_eq!(session.pending_permission().map(|r| r.id), Some(1));
+        session.answer_permission(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision { id: 1, allow: true }
+        );
+        // The second is revealed and resolvable — its callback is not orphaned.
+        let pending = session.pending_permission().expect("second still queued");
+        assert_eq!(pending.id, 2);
+        assert_eq!(pending.origin, "https://second.example");
+        session.answer_permission(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::PermissionDecision { id: 2, allow: true }
+        );
+        assert_no_control_pending(&peer);
+    }
+
+    #[test]
+    fn a_second_document_block_updates_the_interstitial_url() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.set_filter(RequestFilter::empty().with_safe_browsing(
+            filter::SafeBrowsingBlocklist::from_hosts(["malware.test", "evil.test"]),
+        ));
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 1,
+                url: "https://malware.test/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        session.poll();
+        assert_eq!(session.safe_browsing_block(), Some("https://malware.test/"));
+        // A second top-level Document block re-points the interstitial at the new URL.
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 2,
+                url: "https://evil.test/phish".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.safe_browsing_block(),
+            Some("https://evil.test/phish")
+        );
+    }
+
+    #[test]
+    fn fullscreen_interleaved_with_audio_tracks_independently() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(&peer, &EventMsg::Fullscreen { enabled: true });
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        send_event(&peer, &EventMsg::Fullscreen { enabled: false });
+        session.poll();
+        assert!(
+            !session.fullscreen(),
+            "the LAST fullscreen event (exit) wins"
+        );
+        assert!(
+            session.audible(),
+            "the interleaved audio event survives fullscreen churn"
+        );
+    }
+
+    #[test]
+    fn an_audio_state_event_does_not_disturb_the_other_fields() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        session.poll();
+        assert!(session.audible());
+        // Folding an AudioState must leave every unrelated field at its default.
+        assert!(session.cert_error().is_none());
+        assert!(session.safe_browsing_block().is_none());
+        assert!(session.pending_permission().is_none());
+        assert!(session.pending_js_dialog().is_none());
+        assert!(!session.fullscreen());
+        assert_eq!(session.nav(), &NavState::default());
+        assert!(session.title().is_empty());
+    }
+
+    #[test]
+    fn a_cert_error_does_not_disturb_the_audible_flag() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        session.poll();
+        send_event(
+            &peer,
+            &EventMsg::CertError {
+                url: "https://bad.example/".to_owned(),
+                code: -202,
+                message: "unknown authority".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.cert_error().is_some(), "cert error is recorded");
+        assert!(
+            session.audible(),
+            "an unrelated cert error must not clear the audible flag"
+        );
+        assert!(session.pending_permission().is_none());
+    }
+
+    #[test]
+    fn events_after_a_crash_in_the_same_batch_are_dropped() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        // One burst: a real state change, then a crash, then a change that must
+        // NEVER be applied — drain stops at the crash and abandons the rest.
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        send_event(
+            &peer,
+            &EventMsg::Crashed {
+                reason: "gpu process lost".to_owned(),
+            },
+        );
+        send_event(&peer, &EventMsg::AudioState { audible: false });
+        session.poll();
+        assert!(session.is_crashed(), "the crash surfaced");
+        assert!(
+            session.audible(),
+            "the post-crash AudioState(false) in the same batch was dropped"
+        );
+    }
+
+    #[test]
+    fn accessors_stay_sane_after_a_crash_event() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(&peer, &EventMsg::AudioState { audible: true });
+        send_event(&peer, &EventMsg::Fullscreen { enabled: true });
+        send_event(
+            &peer,
+            &EventMsg::PermissionRequest {
+                id: 9,
+                kind: 0,
+                origin: "https://geo.example".to_owned(),
+            },
+        );
+        session.poll();
+        send_event(
+            &peer,
+            &EventMsg::Crashed {
+                reason: "helper died".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.is_crashed());
+        // Every accessor still returns its last value without panicking.
+        assert!(session.audible());
+        assert!(session.fullscreen());
+        assert_eq!(session.pending_permission().map(|p| p.id), Some(9));
+        assert!(session.cert_error().is_none());
+        assert!(session.find_result().is_none());
+        // A further poll on a crashed session is a no-op that stays crashed.
+        session.poll();
+        assert!(session.is_crashed());
+    }
+
+    #[test]
+    fn senders_on_a_crashed_session_write_nothing() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::Crashed {
+                reason: "helper died".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.is_crashed());
+        // Every sender must no-op once crashed — no control frame, no panic.
+        session.load("https://example.test/");
+        session.reload();
+        session.ime_commit_text("x".to_owned());
+        session.answer_permission(true);
+        session.set_zoom(150);
+        assert_no_control_pending(&peer);
+    }
+
+    #[test]
+    fn ime_senders_emit_exact_control_messages() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.ime_set_composition("にほ".to_owned());
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ImeSetComposition {
+                text: "にほ".to_owned()
+            }
+        );
+        session.ime_commit_text("日本語".to_owned());
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ImeCommitText {
+                text: "日本語".to_owned()
+            }
+        );
+        session.ime_finish_composition();
+        assert_eq!(read_control(&mut peer), ControlMsg::ImeFinishComposition);
+    }
+
+    #[test]
+    fn ime_senders_carry_empty_text_verbatim() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        // An empty preedit CLEARS the composition — the empty string must survive
+        // the seam, not be dropped.
+        session.ime_set_composition(String::new());
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ImeSetComposition {
+                text: String::new()
+            }
+        );
+        session.ime_commit_text(String::new());
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::ImeCommitText {
+                text: String::new()
+            }
+        );
+    }
 }
