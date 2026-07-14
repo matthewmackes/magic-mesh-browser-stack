@@ -1109,6 +1109,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::ClearFind => clear_find_in_page(browser),
         ControlMsg::EditCommand { command } => apply_edit_command(browser, *command),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
+        ControlMsg::ToggleMediaPlayback => apply_media_playback_toggle(browser),
         ControlMsg::SetAutoplayBlocked { blocked } => {
             apply_autoplay_blocked(browser, &callbacks.state, *blocked);
         }
@@ -4580,6 +4581,13 @@ fn apply_autoplay_blocked(browser: *mut c_void, state: &CefBrowserState, blocked
         return;
     };
     execute_java_script(frame, &autoplay_block_script(blocked));
+}
+
+fn apply_media_playback_toggle(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, media_playback_toggle_script());
 }
 
 fn apply_user_scripts(browser: *mut c_void, enabled: bool, bundle: &str) {

@@ -1313,6 +1313,19 @@ fn autoplay_block_script_patches_media_play_and_cleans_up() {
 }
 
 #[test]
+fn media_playback_toggle_script_drives_html_media_elements() {
+    let script = media_playback_toggle_script();
+    assert!(script.contains("querySelectorAll('audio,video')"));
+    assert!(script.contains("pause()"));
+    assert!(script.contains("play()"));
+    assert!(script.contains("mdeAutoplayAllowed"));
+    assert!(
+        !script.contains("</script>"),
+        "media transport is injected as bounded script text only"
+    );
+}
+
+#[test]
 fn autoplay_block_control_is_remembered_for_navigation_reinjection() {
     let callbacks = CefBrowserCallbacks::new(
         320,

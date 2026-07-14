@@ -4090,6 +4090,15 @@ impl WebState {
         self.set_active_tab_muted(!muted);
     }
 
+    pub(crate) fn toggle_active_tab_media_playback(&mut self) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        if let Some(tab) = self.active_tab() {
+            tab.session.toggle_media_playback();
+        }
+    }
+
     fn set_active_tab_autoplay_blocked(&mut self, blocked: bool) {
         if !self.can_drive_page_tools() {
             return;
@@ -12474,6 +12483,7 @@ mod tests {
         assert!(state.tabs[state.active].muted);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAudioMute);
         assert!(!state.tabs[state.active].muted);
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleMediaPlayback);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
         assert!(!state.tabs[state.active].autoplay_blocked);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
@@ -12583,6 +12593,12 @@ mod tests {
                 mde_web_preview_client::ControlMsg::SetAudioMuted { muted: false }
             )),
             "unmuting the tab must reach the helper: {controls:?}"
+        );
+        assert!(
+            controls
+                .iter()
+                .any(|msg| matches!(msg, mde_web_preview_client::ControlMsg::ToggleMediaPlayback)),
+            "play/pause media must reach the helper: {controls:?}"
         );
         assert!(
             controls.iter().any(|msg| matches!(

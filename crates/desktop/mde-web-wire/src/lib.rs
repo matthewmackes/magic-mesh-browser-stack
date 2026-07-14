@@ -616,6 +616,8 @@ pub enum ControlMsg {
         /// `true` to mute audio, `false` to unmute.
         muted: bool,
     },
+    /// Toggle playback on the active page's HTML media elements.
+    ToggleMediaPlayback,
     /// Set whether page-initiated autoplay is blocked until user activation.
     SetAutoplayBlocked {
         /// `true` to block autoplay attempts, `false` to restore page defaults.
@@ -823,6 +825,7 @@ impl std::fmt::Debug for ControlMsg {
                 .debug_struct("SetAudioMuted")
                 .field("muted", muted)
                 .finish(),
+            Self::ToggleMediaPlayback => f.write_str("ToggleMediaPlayback"),
             Self::SetAutoplayBlocked { blocked } => f
                 .debug_struct("SetAutoplayBlocked")
                 .field("blocked", blocked)
@@ -998,6 +1001,7 @@ impl ControlMsg {
                 out.push(12);
                 out.push(u8::from(*muted));
             }
+            Self::ToggleMediaPlayback => out.push(36),
             Self::SetAutoplayBlocked { blocked } => {
                 out.push(34);
                 out.push(u8::from(*blocked));
@@ -1151,6 +1155,7 @@ impl ControlMsg {
             },
             11 => Self::ClearFind,
             12 => Self::SetAudioMuted { muted: c.bool()? },
+            36 => Self::ToggleMediaPlayback,
             13 => Self::SetForceDark { enabled: c.bool()? },
             14 => Self::SetReaderMode { enabled: c.bool()? },
             15 => Self::PrintPage,
@@ -2060,6 +2065,7 @@ mod tests {
         round_control(&ControlMsg::ClearFind);
         round_control(&ControlMsg::SetAudioMuted { muted: true });
         round_control(&ControlMsg::SetAudioMuted { muted: false });
+        round_control(&ControlMsg::ToggleMediaPlayback);
         round_control(&ControlMsg::SetAutoplayBlocked { blocked: true });
         round_control(&ControlMsg::SetAutoplayBlocked { blocked: false });
         round_control(&ControlMsg::SetForceDark { enabled: true });

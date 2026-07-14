@@ -705,6 +705,11 @@ impl Engine {
         self.evaluate_page_script(audio_mute_script(muted));
     }
 
+    /// Toggle playback on the active page's HTML media elements.
+    pub fn toggle_media_playback(&self) {
+        self.evaluate_page_script(media_playback_toggle_script());
+    }
+
     /// Apply or remove autoplay blocking in the Servo tab until user activation.
     pub fn set_autoplay_blocked(&self, blocked: bool) {
         self.evaluate_page_script(&autoplay_block_script(blocked));
@@ -1171,6 +1176,10 @@ fn autoplay_block_script(blocked: bool) -> String {
     r#"(function(){var root=document.documentElement;if(!root)return;root.dataset.mdeServoAutoplayBlocked='true';var s=window.__mdeServoAutoplayBlocker;if(s&&s.sweep){s.sweep(document);return;}s={allowed:false};window.__mdeServoAutoplayBlocker=s;s.allow=function(e){if(e&&e.isTrusted===false)return;s.allowed=true;};document.addEventListener('pointerdown',s.allow,true);document.addEventListener('keydown',s.allow,true);document.addEventListener('touchstart',s.allow,true);document.addEventListener('click',s.allow,true);s.blockedError=function(){try{return new DOMException('Autoplay blocked by MDE Browser','NotAllowedError');}catch(_e){var err=new Error('Autoplay blocked by MDE Browser');err.name='NotAllowedError';return err;}};s.sweep=function(scope){try{var base=scope&&scope.querySelectorAll?scope:document;var media=base.querySelectorAll('audio[autoplay],video[autoplay]');for(var i=0;i<media.length;i++){var el=media[i];if(s.allowed||el.dataset.mdeAutoplayAllowed==='true')continue;el.autoplay=false;el.removeAttribute('autoplay');try{el.pause();}catch(_e){}}}catch(_e){}};try{var proto=window.HTMLMediaElement&&HTMLMediaElement.prototype;if(proto&&proto.play&&!s.originalPlay){s.originalPlay=proto.play;s.patchedPlay=function(){if(s.allowed||this.dataset.mdeAutoplayAllowed==='true'||!document.documentElement.dataset.mdeServoAutoplayBlocked){return s.originalPlay.apply(this,arguments);}try{this.pause();}catch(_e){}return Promise.reject(s.blockedError());};try{Object.defineProperty(proto,'play',{value:s.patchedPlay,writable:true,configurable:true});}catch(_e){proto.play=s.patchedPlay;}}}catch(_e){}if(window.MutationObserver){s.observer=new MutationObserver(function(records){for(var i=0;i<records.length;i++){for(var j=0;j<records[i].addedNodes.length;j++){var n=records[i].addedNodes[j];if(n&&n.nodeType===1)s.sweep(n);}}});s.observer.observe(document.documentElement,{childList:true,subtree:true});}s.sweep(document);})();"#.to_owned()
 }
 
+const fn media_playback_toggle_script() -> &'static str {
+    r#"(function(){try{var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){return !el.ended&&(el.readyState>0||el.currentSrc||el.src);});if(!list.length)return;var playing=list.find(function(el){return !el.paused&&!el.ended;});if(playing){for(var i=0;i<list.length;i++){if(!list[i].paused&&!list[i].ended){try{list[i].pause();}catch(_e){}}}return;}var target=list.find(function(el){return el.paused&&!el.ended;})||list[0];try{target.dataset.mdeAutoplayAllowed='true';}catch(_e){}try{var p=target.play();if(p&&p.catch)p.catch(function(){});}catch(_e){}}catch(_e){}})();"#
+}
+
 fn userscript_library_script(enabled: bool, bundle: &str) -> String {
     if !enabled {
         return "(function(){var style=document.getElementById('mde-browser-userscript-style');if(style)style.remove();if(window.__mdeBrowserUserScriptsObserver){window.__mdeBrowserUserScriptsObserver.disconnect();window.__mdeBrowserUserScriptsObserver=null;}delete document.documentElement.dataset.mdeBrowserUserscripts;})();".to_owned();
@@ -1220,7 +1229,7 @@ mod tests {
         audio_mute_script, autoplay_block_script, clamp_utf8, clear_find_script,
         device_profile_script, find_in_page_script, force_dark_script, page_scrape_script,
         page_text_script, page_zoom_script, passkey_bridge_drain_script, passkey_complete_script,
-        print_page_script, reader_mode_script, secure_preferences,
+        print_page_script, reader_mode_script, secure_preferences, media_playback_toggle_script,
         spellcheck_correction_all_script, spellcheck_correction_at_script,
         spellcheck_correction_script, spellcheck_highlight_script, user_agent_override_script,
         userscript_library_script, GENERIC_USER_AGENT,
@@ -1387,6 +1396,19 @@ mod tests {
         assert!(disable.contains("HTMLMediaElement.prototype.play=s.originalPlay"));
         assert!(disable.contains("delete window.__mdeServoAutoplayBlocker"));
         assert!(disable.contains("delete document.documentElement.dataset.mdeServoAutoplayBlocked"));
+    }
+
+    #[test]
+    fn servo_media_playback_toggle_script_drives_html_media_elements() {
+        let script = media_playback_toggle_script();
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains("pause()"));
+        assert!(script.contains("play()"));
+        assert!(script.contains("mdeAutoplayAllowed"));
+        assert!(
+            !script.contains("</script>"),
+            "media transport is injected as bounded script text only"
+        );
     }
 
     #[test]

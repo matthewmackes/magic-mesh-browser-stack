@@ -80,6 +80,8 @@ pub(super) enum MenuAction {
     OpenFind,
     /// Toggle the active tab's audio mute state.
     ToggleAudioMute,
+    /// Toggle active page media playback.
+    ToggleMediaPlayback,
     /// Toggle autoplay blocking for the active tab.
     ToggleAutoplayBlock,
     /// Toggle forced dark styling for the active tab.
@@ -521,6 +523,10 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         },
                     )
                     .enabled(can_tools),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleMediaPlayback, "Play/Pause Media")
+                        .enabled(can_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -1191,6 +1197,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
         MenuAction::ResetZoom => state.reset_zoom(),
         MenuAction::OpenFind => state.open_find_bar(),
         MenuAction::ToggleAudioMute => state.toggle_active_tab_mute(),
+        MenuAction::ToggleMediaPlayback => state.toggle_active_tab_media_playback(),
         MenuAction::ToggleAutoplayBlock => state.toggle_active_tab_autoplay_blocked(),
         MenuAction::ToggleForceDark => state.toggle_active_tab_force_dark(),
         MenuAction::ToggleReaderMode => state.toggle_active_tab_reader_mode(),
@@ -1645,6 +1652,11 @@ mod tests {
         assert!(item(MenuAction::TogglePowerMode).enabled);
         assert_eq!(item(MenuAction::ToggleAudioMute).label, "Mute Tab");
         assert!(item(MenuAction::ToggleAudioMute).enabled);
+        assert_eq!(
+            item(MenuAction::ToggleMediaPlayback).label,
+            "Play/Pause Media"
+        );
+        assert!(item(MenuAction::ToggleMediaPlayback).enabled);
         assert_eq!(
             item(MenuAction::ToggleAutoplayBlock).label,
             "Block Autoplay"
@@ -2403,6 +2415,7 @@ mod tests {
             MenuAction::ResetZoom,
             MenuAction::OpenFind,
             MenuAction::ToggleAudioMute,
+            MenuAction::ToggleMediaPlayback,
             MenuAction::ToggleAutoplayBlock,
             MenuAction::ToggleForceDark,
             MenuAction::ToggleReaderMode,

@@ -972,6 +972,11 @@ impl WebSession {
         self.send(&ControlMsg::SetAudioMuted { muted });
     }
 
+    /// Ask the helper to toggle media playback on the active page.
+    pub fn toggle_media_playback(&mut self) {
+        self.send(&ControlMsg::ToggleMediaPlayback);
+    }
+
     /// Set whether page-initiated autoplay is blocked until user activation.
     pub fn set_autoplay_blocked(&mut self, blocked: bool) {
         self.send(&ControlMsg::SetAutoplayBlocked { blocked });
@@ -2050,6 +2055,9 @@ mod tests {
             read_control(&mut peer),
             ControlMsg::SetAudioMuted { muted: false }
         );
+
+        session.toggle_media_playback();
+        assert_eq!(read_control(&mut peer), ControlMsg::ToggleMediaPlayback);
 
         session.set_autoplay_blocked(true);
         assert_eq!(
