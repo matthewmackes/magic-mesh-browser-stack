@@ -4332,6 +4332,12 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.close_menu();
                             }
                         });
+                    // Speaker glyph for an audible/muted tab, click-to-mute.
+                    if let Some(audio) = tab_audio_glyph(ui, tab.session.audible(), tab.muted) {
+                        if audio.clicked() {
+                            mute_tab = Some((idx, !tab.muted));
+                        }
+                    }
                     // Pinned tabs hide the inline × (Chrome's affordance); they
                     // still close via middle-click or the context menu.
                     if !tab.pinned && inline_close_button(ui).clicked() {
@@ -4574,6 +4580,14 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     ui.close_menu();
                                 }
                             });
+                            // Speaker glyph for an audible/muted tab, click-to-mute.
+                            if let Some(audio) =
+                                tab_audio_glyph(ui, tab.session.audible(), tab.muted)
+                            {
+                                if audio.clicked() {
+                                    mute_tab = Some((idx, !tab.muted));
+                                }
+                            }
                             // Pinned tabs hide the × (close via middle-click / menu).
                             if !tab.pinned && inline_close_button(ui).clicked() {
                                 close = Some(idx);
@@ -4746,6 +4760,40 @@ fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
         .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
     )
     .on_hover_text("Close tab")
+}
+
+/// Which speaker glyph (and its hover label) a tab shows, if any: `🔇` when muted
+/// (mute WINS — the user hears nothing regardless of playback), `🔊` when audibly
+/// playing, `None` when silent and unmuted. Pure, so the choice is unit-tested
+/// without a live `Ui`.
+fn audio_glyph_for(audible: bool, muted: bool) -> Option<(&'static str, &'static str)> {
+    if muted {
+        Some(("\u{1F507}", "Unmute tab")) // 🔇
+    } else if audible {
+        Some(("\u{1F50A}", "Mute tab")) // 🔊
+    } else {
+        None
+    }
+}
+
+/// The speaker affordance a tab shows when it is producing audio or is muted —
+/// Chrome's audible/mute glyph. Clicking it toggles the tab's mute. Renders (and
+/// returns a clickable `Response`) ONLY for an audible or muted tab; a silent,
+/// unmuted tab shows nothing so the strip stays quiet.
+fn tab_audio_glyph(ui: &mut egui::Ui, audible: bool, muted: bool) -> Option<egui::Response> {
+    let (glyph, hover) = audio_glyph_for(audible, muted)?;
+    Some(
+        ui.add(
+            egui::Button::new(
+                RichText::new(glyph)
+                    .size(CHROME_FONT)
+                    .color(Style::TEXT_DIM),
+            )
+            .fill(Style::SURFACE)
+            .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
+        )
+        .on_hover_text(hover),
+    )
 }
 
 fn compact_menu_item(label: &str) -> egui::Button<'_> {
@@ -10246,6 +10294,47 @@ mod tests {
                               // The pinned Personal tab stays at the front — the drag snapped back.
         assert!(state.tabs[0].pinned);
         assert_eq!(state.tabs[0].container, ContainerProfile::Personal);
+    }
+
+    #[test]
+    fn the_audio_glyph_reflects_playback_and_mute() {
+        // Silent + unmuted → no glyph (the strip stays quiet).
+        assert_eq!(audio_glyph_for(false, false), None);
+        // Audibly playing → the speaker, hover offers to mute.
+        assert_eq!(
+            audio_glyph_for(true, false),
+            Some(("\u{1F50A}", "Mute tab"))
+        );
+        // Muted → the muted-speaker; mute WINS the glyph even while audio plays.
+        assert_eq!(
+            audio_glyph_for(false, true),
+            Some(("\u{1F507}", "Unmute tab"))
+        );
+        assert_eq!(
+            audio_glyph_for(true, true),
+            Some(("\u{1F507}", "Unmute tab"))
+        );
+    }
+
+    #[test]
+    fn an_audible_tab_renders_the_speaker_without_panic() {
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default();
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        let mut peer: &UnixStream = &helper;
+        peer.write_all(&wire::frame(
+            &mde_web_preview_client::EventMsg::AudioState { audible: true }.encode(),
+        ))
+        .expect("audio event");
+        state.tabs[0].session.poll();
+        assert!(state.tabs[0].session.audible(), "the tab is now audible");
+
+        // The strip must paint the speaker glyph without panicking, muted or not.
+        let ctx = egui::Context::default();
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        state.tabs[0].muted = true;
+        run_tab_strip_frame(&ctx, &mut state, body_input());
     }
 
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
