@@ -144,6 +144,10 @@ const CHROME_TAB_W: f32 = 132.0;
 /// this the strip stops shrinking and scrolls horizontally instead of wrapping
 /// onto a second row (the standard desktop-browser overflow behaviour).
 const CHROME_TAB_MIN_W: f32 = 54.0;
+/// The fixed, compact width of a pinned tab's pill (favicon only, no title, no ×) —
+/// Chrome's pinned tabs collapse to an icon. Constant so pinned tabs never shrink
+/// under the crowded-strip overflow the way unpinned pills do.
+const CHROME_TAB_PINNED_W: f32 = 24.0;
 const CHROME_TAB_CLOSE: f32 = 18.0;
 const CHROME_NEW_TAB_W: f32 = 58.0;
 const CHROME_OMNIBOX_H: f32 = 22.0;
@@ -197,6 +201,11 @@ struct Tab {
     /// Tab-group membership — an index into [`WebState::tab_groups`], or `None` when
     /// the tab is ungrouped. Grouped tabs render a colored strip.
     group: Option<usize>,
+    /// Whether the tab is pinned. Pinned tabs cluster at the front of the strip
+    /// (the [`WebState::sort_pinned_stable`] invariant), render compact (favicon
+    /// only, no title, no inline close), and survive a stray click on the ×
+    /// (Chrome's pinned-tab affordance). Session-only, like every other tab bit.
+    pinned: bool,
     /// Per-tab audio mute state mirrored to the helper.
     muted: bool,
     /// Per-tab forced dark rendering state mirrored to the helper.
@@ -1275,6 +1284,7 @@ impl WebState {
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
             group: None,
+            pinned: false,
             muted: false,
             force_dark: false,
             reader_mode: false,
@@ -2025,8 +2035,52 @@ impl WebState {
         } else {
             active_tab
         };
+        // A drag that crossed the pinned/unpinned boundary snaps back to its
+        // cluster, keeping pinned tabs at the front (Chrome's invariant).
+        self.sort_pinned_stable();
         self.sync_address_from_active();
         self.publish_session_snapshot();
+    }
+
+    /// Pin or unpin the tab at `index`, then re-cluster so pinned tabs sit at the
+    /// front of the strip. No-op when the flag already matches.
+    fn set_tab_pinned(&mut self, index: usize, pinned: bool) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if tab.pinned == pinned {
+            return;
+        }
+        tab.pinned = pinned;
+        self.sort_pinned_stable();
+        self.sync_address_from_active();
+        self.publish_session_snapshot();
+    }
+
+    /// Re-establish the pinned-first invariant: pinned tabs cluster at the front in
+    /// their existing relative order, unpinned follow in theirs. A *stable*
+    /// partition, so a same-cluster reorder is preserved while a cross-boundary
+    /// drag snaps back. Tracks which session stays active across the permutation.
+    /// Early-returns when the strip is already partitioned (the common case) so a
+    /// plain in-cluster drag costs no allocation.
+    fn sort_pinned_stable(&mut self) {
+        let n = self.tabs.len();
+        if n < 2 {
+            return;
+        }
+        let boundary = self.tabs.iter().take_while(|t| t.pinned).count();
+        if self.tabs.iter().skip(boundary).all(|t| !t.pinned) {
+            return; // already pinned-first
+        }
+        let active = self.active;
+        let mut order: Vec<usize> = (0..n).collect();
+        // Stable sort by `!pinned`: pinned (key `false`) before unpinned (`true`);
+        // equal keys keep their ascending original order (Rust `sort_by_key` is stable).
+        order.sort_by_key(|&i| !self.tabs[i].pinned);
+        let new_active = order.iter().position(|&i| i == active).unwrap_or(0);
+        let mut slots: Vec<Option<Tab>> = self.tabs.drain(..).map(Some).collect();
+        self.tabs = order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        self.active = new_active;
     }
 
     /// Put the tab at `index` into a fresh tab group (Chrome's "Add tab to new
@@ -4101,6 +4155,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
+    let mut pin_tab: Option<(usize, bool)> = None;
 
     // Overflow (BROWSER tabstrip): pills shrink toward a floor as they multiply;
     // once at the floor the strip scrolls horizontally in ONE row instead of
@@ -4130,9 +4185,19 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
             ui.horizontal(|ui| {
                 for (idx, tab) in state.tabs.iter().enumerate() {
                     let active = idx == state.active;
-                    let label = tab_label(tab);
+                    // Pinned tabs collapse to a compact favicon-only pill (no title).
+                    let label = if tab.pinned {
+                        String::new()
+                    } else {
+                        tab_label(tab)
+                    };
+                    let pill_w = if tab.pinned {
+                        CHROME_TAB_PINNED_W
+                    } else {
+                        pill_width
+                    };
                     tab_favicon_image(ui, favicon_textures.get(idx).and_then(Option::as_ref));
-                    let tab_response = tab_pill_sized(ui, &label, active, pill_width);
+                    let tab_response = tab_pill_sized(ui, &label, active, pill_w);
                     pill_rects.push((idx, tab_response.rect));
                     if tab_response.clicked() {
                         select = Some(idx);
@@ -4188,6 +4253,11 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 .clicked()
                             {
                                 move_tab = Some((idx, idx + 1));
+                                ui.close_menu();
+                            }
+                            let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
+                            if ui.add(compact_menu_item(pin_label)).clicked() {
+                                pin_tab = Some((idx, !tab.pinned));
                                 ui.close_menu();
                             }
                             if tab.group.is_none() {
@@ -4262,7 +4332,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.close_menu();
                             }
                         });
-                    if inline_close_button(ui).clicked() {
+                    // Pinned tabs hide the inline × (Chrome's affordance); they
+                    // still close via middle-click or the context menu.
+                    if !tab.pinned && inline_close_button(ui).clicked() {
                         close = Some(idx);
                     }
                 }
@@ -4307,6 +4379,8 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, display_target)) = display_tab {
         state.select_tab(idx);
         state.set_active_tab_display_target(display_target);
+    } else if let Some((idx, pinned)) = pin_tab {
+        state.set_tab_pinned(idx, pinned);
     } else if let Some(idx) = group_tab {
         state.new_group_from_tab(idx);
     } else if let Some(idx) = ungroup_tab_idx {
@@ -4332,6 +4406,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut user_scripts_tab: Option<(usize, bool)> = None;
     let mut container_tab: Option<(usize, ContainerProfile)> = None;
     let mut display_tab: Option<(usize, DisplayTarget)> = None;
+    let mut pin_tab: Option<(usize, bool)> = None;
 
     // Drag-reorder bookkeeping mirrors the horizontal strip, but the drop point is
     // matched along Y — a vertical drag reorders the stacked pills.
@@ -4354,14 +4429,23 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                 .show(ui, |ui| {
                     for (idx, tab) in state.tabs.iter().enumerate() {
                         let active = idx == state.active;
-                        let label = tab_label(tab);
+                        // Pinned tabs collapse to a compact favicon-only pill.
+                        let label = if tab.pinned {
+                            String::new()
+                        } else {
+                            tab_label(tab)
+                        };
                         ui.horizontal(|ui| {
                             tab_favicon_image(
                                 ui,
                                 favicon_textures.get(idx).and_then(Option::as_ref),
                             );
-                            let width = (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
-                                .max(CHROME_NEW_TAB_W);
+                            let width = if tab.pinned {
+                                CHROME_TAB_PINNED_W
+                            } else {
+                                (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
+                                    .max(CHROME_NEW_TAB_W)
+                            };
                             let resp = tab_pill_sized(ui, &label, active, width);
                             pill_rects.push((idx, resp.rect));
                             if resp.clicked() {
@@ -4411,6 +4495,11 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     .clicked()
                                 {
                                     move_tab = Some((idx, idx + 1));
+                                    ui.close_menu();
+                                }
+                                let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
+                                if ui.add(compact_menu_item(pin_label)).clicked() {
+                                    pin_tab = Some((idx, !tab.pinned));
                                     ui.close_menu();
                                 }
                                 if tab.group.is_none() {
@@ -4485,7 +4574,8 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     ui.close_menu();
                                 }
                             });
-                            if inline_close_button(ui).clicked() {
+                            // Pinned tabs hide the × (close via middle-click / menu).
+                            if !tab.pinned && inline_close_button(ui).clicked() {
                                 close = Some(idx);
                             }
                         });
@@ -4528,6 +4618,8 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     } else if let Some((idx, display_target)) = display_tab {
         state.select_tab(idx);
         state.set_active_tab_display_target(display_target);
+    } else if let Some((idx, pinned)) = pin_tab {
+        state.set_tab_pinned(idx, pinned);
     } else if let Some(idx) = group_tab {
         state.new_group_from_tab(idx);
     } else if let Some(idx) = ungroup_tab_idx {
@@ -10097,6 +10189,65 @@ mod tests {
         assert_eq!(state.tabs[state.active].session.title(), active_title);
     }
 
+    /// A `WebState` with `n` (≤4) tabs, each tagged with a distinct container so a
+    /// pinned recluster can be asserted by *identity* (tabs 0..n → Personal, Work,
+    /// Banking, Research). No live helper — the pin/reorder methods never poll.
+    fn tagged_tabs(n: usize) -> WebState {
+        let mut state = WebState::default();
+        for _ in 0..n {
+            let (shell, _peer) = UnixStream::pair().expect("socketpair");
+            state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        }
+        for (i, tab) in state.tabs.iter_mut().enumerate() {
+            tab.container = ContainerProfile::ALL[i + 1]; // skip None (index 0)
+        }
+        state
+    }
+
+    #[test]
+    fn pinning_a_tab_clusters_it_to_the_front_preserving_order() {
+        let mut state = tagged_tabs(3); // [Personal, Work, Banking]
+        state.set_tab_pinned(2, true); // pin the Banking tab
+                                       // The pinned tab jumps to the front; the unpinned tail keeps its order.
+        assert!(state.tabs[0].pinned);
+        assert!(!state.tabs[1].pinned && !state.tabs[2].pinned);
+        assert_eq!(state.tabs[0].container, ContainerProfile::Banking);
+        assert_eq!(state.tabs[1].container, ContainerProfile::Personal);
+        assert_eq!(state.tabs[2].container, ContainerProfile::Work);
+    }
+
+    #[test]
+    fn pinning_tracks_the_active_tab_across_the_recluster() {
+        let mut state = tagged_tabs(3);
+        state.select_tab(1); // active = the Work tab
+        state.set_tab_pinned(2, true); // recluster → [Banking, Personal, Work]
+        assert_eq!(state.active, 2);
+        assert_eq!(state.tabs[state.active].container, ContainerProfile::Work);
+    }
+
+    #[test]
+    fn unpinning_returns_a_tab_to_the_front_of_the_unpinned_cluster() {
+        let mut state = tagged_tabs(3); // [Personal, Work, Banking]
+        state.set_tab_pinned(0, true);
+        state.set_tab_pinned(1, true); // pinned: [Personal, Work]; unpinned: [Banking]
+        state.set_tab_pinned(0, false); // unpin Personal → rejoins unpinned front
+        assert!(state.tabs[0].pinned);
+        assert_eq!(state.tabs[0].container, ContainerProfile::Work); // still pinned
+        assert!(!state.tabs[1].pinned);
+        assert_eq!(state.tabs[1].container, ContainerProfile::Personal); // unpinned front
+        assert_eq!(state.tabs[2].container, ContainerProfile::Banking);
+    }
+
+    #[test]
+    fn a_drag_cannot_pull_an_unpinned_tab_ahead_of_a_pinned_one() {
+        let mut state = tagged_tabs(3); // [Personal, Work, Banking]
+        state.set_tab_pinned(0, true); // Personal pinned at the front
+        state.move_tab(2, 0); // try to drag Banking to the very front
+                              // The pinned Personal tab stays at the front — the drag snapped back.
+        assert!(state.tabs[0].pinned);
+        assert_eq!(state.tabs[0].container, ContainerProfile::Personal);
+    }
+
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
     /// panel's polling), mirroring `middle_clicking_a_tab_pill_closes_that_tab`.
     fn run_tab_strip_frame(ctx: &egui::Context, state: &mut WebState, input: egui::RawInput) {
@@ -11339,6 +11490,7 @@ mod tests {
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
             group: None,
+            pinned: false,
             muted: false,
             force_dark: false,
             reader_mode: false,
