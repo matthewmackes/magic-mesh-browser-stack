@@ -113,6 +113,41 @@ verify_render_smoke() {
   exit 1
 }
 
+verify_wire_smoke() {
+  case "${MDE_CEF_SKIP_WIRE_SMOKE:-}" in
+    1|true|TRUE|yes|YES)
+      log "wire smoke skipped by MDE_CEF_SKIP_WIRE_SMOKE"
+      return 0
+      ;;
+  esac
+
+  local verifier="${MDE_CEF_WIRE_SMOKE_VERIFIER:-/usr/libexec/mackesd/cef-verify}"
+  local helper="${MDE_CEF_WIRE_SMOKE_HELPER:-/usr/bin/mde-web-cef}"
+  local smoke_timeout="${MDE_CEF_WIRE_SMOKE_TIMEOUT:-35s}"
+  local budget="${MDE_CEF_WIRE_SMOKE_BUDGET:-20}"
+  local url="${MDE_CEF_WIRE_SMOKE_URL:-data:text/html,%3Ctitle%3Emde-cef-wire-smoke%3C/title%3E%3Ch1%3Emde-cef-wire-smoke%3C/h1%3E}"
+  if [ ! -x "$verifier" ] || [ ! -x "$helper" ]; then
+    log "wire smoke skipped: verifier or helper is not installed"
+    return 0
+  fi
+
+  need_cmd timeout
+  local smoke_log
+  smoke_log="$(mktemp "${TMPDIR:-/tmp}/mde-cef-wire-smoke.XXXXXX")"
+  if MDE_CEF_ROOT="$ACTIVE_LINK" timeout "$smoke_timeout" "$verifier" "$helper" "$url" "$budget" >"$smoke_log" 2>&1 \
+      && grep -q 'VERIFY RESULT=PASS' "$smoke_log" \
+      && grep -q 'VERIFY on_paint_ready' "$smoke_log"; then
+    log "wire smoke passed"
+    rm -f "$smoke_log"
+    return 0
+  fi
+
+  echo "install-cef-runtime: wire smoke failed" >&2
+  cat "$smoke_log" >&2 || true
+  rm -f "$smoke_log"
+  exit 1
+}
+
 need_cmd curl
 need_cmd sha256sum
 need_cmd tar
@@ -138,6 +173,7 @@ if [ -f "$INSTALL_ROOT/Release/libcef.so" ]; then
   log "$CEF_VERSION already extracted"
   activate_runtime
   verify_render_smoke
+  verify_wire_smoke
   exit 0
 fi
 
@@ -160,3 +196,4 @@ printf 'version=%s\nchromium=%s\nchannel=%s\nasset=%s\nsha256=%s\n' \
   > "$INSTALL_ROOT/mde-cef-runtime.manifest"
 activate_runtime
 verify_render_smoke
+verify_wire_smoke

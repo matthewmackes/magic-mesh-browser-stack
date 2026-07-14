@@ -8,6 +8,7 @@
 //!   * `on_loading_state_change`→ `NavState.{loading,can_back,can_forward}`
 //!   * `on_title_change`        → `title()` changes
 //!   * `on_favicon_urlchange`   → `favicon()` bytes arrive
+//!   * `on_paint_ready`         → a shm frame decoded through `WebSession`
 //!
 //! This is the honest end-to-end proof that the CEF display + load handler blocks
 //! are dispatched by the real CEF vtable under real navigation — captured through
@@ -50,9 +51,19 @@ fn main() {
     let mut favicon_seen = false;
     let mut nav_events = 0u32;
     let mut title_events = 0u32;
+    let mut frame_events = 0u32;
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
         sess.poll();
+        if let Some(frame) = sess.take_frame() {
+            println!(
+                "VERIFY on_paint_ready view={}x{} pixels={}",
+                frame.size[0],
+                frame.size[1],
+                frame.pixels.len()
+            );
+            frame_events += 1;
+        }
         let nav = sess.nav();
         if nav.url != last_url {
             println!(
@@ -78,13 +89,14 @@ fn main() {
     }
 
     println!(
-        "VERIFY DONE nav_events={nav_events} title_events={title_events} favicon={favicon_seen} final_url={} final_title={}",
+        "VERIFY DONE nav_events={nav_events} title_events={title_events} frame_events={frame_events} favicon={favicon_seen} final_url={} final_title={}",
         sess.nav().url,
         sess.title(),
     );
-    if nav_events > 0 {
-        println!("VERIFY RESULT=PASS display/load handler fired: NavState delivered over the wire");
+    if nav_events > 0 && frame_events > 0 {
+        println!("VERIFY RESULT=PASS display/load handler fired and a frame arrived over the wire");
     } else {
-        println!("VERIFY RESULT=FAIL no NavState received (callback did not reach the wire)");
+        println!("VERIFY RESULT=FAIL missing NavState or frame over the wire");
+        std::process::exit(1);
     }
 }
