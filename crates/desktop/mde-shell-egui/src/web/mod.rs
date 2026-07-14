@@ -932,6 +932,12 @@ pub(crate) struct WebState {
     /// navigations to them auto-upgrade silently instead of re-prompting. In-memory
     /// only (no persistence, per the operator's session-HSTS decision).
     hsts_hosts: std::collections::HashSet<String>,
+    /// Session-only per-site permission grants — `(origin, kind)` pairs the user
+    /// ALLOWED this session (kind: 0 geolocation, 1 notifications, 2 clipboard). A
+    /// future same-origin-same-kind request auto-allows without re-prompting; a
+    /// block is never remembered (Chrome re-prompts after a block). In-memory only,
+    /// per the operator's session-only permission decision (browser-gated-features).
+    granted_permissions: std::collections::HashSet<(String, u8)>,
     /// Whether the Site Styles editor drawer is open, and its two input drafts.
     site_styles_open: bool,
     site_style_host_draft: String,
@@ -1063,6 +1069,7 @@ impl Default for WebState {
             tab_groups: Vec::new(),
             user_site_styles: Vec::new(),
             hsts_hosts: std::collections::HashSet::new(),
+            granted_permissions: std::collections::HashSet::new(),
             site_styles_open: false,
             site_style_host_draft: String::new(),
             site_style_css_draft: String::new(),
@@ -3498,6 +3505,49 @@ impl WebState {
             .with_safe_browsing(SafeBrowsingBlocklist::from_hosts(&self.safe_browsing_hosts))
     }
 
+    /// Record a session-only permission grant `(origin, kind)`.
+    fn grant_permission(&mut self, origin: &str, kind: u8) {
+        self.granted_permissions.insert((origin.to_owned(), kind));
+    }
+
+    /// Whether `(origin, kind)` was allowed earlier this session.
+    fn is_permission_granted(&self, origin: &str, kind: u8) -> bool {
+        self.granted_permissions
+            .contains(&(origin.to_owned(), kind))
+    }
+
+    /// Resolve the active tab's pending permission request, if any: a capability
+    /// this origin was already granted this session auto-allows (answers the engine
+    /// with `true`, no prompt) and returns `None`; otherwise returns `(origin, kind)`
+    /// for the shell to render a prompt. Never auto-denies — a previously-blocked
+    /// capability re-prompts (Chrome's behaviour).
+    fn pending_permission_prompt(&mut self) -> Option<(String, u8)> {
+        let (origin, kind) = self
+            .tabs
+            .get(self.active)?
+            .session
+            .pending_permission()
+            .map(|req| (req.origin.clone(), req.kind))?;
+        if self.is_permission_granted(&origin, kind) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.session.answer_permission(true);
+            }
+            return None;
+        }
+        Some((origin, kind))
+    }
+
+    /// Answer the active tab's pending permission prompt; a grant is remembered for
+    /// the session so the same origin+capability won't re-prompt.
+    fn answer_active_permission(&mut self, origin: &str, kind: u8, allow: bool) {
+        if allow {
+            self.grant_permission(origin, kind);
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.session.answer_permission(allow);
+        }
+    }
+
     fn compiled_request_filter_for_url(&self, url: &str) -> RequestFilter {
         let mut filter = self.compiled_request_filter();
         filter.set_page(url);
@@ -4118,6 +4168,14 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             state.mark_active_tab_activity();
         }
         return;
+    }
+    // Permission prompt: an origin's pending capability request renders a small bar
+    // atop the page (Allow/Block). A capability granted earlier this session
+    // auto-allows inside `pending_permission_prompt` and never reaches here.
+    if let Some((origin, kind)) = state.pending_permission_prompt() {
+        if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
+            state.answer_active_permission(&origin, kind, allow);
+        }
     }
     let status = state.tabs.get(active).map(|t| {
         let is_crashed = t.session.is_crashed();
@@ -8210,6 +8268,49 @@ fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
     back
 }
 
+/// Human label for an engine-neutral permission kind (matches
+/// `EventMsg::PermissionRequest`: 0 geolocation, 1 notifications, 2 clipboard).
+fn permission_kind_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "know your location",
+        1 => "show notifications",
+        2 => "access the clipboard",
+        _ => "use a device capability",
+    }
+}
+
+/// A permission prompt bar shown atop the page when an origin requests a capability
+/// ("<origin> wants to <capability>  [Allow] [Block]"). Returns `Some(true)` on
+/// Allow, `Some(false)` on Block, `None` while undecided. Mirrors Chrome's origin
+/// permission bar; a grant is remembered session-only by the caller.
+fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(Style::SURFACE_HI)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{origin} wants to {}", permission_kind_label(kind)))
+                        .color(Style::TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("Allow").color(Style::TEXT)))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Block").color(Style::TEXT)))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
 fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
     let mut back_to_safety = false;
     centered(ui, |ui| {
@@ -10657,6 +10758,51 @@ mod tests {
         assert_eq!(matching_tab_indices(&state.tabs, "MAPS"), vec![2]);
         // No match → empty.
         assert!(matching_tab_indices(&state.tabs, "zzz").is_empty());
+    }
+
+    #[test]
+    fn permission_grant_is_remembered_and_auto_allows_next_time() {
+        assert_eq!(permission_kind_label(0), "know your location");
+        assert_eq!(permission_kind_label(2), "access the clipboard");
+
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default();
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        let mut peer: &UnixStream = &helper;
+        let request = mde_web_preview_client::EventMsg::PermissionRequest {
+            id: 5,
+            kind: 0,
+            origin: "https://maps.example".to_owned(),
+        };
+
+        peer.write_all(&wire::frame(&request.encode()))
+            .expect("req");
+        state.tabs[0].session.poll();
+        // First time: not granted → a prompt is offered (nothing auto-answered).
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://maps.example".to_owned(), 0))
+        );
+
+        // Allow it → remembered, and the pending request is answered + cleared.
+        state.answer_active_permission("https://maps.example", 0, true);
+        assert!(state.is_permission_granted("https://maps.example", 0));
+        assert!(state.tabs[0].session.pending_permission().is_none());
+
+        // A second identical request auto-allows with no prompt.
+        peer.write_all(&wire::frame(&request.encode()))
+            .expect("req2");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            None,
+            "a granted capability auto-allows, no prompt"
+        );
+        assert!(
+            state.tabs[0].session.pending_permission().is_none(),
+            "the auto-allow answered and cleared the request"
+        );
     }
 
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
