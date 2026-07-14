@@ -2405,9 +2405,14 @@ impl WebState {
     }
 
     fn poll_security_update_status(&mut self) {
-        if self
-            .security_update_last_poll
-            .is_some_and(|last| last.elapsed() < SECURITY_UPDATE_STATUS_POLL_INTERVAL)
+        self.refresh_security_update_status(false);
+    }
+
+    fn refresh_security_update_status(&mut self, force: bool) {
+        if !force
+            && self
+                .security_update_last_poll
+                .is_some_and(|last| last.elapsed() < SECURITY_UPDATE_STATUS_POLL_INTERVAL)
         {
             return;
         }
@@ -2432,6 +2437,11 @@ impl WebState {
             return;
         };
         self.latest_security_update = Some(status);
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn refresh_security_update_status_for_launch(&mut self) {
+        self.refresh_security_update_status(true);
     }
 
     fn apply_translation_result(&mut self, result: BrowserTranslationResult) {
@@ -5413,6 +5423,11 @@ impl WebState {
                 ));
                 return None;
             }
+            self.refresh_security_update_status_for_launch();
+            if let Some(notice) = self.cef_security_update_gate_notice() {
+                self.gate_notice = Some(notice);
+                return None;
+            }
         }
         // Pre-size the helper's frame channel to the live seat (device px) so a
         // later resize can grow the CEF paint up to the seat without overflowing
@@ -5436,6 +5451,35 @@ impl WebState {
                 None
             }
         }
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn cef_security_update_gate_notice(&self) -> Option<String> {
+        let status = self.latest_security_update.as_ref()?;
+        if status.node != local_hostname() || status.state == "current" {
+            return None;
+        }
+
+        let expected = status
+            .expected_cef_version
+            .as_deref()
+            .or(status.expected_chromium_version.as_deref())
+            .unwrap_or("unknown");
+        let installed = status
+            .installed_version
+            .as_deref()
+            .or(status.installed_chromium.as_deref())
+            .or(status.active_runtime.as_deref())
+            .unwrap_or("unknown");
+        let reason = status
+            .last_error
+            .as_deref()
+            .or(status.last_update_error.as_deref())
+            .unwrap_or("runtime verification failed");
+        Some(format!(
+            "The Chromium/CEF runtime is not current (state: {}; expected {}; installed {}; reason: {}).",
+            status.state, expected, installed, reason
+        ))
     }
 }
 
@@ -10921,6 +10965,39 @@ mod tests {
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
         })
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn browser_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[cfg(feature = "live-helper")]
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(feature = "live-helper")]
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var_os(key),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-helper")]
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.value.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
     }
 
     fn accesskit_nodes(
@@ -17700,6 +17777,93 @@ mod tests {
         assert_eq!(state.restore_startup_session_once(), None);
     }
 
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn browser_startup_restore_blocks_cef_when_security_update_status_is_mismatch() {
+        use std::cell::Cell;
+
+        let _env = browser_env_lock();
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
+        let root = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let path = session_sync_latest_path(root.path(), &host);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "op": "browser_session_sync",
+                "active_index": 0,
+                "settings": {"future_engine": "cef"},
+                "tabs": [
+                    {"index": 0, "engine": "cef", "url": "https://restored.mesh/"}
+                ],
+                "downloads": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let runtime = make_fake_cef_runtime("mde-shell-cef-mismatch-test");
+        std::env::set_var(CEF_ROOT_ENV, &runtime);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_security_update_status_topic(&host);
+        let status = serde_json::json!({
+            "node": host,
+            "state": "mismatch",
+            "expected_cef_version": "149.0.6",
+            "expected_chromium_version": "149.0.7827.201",
+            "expected_channel": "stable",
+            "active_runtime": runtime.display().to_string(),
+            "installed_version": "148.0.0",
+            "installed_chromium": "148.0.0.1",
+            "libcef_present": true,
+            "updater_state": "failed",
+            "last_update_error": "sha256 mismatch",
+            "updated_ms": 124,
+        })
+        .to_string();
+        persist
+            .write(&topic, Priority::Min, None, Some(&status))
+            .expect("write security status");
+
+        let mut state = WebState::default()
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_session_restore_roots(vec![root.path().to_path_buf()]);
+        assert_eq!(state.restore_startup_session_once(), Some(1));
+        let TabOpenIntent::NewForegroundUrl { engine, url } =
+            state.take_open_request().expect("restored CEF tab intent")
+        else {
+            panic!("restored session should enqueue a URL tab");
+        };
+
+        let spawned = Cell::new(false);
+        state.open_with(
+            true,
+            engine,
+            url,
+            std::env::current_exe().expect("test exe path"),
+            |_spec| {
+                spawned.set(true);
+                Err(std::io::Error::other(
+                    "factory must not run for mismatched CEF",
+                ))
+            },
+        );
+
+        assert!(!spawned.get(), "mismatched CEF must gate before spawn");
+        assert!(state.tabs.is_empty());
+        let notice = state.gate_notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("not current"), "{notice}");
+        assert!(notice.contains("mismatch"), "{notice}");
+        assert!(notice.contains("149.0.6"), "{notice}");
+        assert!(notice.contains("148.0.0"), "{notice}");
+        assert!(notice.contains("sha256 mismatch"), "{notice}");
+
+        std::env::remove_var(CEF_ROOT_ENV);
+        let _ = std::fs::remove_dir_all(runtime);
+    }
+
     #[test]
     fn browser_startup_restore_host_path_matches_the_daemon_sanitizer() {
         assert_eq!(sanitize_session_host("work station/1"), "work-station1");
@@ -22496,6 +22660,9 @@ mod tests {
     #[test]
     fn helper_bin_path_defaults_and_honors_engine_env_overrides() {
         use std::path::PathBuf;
+        let _env = browser_env_lock();
+        let _servo_helper = EnvRestore::capture(SERVO_HELPER_BIN_ENV);
+        let _cef_helper = EnvRestore::capture(CEF_HELPER_BIN_ENV);
         std::env::remove_var(SERVO_HELPER_BIN_ENV);
         std::env::remove_var(CEF_HELPER_BIN_ENV);
         assert_eq!(
@@ -22523,6 +22690,9 @@ mod tests {
     #[cfg(feature = "live-helper")]
     #[test]
     fn default_engine_prefers_cef_only_when_helper_and_runtime_are_installed() {
+        let _env = browser_env_lock();
+        let _cef_helper = EnvRestore::capture(CEF_HELPER_BIN_ENV);
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let helper = dir.path().join("mde-web-cef");
         let runtime = dir.path().join("cef");
@@ -22562,6 +22732,8 @@ mod tests {
     #[test]
     fn cef_open_requires_the_real_cef_runtime_before_spawn() {
         use std::cell::Cell;
+        let _env = browser_env_lock();
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
         let spawned = Cell::new(false);
         let mut state = WebState::default();
         let bin = std::env::current_exe().expect("test exe path");
@@ -22591,6 +22763,8 @@ mod tests {
     #[test]
     fn cef_live_open_uses_the_browser_ui_spawn_path_and_pumps_a_frame() {
         use std::cell::RefCell;
+        let _env = browser_env_lock();
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
         let dir = make_fake_cef_runtime("mde-shell-cef-open-test");
         std::env::set_var(CEF_ROOT_ENV, &dir);
 
@@ -22633,6 +22807,7 @@ mod tests {
     #[cfg(feature = "live-helper")]
     #[test]
     fn cef_live_browser_ui_renders_a_real_site_when_farm_smoke_is_enabled() {
+        let _env = browser_env_lock();
         if std::env::var_os("MDE_CEF_LIVE_UI_SMOKE").is_none() {
             return;
         }
@@ -22706,6 +22881,8 @@ mod tests {
     #[cfg(feature = "live-helper")]
     #[test]
     fn cef_runtime_gate_accepts_the_upstream_bundle_layout() {
+        let _env = browser_env_lock();
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
         let dir = make_fake_cef_runtime("mde-shell-cef-runtime-test");
         std::env::set_var(CEF_ROOT_ENV, &dir);
         assert_eq!(
