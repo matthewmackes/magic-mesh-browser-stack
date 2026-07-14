@@ -296,6 +296,9 @@ fn browser_runtime_permission_wire(kind: u8) -> &'static str {
         0 => "geolocation",
         1 => "notifications",
         2 => "clipboard",
+        3 => "camera",
+        4 => "microphone",
+        5 => "camera_microphone",
         _ => "unknown",
     }
 }

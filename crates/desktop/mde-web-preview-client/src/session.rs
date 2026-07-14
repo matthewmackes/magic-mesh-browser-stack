@@ -216,14 +216,16 @@ impl std::fmt::Debug for BeforeUnloadDialog {
 }
 
 /// A page's pending request for a powerful capability (geolocation / notifications
-/// / clipboard). The engine holds the CEF permission callback open and awaits the
-/// shell's [`crate::ControlMsg::PermissionDecision`] carrying the same `id`; the
-/// shell prompts the user, then calls [`WebSession::answer_permission`].
+/// / clipboard / camera / microphone). The engine holds the CEF permission
+/// callback open and awaits the shell's [`crate::ControlMsg::PermissionDecision`]
+/// carrying the same `id`; the shell prompts the user, then calls
+/// [`WebSession::answer_permission`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     /// Correlates the request with its decision.
     pub id: u64,
-    /// Engine-neutral kind: `0` geolocation, `1` notifications, `2` clipboard.
+    /// Engine-neutral kind: `0` geolocation, `1` notifications, `2` clipboard, `3`
+    /// camera, `4` microphone, `5` camera + microphone.
     pub kind: u8,
     /// The requesting page's origin (scheme + host).
     pub origin: String,
@@ -1473,15 +1475,15 @@ mod tests {
             &peer,
             &EventMsg::PermissionRequest {
                 id: 42,
-                kind: 0,
-                origin: "https://maps.example".to_owned(),
+                kind: 5,
+                origin: "https://meet.example".to_owned(),
             },
         );
         session.poll();
         let pending = session.pending_permission().expect("a pending prompt");
         assert_eq!(pending.id, 42);
-        assert_eq!(pending.kind, 0);
-        assert_eq!(pending.origin, "https://maps.example");
+        assert_eq!(pending.kind, 5);
+        assert_eq!(pending.origin, "https://meet.example");
 
         // Answering sends the engine a decision carrying the request's id and clears it.
         session.answer_permission(true);

@@ -1603,10 +1603,11 @@ pub(crate) struct WebState {
     /// only (no persistence, per the operator's session-HSTS decision).
     hsts_hosts: std::collections::HashSet<String>,
     /// Session-only per-site permission grants — `(origin, kind)` pairs the user
-    /// ALLOWED this session (kind: 0 geolocation, 1 notifications, 2 clipboard). A
-    /// future same-origin-same-kind request auto-allows without re-prompting; a
-    /// block is never remembered (Chrome re-prompts after a block). In-memory only,
-    /// per the operator's session-only permission decision (browser-gated-features).
+    /// ALLOWED this session (kind: 0 geolocation, 1 notifications, 2 clipboard, 3
+    /// camera, 4 microphone, 5 camera + microphone). A future same-origin-same-kind
+    /// request auto-allows without re-prompting; a block is never remembered
+    /// (Chrome re-prompts after a block). In-memory only, per the operator's
+    /// session-only permission decision (browser-gated-features).
     granted_permissions: std::collections::HashSet<(String, u8)>,
     /// The session-only saved-login store (see [`StoredLogin`]). In-memory; cleared
     /// on shell exit; never persisted. Drives the omnibox 🔑 autofill affordance.
@@ -9061,6 +9062,9 @@ fn permission_kind_site_info_label(kind: u8) -> &'static str {
         0 => "geolocation",
         1 => "notifications",
         2 => "clipboard",
+        3 => "camera",
+        4 => "microphone",
+        5 => "camera and microphone",
         _ => "device capability",
     }
 }
@@ -10927,12 +10931,16 @@ fn before_unload_primary_label(prompt: &BeforeUnloadDialog) -> &'static str {
 }
 
 /// Human label for an engine-neutral permission kind (matches
-/// `EventMsg::PermissionRequest`: 0 geolocation, 1 notifications, 2 clipboard).
+/// `EventMsg::PermissionRequest`: 0 geolocation, 1 notifications, 2 clipboard,
+/// 3 camera, 4 microphone, 5 camera + microphone).
 fn permission_kind_label(kind: u8) -> &'static str {
     match kind {
         0 => "know your location",
         1 => "show notifications",
         2 => "access the clipboard",
+        3 => "use your camera",
+        4 => "use your microphone",
+        5 => "use your camera and microphone",
         _ => "use a device capability",
     }
 }
@@ -13714,6 +13722,12 @@ mod tests {
     fn permission_grant_is_remembered_and_auto_allows_next_time() {
         assert_eq!(permission_kind_label(0), "know your location");
         assert_eq!(permission_kind_label(2), "access the clipboard");
+        assert_eq!(permission_kind_label(3), "use your camera");
+        assert_eq!(permission_kind_label(4), "use your microphone");
+        assert_eq!(permission_kind_label(5), "use your camera and microphone");
+        assert_eq!(permission_kind_site_info_label(3), "camera");
+        assert_eq!(permission_kind_site_info_label(4), "microphone");
+        assert_eq!(permission_kind_site_info_label(5), "camera and microphone");
 
         let (shell, helper) = UnixStream::pair().expect("socketpair");
         helper.set_nonblocking(true).expect("helper nonblocking");
@@ -13802,6 +13816,15 @@ mod tests {
         state.answer_active_permission("https://clip.example", 2, false);
         assert!(!state.is_permission_granted("https://clip.example", 2));
 
+        send_permission_request(&helper, 10, 5, "https://meet.example");
+        state.tabs[0].session.poll();
+        assert_eq!(
+            state.pending_permission_prompt(),
+            Some(("https://meet.example".to_owned(), 5))
+        );
+        state.answer_active_permission("https://meet.example", 5, true);
+        assert!(state.is_permission_granted("https://meet.example", 5));
+
         let permission_decisions = drain_control_messages(&helper)
             .into_iter()
             .filter(|msg| matches!(msg, ControlMsg::PermissionDecision { .. }))
@@ -13815,6 +13838,10 @@ mod tests {
                     id: 9,
                     allow: false,
                 },
+                ControlMsg::PermissionDecision {
+                    id: 10,
+                    allow: true,
+                },
             ]
         );
 
@@ -13822,7 +13849,7 @@ mod tests {
         let msgs = persist
             .list_since(EVENT_BROWSER_PERMISSION_DECISION, None)
             .expect("list permission decision events");
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 4);
         let events = msgs
             .iter()
             .map(|msg| {
@@ -13858,6 +13885,13 @@ mod tests {
         assert_eq!(events[2]["grant_scope"], "none");
         assert_eq!(events[2]["enforcement"], "helper_permission_prompt");
         assert_eq!(events[2]["origin_host"], "clip.example");
+
+        assert_eq!(events[3]["permission"], "camera_microphone");
+        assert_eq!(events[3]["permission_kind"], 5);
+        assert_eq!(events[3]["decision"], "allow");
+        assert_eq!(events[3]["grant_scope"], "session");
+        assert_eq!(events[3]["enforcement"], "helper_permission_prompt");
+        assert_eq!(events[3]["origin_host"], "meet.example");
     }
 
     #[test]

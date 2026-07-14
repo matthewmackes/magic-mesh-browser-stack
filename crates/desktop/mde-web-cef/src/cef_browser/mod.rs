@@ -168,8 +168,9 @@ pub const CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET: usize = 120;
 /// on_show_permission_prompt(48), on_dismiss_permission_prompt(56).
 pub const CEF_PERMISSION_HANDLER_SIZE: usize = 64;
 /// `offsetof(cef_permission_handler_t, on_request_media_access_permission)` —
-/// index 0. Camera/mic (getUserMedia) is out of scope: we register a stub
-/// returning 0 (default handling → Alloy-style deny).
+/// index 0. Camera/mic (getUserMedia) uses a separate CEF media-access callback
+/// whose `Continue` argument is an allowed-permissions bitmask, not the generic
+/// `cef_permission_request_result_t`.
 pub const CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET: usize = 40;
 /// `offsetof(cef_permission_handler_t, on_show_permission_prompt)` — index 1.
 /// Signature `int(self, browser, prompt_id: uint64, requesting_origin:
@@ -186,6 +187,14 @@ pub const CEF_PERMISSION_PROMPT_CALLBACK_SIZE: usize = 48;
 /// `offsetof(cef_permission_prompt_callback_t, cont)` — index 0, right after the
 /// 40-byte base. Signature `void(self, result: cef_permission_request_result_t)`.
 pub const CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET: usize = 40;
+/// `sizeof(cef_media_access_callback_t)` for pinned Linux CEF 149 (2 fn ptrs +
+/// 40 base = 56): `cont`, then `cancel`.
+pub const CEF_MEDIA_ACCESS_CALLBACK_SIZE: usize = 56;
+/// `offsetof(cef_media_access_callback_t, cont)` — index 0, right after the
+/// 40-byte base. Signature `void(self, allowed_permissions: uint32_t)`.
+pub const CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET: usize = 40;
+/// `offsetof(cef_media_access_callback_t, cancel)` — index 1.
+pub const CEF_MEDIA_ACCESS_CALLBACK_CANCEL_OFFSET: usize = 48;
 /// `cef_permission_request_result_t::CEF_PERMISSION_RESULT_ACCEPT` (enum value 0)
 /// — grant the permission as if the user allowed it.
 pub const CEF_PERMISSION_RESULT_ACCEPT: c_int = 0;
@@ -196,10 +205,24 @@ pub const CEF_PERMISSION_RESULT_DENY: c_int = 1;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_CLIPBOARD` (1 << 4) — the
 /// async Clipboard API read/write bit in `requested_permissions`.
 pub const CEF_PERMISSION_TYPE_CLIPBOARD: u32 = 1 << 4;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_CAMERA_STREAM` (1 << 2).
+pub const CEF_PERMISSION_TYPE_CAMERA_STREAM: u32 = 1 << 2;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_GEOLOCATION` (1 << 8).
 pub const CEF_PERMISSION_TYPE_GEOLOCATION: u32 = 1 << 8;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_MIC_STREAM` (1 << 12).
+pub const CEF_PERMISSION_TYPE_MIC_STREAM: u32 = 1 << 12;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_NOTIFICATIONS` (1 << 15).
 pub const CEF_PERMISSION_TYPE_NOTIFICATIONS: u32 = 1 << 15;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_MIDI_SYSEX` (1 << 13).
+pub const CEF_PERMISSION_TYPE_MIDI_SYSEX: u32 = 1 << 13;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE: u32 = 1 << 0;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE: u32 = 1 << 1;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE: u32 = 1 << 2;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE: u32 = 1 << 3;
 /// Engine-neutral permission `kind` on the wire (mirrors
 /// [`wire::EventMsg::PermissionRequest`]): geolocation.
 const PERMISSION_KIND_GEOLOCATION: u8 = 0;
@@ -207,6 +230,15 @@ const PERMISSION_KIND_GEOLOCATION: u8 = 0;
 const PERMISSION_KIND_NOTIFICATIONS: u8 = 1;
 /// Engine-neutral permission `kind` on the wire: clipboard.
 const PERMISSION_KIND_CLIPBOARD: u8 = 2;
+/// Engine-neutral permission `kind` on the wire: camera stream.
+const PERMISSION_KIND_CAMERA: u8 = 3;
+/// Engine-neutral permission `kind` on the wire: microphone stream.
+const PERMISSION_KIND_MICROPHONE: u8 = 4;
+/// Engine-neutral permission `kind` on the wire: camera + microphone stream.
+const PERMISSION_KIND_CAMERA_MICROPHONE: u8 = 5;
+/// Bridge-minted ids for CEF media-access prompts live above CEF's normal
+/// `on_show_permission_prompt` ids so both callback classes share one pending map.
+const MEDIA_PERMISSION_ID_BASE: u64 = 1u64 << 63;
 /// `sizeof(cef_life_span_handler_t)` for pinned Linux CEF 149.
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
@@ -1611,11 +1643,12 @@ impl CefBrowserCallbacks {
             CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET,
             fn_ptr(on_audio_stream_error as *const ()),
         );
-        // Per-site permission grants (geolocation / notifications / clipboard): CEF
-        // asks via on_show_permission_prompt; we round-trip to the shell and grant
-        // or deny on its answer (session-only). Camera/mic (media access) is stubbed
-        // to default-deny. Carried on a dedicated `permission_handler_ptr` (never
-        // the size-keyed `lookup_peer`), mirroring the audio/jsdialog path.
+        // Per-site permission grants (geolocation / notifications / clipboard /
+        // camera / microphone): CEF asks via on_show_permission_prompt or
+        // on_request_media_access_permission; we round-trip to the shell and grant
+        // or deny on its answer (session-only). Carried on a dedicated
+        // `permission_handler_ptr` (never the size-keyed `lookup_peer`), mirroring
+        // the audio/jsdialog path.
         self.client.put_fn(
             CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET,
             fn_ptr(get_permission_handler as *const ()),
@@ -1963,15 +1996,17 @@ struct CefBrowserState {
     /// resolves without the size-keyed `lookup_peer`.
     audio_handler_ptr: AtomicUsize,
     /// The permission handler block address (per-site geolocation / notifications /
-    /// clipboard grants). Cached directly like the other child handlers, never the
-    /// size-keyed `lookup_peer`.
+    /// clipboard / camera / microphone grants). Cached directly like the other
+    /// child handlers, never the size-keyed `lookup_peer`.
     permission_handler_ptr: AtomicUsize,
-    /// In-flight permission-prompt callbacks, keyed by CEF's `prompt_id`. Bounded
-    /// by [`MAX_PENDING_PERMISSION_PROMPTS`]. Each is a live refcounted
-    /// `cef_permission_prompt_callback_t*`: add_ref'd when stashed in
-    /// `on_show_permission_prompt`, released after `cont()` on the shell's
-    /// `ControlMsg::PermissionDecision` (or on CEF-initiated dismissal / teardown).
-    pending_permission_prompts: Mutex<HashMap<u64, usize>>,
+    /// In-flight permission callbacks, keyed by CEF's `prompt_id` or a
+    /// bridge-minted media-access id. Bounded by [`MAX_PENDING_PERMISSION_PROMPTS`].
+    /// Each callback is a live refcounted CEF object: add_ref'd when stashed,
+    /// continued on the shell's `ControlMsg::PermissionDecision`, then released.
+    pending_permission_prompts: Mutex<HashMap<u64, PendingPermissionCallback>>,
+    /// Monotonic id minted for CEF media-access prompts. The media-access callback
+    /// has no prompt id, so the bridge creates one for the wire round-trip.
+    next_media_permission_id: AtomicU64,
     /// Monotonic id minted for CEF beforeunload prompts. CEF's callback does not
     /// include a prompt id, so the bridge creates one for the wire round-trip.
     next_before_unload_id: AtomicU64,
@@ -2064,6 +2099,7 @@ impl CefBrowserState {
             audio_handler_ptr: AtomicUsize::new(0),
             permission_handler_ptr: AtomicUsize::new(0),
             pending_permission_prompts: Mutex::new(HashMap::new()),
+            next_media_permission_id: AtomicU64::new(MEDIA_PERMISSION_ID_BASE),
             next_before_unload_id: AtomicU64::new(1),
             pending_before_unload_dialogs: Mutex::new(HashMap::new()),
             string_userfree_free,
@@ -2808,39 +2844,31 @@ impl CefBrowserState {
             .unwrap_or(0)
     }
 
-    /// CEF asks us to show a permission prompt (`on_show_permission_prompt`). Map
-    /// the requested types to our wire `kind`; out-of-scope requests return 0 so CEF
-    /// applies default handling (Alloy-style deny) — no prompt, no callback
-    /// retention. For an in-scope kind we add_ref the callback, emit
-    /// `EventMsg::PermissionRequest`, stash the callback under `prompt_id`, and
-    /// return 1 (we continue it on the shell's `PermissionDecision`).
-    fn begin_permission_prompt(
+    fn begin_permission_prompt_for_kind(
         &self,
         prompt_id: u64,
         origin: String,
-        requested_permissions: u32,
-        callback: *mut c_void,
+        kind: u8,
+        pending_callback: PendingPermissionCallback,
     ) -> c_int {
-        let Some(kind) = permission_kind_from_cef(requested_permissions) else {
-            return 0;
-        };
+        let callback = pending_callback.callback_ptr();
         if callback.is_null() {
             return 0;
         }
         let Ok(mut pending) = self.pending_permission_prompts.lock() else {
-            continue_permission_callback(callback, CEF_PERMISSION_RESULT_DENY);
+            pending_callback.deny();
             return 1;
         };
         if pending.len() >= MAX_PENDING_PERMISSION_PROMPTS || pending.contains_key(&prompt_id) {
             drop(pending);
-            continue_permission_callback(callback, CEF_PERMISSION_RESULT_DENY);
+            pending_callback.deny();
             return 1;
         }
         // The callback is a live refcounted CEF object; retain it across the async
         // shell round-trip. Paired with the `release_cef` in
         // `apply_permission_decision` / `discard_permission_prompt` / teardown.
         add_ref_cef(callback);
-        pending.insert(prompt_id, callback as usize);
+        pending.insert(prompt_id, pending_callback);
         drop(pending);
 
         let event = EventMsg::PermissionRequest {
@@ -2869,6 +2897,58 @@ impl CefBrowserState {
         0
     }
 
+    /// CEF asks us to show a generic permission prompt (`on_show_permission_prompt`).
+    /// Map the requested types to our wire `kind`; out-of-scope requests return 0
+    /// so CEF applies default handling (Alloy-style deny) — no prompt, no callback
+    /// retention. For an in-scope kind we add_ref the callback, emit
+    /// `EventMsg::PermissionRequest`, stash the callback under `prompt_id`, and
+    /// return 1 (we continue it on the shell's `PermissionDecision`).
+    fn begin_permission_prompt(
+        &self,
+        prompt_id: u64,
+        origin: String,
+        requested_permissions: u32,
+        callback: *mut c_void,
+    ) -> c_int {
+        let Some(kind) = permission_kind_from_cef(requested_permissions) else {
+            return 0;
+        };
+        self.begin_permission_prompt_for_kind(
+            prompt_id,
+            origin,
+            kind,
+            PendingPermissionCallback::Prompt {
+                callback: callback as usize,
+            },
+        )
+    }
+
+    /// CEF asks for camera/microphone media access (`getUserMedia`). This callback
+    /// is separate from generic permission prompts: allowing requires echoing the
+    /// requested media-access bitmask back to CEF, and denying is `Continue(0)`.
+    fn begin_media_access_permission(
+        &self,
+        origin: String,
+        requested_permissions: u32,
+        callback: *mut c_void,
+    ) -> c_int {
+        let Some(kind) = media_access_kind_from_cef(requested_permissions) else {
+            return 0;
+        };
+        let prompt_id = self
+            .next_media_permission_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.begin_permission_prompt_for_kind(
+            prompt_id,
+            origin,
+            kind,
+            PendingPermissionCallback::MediaAccess {
+                callback: callback as usize,
+                requested_permissions,
+            },
+        )
+    }
+
     /// The shell answered a permission prompt (`ControlMsg::PermissionDecision`).
     /// Look up the stashed callback by `id`, continue it with ACCEPT/DENY, then
     /// release our stash ref and drop the entry. A missing id is a safe no-op (the
@@ -2876,20 +2956,14 @@ impl CefBrowserState {
     /// released before `cont()` so a synchronous CEF `on_dismiss` re-entry cannot
     /// deadlock or double-release.
     fn apply_permission_decision(&self, id: u64, allow: bool) {
-        let callback = self
+        let pending_callback = self
             .pending_permission_prompts
             .lock()
             .ok()
-            .and_then(|mut pending| pending.remove(&id))
-            .map(|ptr| ptr as *mut c_void);
-        if let Some(callback) = callback {
-            let result = if allow {
-                CEF_PERMISSION_RESULT_ACCEPT
-            } else {
-                CEF_PERMISSION_RESULT_DENY
-            };
-            continue_permission_callback(callback, result);
-            release_cef(callback);
+            .and_then(|mut pending| pending.remove(&id));
+        if let Some(pending_callback) = pending_callback {
+            pending_callback.answer(allow);
+            release_cef(pending_callback.callback_ptr());
         }
     }
 
@@ -2898,14 +2972,13 @@ impl CefBrowserState {
     /// (CEF owns the dismissal). A missing id — already answered by the shell — is a
     /// safe no-op; the map removal guarantees we never release twice.
     fn discard_permission_prompt(&self, id: u64) {
-        let callback = self
+        let pending_callback = self
             .pending_permission_prompts
             .lock()
             .ok()
-            .and_then(|mut pending| pending.remove(&id))
-            .map(|ptr| ptr as *mut c_void);
-        if let Some(callback) = callback {
-            release_cef(callback);
+            .and_then(|mut pending| pending.remove(&id));
+        if let Some(pending_callback) = pending_callback {
+            release_cef(pending_callback.callback_ptr());
         }
     }
 
@@ -2918,10 +2991,9 @@ impl CefBrowserState {
             .lock()
             .map(|mut pending| pending.drain().map(|(_, ptr)| ptr).collect::<Vec<_>>())
             .unwrap_or_default();
-        for callback in callbacks {
-            let callback = callback as *mut c_void;
-            continue_permission_callback(callback, CEF_PERMISSION_RESULT_DENY);
-            release_cef(callback);
+        for pending_callback in callbacks {
+            pending_callback.deny();
+            release_cef(pending_callback.callback_ptr());
         }
     }
 
@@ -3028,6 +3100,49 @@ impl CefKeyEvent {
     fn put_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + std::mem::size_of::<u16>()]
             .copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingPermissionCallback {
+    Prompt { callback: usize },
+    MediaAccess {
+        callback: usize,
+        requested_permissions: u32,
+    },
+}
+
+impl PendingPermissionCallback {
+    fn callback_ptr(self) -> *mut c_void {
+        match self {
+            Self::Prompt { callback } | Self::MediaAccess { callback, .. } => {
+                callback as *mut c_void
+            }
+        }
+    }
+
+    fn answer(self, allow: bool) {
+        match self {
+            Self::Prompt { callback } => {
+                let result = if allow {
+                    CEF_PERMISSION_RESULT_ACCEPT
+                } else {
+                    CEF_PERMISSION_RESULT_DENY
+                };
+                continue_permission_callback(callback as *mut c_void, result);
+            }
+            Self::MediaAccess {
+                callback,
+                requested_permissions,
+            } => {
+                let allowed_permissions = if allow { requested_permissions } else { 0 };
+                continue_media_access_callback(callback as *mut c_void, allowed_permissions);
+            }
+        }
+    }
+
+    fn deny(self) {
+        self.answer(false);
     }
 }
 
@@ -3464,11 +3579,11 @@ unsafe extern "C" fn get_permission_handler(self_: *mut c_void) -> *mut c_void {
 }
 
 /// Map a `cef_permission_request_types_t` bitmask (`requested_permissions`) onto
-/// our engine-neutral wire `kind`. Only geolocation / notifications / clipboard are
-/// in scope (operator-authorized, session-only); every other request (camera/mic,
-/// MIDI, sensors, protected-media, …) yields `None` → default deny without a
-/// prompt. When several in-scope bits are set we surface the first in wire order
-/// (geolocation < notifications < clipboard).
+/// our engine-neutral wire `kind`. Geolocation / notifications / clipboard and
+/// camera / microphone are in scope (operator-authorized, session-only); every
+/// other request (MIDI, sensors, protected-media, …) yields `None` → default deny
+/// without a prompt. When several in-scope bits are set we surface the first in
+/// wire order (geolocation < notifications < clipboard < camera/microphone).
 fn permission_kind_from_cef(requested: u32) -> Option<u8> {
     if requested & CEF_PERMISSION_TYPE_GEOLOCATION != 0 {
         Some(PERMISSION_KIND_GEOLOCATION)
@@ -3477,23 +3592,54 @@ fn permission_kind_from_cef(requested: u32) -> Option<u8> {
     } else if requested & CEF_PERMISSION_TYPE_CLIPBOARD != 0 {
         Some(PERMISSION_KIND_CLIPBOARD)
     } else {
-        None
+        let camera = requested & CEF_PERMISSION_TYPE_CAMERA_STREAM != 0;
+        let microphone = requested & CEF_PERMISSION_TYPE_MIC_STREAM != 0;
+        match (camera, microphone) {
+            (true, true) => Some(PERMISSION_KIND_CAMERA_MICROPHONE),
+            (true, false) => Some(PERMISSION_KIND_CAMERA),
+            (false, true) => Some(PERMISSION_KIND_MICROPHONE),
+            (false, false) => None,
+        }
+    }
+}
+
+/// Map CEF's media-access bitmask onto the same shell permission kinds. This path
+/// only handles device camera/microphone capture; desktop capture remains out of
+/// scope and returns 0 from the CEF callback for default deny.
+fn media_access_kind_from_cef(requested: u32) -> Option<u8> {
+    const SUPPORTED_CAPTURE: u32 =
+        CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE;
+    if requested & !SUPPORTED_CAPTURE != 0 {
+        return None;
+    }
+    let audio = requested & CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE != 0;
+    let video = requested & CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE != 0;
+    match (video, audio) {
+        (true, true) => Some(PERMISSION_KIND_CAMERA_MICROPHONE),
+        (true, false) => Some(PERMISSION_KIND_CAMERA),
+        (false, true) => Some(PERMISSION_KIND_MICROPHONE),
+        (false, false) => None,
     }
 }
 
 /// CEF `on_request_media_access_permission(self, browser, frame, requesting_origin,
 /// requested_permissions, callback) -> int` — a page's getUserMedia camera/mic
-/// request. Out of scope this unit: return 0 (proceed with default handling, which
-/// is deny under Alloy style). We never touch the media-access callback.
+/// request. Device camera/mic requests are bridged to the shell's session-only
+/// permission prompt. Desktop capture remains out of scope and returns 0 (default
+/// handling / deny).
 unsafe extern "C" fn on_request_media_access_permission(
-    _self: *mut c_void,
+    self_: *mut c_void,
     _browser: *mut c_void,
     _frame: *mut c_void,
-    _requesting_origin: *const CefString,
-    _requested_permissions: u32,
-    _callback: *mut c_void,
+    requesting_origin: *const CefString,
+    requested_permissions: u32,
+    callback: *mut c_void,
 ) -> c_int {
-    0
+    let origin = cef_string_to_string(requesting_origin);
+    with_state(self_, |state| {
+        state.begin_media_access_permission(origin, requested_permissions, callback)
+    })
+    .unwrap_or(0)
 }
 
 /// CEF `on_show_permission_prompt(self, browser, prompt_id, requesting_origin,
@@ -5233,6 +5379,21 @@ fn continue_permission_callback(callback: *mut c_void, result: c_int) {
     // SAFETY: `callback` is the live CEF callback for this prompt, kept alive by our
     // stash ref until the paired `release_cef`.
     unsafe { cont(callback, result) };
+}
+
+/// Invoke `cef_media_access_callback_t::cont(self, allowed_permissions)`. CEF
+/// expects the allowed media-access bitmask, not ACCEPT/DENY; denying is `0`.
+/// No-op if the slot is null.
+fn continue_media_access_callback(callback: *mut c_void, allowed_permissions: u32) {
+    let Some(cont) = read_fn(callback, CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET) else {
+        return;
+    };
+    // SAFETY: read from `cef_media_access_callback_t::cont`, whose pinned C
+    // signature is `void (*)(cef_media_access_callback_t*, uint32_t)`.
+    let cont: unsafe extern "C" fn(*mut c_void, u32) = unsafe { std::mem::transmute(cont) };
+    // SAFETY: `callback` is the live CEF callback for this prompt, kept alive by our
+    // stash ref until the paired `release_cef`.
+    unsafe { cont(callback, allowed_permissions) };
 }
 
 fn call_ref_counted_void(object: *mut c_void, offset: usize) {

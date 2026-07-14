@@ -2,7 +2,7 @@
 use super::*;
 use std::mem::{align_of, size_of};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -3107,11 +3107,126 @@ unsafe extern "C" fn test_perm_cont(self_: *mut c_void, result: c_int) {
     }
 }
 
+/// A fake `cef_media_access_callback_t` recording add_ref/release counts and the
+/// `cont(allowed_permissions)` bitmask returned to CEF.
+struct TestMediaAccessCallback {
+    block: CefCallbackBlock<CEF_MEDIA_ACCESS_CALLBACK_SIZE>,
+    add_refs: Box<AtomicUsize>,
+    releases: Box<AtomicUsize>,
+    conts: Box<AtomicUsize>,
+    allowed: Box<AtomicU32>,
+}
+
+impl TestMediaAccessCallback {
+    fn new() -> Box<Self> {
+        let add_refs = Box::new(AtomicUsize::new(0));
+        let releases = Box::new(AtomicUsize::new(0));
+        let conts = Box::new(AtomicUsize::new(0));
+        let allowed = Box::new(AtomicU32::new(u32::MAX));
+        let mut block = CefCallbackBlock::new(CEF_MEDIA_ACCESS_CALLBACK_SIZE);
+        block.put_fn(BASE_ADD_REF_OFFSET, fn_ptr(test_media_add_ref as *const ()));
+        block.put_fn(BASE_RELEASE_OFFSET, fn_ptr(test_media_release as *const ()));
+        block.put_fn(
+            CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET,
+            fn_ptr(test_media_cont as *const ()),
+        );
+        let value = Box::new(Self {
+            block,
+            add_refs,
+            releases,
+            conts,
+            allowed,
+        });
+        value.install_state_pointers();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn install_state_pointers(&self) {
+        let state = TestMediaAccessCallbackState {
+            add_refs: self.add_refs.as_ref() as *const AtomicUsize as usize,
+            releases: self.releases.as_ref() as *const AtomicUsize as usize,
+            conts: self.conts.as_ref() as *const AtomicUsize as usize,
+            allowed: self.allowed.as_ref() as *const AtomicU32 as usize,
+        };
+        test_media_registry()
+            .lock()
+            .expect("test media registry")
+            .insert(self.as_mut_ptr() as usize, state);
+    }
+}
+
+impl Drop for TestMediaAccessCallback {
+    fn drop(&mut self) {
+        let _ = test_media_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestMediaAccessCallbackState {
+    add_refs: usize,
+    releases: usize,
+    conts: usize,
+    allowed: usize,
+}
+
+fn test_media_registry() -> &'static Mutex<HashMap<usize, TestMediaAccessCallbackState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, TestMediaAccessCallbackState>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn test_media_state(self_: *mut c_void) -> TestMediaAccessCallbackState {
+    test_media_registry()
+        .lock()
+        .expect("test media registry")
+        .get(&(self_ as usize))
+        .copied()
+        .expect("registered test media callback")
+}
+
+unsafe extern "C" fn test_media_add_ref(self_: *mut c_void) {
+    let state = test_media_state(self_);
+    // SAFETY: the recorder outlives the callback (owned by TestMediaAccessCallback).
+    unsafe { (*(state.add_refs as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+}
+
+unsafe extern "C" fn test_media_release(self_: *mut c_void) -> c_int {
+    let state = test_media_state(self_);
+    // SAFETY: as above.
+    unsafe { (*(state.releases as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+    0
+}
+
+unsafe extern "C" fn test_media_cont(self_: *mut c_void, allowed_permissions: u32) {
+    let state = test_media_state(self_);
+    // SAFETY: as above.
+    unsafe {
+        (*(state.conts as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+        (*(state.allowed as *const AtomicU32)).store(allowed_permissions, Ordering::SeqCst);
+    }
+}
+
 /// `cef_permission_handler_t::on_show_permission_prompt` C signature.
 type OnShowPromptFn = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
     u64,
+    *const CefString,
+    u32,
+    *mut c_void,
+) -> c_int;
+
+/// `cef_permission_handler_t::on_request_media_access_permission` C signature.
+type OnRequestMediaAccessFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
     *const CefString,
     u32,
     *mut c_void,
@@ -3132,6 +3247,22 @@ fn resolve_on_show_permission_prompt(
         )
     };
     (on_show, handler)
+}
+
+/// Resolve `on_request_media_access_permission` through the installed permission
+/// handler vtable.
+fn resolve_on_request_media_access(
+    callbacks: &CefBrowserCallbacks,
+) -> (OnRequestMediaAccessFn, *mut c_void) {
+    let handler = unsafe { get_permission_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_permission_handler returned null");
+    let on_request: OnRequestMediaAccessFn = unsafe {
+        std::mem::transmute(
+            read_fn(handler, CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET)
+                .expect("on_request_media_access_permission slot"),
+        )
+    };
+    (on_request, handler)
 }
 
 #[test]
@@ -3365,14 +3496,26 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     // cef_permission_prompt_callback_t: cont right after the base.
     assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET, 40);
     assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_SIZE, 40 + 8);
+    // cef_media_access_callback_t: cont + cancel after the base.
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET, 40);
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_CANCEL_OFFSET, 40 + 8);
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_SIZE, 40 + 2 * 8);
     // cef_permission_request_result_t (ACCEPT=0, DENY=1, DISMISS=2, IGNORE=3).
     assert_eq!(CEF_PERMISSION_RESULT_ACCEPT, 0);
     assert_eq!(CEF_PERMISSION_RESULT_DENY, 1);
     // cef_permission_request_types_t bits (from cef_types.h).
+    assert_eq!(CEF_PERMISSION_TYPE_CAMERA_STREAM, 1 << 2);
     assert_eq!(CEF_PERMISSION_TYPE_CLIPBOARD, 1 << 4);
     assert_eq!(CEF_PERMISSION_TYPE_GEOLOCATION, 1 << 8);
+    assert_eq!(CEF_PERMISSION_TYPE_MIC_STREAM, 1 << 12);
+    assert_eq!(CEF_PERMISSION_TYPE_MIDI_SYSEX, 1 << 13);
     assert_eq!(CEF_PERMISSION_TYPE_NOTIFICATIONS, 1 << 15);
-    // Bitmask → engine-neutral wire kind (0 geo, 1 notif, 2 clipboard).
+    // cef_media_access_permission_types_t bits (from cef_types.h).
+    assert_eq!(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE, 1 << 0);
+    assert_eq!(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE, 1 << 1);
+    assert_eq!(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE, 1 << 2);
+    assert_eq!(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE, 1 << 3);
+    // Permission bitmask → engine-neutral wire kind.
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION),
         Some(0)
@@ -3385,9 +3528,15 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
         permission_kind_from_cef(CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(2)
     );
-    assert_eq!(permission_kind_from_cef(1 << 12), None); // MIC_STREAM, out of scope
+    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM), Some(3));
+    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_MIC_STREAM), Some(4));
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_MIC_STREAM),
+        Some(5)
+    );
+    assert_eq!(permission_kind_from_cef(CEF_PERMISSION_TYPE_MIDI_SYSEX), None);
     assert_eq!(permission_kind_from_cef(0), None); // NONE
-                                                   // Several in-scope bits at once → geolocation wins (wire order).
+                                                   // Several in-scope bits at once → earlier wire order wins.
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION | CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(0)
@@ -3395,6 +3544,31 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_NOTIFICATIONS | CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(1)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE),
+        Some(3)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE),
+        Some(4)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE
+        ),
+        Some(5)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE),
+        None
+    );
+    assert_eq!(
+        media_access_kind_from_cef(
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE
+                | CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE
+        ),
+        None
     );
 }
 
@@ -3542,6 +3716,140 @@ fn permission_prompt_notifications_deny_denies_and_releases() {
 }
 
 #[test]
+fn media_access_permission_camera_mic_prompts_then_allows_requested_bits() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_request, handler) = resolve_on_request_media_access(&callbacks);
+
+    let origin = CefStringOwned::new("https://meet.example.com").expect("origin");
+    let cef_callback = TestMediaAccessCallback::new();
+    let requested_permissions =
+        CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE;
+    let rv = unsafe {
+        on_request(
+            handler,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            requested_permissions,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("media permission recv") else {
+        panic!("expected media permission request")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    let EventMsg::PermissionRequest { id, kind, origin } =
+        EventMsg::decode(&payload).expect("event")
+    else {
+        panic!("expected permission request");
+    };
+    assert_eq!(id, MEDIA_PERMISSION_ID_BASE);
+    assert_eq!(kind, 5);
+    assert_eq!(origin, "https://meet.example.com");
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cef_callback.allowed.load(Ordering::SeqCst),
+        requested_permissions,
+        "CEF media access grants must echo exactly the requested device bits"
+    );
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn media_access_permission_microphone_deny_returns_zero_allowed_bits() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_request, handler) = resolve_on_request_media_access(&callbacks);
+
+    let origin = CefStringOwned::new("https://voice.example.com").expect("origin");
+    let cef_callback = TestMediaAccessCallback::new();
+    let rv = unsafe {
+        on_request(
+            handler,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, .. } = recv(&shell).expect("media permission recv") else {
+        panic!("expected media permission request")
+    };
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    let EventMsg::PermissionRequest { id, kind, origin } =
+        EventMsg::decode(&payload).expect("event")
+    else {
+        panic!("expected permission request");
+    };
+    assert_eq!(id, MEDIA_PERMISSION_ID_BASE);
+    assert_eq!(kind, 4);
+    assert_eq!(origin, "https://voice.example.com");
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: false },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.allowed.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn permission_prompts_are_bounded_and_overflow_denies_synchronously() {
     use crate::sock::{recv, RecvOutcome};
     use crate::wire::{take_frame, EventMsg};
@@ -3661,17 +3969,17 @@ fn permission_prompt_out_of_scope_types_default_deny_without_emitting() {
     shell.set_nonblocking(true).expect("nonblocking");
     let (on_show, handler) = resolve_on_show_permission_prompt(&callbacks);
 
-    let origin = CefStringOwned::new("https://cam.example.com").expect("origin");
+    let origin = CefStringOwned::new("https://midi.example.com").expect("origin");
     let cef_callback = TestPermissionCallback::new();
-    // MIC_STREAM (1 << 12) alone is out of scope → return 0 (default handling / deny
-    // under Alloy style): no add_ref, no stash, nothing published.
+    // MIDI sysex remains out of scope → return 0 (default handling / deny under
+    // Alloy style): no add_ref, no stash, nothing published.
     let rv = unsafe {
         on_show(
             handler,
             ptr::null_mut(),
             3,
             origin.as_ptr().cast::<CefString>(),
-            1u32 << 12,
+            CEF_PERMISSION_TYPE_MIDI_SYSEX,
             cef_callback.as_mut_ptr(),
         )
     };

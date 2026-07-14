@@ -1465,17 +1465,20 @@ pub enum EventMsg {
         audible: bool,
     },
     /// A page asked for a powerful capability (geolocation / notifications /
-    /// clipboard) at a top-level `origin`. The engine has NOT granted it — it holds
-    /// the CEF permission callback open and waits for the shell's
+    /// clipboard / camera / microphone) at a top-level `origin`. The engine has
+    /// NOT granted it — it holds the CEF permission callback open and waits for the
+    /// shell's
     /// [`ControlMsg::PermissionDecision`] carrying the same `id`. The shell prompts
     /// the user (allow-session-only / block) per [[browser-gated-features-unblocked]].
-    /// `kind` is engine-neutral: `0` geolocation, `1` notifications, `2` clipboard —
-    /// the helper maps CEF's request-type bitmask onto this and denies unlisted types
-    /// without prompting.
+    /// `kind` is engine-neutral: `0` geolocation, `1` notifications, `2`
+    /// clipboard, `3` camera, `4` microphone, `5` camera + microphone — the helper
+    /// maps CEF's request-type bitmask onto this and denies unlisted types without
+    /// prompting.
     PermissionRequest {
         /// Correlates this request with its [`ControlMsg::PermissionDecision`].
         id: u64,
-        /// Engine-neutral permission kind (0 geolocation, 1 notifications, 2 clipboard).
+        /// Engine-neutral permission kind (0 geolocation, 1 notifications, 2
+        /// clipboard, 3 camera, 4 microphone, 5 camera + microphone).
         kind: u8,
         /// The requesting page's origin (scheme + host), for the prompt.
         origin: String,
@@ -2346,6 +2349,21 @@ mod tests {
             id: 77,
             kind: 0,
             origin: "https://maps.example".to_owned(),
+        });
+        round_event(&EventMsg::PermissionRequest {
+            id: 78,
+            kind: 3,
+            origin: "https://camera.example".to_owned(),
+        });
+        round_event(&EventMsg::PermissionRequest {
+            id: 79,
+            kind: 4,
+            origin: "https://voice.example".to_owned(),
+        });
+        round_event(&EventMsg::PermissionRequest {
+            id: 80,
+            kind: 5,
+            origin: "https://meet.example".to_owned(),
         });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
