@@ -347,6 +347,20 @@ struct PendingDangerousDownload {
     filename: String,
 }
 
+/// One saved login in the SESSION-ONLY credential store. Keyed by origin host so a
+/// revisit offers it for autofill. In-memory only — never persisted to disk (the
+/// browser is private-by-default; the sandbox has no writable $HOME). The user adds
+/// these explicitly; auto-capture-on-submit is a separate, operator-reviewed feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredLogin {
+    /// Host the credential belongs to (e.g. `mail.example.com`).
+    host: String,
+    /// Username / email.
+    username: String,
+    /// Password (session RAM only).
+    password: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessOutput {
     success: bool,
@@ -938,6 +952,12 @@ pub(crate) struct WebState {
     /// block is never remembered (Chrome re-prompts after a block). In-memory only,
     /// per the operator's session-only permission decision (browser-gated-features).
     granted_permissions: std::collections::HashSet<(String, u8)>,
+    /// The session-only saved-login store (see [`StoredLogin`]). In-memory; cleared
+    /// on shell exit; never persisted. Drives the omnibox 🔑 autofill affordance.
+    session_logins: Vec<StoredLogin>,
+    /// Draft inputs for the 🔑 menu's "save a login for this site" mini-form.
+    login_user_draft: String,
+    login_pass_draft: String,
     /// Whether the Site Styles editor drawer is open, and its two input drafts.
     site_styles_open: bool,
     site_style_host_draft: String,
@@ -1070,6 +1090,9 @@ impl Default for WebState {
             user_site_styles: Vec::new(),
             hsts_hosts: std::collections::HashSet::new(),
             granted_permissions: std::collections::HashSet::new(),
+            session_logins: Vec::new(),
+            login_user_draft: String::new(),
+            login_pass_draft: String::new(),
             site_styles_open: false,
             site_style_host_draft: String::new(),
             site_style_css_draft: String::new(),
@@ -3546,6 +3569,54 @@ impl WebState {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.session.answer_permission(allow);
         }
+    }
+
+    /// Save (or update) a session-only login for `host`; replaces an existing entry
+    /// with the same host+username. Blank host/username/password is ignored.
+    fn save_login(&mut self, host: &str, username: &str, password: &str) {
+        let host = host.trim().to_ascii_lowercase();
+        let username = username.trim().to_owned();
+        if host.is_empty() || username.is_empty() || password.is_empty() {
+            return;
+        }
+        if let Some(existing) = self
+            .session_logins
+            .iter_mut()
+            .find(|l| l.host == host && l.username == username)
+        {
+            existing.password = password.to_owned();
+        } else {
+            self.session_logins.push(StoredLogin {
+                host,
+                username,
+                password: password.to_owned(),
+            });
+        }
+    }
+
+    /// The saved logins for `host` (lowercased), in save order.
+    fn logins_for_host(&self, host: &str) -> Vec<&StoredLogin> {
+        let host = host.trim().to_ascii_lowercase();
+        self.session_logins
+            .iter()
+            .filter(|l| l.host == host)
+            .collect()
+    }
+
+    /// Remove the saved login at `index` (manager delete).
+    fn remove_login(&mut self, index: usize) {
+        if index < self.session_logins.len() {
+            self.session_logins.remove(index);
+        }
+    }
+
+    /// Autofill the active tab's login form with a chosen credential (the engine
+    /// injects the fill script). User-initiated only.
+    fn fill_active_login(&mut self, username: String, password: String) {
+        if let Some(tab) = self.active_tab() {
+            tab.session.fill_login(username, password);
+        }
+        self.mark_active_tab_activity();
     }
 
     fn compiled_request_filter_for_url(&self, url: &str) -> RequestFilter {
@@ -6469,6 +6540,108 @@ fn page_actions_menu(
     }
 }
 
+/// The toolbar 🔑 password menu: fill a saved login into the current site's form, or
+/// save a new credential for it. Session-only store, user-initiated fill (the engine
+/// injects the fill script). Deferred actions are applied after the popup closure so
+/// the store borrow ends before the save-form's mutable draft edit.
+fn password_menu(ui: &mut egui::Ui, state: &mut WebState, page_url: &str, has_page: bool) {
+    let host = host_of(page_url).unwrap_or_default();
+    let mut fill: Option<(String, String)> = None;
+    let mut remove: Option<usize> = None;
+    let mut save = false;
+    // Clone matches out (index, user, pass) so the store borrow does not outlive into
+    // the save-form's `&mut login_*_draft`.
+    let matches: Vec<(usize, String, String)> = if host.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .session_logins
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.host == host)
+            .map(|(i, l)| (i, l.username.clone(), l.password.clone()))
+            .collect()
+    };
+    ui.menu_button(
+        RichText::new("\u{1F511}") // 🔑
+            .size(CHROME_FONT)
+            .color(Style::TEXT_DIM),
+        |ui| {
+            ui.set_min_width(260.0);
+            if host.is_empty() {
+                ui.weak("No site loaded");
+                return;
+            }
+            ui.label(
+                RichText::new("Saved logins (this session)")
+                    .size(CHROME_FONT)
+                    .strong(),
+            );
+            if matches.is_empty() {
+                ui.weak(format!("None saved for {host}"));
+            } else {
+                for (idx, username, password) in &matches {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                has_page,
+                                egui::Button::new(
+                                    RichText::new(format!("Fill {username}")).size(CHROME_FONT),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            fill = Some((username.clone(), password.clone()));
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("\u{00D7}").size(CHROME_FONT),
+                            ))
+                            .on_hover_text("Delete saved login")
+                            .clicked()
+                        {
+                            remove = Some(*idx);
+                            ui.close_menu();
+                        }
+                    });
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new(format!("Save a login for {host}")).size(CHROME_FONT));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.login_user_draft)
+                    .hint_text("username")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut state.login_pass_draft)
+                    .password(true)
+                    .hint_text("password")
+                    .desired_width(f32::INFINITY),
+            );
+            if ui
+                .add(egui::Button::new(RichText::new("Save").size(CHROME_FONT)))
+                .clicked()
+            {
+                save = true;
+                ui.close_menu();
+            }
+        },
+    );
+    if let Some((user, pass)) = fill {
+        state.fill_active_login(user, pass);
+    }
+    if let Some(idx) = remove {
+        state.remove_login(idx);
+    }
+    if save {
+        let user = std::mem::take(&mut state.login_user_draft);
+        let pass = std::mem::take(&mut state.login_pass_draft);
+        state.save_login(&host, &user, &pass);
+    }
+}
+
 /// The toolbar star that opens the BOOKMARKS-10 [`page_actions_menu`]; the glyph
 /// dims with no live page (the menu items disable themselves too). Split out of
 /// [`nav_chrome`] to keep that toolbar within its line budget.
@@ -6982,6 +7155,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             &page_url,
             &page_title,
         );
+        password_menu(ui, state, &page_url, has_page);
 
         if nav_button(
             ui,
@@ -10903,6 +11077,56 @@ mod tests {
         assert!(
             state.tabs[0].session.pending_permission().is_none(),
             "the auto-allow answered and cleared the request"
+        );
+    }
+
+    #[test]
+    fn session_login_store_matches_by_host_updates_and_removes() {
+        let mut state = WebState::default();
+        state.save_login("Mail.Example.com", " alice ", "pw1"); // host lowercased, user trimmed
+        state.save_login("mail.example.com", "bob", "pw2");
+        state.save_login("other.example", "carol", "pw3");
+        let m = state.logins_for_host("mail.example.com");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].username, "alice");
+
+        // Re-saving same host+username UPDATES the password (no duplicate).
+        state.save_login("mail.example.com", "alice", "pw1-new");
+        let m = state.logins_for_host("mail.example.com");
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m.iter().find(|l| l.username == "alice").unwrap().password,
+            "pw1-new"
+        );
+
+        // Blank host/username/password entries are ignored.
+        state.save_login("mail.example.com", "", "x");
+        state.save_login("", "u", "p");
+        state.save_login("mail.example.com", "dave", "");
+        assert_eq!(state.logins_for_host("mail.example.com").len(), 2);
+
+        // Remove by index.
+        let before = state.session_logins.len();
+        state.remove_login(0);
+        assert_eq!(state.session_logins.len(), before - 1);
+        state.remove_login(999); // out of range is a no-op
+        assert_eq!(state.session_logins.len(), before - 1);
+    }
+
+    #[test]
+    fn filling_a_login_sends_the_credential_to_the_helper() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        state.fill_active_login("alice@example.com".to_owned(), "hunter2".to_owned());
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|m| matches!(
+                m,
+                mde_web_preview_client::ControlMsg::FillLogin { username, password }
+                    if username == "alice@example.com" && password == "hunter2"
+            )),
+            "fill_active_login sends the chosen credential to the page: {controls:?}"
         );
     }
 

@@ -1162,6 +1162,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::ImeSetComposition { text } => ime_set_composition(browser, text),
         ControlMsg::ImeCommitText { text } => ime_commit_text(browser, text),
         ControlMsg::ImeFinishComposition => ime_finish_composing(browser),
+        ControlMsg::FillLogin { username, password } => fill_login(browser, username, password),
     }
 }
 
@@ -4183,6 +4184,15 @@ fn apply_user_agent(browser: *mut c_void, user_agent: &str) {
         return;
     };
     execute_java_script(frame, &user_agent_override_script(user_agent));
+}
+
+/// Fill the page's login form with a user-chosen saved credential (autofill). Injects
+/// the fill script into the main frame; user-initiated only, session-only creds.
+fn fill_login(browser: *mut c_void, username: &str, password: &str) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &login_fill_script(username, password));
 }
 
 fn apply_device_profile(

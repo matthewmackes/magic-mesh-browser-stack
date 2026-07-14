@@ -349,7 +349,8 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         | ControlMsg::PermissionDecision { .. }
         | ControlMsg::ImeSetComposition { .. }
         | ControlMsg::ImeCommitText { .. }
-        | ControlMsg::ImeFinishComposition => {}
+        | ControlMsg::ImeFinishComposition
+        | ControlMsg::FillLogin { .. } => {}
     }
 }
 

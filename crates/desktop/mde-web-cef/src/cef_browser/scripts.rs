@@ -13,6 +13,20 @@ pub(super) fn cosmetic_filter_script(css: &str) -> String {
     )
 }
 
+/// Fill the page's first login form with a user-chosen saved credential: locate the
+/// first `input[type=password]`, then (within its form) the best-guess username field,
+/// set both values, and dispatch `input`+`change` so the page's own JS observes the
+/// edit. User-initiated only (never auto-runs on load); credentials are the
+/// shell's session-only store. Unquoted CSS attribute selectors keep the embedded
+/// JS free of nested quotes.
+pub(super) fn login_fill_script(username: &str, password: &str) -> String {
+    let user = js_string_literal(username);
+    let pass = js_string_literal(password);
+    format!(
+        "(function(){{var pw=document.querySelector('input[type=password]');if(!pw)return;var scope=pw.form||document;var u=scope.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');function set(el,val){{if(!el)return;try{{el.focus();}}catch(e){{}}el.value=val;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));}}set(u,{user});set(pw,{pass});}})();"
+    )
+}
+
 pub(super) fn force_dark_script(enabled: bool) -> String {
     if !enabled {
         return "(function(){var id='mde-cef-force-dark-style';var el=document.getElementById(id);if(el)el.remove();document.documentElement.style.colorScheme='';})();".to_owned();

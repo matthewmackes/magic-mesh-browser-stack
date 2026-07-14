@@ -1298,6 +1298,22 @@ fn user_agent_override_script_installs_and_clears_page_visible_ua() {
 }
 
 #[test]
+fn login_fill_script_targets_the_login_form_and_dispatches_events() {
+    let s = login_fill_script("alice@example.com", "hunter2");
+    // Finds the password field, prefers an autocomplete=username field, sets both.
+    assert!(s.contains("input[type=password]"));
+    assert!(s.contains("autocomplete=username"));
+    assert!(s.contains("alice@example.com"));
+    assert!(s.contains("hunter2"));
+    // Fires input+change so the page's own JS observes the autofill.
+    assert!(s.contains("dispatchEvent"));
+    assert!(s.contains("input"));
+    assert!(s.contains("change"));
+    // Injected as bounded script text only — no tag-breakout.
+    assert!(!s.contains("</script>"));
+}
+
+#[test]
 fn device_profile_script_installs_and_clears_page_visible_device_metadata() {
     let enable = device_profile_script("phone", 390, 844, 300, true);
     assert!(enable.contains("mdeDeviceProfile"));

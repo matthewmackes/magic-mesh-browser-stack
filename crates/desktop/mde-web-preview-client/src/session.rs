@@ -693,6 +693,12 @@ impl WebSession {
         self.send(&ControlMsg::ImeFinishComposition);
     }
 
+    /// Autofill a user-chosen saved login into the page's first login form (the engine
+    /// injects a fill script). User-initiated; session-only credentials.
+    pub fn fill_login(&mut self, username: String, password: String) {
+        self.send(&ControlMsg::FillLogin { username, password });
+    }
+
     /// Find text on the current page.
     /// Run a clipboard/editing command on the page's focused element (in-page
     /// context menu). Reuses the engine's native frame edit commands.

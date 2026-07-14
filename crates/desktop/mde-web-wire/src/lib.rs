@@ -655,6 +655,17 @@ pub enum ControlMsg {
     /// IME finish: finalize any pending composition in place without new text
     /// (`ime_finish_composing_text`). Driven by egui `ImeEvent::Disable`.
     ImeFinishComposition,
+    /// Autofill a saved login into the page's first login form. The user EXPLICITLY
+    /// picks a stored credential; the engine injects a fill script (no auto-fill on
+    /// load, no page-reading). Session-only creds — the shell keeps no persistent
+    /// password store (private-by-default). Capture-on-submit is a separate,
+    /// operator-security-reviewed feature (needs a JS↔native bridge).
+    FillLogin {
+        /// Username to fill.
+        username: String,
+        /// Password to fill.
+        password: String,
+    },
     /// Apply shell-owned spellcheck highlights to visible page text. Empty words
     /// clear prior highlights.
     SetSpellcheckHighlights {
@@ -847,6 +858,11 @@ impl ControlMsg {
                 put_str(&mut out, text);
             }
             Self::ImeFinishComposition => out.push(31),
+            Self::FillLogin { username, password } => {
+                out.push(32);
+                put_str(&mut out, username);
+                put_str(&mut out, password);
+            }
         }
         out
     }
@@ -937,6 +953,10 @@ impl ControlMsg {
             29 => Self::ImeSetComposition { text: c.string()? },
             30 => Self::ImeCommitText { text: c.string()? },
             31 => Self::ImeFinishComposition,
+            32 => Self::FillLogin {
+                username: c.string()?,
+                password: c.string()?,
+            },
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -1631,6 +1651,10 @@ mod tests {
             text: "\u{4f60}\u{597d}".to_owned(),
         });
         round_control(&ControlMsg::ImeFinishComposition);
+        round_control(&ControlMsg::FillLogin {
+            username: "alice@example.com".to_owned(),
+            password: "hunter2".to_owned(),
+        });
         round_control(&ControlMsg::EditCommand {
             command: EditCommand::SelectAll,
         });
