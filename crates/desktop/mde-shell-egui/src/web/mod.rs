@@ -908,6 +908,9 @@ pub(crate) struct WebState {
     /// chrome. A session-only chrome toggle (View → Show Bookmarks Bar), defaulting
     /// hidden like the other browser chrome toggles (find / downloads / vertical).
     bookmarks_bar_visible: bool,
+    /// Live query text for the tab-search dropdown (Chrome's "Search tabs" ⌄). A
+    /// session-only, in-memory UI field — cleared when a result is chosen.
+    tab_search_query: String,
     /// The top-level bookmark links mirrored from `state/bookmarks/collection` — the
     /// buttons the bar renders. Rebuilt each poll from the converged daemon
     /// collection; empty until the first snapshot is seen.
@@ -1052,6 +1055,7 @@ impl Default for WebState {
             pending_cups_prints: BTreeMap::new(),
             bus_root: mde_bus::client_data_dir(),
             bookmarks_bar_visible: false,
+            tab_search_query: String::new(),
             bookmark_bar_links: Vec::new(),
             bookmarked_urls: std::collections::HashSet::new(),
             bookmark_index: Vec::new(),
@@ -4420,6 +4424,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                     }
                 }
                 engine_new_tab_buttons(ui, state, false);
+                tab_search_menu(ui, state);
             });
         });
 
@@ -4703,6 +4708,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         });
                     }
                     engine_new_tab_buttons(ui, state, true);
+                    tab_search_menu(ui, state);
                 });
         });
 
@@ -4758,6 +4764,89 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.close_tab(idx);
     } else if let Some(idx) = select {
         state.select_tab(idx);
+    }
+}
+
+/// Case-insensitive match of `query` against each tab's title AND committed URL;
+/// returns the matching tab indices in strip order. An empty/blank query matches
+/// everything (the full list). Pure — the tab-search dropdown and its test share it.
+fn matching_tab_indices(tabs: &[Tab], query: &str) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, tab)| {
+            q.is_empty()
+                || tab.session.title().to_ascii_lowercase().contains(&q)
+                || tab.session.nav().url.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A one-line label for a tab-search result row: the page title, falling back to
+/// the URL, then "New tab" — no state dot (the dropdown is a chooser, not the strip).
+fn tab_search_row_label(tab: &Tab) -> String {
+    let title = tab.session.title().trim();
+    if !title.is_empty() {
+        return ellipsize(title, 48);
+    }
+    let url = tab.session.nav().url.trim();
+    if url.is_empty() {
+        "New tab".to_owned()
+    } else {
+        ellipsize(url, 48)
+    }
+}
+
+/// The tab-search dropdown (Chrome's "Search tabs" ⌄): a 🔍 menu button opening a
+/// live-filtered, clickable list of every open tab. Selecting a row activates that
+/// tab and clears the query. Pure list logic lives in [`matching_tab_indices`].
+fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
+    let mut select: Option<usize> = None;
+    ui.menu_button(
+        RichText::new("\u{1F50D}") // 🔍
+            .size(CHROME_FONT)
+            .color(Style::TEXT_DIM),
+        |ui| {
+            ui.set_min_width(300.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut state.tab_search_query)
+                    .hint_text("Search tabs")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.separator();
+            let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if matches.is_empty() {
+                        ui.weak("No matching tabs");
+                    }
+                    for idx in matches {
+                        let active = idx == state.active;
+                        let label = tab_search_row_label(&state.tabs[idx]);
+                        let color = if active { Style::TEXT } else { Style::TEXT_DIM };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label).size(CHROME_FONT).color(color),
+                                )
+                                .min_size(egui::vec2(288.0, CHROME_TAB_H)),
+                            )
+                            .clicked()
+                        {
+                            select = Some(idx);
+                            ui.close_menu();
+                        }
+                    }
+                });
+        },
+    )
+    .response
+    .on_hover_text("Search tabs");
+    if let Some(idx) = select {
+        state.select_tab(idx);
+        state.tab_search_query.clear();
     }
 }
 
@@ -10531,6 +10620,43 @@ mod tests {
                 .any(|t| t.container == ContainerProfile::Banking),
             "the unpinned tail is closed"
         );
+    }
+
+    #[test]
+    fn tab_search_filters_on_title_and_url() {
+        let mut state = WebState::default();
+        let mut _peers = Vec::new();
+        for url in [
+            "https://news.example/",
+            "https://mail.example/",
+            "https://maps.example/",
+        ] {
+            let (shell, helper) = UnixStream::pair().expect("socketpair");
+            helper.set_nonblocking(true).expect("helper nonblocking");
+            state.push_session(WebSession::from_stream(shell, None).expect("session"));
+            let idx = state.tabs.len() - 1;
+            let mut peer: &UnixStream = &helper;
+            peer.write_all(&wire::frame(
+                &mde_web_preview_client::EventMsg::NavState {
+                    can_back: false,
+                    can_forward: false,
+                    loading: false,
+                    url: url.to_owned(),
+                }
+                .encode(),
+            ))
+            .expect("nav");
+            state.tabs[idx].session.poll();
+            _peers.push(helper); // keep the peers alive so the sessions don't crash
+        }
+
+        // Empty query → the full list.
+        assert_eq!(matching_tab_indices(&state.tabs, ""), vec![0, 1, 2]);
+        // A URL-substring match, case-insensitive.
+        assert_eq!(matching_tab_indices(&state.tabs, "mail"), vec![1]);
+        assert_eq!(matching_tab_indices(&state.tabs, "MAPS"), vec![2]);
+        // No match → empty.
+        assert!(matching_tab_indices(&state.tabs, "zzz").is_empty());
     }
 
     /// Drive ONE headless frame of just the tab strip (isolating it from the full
