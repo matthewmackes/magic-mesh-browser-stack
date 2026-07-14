@@ -70,7 +70,9 @@ pub use session::{
     BeforeUnloadDialog, CertError, JsDialog, LoginCaptureStatus, NavState, PasskeyRequestStatus,
     PermissionRequest, ResourceRequestStatus, SessionState, WebSession,
 };
-pub use wire::{ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, WireError};
+pub use wire::{
+    ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, MediaTransportAction, WireError,
+};
 
 // The ad-filter engine types the shell compiles a session's [`RequestFilter`]
 // from (BOOKMARKS-7). Re-exported so the Browser surface + the live-helper spawn

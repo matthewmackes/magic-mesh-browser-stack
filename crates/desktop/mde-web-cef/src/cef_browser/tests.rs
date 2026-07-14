@@ -1326,6 +1326,29 @@ fn media_playback_toggle_script_drives_html_media_elements() {
 }
 
 #[test]
+fn media_transport_script_covers_page_media_actions() {
+    for (action, token) in [
+        (MediaTransportAction::PlayPause, "playPause"),
+        (MediaTransportAction::Play, "play"),
+        (MediaTransportAction::Pause, "pause"),
+        (MediaTransportAction::Stop, "stop"),
+        (MediaTransportAction::Next, "next"),
+        (MediaTransportAction::Previous, "previous"),
+    ] {
+        let script = media_transport_script(action);
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains(&format!("action='{token}'")));
+        assert!(script.contains("pauseActive"));
+        assert!(script.contains("fastSeek"));
+        assert!(script.contains("mdeAutoplayAllowed"));
+        assert!(
+            !script.contains("</script>"),
+            "media transport is injected as bounded script text only"
+        );
+    }
+}
+
+#[test]
 fn autoplay_block_control_is_remembered_for_navigation_reinjection() {
     let callbacks = CefBrowserCallbacks::new(
         320,

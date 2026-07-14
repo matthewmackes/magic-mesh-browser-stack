@@ -4099,6 +4099,18 @@ impl WebState {
         }
     }
 
+    pub(crate) fn active_tab_media_transport(
+        &mut self,
+        action: mde_web_preview_client::MediaTransportAction,
+    ) {
+        if !self.can_drive_page_tools() {
+            return;
+        }
+        if let Some(tab) = self.active_tab() {
+            tab.session.media_transport(action);
+        }
+    }
+
     fn set_active_tab_autoplay_blocked(&mut self, blocked: bool) {
         if !self.can_drive_page_tools() {
             return;
@@ -12484,6 +12496,16 @@ mod tests {
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAudioMute);
         assert!(!state.tabs[state.active].muted);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleMediaPlayback);
+        for action in [
+            mde_web_preview_client::MediaTransportAction::PlayPause,
+            mde_web_preview_client::MediaTransportAction::Play,
+            mde_web_preview_client::MediaTransportAction::Pause,
+            mde_web_preview_client::MediaTransportAction::Stop,
+            mde_web_preview_client::MediaTransportAction::Next,
+            mde_web_preview_client::MediaTransportAction::Previous,
+        ] {
+            state.active_tab_media_transport(action);
+        }
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
         assert!(!state.tabs[state.active].autoplay_blocked);
         menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleAutoplayBlock);
@@ -12600,6 +12622,23 @@ mod tests {
                 .any(|msg| matches!(msg, mde_web_preview_client::ControlMsg::ToggleMediaPlayback)),
             "play/pause media must reach the helper: {controls:?}"
         );
+        for action in [
+            mde_web_preview_client::MediaTransportAction::PlayPause,
+            mde_web_preview_client::MediaTransportAction::Play,
+            mde_web_preview_client::MediaTransportAction::Pause,
+            mde_web_preview_client::MediaTransportAction::Stop,
+            mde_web_preview_client::MediaTransportAction::Next,
+            mde_web_preview_client::MediaTransportAction::Previous,
+        ] {
+            assert!(
+                controls.iter().any(|msg| matches!(
+                    msg,
+                    mde_web_preview_client::ControlMsg::MediaTransport { action: seen }
+                        if *seen == action
+                )),
+                "{action:?} media transport must reach the helper: {controls:?}"
+            );
+        }
         assert!(
             controls.iter().any(|msg| matches!(
                 msg,

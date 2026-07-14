@@ -276,6 +276,7 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::ClearFind => engine.clear_find(),
         ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
         ControlMsg::ToggleMediaPlayback => engine.toggle_media_playback(),
+        ControlMsg::MediaTransport { action } => engine.media_transport(*action),
         ControlMsg::SetAutoplayBlocked { blocked } => engine.set_autoplay_blocked(*blocked),
         ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
         ControlMsg::SetReaderMode { enabled } => engine.set_reader_mode(*enabled),

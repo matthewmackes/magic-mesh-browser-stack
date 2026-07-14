@@ -29,7 +29,7 @@ use crate::egui::{self, ColorImage};
 use crate::filter::{self, RequestFilter};
 use crate::frame::FrameReader;
 use crate::scm::{self, RecvOutcome};
-use crate::wire::{ControlMsg, CursorKind, EventMsg};
+use crate::wire::{ControlMsg, CursorKind, EventMsg, MediaTransportAction};
 use crate::{input, wire};
 
 /// How many `recvmsg` batches one [`WebSession::poll`] drains before yielding
@@ -975,6 +975,11 @@ impl WebSession {
     /// Ask the helper to toggle media playback on the active page.
     pub fn toggle_media_playback(&mut self) {
         self.send(&ControlMsg::ToggleMediaPlayback);
+    }
+
+    /// Ask the helper to run one media transport action on the active page.
+    pub fn media_transport(&mut self, action: MediaTransportAction) {
+        self.send(&ControlMsg::MediaTransport { action });
     }
 
     /// Set whether page-initiated autoplay is blocked until user activation.
@@ -2058,6 +2063,21 @@ mod tests {
 
         session.toggle_media_playback();
         assert_eq!(read_control(&mut peer), ControlMsg::ToggleMediaPlayback);
+
+        for action in [
+            MediaTransportAction::PlayPause,
+            MediaTransportAction::Play,
+            MediaTransportAction::Pause,
+            MediaTransportAction::Stop,
+            MediaTransportAction::Next,
+            MediaTransportAction::Previous,
+        ] {
+            session.media_transport(action);
+            assert_eq!(
+                read_control(&mut peer),
+                ControlMsg::MediaTransport { action }
+            );
+        }
 
         session.set_autoplay_blocked(true);
         assert_eq!(

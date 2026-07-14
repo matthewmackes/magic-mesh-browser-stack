@@ -195,6 +195,40 @@ impl EditCommand {
     }
 }
 
+/// A page media transport command for HTML audio/video elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MediaTransportAction {
+    /// Toggle playback: pause active media, otherwise play the best candidate.
+    PlayPause = 0,
+    /// Start playback on the best candidate.
+    Play = 1,
+    /// Pause active media.
+    Pause = 2,
+    /// Pause active media and seek it back to the start.
+    Stop = 3,
+    /// Move to the next media element, or seek the current one to the end.
+    Next = 4,
+    /// Move to the previous media element, or seek the current one to the start.
+    Previous = 5,
+}
+
+impl MediaTransportAction {
+    /// Decode from the wire byte.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::PlayPause),
+            1 => Some(Self::Play),
+            2 => Some(Self::Pause),
+            3 => Some(Self::Stop),
+            4 => Some(Self::Next),
+            5 => Some(Self::Previous),
+            _ => None,
+        }
+    }
+}
+
 /// Keyboard-modifier bitflags, engine-neutral (matches the common egui set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Modifiers(pub u8);
@@ -618,6 +652,11 @@ pub enum ControlMsg {
     },
     /// Toggle playback on the active page's HTML media elements.
     ToggleMediaPlayback,
+    /// Run one page media transport action on HTML media elements.
+    MediaTransport {
+        /// Requested transport action.
+        action: MediaTransportAction,
+    },
     /// Set whether page-initiated autoplay is blocked until user activation.
     SetAutoplayBlocked {
         /// `true` to block autoplay attempts, `false` to restore page defaults.
@@ -826,6 +865,10 @@ impl std::fmt::Debug for ControlMsg {
                 .field("muted", muted)
                 .finish(),
             Self::ToggleMediaPlayback => f.write_str("ToggleMediaPlayback"),
+            Self::MediaTransport { action } => f
+                .debug_struct("MediaTransport")
+                .field("action", action)
+                .finish(),
             Self::SetAutoplayBlocked { blocked } => f
                 .debug_struct("SetAutoplayBlocked")
                 .field("blocked", blocked)
@@ -1002,6 +1045,10 @@ impl ControlMsg {
                 out.push(u8::from(*muted));
             }
             Self::ToggleMediaPlayback => out.push(36),
+            Self::MediaTransport { action } => {
+                out.push(37);
+                out.push(*action as u8);
+            }
             Self::SetAutoplayBlocked { blocked } => {
                 out.push(34);
                 out.push(u8::from(*blocked));
@@ -1156,6 +1203,9 @@ impl ControlMsg {
             11 => Self::ClearFind,
             12 => Self::SetAudioMuted { muted: c.bool()? },
             36 => Self::ToggleMediaPlayback,
+            37 => Self::MediaTransport {
+                action: MediaTransportAction::from_u8(c.u8()?).ok_or(WireError::BadTag(37))?,
+            },
             13 => Self::SetForceDark { enabled: c.bool()? },
             14 => Self::SetReaderMode { enabled: c.bool()? },
             15 => Self::PrintPage,
@@ -2066,6 +2116,16 @@ mod tests {
         round_control(&ControlMsg::SetAudioMuted { muted: true });
         round_control(&ControlMsg::SetAudioMuted { muted: false });
         round_control(&ControlMsg::ToggleMediaPlayback);
+        for action in [
+            MediaTransportAction::PlayPause,
+            MediaTransportAction::Play,
+            MediaTransportAction::Pause,
+            MediaTransportAction::Stop,
+            MediaTransportAction::Next,
+            MediaTransportAction::Previous,
+        ] {
+            round_control(&ControlMsg::MediaTransport { action });
+        }
         round_control(&ControlMsg::SetAutoplayBlocked { blocked: true });
         round_control(&ControlMsg::SetAutoplayBlocked { blocked: false });
         round_control(&ControlMsg::SetForceDark { enabled: true });
@@ -2152,6 +2212,7 @@ mod tests {
             command: EditCommand::SelectAll,
         });
         assert_eq!(EditCommand::from_u8(99), None);
+        assert_eq!(MediaTransportAction::from_u8(99), None);
         round_control(&ControlMsg::SetSpellcheckHighlights {
             words: vec!["wrold".to_owned(), "msh".to_owned()],
         });

@@ -24,8 +24,8 @@ use crate::cef_abi::{CefAbi, CefStringListSize, CefStringListValue, CefStringUse
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
 use crate::wire::{
-    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode, Modifiers,
-    PointerButton,
+    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode,
+    MediaTransportAction, Modifiers, PointerButton,
 };
 
 mod scripts;
@@ -1110,6 +1110,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::EditCommand { command } => apply_edit_command(browser, *command),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
         ControlMsg::ToggleMediaPlayback => apply_media_playback_toggle(browser),
+        ControlMsg::MediaTransport { action } => apply_media_transport(browser, *action),
         ControlMsg::SetAutoplayBlocked { blocked } => {
             apply_autoplay_blocked(browser, &callbacks.state, *blocked);
         }
@@ -4588,6 +4589,13 @@ fn apply_media_playback_toggle(browser: *mut c_void) {
         return;
     };
     execute_java_script(frame, media_playback_toggle_script());
+}
+
+fn apply_media_transport(browser: *mut c_void, action: MediaTransportAction) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &media_transport_script(action));
 }
 
 fn apply_user_scripts(browser: *mut c_void, enabled: bool, bundle: &str) {

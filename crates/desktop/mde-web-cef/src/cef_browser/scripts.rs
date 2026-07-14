@@ -111,6 +111,20 @@ pub(super) const fn media_playback_toggle_script() -> &'static str {
     r#"(function(){try{var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){return !el.ended&&(el.readyState>0||el.currentSrc||el.src);});if(!list.length)return;var playing=list.find(function(el){return !el.paused&&!el.ended;});if(playing){for(var i=0;i<list.length;i++){if(!list[i].paused&&!list[i].ended){try{list[i].pause();}catch(_e){}}}return;}var target=list.find(function(el){return el.paused&&!el.ended;})||list[0];try{target.dataset.mdeAutoplayAllowed='true';}catch(_e){}try{var p=target.play();if(p&&p.catch)p.catch(function(){});}catch(_e){}}catch(_e){}})();"#
 }
 
+pub(super) fn media_transport_script(action: MediaTransportAction) -> String {
+    let action = match action {
+        MediaTransportAction::PlayPause => "playPause",
+        MediaTransportAction::Play => "play",
+        MediaTransportAction::Pause => "pause",
+        MediaTransportAction::Stop => "stop",
+        MediaTransportAction::Next => "next",
+        MediaTransportAction::Previous => "previous",
+    };
+    format!(
+        r#"(function(){{try{{var action='{action}';var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){{return !el.ended&&(el.readyState>0||el.currentSrc||el.src||el.currentTime>0);}});if(!list.length)return;var playing=list.find(function(el){{return !el.paused&&!el.ended;}});var current=playing||list.find(function(el){{return el.currentTime>0&&!el.ended;}})||list[0];function play(el){{if(!el)return;try{{el.dataset.mdeAutoplayAllowed='true';}}catch(_e){{}}try{{var p=el.play();if(p&&p.catch)p.catch(function(){{}});}}catch(_e){{}}}}function pause(el){{try{{el.pause();}}catch(_e){{}}}}function seek(el,t){{try{{if(isFinite(t)){{if(el.fastSeek)el.fastSeek(t);else el.currentTime=t;}}}}catch(_e){{}}}}function pauseActive(){{for(var i=0;i<list.length;i++){{if(!list[i].paused&&!list[i].ended)pause(list[i]);}}}}if(action==='pause'){{pauseActive();return;}}if(action==='stop'){{for(var i=0;i<list.length;i++){{pause(list[i]);seek(list[i],0);}}return;}}if(action==='play'){{play(current);return;}}if(action==='playPause'){{if(playing)pauseActive();else play(current);return;}}var dir=action==='next'?1:-1;var wasPlaying=!!playing;var idx=Math.max(0,list.indexOf(current));if(list.length>1){{pause(current);var target=list[(idx+dir+list.length)%list.length];seek(target,0);play(target);return;}}if(action==='next'){{var end=isFinite(current.duration)&&current.duration>0?current.duration:current.currentTime+30;seek(current,end);}}else{{seek(current,0);}}if(wasPlaying)play(current);}}catch(_e){{}}}})();"#
+    )
+}
+
 pub(super) fn user_agent_override_script(user_agent: &str) -> String {
     if user_agent.trim().is_empty() {
         return "(function(){delete window.__mdeUserAgentOverride;})();".to_owned();
