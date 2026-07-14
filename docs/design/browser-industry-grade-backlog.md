@@ -62,6 +62,39 @@ confirms `CEF_INITIALIZE_OK` + display block resolves/fires + `paints=1` (no reg
 `requestFullscreen()` gesture-trigger is eyes-on. **TEMPLATE for the rest of Wave B: extend a
 verified vtable block (display/load/request) rather than mint a new handler struct.**
 
+### FINAL STATE — 2026-07-13 (drive 3 close): pure-shell + engine round-trips DONE; 4 remain, each with a named blocker
+
+**Completed this session (all farm-green + pushed):** safe-browsing interstitial, UA HTTP-header override,
+audible-tab round-trip, HTML5 fullscreen, F11 fullscreen, HSTS, safe-browsing mesh source, pinned tabs,
+Duplicate/Close-others/Close-right, tab-search, per-site permission ALLOW path (engine+shell), **IME preedit
+(full 4-layer round-trip)**, configurable search engines, print options, tab groups, site styles, adblock
+breakdown, Clear-All, plus 18 adversarial stress-tests. **Plus a real bug fix**: `print`/`print_to_pdf` host
+offsets were stale (504/512 → 192/200) so PrintPage/SavePdf hit the wrong live-CEF methods — fixed `801331e9`.
+
+**The 4 genuinely-remaining features are NOT clean gaps — each is blocked on infrastructure, architecture, or an
+operator-gated resource (not effort I'm choosing to skip):**
+1. **Password manager (auto-capture)** — BLOCKED on missing infrastructure. There is NO JS↔native bridge in the
+   crate (no `cefQuery`/message-router/`on_process_message` wiring). Capturing a submitted login needs a
+   render-process handler + `send_process_message` → `on_process_message_received` (client slot 184 exists but is
+   unwired) routing, then a credential store. Autofill-FILL alone (JS-injection via a new `FillCredential`
+   ControlMsg) is buildable now, but a fill-only, manual-save manager is not industry-grade, and credential
+   handling is security-critical — this is a deliberate multi-session build, not a rush.
+2. **Picture-in-Picture** — architecturally constrained by the OSR/egui-texture model (the engine renders
+   offscreen; there is no native video window for `requestPictureInPicture`). Like WebRTC-removal, this needs an
+   operator decision on whether to add a second OSR surface + floating shell window, or declare it a non-goal.
+3. **B4 WebExtensions runtime smoke** — the registry validates + allowlists, but the runtime is gated
+   (`CEF_EXTENSIONS_UNPROVEN … reason=live_extension_runtime_smoke_pending`). Proving it is a live-verify on the
+   `.15` seat, which needs an F44 rebuild+deploy — the F44 builder (`.131`) is an operator-gated RAM juggle.
+4. **In-shell PDF viewer** — no shell viewer exists (only save-to-PDF, now fixed). Chromium/CEF ships a native
+   PDFium viewer, so navigating to a `.pdf` most likely already renders inline via the engine — but that is
+   unverified on the current build and needs an eyes-on `.15` check (same F44-deploy gate) to confirm before
+   deciding whether any shell work is even needed.
+
+**Unblock asks for the operator:** (a) authorize the multi-session password JS↔native bridge build (or scope it
+to fill-only for now); (b) decide PiP: build the OSR video-surface path or declare non-goal; (c) bring up the
+F44 builder so I can deploy current master to `.15` and live-verify B4 + PDF + the audible/UA/permission/IME
+handlers on glass (closing every on-glass caveat at once).
+
 ### Wave-B engine round-trips COMPLETE + tab-management sweep — 2026-07-13 (drive 3)
 
 Nine more features, all farm-green + pushed (`mde-shell-egui` 1174→1186/0, `mde-web-cef`
