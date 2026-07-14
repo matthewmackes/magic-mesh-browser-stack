@@ -331,8 +331,16 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_BROWSER_HOST_SEND_MOUSE_CLICK_EVENT_OFFSET, 352);
     assert_eq!(CEF_BROWSER_HOST_SEND_MOUSE_MOVE_EVENT_OFFSET, 360);
     assert_eq!(CEF_BROWSER_HOST_SEND_MOUSE_WHEEL_EVENT_OFFSET, 368);
-    assert_eq!(CEF_BROWSER_HOST_PRINT_OFFSET, 504);
-    assert_eq!(CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET, 512);
+    // print / print_to_pdf: fields 19/20 of the cef_browser_host_t vtable, verified via
+    // `offsetof` against the pinned CEF 149 header (/opt/mde/cef/include/capi/) — a stale
+    // 504/512 (fields 58/59 = set_accessibility_state / set_auto_resize_enabled) had made
+    // PrintPage/SavePdf call the WRONG host methods on live CEF. Expressed as 40+idx*8 so
+    // the field index is legible, not an opaque literal that can drift undetected.
+    assert_eq!(CEF_BROWSER_HOST_PRINT_OFFSET, 40 + 19 * 8);
+    assert_eq!(CEF_BROWSER_HOST_PRINT_OFFSET, 192);
+    assert_eq!(CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET, 40 + 20 * 8);
+    assert_eq!(CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET, 200);
+    assert_eq!(CEF_BROWSER_HOST_SET_AUDIO_MUTED_OFFSET, 40 + 60 * 8);
     assert_eq!(CEF_BROWSER_HOST_SET_AUDIO_MUTED_OFFSET, 520);
     assert_eq!(CEF_BROWSER_HOST_IS_AUDIO_MUTED_OFFSET, 528);
     // IME slots: fields 47/48/49 of the cef_browser_host_t vtable, confirmed via

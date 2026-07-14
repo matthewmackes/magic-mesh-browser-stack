@@ -312,10 +312,15 @@ pub const CEF_BROWSER_HOST_SEND_MOUSE_CLICK_EVENT_OFFSET: usize = 352;
 pub const CEF_BROWSER_HOST_SEND_MOUSE_MOVE_EVENT_OFFSET: usize = 360;
 /// `offsetof(cef_browser_host_t, send_mouse_wheel_event)`.
 pub const CEF_BROWSER_HOST_SEND_MOUSE_WHEEL_EVENT_OFFSET: usize = 368;
-/// `offsetof(cef_browser_host_t, print)`.
-pub const CEF_BROWSER_HOST_PRINT_OFFSET: usize = 504;
-/// `offsetof(cef_browser_host_t, print_to_pdf)`.
-pub const CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET: usize = 512;
+/// `offsetof(cef_browser_host_t, print)` — field 19 of the pinned CEF 149
+/// `cef_browser_host_t` vtable (`40 + 19*8`). Corrected from a stale 504 (field 58,
+/// which is `set_accessibility_state`) that silently made `PrintPage` call the wrong
+/// host method on live CEF — verified against `/opt/mde/cef/include/capi/cef_browser_capi.h`.
+pub const CEF_BROWSER_HOST_PRINT_OFFSET: usize = 192;
+/// `offsetof(cef_browser_host_t, print_to_pdf)` — field 20 (`40 + 20*8`). Corrected
+/// from a stale 512 (field 59, `set_auto_resize_enabled`) that made `SavePdf` call the
+/// wrong host method. Same ground-truth header.
+pub const CEF_BROWSER_HOST_PRINT_TO_PDF_OFFSET: usize = 200;
 /// `offsetof(cef_browser_host_t, set_audio_muted)`.
 pub const CEF_BROWSER_HOST_SET_AUDIO_MUTED_OFFSET: usize = 520;
 /// `offsetof(cef_browser_host_t, is_audio_muted)`.
