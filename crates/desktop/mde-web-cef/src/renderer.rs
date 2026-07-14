@@ -73,9 +73,17 @@ fn main() -> ExitCode {
     // it cannot be re-enabled nested inside this one, and why the OS sandbox is
     // the honest confinement instead.
     let is_cef_subprocess = args.iter().any(|arg| arg.starts_with("--type="));
-    let will_run_cef = mode == "tab"
-        || std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some()
-        || std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some();
+    let is_tab = mode == "tab";
+    let is_render_once = mode == "render-once";
+    let initialize_probe_requested = std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some();
+    let browser_probe_requested = std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some();
+    let will_run_cef = mode_runs_cef(
+        is_tab,
+        is_render_once,
+        is_cef_subprocess,
+        initialize_probe_requested,
+        browser_probe_requested,
+    );
     let bridge_exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mde-web-cef-renderer"));
     if will_run_cef && !is_cef_subprocess {
@@ -103,14 +111,9 @@ fn main() -> ExitCode {
     let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
     println!("{}", settings.status_line());
 
-    let is_tab = mode == "tab";
     // `is_cef_subprocess` + the CEF-init env gates were resolved above (where the
     // OS sandbox is applied for the top-level browser process).
-    if is_tab
-        || is_cef_subprocess
-        || std::env::var_os(CEF_INITIALIZE_PROBE_ENV).is_some()
-        || std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some()
-    {
+    if will_run_cef {
         let mut cef_args = args.clone();
         cef_args.extend(paths.command_line_switches());
         let main_args = match CefMainArgs::from_args(&cef_args) {
@@ -138,8 +141,9 @@ fn main() -> ExitCode {
                             return ExitCode::from(78);
                         }
                     }
-                } else if std::env::var_os(CEF_BROWSER_PROBE_ENV).is_some() {
+                } else if is_render_once || browser_probe_requested {
                     let url = url_arg(&args).unwrap_or("https://example.com/");
+                    let (width, height) = dimensions(&args);
                     if let Some(expected) = std::env::var_os(CEF_TEXT_PROBE_EXPECT_ENV) {
                         if let Some(line) = windowless_extension_runtime_gate(
                             contract.extensions.len(),
@@ -152,8 +156,8 @@ fn main() -> ExitCode {
                         match run_windowless_text_probe(
                             &abi,
                             url,
-                            1024,
-                            768,
+                            width,
+                            height,
                             Duration::from_secs(15),
                             &expected,
                         ) {
@@ -184,8 +188,8 @@ fn main() -> ExitCode {
                     match run_windowless_browser_probe_with_stream(
                         &abi,
                         url,
-                        1024,
-                        768,
+                        width,
+                        height,
                         Duration::from_secs(15),
                         session_socket_ref,
                     ) {
@@ -402,6 +406,20 @@ fn u32_flag(args: &[String], flag: &str) -> Option<u32> {
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].parse().ok()).flatten())
 }
 
+fn mode_runs_cef(
+    is_tab: bool,
+    is_render_once: bool,
+    is_cef_subprocess: bool,
+    initialize_probe_requested: bool,
+    browser_probe_requested: bool,
+) -> bool {
+    is_tab
+        || is_render_once
+        || is_cef_subprocess
+        || initialize_probe_requested
+        || browser_probe_requested
+}
+
 fn allow_alloy_extension_smoke_enabled() -> bool {
     std::env::var(CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV)
         .ok()
@@ -570,6 +588,16 @@ mod tests {
         assert!(line.contains(CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV));
         assert!(windowless_extension_runtime_gate(0, false).is_none());
         assert!(windowless_extension_runtime_gate(1, true).is_none());
+    }
+
+    #[test]
+    fn render_once_is_a_real_cef_mode_not_an_env_only_probe() {
+        assert!(mode_runs_cef(false, true, false, false, false));
+        assert!(mode_runs_cef(true, false, false, false, false));
+        assert!(mode_runs_cef(false, false, true, false, false));
+        assert!(mode_runs_cef(false, false, false, true, false));
+        assert!(mode_runs_cef(false, false, false, false, true));
+        assert!(!mode_runs_cef(false, false, false, false, false));
     }
 
     fn contract(

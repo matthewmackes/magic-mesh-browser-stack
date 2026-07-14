@@ -78,6 +78,41 @@ activate_runtime() {
   log "active runtime: $ACTIVE_LINK -> $INSTALL_ROOT"
 }
 
+verify_render_smoke() {
+  case "${MDE_CEF_SKIP_RENDER_SMOKE:-}" in
+    1|true|TRUE|yes|YES)
+      log "render smoke skipped by MDE_CEF_SKIP_RENDER_SMOKE"
+      return 0
+      ;;
+  esac
+
+  local helper="${MDE_CEF_RENDER_SMOKE_HELPER:-/usr/bin/mde-web-cef}"
+  local bridge="${MDE_CEF_RENDER_SMOKE_BRIDGE:-/usr/libexec/mackesd/mde-web-cef-renderer}"
+  local smoke_timeout="${MDE_CEF_RENDER_SMOKE_TIMEOUT:-30s}"
+  if [ ! -x "$helper" ] || [ ! -x "$bridge" ]; then
+    log "render smoke skipped: helper or renderer bridge is not installed"
+    return 0
+  fi
+
+  need_cmd timeout
+  local smoke_log
+  smoke_log="$(mktemp "${TMPDIR:-/tmp}/mde-cef-render-smoke.XXXXXX")"
+  if MDE_CEF_ROOT="$ACTIVE_LINK" MDE_CEF_BRIDGE_BIN="$bridge" \
+      timeout "$smoke_timeout" "$helper" render-once \
+        --url 'data:text/html,<html><body><h1>MCNF CEF runtime smoke</h1></body></html>' \
+        --width 320 --height 240 >"$smoke_log" 2>&1 \
+      && grep -q 'CEF_BROWSER_PAINT_READY' "$smoke_log"; then
+    log "render smoke passed"
+    rm -f "$smoke_log"
+    return 0
+  fi
+
+  echo "install-cef-runtime: render smoke failed" >&2
+  cat "$smoke_log" >&2 || true
+  rm -f "$smoke_log"
+  exit 1
+}
+
 need_cmd curl
 need_cmd sha256sum
 need_cmd tar
@@ -102,6 +137,7 @@ fi
 if [ -f "$INSTALL_ROOT/Release/libcef.so" ]; then
   log "$CEF_VERSION already extracted"
   activate_runtime
+  verify_render_smoke
   exit 0
 fi
 
@@ -123,3 +159,4 @@ printf 'version=%s\nchromium=%s\nchannel=%s\nasset=%s\nsha256=%s\n' \
   "$CEF_VERSION" "$CEF_CHROMIUM_VERSION" "$CEF_CHANNEL" "$CEF_ASSET" "$CEF_SHA256" \
   > "$INSTALL_ROOT/mde-cef-runtime.manifest"
 activate_runtime
+verify_render_smoke
