@@ -83,6 +83,9 @@ pub(super) const CHROME_ERROR: Color32 = Color32::from_rgb(179, 38, 30);
 const STATE_HOVER_ALPHA: u8 = 20;
 const STATE_FOCUS_ALPHA: u8 = 26;
 const STATE_PRESSED_ALPHA: u8 = 26;
+const ENGINE_NEW_TAB_W: f32 = 34.0;
+const ENGINE_SEGMENT_W: f32 = 78.0;
+const ENGINE_SEGMENT_RADIUS: f32 = 8.0;
 
 /// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
 /// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
@@ -175,6 +178,49 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
         ChipTone::Warn | ChipTone::Danger => CHROME_WARN,
         ChipTone::Info => CHROME_PRIMARY,
         ChipTone::Neutral => CHROME_TEXT_DIM,
+    }
+}
+
+pub(super) const fn engine_display_name(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Servo",
+    }
+}
+
+pub(super) const fn engine_marker(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Cr",
+        BrowserEngine::Servo => "Sv",
+    }
+}
+
+const fn engine_accent(engine: BrowserEngine) -> Color32 {
+    match engine {
+        BrowserEngine::Cef => CHROME_PRIMARY,
+        BrowserEngine::Servo => CHROME_SUCCESS,
+    }
+}
+
+pub(super) const fn engine_segment_fill(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
+    if matches!(
+        (engine, selected),
+        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
+    ) {
+        CHROME_PRIMARY_CONTAINER
+    } else {
+        CHROME_TOOLBAR
+    }
+}
+
+pub(super) const fn engine_segment_text(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
+    if matches!(
+        (engine, selected),
+        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
+    ) {
+        CHROME_ON_PRIMARY_CONTAINER
+    } else {
+        CHROME_TEXT
     }
 }
 
@@ -476,8 +522,9 @@ pub(super) fn tab_label(tab: &Tab) -> String {
     let user_scripts = if tab.user_scripts { "S " } else { "" };
     let user_agent = tab.user_agent.marker();
     let device_profile = tab.device_profile.marker();
+    let engine = engine_marker(tab.engine);
     format!(
-        "{state} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
+        "{state} {engine} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
         ellipsize(base, 24)
     )
 }
@@ -501,6 +548,7 @@ pub(super) fn tab_hover(tab: &Tab) -> String {
         DisplayTarget::Current => String::new(),
         target => format!(" - Display target: {}", target.label()),
     };
+    let engine = format!(" - Engine: {}", engine_display_name(tab.engine));
     let audio = if tab.muted { " - Muted" } else { "" };
     let now_playing = tab
         .session
@@ -529,11 +577,11 @@ pub(super) fn tab_hover(tab: &Tab) -> String {
     };
     if url.is_empty() {
         format!(
-            "{state}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state}{engine}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     } else {
         format!(
-            "{state} - {url}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state} - {url}{engine}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     }
 }
@@ -660,28 +708,92 @@ pub(super) fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
 }
 
 pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: bool) {
-    let mut button = |ui: &mut egui::Ui, engine: BrowserEngine| {
-        let label = format!("+{}", engine.label());
-        let mut widget = egui::Button::new(
-            egui::RichText::new(label)
-                .size(CHROME_FONT)
-                .color(CHROME_TEXT),
-        )
-        .fill(control_fill(false))
-        .min_size(egui::vec2(CHROME_NEW_TAB_W, CHROME_TAB_H));
-        if vertical {
-            widget = widget.min_size(egui::vec2(ui.available_width(), CHROME_TAB_H));
+    let selected = state.engine;
+    let mut open_selected = false;
+    let mut selected_engine = None;
+
+    let mut controls = |ui: &mut egui::Ui, full_width: bool| {
+        let plus_w = if full_width {
+            ui.available_width()
+        } else {
+            ENGINE_NEW_TAB_W
+        };
+        if engine_new_tab_button(ui, selected, plus_w).clicked() {
+            open_selected = true;
         }
-        if ui
-            .add(widget)
-            .on_hover_text(format!("New {} tab", engine.label()))
-            .clicked()
-        {
-            state.request_new_tab(engine);
+        if full_width {
+            ui.add_space(CHROME_GAP);
+        }
+        for engine in [BrowserEngine::Cef, BrowserEngine::Servo] {
+            let width = if full_width {
+                ui.available_width()
+            } else {
+                ENGINE_SEGMENT_W
+            };
+            if engine_segment_button(ui, engine, selected, width).clicked() {
+                selected_engine = Some(engine);
+            }
         }
     };
-    button(ui, BrowserEngine::Servo);
-    button(ui, BrowserEngine::Cef);
+
+    if vertical {
+        ui.vertical(|ui| controls(ui, true));
+    } else {
+        ui.horizontal(|ui| controls(ui, false));
+    }
+
+    if let Some(engine) = selected_engine {
+        state.select_engine(engine);
+    }
+    if open_selected {
+        state.request_new_tab(selected);
+    }
+}
+
+fn engine_new_tab_button(ui: &mut egui::Ui, engine: BrowserEngine, width: f32) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new("+")
+                .size(CHROME_FONT + 4.0)
+                .color(CHROME_TOOLBAR),
+        )
+        .fill(CHROME_PRIMARY)
+        .stroke(egui::Stroke::new(1.0, engine_accent(engine)))
+        .corner_radius(ENGINE_SEGMENT_RADIUS)
+        .min_size(egui::vec2(width, CHROME_TAB_H)),
+    )
+    .on_hover_text(format!("New {} tab", engine_display_name(engine)))
+}
+
+fn engine_segment_button(
+    ui: &mut egui::Ui,
+    engine: BrowserEngine,
+    selected: BrowserEngine,
+    width: f32,
+) -> egui::Response {
+    let is_selected = engine == selected;
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(engine_display_name(engine))
+                .size(CHROME_FONT)
+                .color(engine_segment_text(engine, selected)),
+        )
+        .fill(engine_segment_fill(engine, selected))
+        .stroke(egui::Stroke::new(
+            if is_selected { 1.5 } else { 1.0 },
+            if is_selected {
+                engine_accent(engine)
+            } else {
+                CHROME_OUTLINE
+            },
+        ))
+        .corner_radius(ENGINE_SEGMENT_RADIUS)
+        .min_size(egui::vec2(width, CHROME_TAB_H)),
+    )
+    .on_hover_text(format!(
+        "Use {} for future Browser tabs",
+        engine_display_name(engine)
+    ))
 }
 
 pub(super) fn tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
@@ -3806,6 +3918,30 @@ mod tests {
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
         assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
+    }
+
+    #[test]
+    fn engine_selector_uses_browser_local_labels_and_state() {
+        assert_eq!(engine_display_name(BrowserEngine::Cef), "Chromium");
+        assert_eq!(engine_marker(BrowserEngine::Cef), "Cr");
+        assert_eq!(engine_display_name(BrowserEngine::Servo), "Servo");
+        assert_eq!(engine_marker(BrowserEngine::Servo), "Sv");
+        assert_eq!(
+            engine_segment_fill(BrowserEngine::Cef, BrowserEngine::Cef),
+            CHROME_PRIMARY_CONTAINER
+        );
+        assert_eq!(
+            engine_segment_text(BrowserEngine::Cef, BrowserEngine::Cef),
+            CHROME_ON_PRIMARY_CONTAINER
+        );
+        assert_eq!(
+            engine_segment_fill(BrowserEngine::Servo, BrowserEngine::Cef),
+            CHROME_TOOLBAR
+        );
+        assert_eq!(
+            engine_segment_text(BrowserEngine::Servo, BrowserEngine::Cef),
+            CHROME_TEXT
+        );
     }
 
     #[test]

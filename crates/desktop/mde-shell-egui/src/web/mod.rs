@@ -3108,13 +3108,12 @@ impl WebState {
         self.set_vertical_tabs(!self.vertical_tabs);
     }
 
-    #[cfg(test)]
-    #[cfg_attr(
-        not(feature = "live-helper"),
-        allow(dead_code, reason = "used by live-helper-only Browser tests")
-    )]
     fn select_engine(&mut self, engine: BrowserEngine) {
+        if self.engine == engine {
+            return;
+        }
         self.engine = engine;
+        self.publish_session_snapshot();
     }
 
     fn submit_address(&mut self) {
@@ -12216,6 +12215,65 @@ mod tests {
         );
         assert_eq!(state.tabs.len(), 2);
         assert!(state.vertical_tabs);
+    }
+
+    #[test]
+    fn tab_strip_engine_picker_replaces_raw_engine_new_tab_buttons() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
+        });
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+
+        assert!(
+            texts.iter().any(|text| text == "Chromium"),
+            "engine picker should expose Chromium as a first-class segment: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Servo"),
+            "engine picker should keep Servo visible as the fallback segment: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "+"),
+            "engine picker should use one familiar new-tab plus affordance: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("+CEF") || text.contains("+Servo")),
+            "the old raw +engine buttons should be gone: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn tab_labels_and_hover_cards_name_each_tabs_engine() {
+        let (cef, _cef_helper) = testkit::connect().expect("connect CEF");
+        let (servo, _servo_helper) = testkit::connect().expect("connect Servo");
+        let mut state = WebState::default();
+        state.push_session_with_engine(cef, BrowserEngine::Cef);
+        state.push_session_with_engine(servo, BrowserEngine::Servo);
+
+        assert!(
+            chrome_ui::tab_label(&state.tabs[0]).contains("Cr "),
+            "CEF/Chromium tabs should carry a compact Chromium marker"
+        );
+        assert!(
+            chrome_ui::tab_hover(&state.tabs[0]).contains("Engine: Chromium"),
+            "CEF/Chromium hover card should name the engine"
+        );
+        assert!(
+            chrome_ui::tab_label(&state.tabs[1]).contains("Sv "),
+            "Servo tabs should carry a compact Servo marker"
+        );
+        assert!(
+            chrome_ui::tab_hover(&state.tabs[1]).contains("Engine: Servo"),
+            "Servo hover card should name the engine"
+        );
     }
 
     #[test]
