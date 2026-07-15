@@ -12163,15 +12163,42 @@ mod tests {
             texts.iter().any(|text| text == "Servo"),
             "engine picker should keep Servo visible as the fallback segment: {texts:?}"
         );
+        let selected_action = chrome_ui::engine_new_tab_text(state.engine);
         assert!(
-            texts.iter().any(|text| text == "New tab"),
-            "engine picker should use one clear primary new-tab affordance: {texts:?}"
+            texts.iter().any(|text| text == selected_action),
+            "engine picker should name the selected engine in the primary new-tab action ({selected_action}): {texts:?}"
         );
         assert!(
             !texts
                 .iter()
                 .any(|text| text.contains("+CEF") || text.contains("+Servo")),
             "the old raw +engine buttons should be gone: {texts:?}"
+        );
+
+        state.select_engine(BrowserEngine::Cef);
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
+        });
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text == "New CEF tab"),
+            "engine picker should retitle the primary action when CEF is selected: {texts:?}"
+        );
+
+        state.select_engine(BrowserEngine::Servo);
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
+        });
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text == "New Servo tab"),
+            "engine picker should retitle the primary action when Servo is selected: {texts:?}"
         );
     }
 
@@ -12192,8 +12219,8 @@ mod tests {
             "CEF/Chromium hover card should name the engine stack"
         );
         assert!(
-            chrome_ui::engine_marker(state.tabs[1].engine) == "Sv",
-            "Servo tabs should carry a compact Servo badge marker"
+            chrome_ui::engine_marker(state.tabs[1].engine) == "Servo",
+            "Servo tabs should carry a readable Servo badge marker"
         );
         assert!(
             chrome_ui::tab_hover(&state.tabs[1]).contains("Engine: Servo"),
