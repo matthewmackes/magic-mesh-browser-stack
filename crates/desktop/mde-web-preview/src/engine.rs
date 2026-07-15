@@ -796,6 +796,23 @@ impl Engine {
         self.evaluate_page_script(&media_transport_script(action));
     }
 
+    /// Read bounded page/media-session now-playing metadata.
+    pub fn poll_media_metadata<F>(&self, publish: F)
+    where
+        F: FnOnce(String) + 'static,
+    {
+        self.webview
+            .evaluate_javascript(media_metadata_script(), move |result| {
+                let body = match result {
+                    Ok(JSValue::String(body)) => clamp_utf8(body.trim(), 8 * 1024),
+                    _ => return,
+                };
+                if body.is_empty() || body.trim_start().starts_with('{') {
+                    publish(body);
+                }
+            });
+    }
+
     /// Apply or remove autoplay blocking in the Servo tab until user activation.
     pub fn set_autoplay_blocked(&self, blocked: bool) {
         self.evaluate_page_script(&autoplay_block_script(blocked));
@@ -1427,6 +1444,42 @@ fn media_transport_script(action: MediaTransportAction) -> String {
     )
 }
 
+const fn media_metadata_script() -> &'static str {
+    r#"(function(){try{
+function trim(v,n){v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?v.slice(0,n):v;}
+function has(v){return trim(v,2048).length>0;}
+function meta(sel){try{var el=document.querySelector(sel);return el?(el.content||el.getAttribute('content')||''):'';}catch(_e){return '';}}
+function ms(v){v=Number(v);return isFinite(v)&&v>0?Math.round(v*1000):0;}
+var list=[];
+try{list=[].slice.call(document.querySelectorAll('audio,video'));}catch(_e){}
+var media=list.find(function(el){return !el.paused&&!el.ended;})||list.find(function(el){return !el.ended&&(el.currentTime>0||el.readyState>0||el.currentSrc||el.src);})||null;
+var md={};
+try{md=(navigator.mediaSession&&navigator.mediaSession.metadata)||{};}catch(_e){md={};}
+var artwork='';
+try{if(md.artwork&&md.artwork.length)artwork=md.artwork[0].src||'';}catch(_e){}
+var hasSession=has(md.title)||has(md.artist)||has(md.album)||has(artwork);
+if(!media&&!hasSession){
+  if(window.__mdeMediaMetadataLast==='')return null;
+  window.__mdeMediaMetadataLast='';
+  return '';
+}
+var source=media?(media.currentSrc||media.src||''):'';
+var body=JSON.stringify({
+  title:trim(md.title||meta('meta[property="og:title"]')||meta('meta[name="twitter:title"]')||document.title||'',160),
+  artist:trim(md.artist||meta('meta[name="author"]')||'',160),
+  album:trim(md.album||'',160),
+  artwork_url:trim(artwork||meta('meta[property="og:image"]')||meta('meta[name="twitter:image"]')||'',2048),
+  source_url:trim(source||location.href||'',2048),
+  paused:media?!!media.paused:true,
+  duration_ms:ms(media&&media.duration),
+  position_ms:ms(media&&media.currentTime)
+});
+if(body===window.__mdeMediaMetadataLast)return null;
+window.__mdeMediaMetadataLast=body;
+return body;
+}catch(_e){return '';}})();"#
+}
+
 fn userscript_library_script(enabled: bool, bundle: &str) -> String {
     if !enabled {
         return "(function(){var style=document.getElementById('mde-browser-userscript-style');if(style)style.remove();if(window.__mdeBrowserUserScriptsObserver){window.__mdeBrowserUserScriptsObserver.disconnect();window.__mdeBrowserUserScriptsObserver=null;}delete document.documentElement.dataset.mdeBrowserUserscripts;})();".to_owned();
@@ -1474,7 +1527,7 @@ fn js_string_array_literal(values: &[String]) -> String {
 mod tests {
     use super::{
         audio_mute_script, autoplay_block_script, clamp_utf8, clear_find_script,
-        device_profile_script, find_in_page_script, force_dark_script,
+        device_profile_script, find_in_page_script, force_dark_script, media_metadata_script,
         media_playback_toggle_script, media_transport_script, page_scrape_script, page_text_script,
         page_zoom_script, passkey_bridge_drain_script, passkey_complete_script, print_page_script,
         reader_mode_script, secure_preferences, servo_keyboard_event, servo_mouse_button,
@@ -1745,6 +1798,20 @@ mod tests {
                 "media transport is injected as bounded script text only"
             );
         }
+    }
+
+    #[test]
+    fn servo_media_metadata_script_reads_media_session_and_html_media() {
+        let script = media_metadata_script();
+        assert!(script.contains("navigator.mediaSession"));
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains("duration_ms"));
+        assert!(script.contains("position_ms"));
+        assert!(script.contains("__mdeMediaMetadataLast"));
+        assert!(script.contains("JSON.stringify"));
+        assert!(script.contains("return null"));
+        assert!(script.contains("return '';"));
+        assert!(!script.contains("</script>"));
     }
 
     #[test]

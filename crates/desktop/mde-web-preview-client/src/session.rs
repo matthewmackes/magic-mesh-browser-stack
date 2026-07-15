@@ -133,6 +133,22 @@ impl std::fmt::Debug for PasskeyRequestStatus {
     }
 }
 
+/// One page/media-session now-playing metadata update from the helper.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaMetadataStatus {
+    /// Bounded helper JSON body with page-provided now-playing metadata.
+    pub body: String,
+}
+
+impl std::fmt::Debug for MediaMetadataStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaMetadataStatus")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// A page-initiated request to open a new window/tab (window.open, target=_blank).
 /// The helper cancels the native popup; the shell opens the URL as a regular tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +301,8 @@ pub struct WebSession {
     /// The page is currently producing audio (Chromium's audible state). Drives the
     /// tab-strip 🔊 indicator. Independent of mute — a muted-but-playing tab stays true.
     audible: bool,
+    /// Latest bounded page/media-session now-playing metadata observed by the helper.
+    media_metadata: Option<MediaMetadataStatus>,
     /// The latest engine-fetched favicon (PNG bytes), if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     favicon: Option<Vec<u8>>,
@@ -358,6 +376,7 @@ impl WebSession {
             cursor: CursorKind::default(),
             fullscreen: false,
             audible: false,
+            media_metadata: None,
             favicon: None,
             find_result: None,
             cert_error: None,
@@ -627,6 +646,10 @@ impl WebSession {
             EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
             EventMsg::AudioState { audible } => self.audible = audible,
+            EventMsg::MediaMetadata { body } => {
+                let body = body.trim().to_owned();
+                self.media_metadata = (!body.is_empty()).then_some(MediaMetadataStatus { body });
+            }
             EventMsg::PermissionRequest { id, kind, origin } => {
                 if self.pending_permissions.len() >= MAX_PENDING_PERMISSIONS {
                     // Overflow: deny the oldest so the engine releases its held CEF
@@ -786,6 +809,12 @@ impl WebSession {
     #[must_use]
     pub const fn audible(&self) -> bool {
         self.audible
+    }
+
+    /// Latest page/media-session now-playing metadata observed by the helper.
+    #[must_use]
+    pub const fn media_metadata(&self) -> Option<&MediaMetadataStatus> {
+        self.media_metadata.as_ref()
     }
 
     /// The latest engine-fetched favicon as PNG bytes, if the page reported one.
@@ -1463,6 +1492,46 @@ mod tests {
         send_event(&peer, &EventMsg::AudioState { audible: false });
         session.poll();
         assert!(!session.audible(), "an audio stream stop clears it");
+    }
+
+    #[test]
+    fn media_metadata_event_folds_to_the_latest_body() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.media_metadata().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: r#"{"title":"First"}"#.to_owned(),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.media_metadata().map(|m| m.body.as_str()),
+            Some(r#"{"title":"First"}"#)
+        );
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: r#"{"title":"Second","paused":false}"#.to_owned(),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.media_metadata().map(|m| m.body.as_str()),
+            Some(r#"{"title":"Second","paused":false}"#)
+        );
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: "   ".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.media_metadata().is_none());
     }
 
     #[test]

@@ -1494,6 +1494,16 @@ pub enum EventMsg {
         /// but consumers must ignore that untrusted page-supplied field).
         body: String,
     },
+    /// Bounded page/media-session now-playing metadata observed by the helper.
+    ///
+    /// The body is a UTF-8 JSON object with conservative public media fields such
+    /// as `title`, `artist`, `album`, `source_url`, `paused`, `duration_ms`, and
+    /// `position_ms`. The shell treats it as page-provided display metadata, not
+    /// trusted control input.
+    MediaMetadata {
+        /// Bounded JSON body with now-playing metadata.
+        body: String,
+    },
 }
 
 impl std::fmt::Debug for EventMsg {
@@ -1628,6 +1638,11 @@ impl std::fmt::Debug for EventMsg {
             Self::LoginSubmitted { origin, body } => f
                 .debug_struct("LoginSubmitted")
                 .field("origin", origin)
+                .field("body", &REDACTED)
+                .field("bytes", &body.len())
+                .finish(),
+            Self::MediaMetadata { body } => f
+                .debug_struct("MediaMetadata")
                 .field("body", &REDACTED)
                 .field("bytes", &body.len())
                 .finish(),
@@ -1768,6 +1783,10 @@ impl EventMsg {
                 put_str(&mut out, origin);
                 put_str(&mut out, body);
             }
+            Self::MediaMetadata { body } => {
+                out.push(23);
+                put_str(&mut out, body);
+            }
             Self::BeforeUnloadDialog {
                 id,
                 message,
@@ -1877,6 +1896,7 @@ impl EventMsg {
                 origin: c.string()?,
                 body: c.string()?,
             },
+            23 => Self::MediaMetadata { body: c.string()? },
             t => return Err(WireError::BadTag(t)),
         };
         c.finish()?;
@@ -2365,6 +2385,9 @@ mod tests {
             kind: 5,
             origin: "https://meet.example".to_owned(),
         });
+        round_event(&EventMsg::MediaMetadata {
+            body: r#"{"title":"Song","artist":"Artist","paused":false}"#.to_owned(),
+        });
         // Unknown wire bytes decode to the default cursor, never an error.
         assert_eq!(CursorKind::from_u8(200), CursorKind::Default);
     }
@@ -2455,6 +2478,15 @@ mod tests {
             }
         );
         assert!(!before_unload.contains("private unload text"));
+
+        let media_metadata = format!(
+            "{:?}",
+            EventMsg::MediaMetadata {
+                body: r#"{"title":"private track","artist":"private artist"}"#.to_owned(),
+            }
+        );
+        assert!(!media_metadata.contains("private track"));
+        assert!(!media_metadata.contains("private artist"));
     }
 
     #[test]

@@ -1429,6 +1429,38 @@ fn media_transport_script_covers_page_media_actions() {
 }
 
 #[test]
+fn media_metadata_beacon_script_is_bounded_and_decodable() {
+    let script = media_metadata_beacon_script();
+    assert!(script.contains("navigator.mediaSession"));
+    assert!(script.contains("querySelectorAll('audio,video')"));
+    assert!(script.contains("duration_ms"));
+    assert!(script.contains("position_ms"));
+    assert!(script.contains("__mdeMediaMetadataLast"));
+    assert!(script.contains(CEF_MEDIA_METADATA_BEACON_PREFIX));
+    assert!(script.contains("encodeURIComponent(body)"));
+    assert!(script.contains("publish('')"));
+    assert!(
+        !script.contains("</script>"),
+        "media metadata is injected as bounded script text only"
+    );
+
+    let body = decode_media_metadata_beacon(
+        "https://mde-media.invalid/metadata/?body=%7B%22title%22%3A%22Track%22%2C%22paused%22%3Afalse%7D",
+    )
+    .expect("media metadata beacon");
+    assert_eq!(body, r#"{"title":"Track","paused":false}"#);
+    assert_eq!(
+        decode_media_metadata_beacon("https://mde-media.invalid/metadata/?body=not-json"),
+        None
+    );
+    assert_eq!(
+        decode_media_metadata_beacon("https://mde-media.invalid/metadata/?body="),
+        Some(String::new())
+    );
+    assert_eq!(decode_media_metadata_beacon("https://example.com/"), None);
+}
+
+#[test]
 fn autoplay_block_control_is_remembered_for_navigation_reinjection() {
     let callbacks = CefBrowserCallbacks::new(
         320,
@@ -2493,6 +2525,50 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
         EventMsg::PageText {
             id: 77,
             text: "hello page".to_owned(),
+        }
+    );
+    assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn media_metadata_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let cef_callback = TestCefCallback::new();
+    let rv = callbacks.state.begin_resource_request(
+        "https://mde-media.invalid/metadata/?body=%7B%22title%22%3A%22Track%22%2C%22artist%22%3A%22Artist%22%7D".to_owned(),
+        cef_callback.as_mut_ptr(),
+    );
+    assert_eq!(rv, RV_CANCEL);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("media metadata recv") else {
+        panic!("expected media metadata")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::MediaMetadata {
+            body: r#"{"title":"Track","artist":"Artist"}"#.to_owned(),
         }
     );
     assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);

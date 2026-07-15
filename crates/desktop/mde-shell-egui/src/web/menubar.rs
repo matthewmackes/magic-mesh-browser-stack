@@ -8,9 +8,9 @@
 //! MENUBAR-SWEEP tests and any caller that explicitly wants the shared bar.
 
 use super::{
-    bookmark_add_body, chat_share_body, local_hostname, publish, publish_browser_send_tab,
-    publish_browser_share, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
-    BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
+    bookmark_add_body, chat_share_body, local_hostname, media_metadata_chip_label, publish,
+    publish_browser_send_tab, publish_browser_share, BrowserEngine, BrowserPasskeyStatus,
+    BrowserReadAloudStatus, BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
     BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
     DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
     ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
@@ -231,6 +231,8 @@ struct Snapshot {
     power_mode: bool,
     /// Active tab audio is muted.
     audio_muted: bool,
+    /// Active tab now-playing label extracted from page/media-session metadata.
+    media_metadata_chip: Option<String>,
     /// Active tab blocks page-initiated autoplay until user activation.
     autoplay_blocked: bool,
     /// Active tab force-dark styling is enabled.
@@ -331,6 +333,10 @@ fn snapshot(state: &WebState) -> Snapshot {
                 total_downloads,
                 power_mode: state.power_mode,
                 audio_muted: tab.muted,
+                media_metadata_chip: tab
+                    .session
+                    .media_metadata()
+                    .and_then(|metadata| media_metadata_chip_label(&metadata.body)),
                 autoplay_blocked: tab.autoplay_blocked,
                 force_dark: tab.force_dark,
                 reader_mode: tab.reader_mode,
@@ -964,6 +970,9 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
     if s.has_tab && s.audio_muted {
         chips.push(StatusChip::new("Muted", ChipTone::Warn));
     }
+    if let Some(label) = &s.media_metadata_chip {
+        chips.push(StatusChip::new(label, ChipTone::Info));
+    }
     if s.has_tab && s.autoplay_blocked {
         chips.push(StatusChip::new("Autoplay", ChipTone::Warn));
     }
@@ -1401,6 +1410,7 @@ mod tests {
             total_downloads: 0,
             power_mode: false,
             audio_muted: false,
+            media_metadata_chip: None,
             autoplay_blocked: false,
             force_dark: false,
             reader_mode: false,
@@ -2329,6 +2339,19 @@ mod tests {
         assert!(texts.contains(&"Live"), "the lifecycle chip is present");
         assert!(texts.contains(&"https"), "the security chip is present");
         assert!(texts.contains(&"3"), "the ad-filter shield shows the count");
+    }
+
+    #[test]
+    fn the_status_cluster_surfaces_now_playing_metadata() {
+        let playing = Snapshot {
+            media_metadata_chip: Some("Now: Track - Artist".to_owned()),
+            ..https_page()
+        };
+        let chips = build_status(&playing);
+
+        assert!(chips
+            .iter()
+            .any(|c| { c.text == "Now: Track - Artist" && c.tone == ChipTone::Info }));
     }
 
     #[test]

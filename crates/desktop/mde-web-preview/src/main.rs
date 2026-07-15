@@ -49,6 +49,9 @@ const FIRST_FRAME_WATCHDOG: Duration = Duration::from_millis(750);
 
 /// Cadence for draining the in-page WebAuthn/passkey bridge.
 const PASSKEY_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence for reading page/media-session now-playing metadata. The script
+/// dedupes in-page before returning a body, so unchanged pages stay quiet.
+const MEDIA_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// The session socket the shell hands the `tab` child as its stdin (fd 0) — see
 /// `mde-web-preview-client`'s `WebSession::spawn`.
@@ -165,6 +168,9 @@ fn run_tab(args: &[String]) -> Result<()> {
     let mut last_passkey_poll = Instant::now()
         .checked_sub(PASSKEY_BRIDGE_POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut last_media_metadata_poll = Instant::now()
+        .checked_sub(MEDIA_METADATA_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         // (a) Apply every pending control frame the shell sent.
         match sock::recv(&socket) {
@@ -199,6 +205,15 @@ fn run_tab(args: &[String]) -> Result<()> {
                 });
             }
             last_passkey_poll = Instant::now();
+        }
+
+        if last_media_metadata_poll.elapsed() >= MEDIA_METADATA_POLL_INTERVAL {
+            if let Ok(socket) = socket.try_clone() {
+                engine.poll_media_metadata(move |body| {
+                    let _ = sock::send_frame(&socket, &EventMsg::MediaMetadata { body }.encode());
+                });
+            }
+            last_media_metadata_poll = Instant::now();
         }
 
         // (c) First-frame watchdog: if nothing has been delivered yet and the grace

@@ -67,8 +67,8 @@ pub use filter::{
 pub use frame::{FrameReader, FrameSnapshot, PixelFormat, ReaderError};
 pub use input::map_event;
 pub use session::{
-    BeforeUnloadDialog, CertError, JsDialog, LoginCaptureStatus, NavState, PasskeyRequestStatus,
-    PermissionRequest, ResourceRequestStatus, SessionState, WebSession,
+    BeforeUnloadDialog, CertError, JsDialog, LoginCaptureStatus, MediaMetadataStatus, NavState,
+    PasskeyRequestStatus, PermissionRequest, ResourceRequestStatus, SessionState, WebSession,
 };
 pub use wire::{
     ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, MediaTransportAction, WireError,

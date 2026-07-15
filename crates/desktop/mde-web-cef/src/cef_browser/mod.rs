@@ -286,6 +286,8 @@ const CEF_PAGE_SCRAPE_BEACON_PREFIX: &str = "https://mde-page-scrape.invalid/cap
 const CEF_PAGE_SCRAPE_BEACON_MAX_BYTES: usize = 32 * 1024;
 const CEF_PASSKEY_BEACON_PREFIX: &str = "https://mde-passkey.invalid/request/";
 const CEF_PASSKEY_BEACON_MAX_BYTES: usize = 8 * 1024;
+const CEF_MEDIA_METADATA_BEACON_PREFIX: &str = "https://mde-media.invalid/metadata/";
+const CEF_MEDIA_METADATA_BEACON_MAX_BYTES: usize = 8 * 1024;
 /// Login-capture beacon: the page-side [`scripts::login_capture_script`] posts a
 /// submitted login's JSON here; the resource-request handler intercepts + cancels it
 /// (never hits the network — creds stay in the sandbox), mirroring the passkey beacon.
@@ -873,6 +875,9 @@ const SHIM_SETTLE: Duration = Duration::from_millis(1000);
 /// request native must pick up), so a lightweight drain keeps running — but it no
 /// longer recompiles the multi-KB bridge shim on every tick.
 const PASSKEY_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence for now-playing metadata probes. The script dedupes in-page before
+/// beaconing, so an unchanged media page remains quiet while this poll runs.
+const MEDIA_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Emergency/privacy override: when set to `1`/`true`/`yes`/`on`, CEF keeps the
 /// legacy best-effort JS WebRTC block. The operational default is enabled WebRTC
 /// with CEF's real IP-handling policy plus the native media permission callback.
@@ -1028,6 +1033,9 @@ pub fn run_windowless_tab(
     let mut shims = ShimInjector::new();
     let mut last_nav = callbacks.navigations();
     let mut last_passkey_drain = Instant::now();
+    let mut last_media_metadata_poll = Instant::now()
+        .checked_sub(MEDIA_METADATA_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     // perf-6: adaptive pump. `last_activity` tracks the last paint / control
     // frame / navigation so the pump runs fast while the tab is active and backs
@@ -1086,6 +1094,10 @@ pub fn run_windowless_tab(
         if last_passkey_drain.elapsed() >= PASSKEY_DRAIN_INTERVAL {
             poll_passkey_drain(browser);
             last_passkey_drain = now;
+        }
+        if last_media_metadata_poll.elapsed() >= MEDIA_METADATA_POLL_INTERVAL {
+            poll_media_metadata(browser);
+            last_media_metadata_poll = now;
         }
 
         if awaiting_first_paint && started.elapsed() > Duration::from_secs(15) {
@@ -2261,6 +2273,18 @@ impl CefBrowserState {
         });
     }
 
+    /// Forward bounded page/media-session now-playing metadata to the shell.
+    fn publish_media_metadata(&self, body: String) {
+        let event = EventMsg::MediaMetadata {
+            body: clamp_utf8(&body, CEF_MEDIA_METADATA_BEACON_MAX_BYTES),
+        };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
     /// Forward an engine-decoded favicon (PNG bytes) to the shell, which uploads
     /// it as the tab-strip icon.
     fn publish_favicon(&self, png: Vec<u8>) {
@@ -2377,6 +2401,13 @@ impl CefBrowserState {
         }
         if let Some(body) = decode_passkey_beacon(&url) {
             self.publish_passkey_request(body);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
+        if let Some(body) = decode_media_metadata_beacon(&url) {
+            self.publish_media_metadata(body);
             if !callback.is_null() {
                 cancel_cef_callback(callback);
             }
@@ -5128,6 +5159,13 @@ fn poll_passkey_drain(browser: *mut c_void) {
     execute_java_script(frame, passkey_drain_script());
 }
 
+fn poll_media_metadata(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &media_metadata_beacon_script());
+}
+
 fn complete_passkey(browser: *mut c_void, body: &str) {
     let Some(frame) = main_frame(browser) else {
         return;
@@ -5291,6 +5329,20 @@ fn decode_passkey_beacon(url: &str) -> Option<String> {
         .find_map(|pair| pair.strip_prefix("body="))
         .unwrap_or_default();
     let body = clamp_utf8(&percent_decode(body), CEF_PASSKEY_BEACON_MAX_BYTES);
+    body.trim_start().starts_with('{').then_some(body)
+}
+
+fn decode_media_metadata_beacon(url: &str) -> Option<String> {
+    let query = url.strip_prefix(CEF_MEDIA_METADATA_BEACON_PREFIX)?;
+    let query = query.strip_prefix('?').unwrap_or(query);
+    let body = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("body="))
+        .unwrap_or_default();
+    let body = clamp_utf8(&percent_decode(body), CEF_MEDIA_METADATA_BEACON_MAX_BYTES);
+    if body.is_empty() {
+        return Some(body);
+    }
     body.trim_start().starts_with('{').then_some(body)
 }
 

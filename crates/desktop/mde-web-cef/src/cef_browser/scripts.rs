@@ -125,6 +125,40 @@ pub(super) fn media_transport_script(action: MediaTransportAction) -> String {
     )
 }
 
+pub(super) fn media_metadata_beacon_script() -> String {
+    format!(
+        r#"(function(){{try{{
+function trim(v,n){{v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?v.slice(0,n):v;}}
+function has(v){{return trim(v,2048).length>0;}}
+function meta(sel){{try{{var el=document.querySelector(sel);return el?(el.content||el.getAttribute('content')||''):'';}}catch(_e){{return '';}}}}
+function ms(v){{v=Number(v);return isFinite(v)&&v>0?Math.round(v*1000):0;}}
+var list=[];
+try{{list=[].slice.call(document.querySelectorAll('audio,video'));}}catch(_e){{}}
+var media=list.find(function(el){{return !el.paused&&!el.ended;}})||list.find(function(el){{return !el.ended&&(el.currentTime>0||el.readyState>0||el.currentSrc||el.src);}})||null;
+var md={{}};
+try{{md=(navigator.mediaSession&&navigator.mediaSession.metadata)||{{}};}}catch(_e){{md={{}};}}
+var artwork='';
+try{{if(md.artwork&&md.artwork.length)artwork=md.artwork[0].src||'';}}catch(_e){{}}
+var hasSession=has(md.title)||has(md.artist)||has(md.album)||has(artwork);
+function publish(body){{if(body===window.__mdeMediaMetadataLast)return;window.__mdeMediaMetadataLast=body;var url='{prefix}?body='+encodeURIComponent(body);try{{if(window.fetch)fetch(url,{{mode:'no-cors',cache:'no-store',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=url;(document.body||document.documentElement).appendChild(img);}}catch(_e){{}}}}
+if(!media&&!hasSession){{publish('');return;}}
+var source=media?(media.currentSrc||media.src||''):'';
+var body=JSON.stringify({{
+  title:trim(md.title||meta('meta[property="og:title"]')||meta('meta[name="twitter:title"]')||document.title||'',160),
+  artist:trim(md.artist||meta('meta[name="author"]')||'',160),
+  album:trim(md.album||'',160),
+  artwork_url:trim(artwork||meta('meta[property="og:image"]')||meta('meta[name="twitter:image"]')||'',2048),
+  source_url:trim(source||location.href||'',2048),
+  paused:media?!!media.paused:true,
+  duration_ms:ms(media&&media.duration),
+  position_ms:ms(media&&media.currentTime)
+}});
+publish(body);
+}}catch(_e){{}}}})();"#,
+        prefix = CEF_MEDIA_METADATA_BEACON_PREFIX
+    )
+}
+
 pub(super) fn user_agent_override_script(user_agent: &str) -> String {
     if user_agent.trim().is_empty() {
         return "(function(){delete window.__mdeUserAgentOverride;})();".to_owned();

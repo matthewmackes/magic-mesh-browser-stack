@@ -7310,6 +7310,11 @@ fn tab_hover(tab: &Tab) -> String {
         target => format!(" - Display target: {}", target.label()),
     };
     let audio = if tab.muted { " - Muted" } else { "" };
+    let now_playing = tab
+        .session
+        .media_metadata()
+        .and_then(|metadata| media_metadata_chip_label(&metadata.body))
+        .map_or_else(String::new, |label| format!(" - {label}"));
     let autoplay = if tab.autoplay_blocked {
         " - Autoplay blocked"
     } else {
@@ -7332,11 +7337,11 @@ fn tab_hover(tab: &Tab) -> String {
     };
     if url.is_empty() {
         format!(
-            "{state}{container}{display}{audio}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     } else {
         format!(
-            "{state} - {url}{container}{display}{audio}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+            "{state} - {url}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
         )
     }
 }
@@ -7457,6 +7462,32 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn media_metadata_chip_label(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            value
+                .get("source_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })?;
+    let artist = value
+        .get("artist")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let label = artist.map_or_else(
+        || format!("Now: {title}"),
+        |artist| format!("Now: {title} - {artist}"),
+    );
+    Some(ellipsize(&label, 32))
 }
 
 /// The crash reason string for a session, or empty if it has not crashed.
@@ -13827,6 +13858,23 @@ mod tests {
             audio_glyph_for(true, true),
             Some(("\u{1F507}", "Unmute tab"))
         );
+    }
+
+    #[test]
+    fn media_metadata_chip_label_uses_title_artist_and_source_fallbacks() {
+        assert_eq!(
+            media_metadata_chip_label(r#"{"title":" Track ","artist":" Artist "}"#).as_deref(),
+            Some("Now: Track - Artist")
+        );
+        assert_eq!(
+            media_metadata_chip_label(
+                r#"{"title":"","source_url":"https://media.example/song.mp3"}"#
+            )
+            .as_deref(),
+            Some("Now: https://media.example/song…")
+        );
+        assert_eq!(media_metadata_chip_label(r#"{"title":"   "}"#), None);
+        assert_eq!(media_metadata_chip_label("not-json"), None);
     }
 
     #[test]
