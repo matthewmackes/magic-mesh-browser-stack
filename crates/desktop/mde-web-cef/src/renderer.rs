@@ -25,8 +25,9 @@ use mde_web_cef::{
     cef_init::{CefInitPaths, CefMainArgs, CefSettingsOwned},
     detect_extension_registry, extension_power_mode_enabled, CefExtensionRegistry,
     CEF_BRIDGE_EXTENSIONS_ENV, CEF_BRIDGE_EXTENSION_REGISTRY_ENV, CEF_BRIDGE_LIBCEF_ENV,
-    CEF_BRIDGE_RELEASE_ENV, CEF_BRIDGE_RESOURCES_ENV, CEF_BRIDGE_ROOT_ENV, CEF_ICU_DATA,
-    CEF_RESOURCES_PAK,
+    CEF_BRIDGE_RELEASE_ENV, CEF_BRIDGE_RESOURCES_ENV, CEF_BRIDGE_ROOT_ENV,
+    CEF_BRIDGE_WIDEVINE_LIB_ENV, CEF_BRIDGE_WIDEVINE_ROOT_ENV, CEF_ICU_DATA, CEF_RESOURCES_PAK,
+    WIDEVINE_LIB_NAME,
 };
 
 const CEF_INITIALIZE_PROBE_ENV: &str = "MDE_CEF_INITIALIZE_PROBE";
@@ -35,6 +36,8 @@ const CEF_TEXT_PROBE_EXPECT_ENV: &str = "MDE_CEF_TEXT_PROBE_EXPECT";
 const CEF_ATTACH_STDIN_ENV: &str = "MDE_CEF_ATTACH_STDIN";
 const CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV: &str = "MDE_CEF_ALLOW_ALLOY_EXTENSION_SMOKE";
 const SESSION_SOCKET_FD: i32 = 0;
+const WIDEVINE_ACTIVE_ROOT: &str = "/opt/mde/widevine";
+const WIDEVINE_INSTALL_PARENT: &str = "/opt/mde/widevine-cdms";
 const CEF_PRIVATE_HOME: &str = "/tmp/mde-web-cef/home";
 const CEF_PRIVATE_CACHE_HOME: &str = "/tmp/mde-web-cef/cache";
 const CEF_PRIVATE_CONFIG_HOME: &str = "/tmp/mde-web-cef/config";
@@ -62,6 +65,9 @@ fn main() -> ExitCode {
         contract.resources_dir.display(),
         contract.extensions.len()
     );
+    if let Some(line) = contract.widevine_status_line() {
+        println!("{line}");
+    }
 
     // security-1: confine THIS (top-level CEF browser) process BEFORE it dlopens
     // libcef.so or touches a single line of web content. The OS sandbox
@@ -249,7 +255,12 @@ fn main() -> ExitCode {
 /// becomes a signal-forwarding supervisor that never returns. A failure is fatal
 /// — the caller must never run web content unconfined.
 fn apply_os_sandbox(contract: &BridgeContract, bridge_exe: &Path) -> Result<(), String> {
-    let binds = cef_extra_readonly_binds(&contract.root, &contract.extensions, bridge_exe);
+    let binds = cef_extra_readonly_binds(
+        &contract.root,
+        contract.widevine_root.as_deref(),
+        &contract.extensions,
+        bridge_exe,
+    );
     let policy = SandboxPolicy::web_cef();
     mde_web_sandbox::apply_with_binds(policy, &binds).map_err(|err| format!("{err:#}"))?;
     // Observable on the seat (stdout/journal) for live confinement verification.
@@ -327,22 +338,27 @@ fn install_private_desktop_runtime_env(env: &PrivateDesktopRuntimeEnv) {
 
 /// The extra read-only paths the CEF browser tree needs visible after
 /// `pivot_root`: the vendored CEF runtime root (`/opt/mde/cef` — its `Release/`
-/// libcef.so + `Resources/`) plus any vetted unpacked extension dirs. Production's
-/// subprocess bridge binary lives under `/usr/libexec`, already covered by the
-/// sandbox's `/usr` bind; non-`/usr` developer/farm bridge overrides are exposed
-/// as exactly that one read-only executable file so Chromium subprocess `execvp`
-/// still works after the rootfs pivot.
+/// libcef.so + `Resources/`), the optional Widevine CDM root after the helper has
+/// validated it, plus any vetted unpacked extension dirs. Production's subprocess
+/// bridge binary lives under `/usr/libexec`, already covered by the sandbox's
+/// `/usr` bind; non-`/usr` developer/farm bridge overrides are exposed as exactly
+/// that one read-only executable file so Chromium subprocess `execvp` still works
+/// after the rootfs pivot.
 ///
 /// SECURITY INVARIANT: this list is ENGINE RUNTIME + vetted extensions only —
 /// never a `$HOME`/SSH/Nebula/mesh path. Enforced by the unit tests below; the
 /// shared sandbox binds each entry read-only.
 fn cef_extra_readonly_binds(
     root: &Path,
+    widevine_root: Option<&Path>,
     extensions: &[PathBuf],
     bridge_exe: &Path,
 ) -> Vec<PathBuf> {
-    let mut binds = Vec::with_capacity(2 + extensions.len());
+    let mut binds = Vec::with_capacity(3 + extensions.len());
     binds.push(root.to_path_buf());
+    if let Some(widevine_root) = widevine_root {
+        binds.push(widevine_root.to_path_buf());
+    }
     binds.extend(extensions.iter().cloned());
     if bridge_exe.is_absolute() && !bridge_exe.starts_with("/usr") {
         binds.push(bridge_exe.to_path_buf());
@@ -371,6 +387,8 @@ struct BridgeContract {
     libcef: PathBuf,
     release_dir: PathBuf,
     resources_dir: PathBuf,
+    widevine_root: Option<PathBuf>,
+    widevine_lib: Option<PathBuf>,
     extensions: Vec<PathBuf>,
     extension_registry: Option<PathBuf>,
     extension_power_mode: bool,
@@ -383,6 +401,8 @@ impl BridgeContract {
             libcef: env_path(CEF_BRIDGE_LIBCEF_ENV)?,
             release_dir: env_path(CEF_BRIDGE_RELEASE_ENV)?,
             resources_dir: env_path(CEF_BRIDGE_RESOURCES_ENV)?,
+            widevine_root: env_path(CEF_BRIDGE_WIDEVINE_ROOT_ENV),
+            widevine_lib: env_path(CEF_BRIDGE_WIDEVINE_LIB_ENV),
             extensions: env_paths(CEF_BRIDGE_EXTENSIONS_ENV),
             extension_registry: env_path(CEF_BRIDGE_EXTENSION_REGISTRY_ENV),
             extension_power_mode: extension_power_mode_enabled(),
@@ -416,7 +436,57 @@ impl BridgeContract {
                 return Err(format!("extension directory {} missing", path.display()));
             }
         }
+        self.validate_widevine()?;
         self.validate_extension_registry()
+    }
+
+    fn widevine_status_line(&self) -> Option<String> {
+        let (Some(root), Some(lib)) = (&self.widevine_root, &self.widevine_lib) else {
+            return None;
+        };
+        Some(format!(
+            "WIDEVINE_BRIDGE_READY root={} lib={}",
+            root.display(),
+            lib.display()
+        ))
+    }
+
+    fn validate_widevine(&self) -> Result<(), String> {
+        match (&self.widevine_root, &self.widevine_lib) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(format!(
+                "{CEF_BRIDGE_WIDEVINE_LIB_ENV} missing for Widevine handoff"
+            )),
+            (None, Some(_)) => Err(format!(
+                "{CEF_BRIDGE_WIDEVINE_ROOT_ENV} missing for Widevine handoff"
+            )),
+            (Some(root), Some(lib)) => {
+                validate_widevine_bind_root_path(root)?;
+                if !root.is_dir() {
+                    return Err(format!(
+                        "Widevine root {} is not a directory",
+                        root.display()
+                    ));
+                }
+                if !lib.is_file() {
+                    return Err(format!("Widevine library {} is not a file", lib.display()));
+                }
+                if !lib.starts_with(root) {
+                    return Err(format!(
+                        "Widevine library {} is outside root {}",
+                        lib.display(),
+                        root.display()
+                    ));
+                }
+                if lib.file_name().and_then(|name| name.to_str()) != Some(WIDEVINE_LIB_NAME) {
+                    return Err(format!(
+                        "Widevine library {} must be named {WIDEVINE_LIB_NAME}",
+                        lib.display()
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn validate_extension_registry(&self) -> Result<(), String> {
@@ -450,6 +520,34 @@ impl BridgeContract {
         }
         Ok(())
     }
+}
+
+fn validate_widevine_bind_root_path(root: &Path) -> Result<(), String> {
+    if !root.is_absolute() {
+        return Err(format!("Widevine root {} must be absolute", root.display()));
+    }
+    for prefix in ["/home", "/root", "/tmp", "/var", "/run", "/mnt"] {
+        if root.starts_with(prefix) {
+            return Err(format!(
+                "Widevine root {} is under {prefix}; use {} or a versioned root under {}",
+                root.display(),
+                WIDEVINE_ACTIVE_ROOT,
+                WIDEVINE_INSTALL_PARENT
+            ));
+        }
+    }
+    if !cfg!(test)
+        && root != Path::new(WIDEVINE_ACTIVE_ROOT)
+        && !root.starts_with(WIDEVINE_INSTALL_PARENT)
+    {
+        return Err(format!(
+            "Widevine root {} is outside the installed CDM roots {} or {}",
+            root.display(),
+            WIDEVINE_ACTIVE_ROOT,
+            WIDEVINE_INSTALL_PARENT
+        ));
+    }
+    Ok(())
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -579,6 +677,8 @@ mod tests {
             &root,
             &release,
             &resources,
+            None,
+            None,
             Some(registry.clone()),
             true,
             vec![lastpass.clone()],
@@ -589,6 +689,8 @@ mod tests {
             &root,
             &release,
             &resources,
+            None,
+            None,
             Some(registry.clone()),
             false,
             vec![lastpass],
@@ -603,6 +705,8 @@ mod tests {
             &release,
             &resources,
             None,
+            None,
+            None,
             true,
             vec![forged.clone()],
         );
@@ -615,6 +719,8 @@ mod tests {
             &root,
             &release,
             &resources,
+            None,
+            None,
             Some(registry),
             true,
             vec![forged],
@@ -628,21 +734,134 @@ mod tests {
     }
 
     #[test]
+    fn bridge_contract_validates_widevine_handoff_before_cef_starts() {
+        let root = temp_root_under_dev_shm("mde-cef-bridge-widevine");
+        let release = root.join("Release");
+        let resources = root.join("Resources");
+        let widevine = root.join("widevine");
+        fs::create_dir_all(&release).expect("release dir");
+        fs::create_dir_all(&resources).expect("resources dir");
+        fs::create_dir_all(&widevine).expect("widevine dir");
+        fs::write(release.join("libcef.so"), b"fake cef").expect("libcef");
+        fs::write(resources.join(CEF_ICU_DATA), b"icu").expect("icu");
+        fs::write(resources.join(CEF_RESOURCES_PAK), b"pak").expect("pak");
+        let widevine_lib = widevine.join(WIDEVINE_LIB_NAME);
+        fs::write(&widevine_lib, b"widevine").expect("widevine lib");
+
+        let valid = contract(
+            &root,
+            &release,
+            &resources,
+            Some(widevine.clone()),
+            Some(widevine_lib.clone()),
+            None,
+            false,
+            Vec::new(),
+        );
+        valid.validate().expect("valid Widevine handoff");
+        let line = valid.widevine_status_line().expect("widevine status");
+        assert!(line.contains("WIDEVINE_BRIDGE_READY"));
+        assert!(line.contains(&widevine.display().to_string()));
+        assert!(line.contains(&widevine_lib.display().to_string()));
+
+        let missing_lib = contract(
+            &root,
+            &release,
+            &resources,
+            Some(widevine.clone()),
+            None,
+            None,
+            false,
+            Vec::new(),
+        );
+        let err = missing_lib
+            .validate()
+            .expect_err("missing CDM lib rejected");
+        assert!(err.contains(CEF_BRIDGE_WIDEVINE_LIB_ENV), "{err}");
+
+        let outside_lib = contract(
+            &root,
+            &release,
+            &resources,
+            Some(widevine.clone()),
+            Some(release.join(WIDEVINE_LIB_NAME)),
+            None,
+            false,
+            Vec::new(),
+        );
+        fs::write(release.join(WIDEVINE_LIB_NAME), b"widevine").expect("outside widevine lib");
+        let err = outside_lib
+            .validate()
+            .expect_err("CDM lib outside declared root rejected");
+        assert!(err.contains("outside root"), "{err}");
+
+        let wrong_name = widevine.join("libnotwidevine.so");
+        fs::write(&wrong_name, b"widevine").expect("wrong widevine lib");
+        let wrong_name_contract = contract(
+            &root,
+            &release,
+            &resources,
+            Some(widevine),
+            Some(wrong_name),
+            None,
+            false,
+            Vec::new(),
+        );
+        let err = wrong_name_contract
+            .validate()
+            .expect_err("wrong CDM library name rejected");
+        assert!(err.contains(WIDEVINE_LIB_NAME), "{err}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn widevine_bind_root_policy_rejects_sandbox_replaced_or_private_paths() {
+        assert!(validate_widevine_bind_root_path(Path::new(WIDEVINE_ACTIVE_ROOT)).is_ok());
+        assert!(
+            validate_widevine_bind_root_path(Path::new("/opt/mde/widevine-cdms/4.10.2830.0"))
+                .is_ok()
+        );
+
+        for path in [
+            "/tmp/mde-widevine-fake",
+            "/home/mm/widevine",
+            "/root/widevine",
+            "/var/cache/magic-mesh/widevine",
+            "/mnt/mesh-storage/browser/widevine",
+        ] {
+            let err = validate_widevine_bind_root_path(Path::new(path))
+                .expect_err("private or sandbox-replaced root rejected");
+            assert!(err.contains("use /opt/mde/widevine"), "{err}");
+        }
+
+        let err = validate_widevine_bind_root_path(Path::new("relative-widevine"))
+            .expect_err("relative root rejected");
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
     fn cef_extra_binds_expose_the_runtime_and_extensions_never_keys() {
         // security-1: the extra RO binds the CEF browser gets inside its confined
-        // rootfs are the vendored runtime, vetted extensions, and the exact
-        // renderer bridge executable when a farm/dev override is outside /usr.
-        // The sandbox must expose no broad home/keys/mesh path even here.
+        // rootfs are the vendored runtime, optional Widevine root, vetted
+        // extensions, and the exact renderer bridge executable when a farm/dev
+        // override is outside /usr. The sandbox must expose no broad
+        // home/keys/mesh path even here.
         let root = PathBuf::from("/opt/mde/cef");
+        let widevine = PathBuf::from("/opt/mde/widevine");
         let exts = vec![
             PathBuf::from("/mnt/mesh-storage/browser/extensions/ublock-origin"),
             PathBuf::from("/mnt/mesh-storage/browser/extensions/lastpass"),
         ];
         let bridge = PathBuf::from("/home/mm/magic-mesh/target/debug/mde-web-cef-renderer");
-        let binds = cef_extra_readonly_binds(&root, &exts, &bridge);
+        let binds = cef_extra_readonly_binds(&root, Some(&widevine), &exts, &bridge);
         assert!(
             binds.contains(&PathBuf::from("/opt/mde/cef")),
             "runtime root"
+        );
+        assert!(
+            binds.contains(&PathBuf::from("/opt/mde/widevine")),
+            "Widevine root"
         );
         assert!(binds.contains(&exts[0]));
         assert!(binds.contains(&exts[1]));
@@ -669,6 +888,7 @@ mod tests {
     fn cef_extra_binds_default_to_runtime_root_for_packaged_bridge() {
         let binds = cef_extra_readonly_binds(
             &PathBuf::from("/opt/mde/cef"),
+            None,
             &[],
             &PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer"),
         );
@@ -772,6 +992,8 @@ mod tests {
         root: &PathBuf,
         release: &PathBuf,
         resources: &PathBuf,
+        widevine_root: Option<PathBuf>,
+        widevine_lib: Option<PathBuf>,
         extension_registry: Option<PathBuf>,
         extension_power_mode: bool,
         extensions: Vec<PathBuf>,
@@ -781,6 +1003,8 @@ mod tests {
             libcef: release.join("libcef.so"),
             release_dir: release.clone(),
             resources_dir: resources.clone(),
+            widevine_root,
+            widevine_lib,
             extensions,
             extension_registry,
             extension_power_mode,
@@ -808,5 +1032,13 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn temp_root_under_dev_shm(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        PathBuf::from("/dev/shm").join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }
