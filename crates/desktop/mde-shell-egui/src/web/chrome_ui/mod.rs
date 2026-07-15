@@ -615,6 +615,315 @@ pub(super) fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: boo
     .clicked()
 }
 
+/// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
+/// the active session; the address bar loads on submit. On a crashed tab, Reload
+/// becomes a respawn request. The page-actions menu (BOOKMARKS-10) hangs off both
+/// the toolbar star button and the address bar's right-click.
+pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
+    let crashed = state
+        .tabs
+        .get(state.active)
+        .is_some_and(|t| t.session.is_crashed());
+    let nav = state
+        .tabs
+        .get(state.active)
+        .map(|t| t.session.nav().clone())
+        .unwrap_or_default();
+    let active_engine = state.tabs.get(state.active).map(|t| t.engine);
+    let has_tab = !state.tabs.is_empty();
+    // BOOKMARKS-7 — the per-page ad-filter blocked count the active session tracks.
+    let blocked = state
+        .tabs
+        .get(state.active)
+        .map_or(0, |t| t.session.blocked_count());
+    // BOOKMARKS-10 — the live page's URL + title, owned clones so the page-actions
+    // closures never borrow `state`; empty when there is no live tab to act on.
+    let page_url = state
+        .tabs
+        .get(state.active)
+        .map(|t| t.session.nav().url.clone())
+        .unwrap_or_default();
+    let page_title = state
+        .tabs
+        .get(state.active)
+        .map(|t| t.session.title().to_string())
+        .unwrap_or_default();
+    let recent_resources = state
+        .tabs
+        .get(state.active)
+        .map_or_else(Vec::new, |t| t.session.recent_resource_requests());
+    let permission_summary = super::site_info_permission_summary(state);
+    let has_page = has_tab && !crashed && !page_url.trim().is_empty();
+
+    let mut accepted_suggestion: Option<String> = None;
+    let mut toolbar_action: Option<super::menubar::MenuAction> = None;
+    ui.horizontal(|ui| {
+        // Back / forward — enabled only when the live session offers the history.
+        if nav_button(ui, "\u{2039}", "Back", has_tab && !crashed && nav.can_back) {
+            if let Some(tab) = state.active_tab() {
+                tab.session.go_back();
+            }
+        }
+        if nav_button(
+            ui,
+            "\u{203A}",
+            "Forward",
+            has_tab && !crashed && nav.can_forward,
+        ) {
+            if let Some(tab) = state.active_tab() {
+                tab.session.go_forward();
+            }
+        }
+        // Stop while CEF is loading; otherwise Reload respawns crashed tabs or
+        // reloads the page. Servo currently has no real cancel-load hook (DD-2,
+        // investigated 2026-07-10 — see `can_show_stop_control`), so its compact
+        // chrome keeps the honest Reload control while loading.
+        let can_stop = super::can_show_stop_control(has_tab, crashed, nav.loading, active_engine);
+        let (nav_label, nav_tip) = if can_stop {
+            ("\u{00D7}", "Stop loading")
+        } else if crashed {
+            ("\u{21BB}", "Reload (restart page)")
+        } else {
+            ("\u{21BB}", "Reload")
+        };
+        if nav_button(ui, nav_label, nav_tip, has_tab) {
+            if crashed {
+                state.respawn_requested = true;
+            } else if can_stop {
+                if let Some(tab) = state.active_tab() {
+                    tab.session.stop();
+                }
+            } else if let Some(tab) = state.active_tab() {
+                tab.session.reload();
+            }
+        }
+
+        // BOOKMARKS-10 — the page-actions menu (bookmark this page / copy its URL /
+        // send it in Chat). The SAME three verbs also hang off the address bar's
+        // right-click (below), so both the toolbar and the context menu reach them.
+        let is_bookmarked = has_page
+            && state
+                .bookmarked_urls
+                .contains(super::bookmark_membership_key(&page_url));
+        super::page_actions_button(
+            ui,
+            has_page,
+            is_bookmarked,
+            state.bus_root.as_deref(),
+            active_engine,
+            &page_url,
+            &page_title,
+        );
+        super::password_menu(
+            ui,
+            state,
+            &page_url,
+            has_page,
+            active_engine == Some(BrowserEngine::Cef),
+        );
+
+        if nav_button(
+            ui,
+            "\u{25A3}",
+            if state.capture_region_mode {
+                "Select capture region"
+            } else {
+                "Capture viewport"
+            },
+            state.active_tab_has_frame(),
+        ) {
+            if state.capture_region_mode {
+                state.cancel_region_capture();
+            } else {
+                state.capture_active_viewport();
+            }
+        }
+
+        let (active_downloads, total_downloads) = state.download_counts();
+        let downloads_label = if active_downloads > 0 {
+            format!("\u{2193} {active_downloads}")
+        } else {
+            "\u{2193}".to_owned()
+        };
+        let downloads_tip = if total_downloads == 0 {
+            "Downloads"
+        } else {
+            "Downloads from the shared Transfers ledger"
+        };
+        if ui
+            .button(
+                egui::RichText::new(downloads_label)
+                    .size(CHROME_FONT)
+                    .color(if state.downloads_open {
+                        Style::ACCENT
+                    } else {
+                        CHROME_TEXT
+                    }),
+            )
+            .on_hover_text(downloads_tip)
+            .clicked()
+        {
+            state.downloads_open = !state.downloads_open;
+            if state.downloads_open {
+                state.refresh_downloads();
+            }
+        }
+
+        // BOOKMARKS-7 — a compact "N blocked" shield when the ad-filter has dropped
+        // requests on this page (honest 0 stays hidden). Reads the session's
+        // per-page counter; the engine is compiled from the mackesd `adfilter` blob.
+        if blocked > 0 {
+            ui.add_space(CHROME_GAP);
+            // The by-domain breakdown behind the count (uBlock-style detail): the top
+            // blocked domains for THIS page, surfaced on hover of the shield.
+            let top_blocked = state
+                .tabs
+                .get(state.active)
+                .map(|t| t.session.block_tally().top_domains(6))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!("\u{2298} {blocked}"))
+                    .size(CHROME_FONT)
+                    .color(CHROME_TEXT_DIM),
+            )
+            .on_hover_ui(|ui| {
+                ui.label(format!(
+                    "Ad-filter blocked {blocked} request{} on this page",
+                    if blocked == 1 { "" } else { "s" }
+                ));
+                if !top_blocked.is_empty() {
+                    ui.separator();
+                    for (domain, count) in &top_blocked {
+                        ui.label(
+                            egui::RichText::new(format!("{count}\u{00D7}  {domain}"))
+                                .small()
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
+                }
+            });
+        }
+
+        ui.add_space(CHROME_GAP);
+
+        // OMNIBOX-STYLE — the leading security chip reflects the CURRENT
+        // (committed) page URL's scheme, never the in-progress edit draft.
+        super::security_chip(
+            ui,
+            &page_url,
+            &recent_resources,
+            permission_summary.as_ref(),
+        );
+        ui.add_space(CHROME_GAP);
+
+        // The address bar fills the rest of the row.
+        let field = egui::TextEdit::singleline(&mut state.address)
+            .id(super::omnibox_widget_id())
+            .desired_width((ui.available_width() - (CHROME_BUTTON * 2.0 + Style::SP_XL)).max(160.0))
+            .hint_text("Enter an address")
+            .text_color(CHROME_TEXT)
+            .font(egui::TextStyle::Small)
+            .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H));
+        let resp = ui.add_enabled(has_tab && !crashed, field);
+        // Latch omnibox focus for next frame's engine-sync + accelerator
+        // guards (the same tracked-focus idiom as `Tab::page_focused`).
+        state.omnibox_focused = resp.has_focus();
+        state.chrome_edit_focus |= resp.has_focus();
+        // The branded 2px accent focus ring (mde_egui::focus, the dock/Console/Start
+        // idiom) on the primary keyboard target, so keyboard-only users get a clear,
+        // consistent focus indicator instead of egui's faint default outline (a11y).
+        mde_egui::focus::paint_focus_ring(ui.painter(), resp.rect, resp.has_focus());
+        if resp.changed() && has_tab && !crashed {
+            state.update_suggestions_for_address();
+        }
+        // OMNIBOX-STYLE — when the omnibox is NOT being edited, paint the
+        // Chrome-style elided/emphasized read-out ON TOP of the TextEdit
+        // (never touching its own layouter/cursor logic, so click-to-edit
+        // cursor placement stays exactly as correct as it is today). Focused
+        // editing always shows the full, unmodified draft underneath.
+        if has_tab && !crashed && resp.has_focus() {
+            if let Some(tail) = state.suggestions.inline_completion_tail() {
+                super::paint_omnibox_inline_completion(ui, resp.rect, &state.address, &tail);
+            }
+        } else if has_tab && !crashed && !state.address.trim().is_empty() {
+            let font_id = font_id(CHROME_FONT);
+            let job = super::omnibox_layout_job(&state.address, font_id);
+            if !job.is_empty() {
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let bg = ui.visuals().extreme_bg_color;
+                let corner_radius = ui.visuals().widgets.inactive.corner_radius;
+                ui.painter().rect_filled(resp.rect, corner_radius, bg);
+                let text_pos = egui::pos2(
+                    resp.rect.left() + 4.0,
+                    resp.rect.center().y - galley.size().y / 2.0,
+                );
+                ui.painter().galley(text_pos, galley, CHROME_TEXT);
+            }
+        }
+        // Keyboard-navigate the suggestion dropdown: a single-line TextEdit ignores
+        // vertical arrows, so intercepting Up/Down here (while the omnibox has focus)
+        // is free and doesn't disturb caret motion. Enter then commits the highlight.
+        if resp.has_focus() && has_tab && !crashed {
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                state.suggestions.move_selection(1);
+            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                state.suggestions.move_selection(-1);
+            }
+        }
+        // BOOKMARKS-10 — right-click the address bar for the same page actions
+        // (bookmark / copy URL / Send-in-Chat) the toolbar star exposes.
+        resp.context_menu(|ui| {
+            super::page_actions_menu(
+                ui,
+                state.bus_root.as_deref(),
+                active_engine,
+                &page_url,
+                &page_title,
+            );
+        });
+        let submit = resp.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && has_tab
+            && !crashed;
+
+        let go = ui
+            .add_enabled(
+                has_tab && !crashed && !state.address.trim().is_empty(),
+                egui::Button::new(
+                    egui::RichText::new("\u{2192}")
+                        .size(CHROME_FONT)
+                        .color(CHROME_TEXT),
+                )
+                .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+            )
+            .on_hover_text("Go")
+            .clicked();
+
+        if submit {
+            // Enter commits the keyboard-highlighted suggestion if one is selected,
+            // else the typed draft — Chrome's omnibox behavior.
+            if let Some(selected) = state.suggestions.selected_value() {
+                state.accept_suggestion(selected);
+            } else {
+                state.submit_address();
+            }
+        } else if go {
+            state.submit_address();
+        }
+
+        toolbar_action = super::menubar::show_chrome_menu(state, ui);
+    });
+    if let Some(action) = toolbar_action {
+        super::menubar::apply(ui.ctx(), state, action);
+    }
+    if has_tab && !crashed {
+        accepted_suggestion = super::suggestions_panel(ui, state);
+    }
+    if let Some(suggestion) = accepted_suggestion {
+        state.accept_suggestion(suggestion);
+    }
+}
+
 /// How many of `total` fixed-width bookmark buttons fit on the single bar row of
 /// `available` width. When every button fits, the return is `total` (no overflow
 /// slot). Otherwise one `overflow_w`-wide ">>" slot is reserved and the return is
