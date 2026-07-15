@@ -12,6 +12,7 @@ use std::{
     ops::Range,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use mde_egui::egui::{
@@ -19,16 +20,17 @@ use mde_egui::egui::{
 };
 use mde_egui::{muted_note, ChipTone, Style};
 use mde_web_preview_client::{
-    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, EditCommand,
-    JsDialog, SessionState,
+    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, CursorKind,
+    EditCommand, JsDialog, SessionState,
 };
 
 use super::{
-    centered, ellipsize, media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult,
-    ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock,
-    PendingPasskeyConsent, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT,
-    CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H,
-    CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_W, PRIVATE_MODE_EXPLAINER,
+    browser_capture_dir, centered, ellipsize, install_browser_page_accessibility,
+    media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult, ContainerProfile,
+    DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock, PendingPasskeyConsent,
+    PixelRegion, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
+    CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
+    CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
 };
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
@@ -3325,6 +3327,315 @@ pub(super) fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
             ),
         );
     });
+}
+
+/// Map a pointer position from egui panel space into the helper frame's **device
+/// pixels**. The decoded frame is painted to fill `image_rect`, whose origin and
+/// size may differ from the helper's frame size on HiDPI or resized seats.
+pub(super) fn map_pointer_to_frame(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    frame_size: [usize; 2],
+) -> egui::Pos2 {
+    let clamped = pos.clamp(image_rect.min, image_rect.max);
+    let rel = clamped - image_rect.min;
+    egui::pos2(
+        rel.x * frame_size[0] as f32 / image_rect.width().max(1.0),
+        rel.y * frame_size[1] as f32 / image_rect.height().max(1.0),
+    )
+}
+
+/// The device-pixel size the helper's frame should track.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "device extent is scaled, rounded, then clamped into [1, MAX_CHANNEL_DIM]"
+)]
+pub(super) fn frame_target_device_px(rect: egui::Rect, ppp: f32) -> (u32, u32) {
+    let dim = |v: f32| -> u32 {
+        if v.is_finite() {
+            (v * ppp).round().clamp(1.0, MAX_CHANNEL_DIM as f32) as u32
+        } else {
+            1
+        }
+    };
+    (dim(rect.width()), dim(rect.height()))
+}
+
+fn cursor_icon_for(kind: CursorKind) -> egui::CursorIcon {
+    match kind {
+        CursorKind::Default => egui::CursorIcon::Default,
+        CursorKind::Pointer => egui::CursorIcon::PointingHand,
+        CursorKind::Text => egui::CursorIcon::Text,
+        CursorKind::Crosshair => egui::CursorIcon::Crosshair,
+        CursorKind::Wait => egui::CursorIcon::Wait,
+        CursorKind::Progress => egui::CursorIcon::Progress,
+        CursorKind::Help => egui::CursorIcon::Help,
+        CursorKind::Move => egui::CursorIcon::Move,
+        CursorKind::Grab => egui::CursorIcon::Grab,
+        CursorKind::Grabbing => egui::CursorIcon::Grabbing,
+        CursorKind::NotAllowed => egui::CursorIcon::NotAllowed,
+        CursorKind::ResizeHorizontal => egui::CursorIcon::ResizeHorizontal,
+        CursorKind::ResizeVertical => egui::CursorIcon::ResizeVertical,
+        CursorKind::ResizeNeSw => egui::CursorIcon::ResizeNeSw,
+        CursorKind::ResizeNwSe => egui::CursorIcon::ResizeNwSe,
+        CursorKind::ZoomIn => egui::CursorIcon::ZoomIn,
+        CursorKind::ZoomOut => egui::CursorIcon::ZoomOut,
+    }
+}
+
+/// Paint the active tab's decoded frame to fill the body and forward this frame's
+/// egui input to the session.
+pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
+    let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
+        let texture = tab.texture.as_ref()?;
+        Some((
+            texture.id(),
+            texture.size_vec2(),
+            tab.last_frame.as_ref().map_or([0, 0], |frame| frame.size),
+        ))
+    }) else {
+        return;
+    };
+    let size = ui.available_size();
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let image_rect = fit_rect_preserving_aspect(rect, texture_size);
+    ui.painter().rect_filled(rect, 0.0, Style::SURFACE);
+    egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
+        .paint_at(ui, image_rect);
+
+    if !state.capture_region_mode && resp.hovered() {
+        if let Some(kind) = state.tabs.get(active).map(|tab| tab.session.cursor()) {
+            ui.output_mut(|o| o.cursor_icon = cursor_icon_for(kind));
+        }
+    }
+
+    if !state.capture_region_mode {
+        let (can_back, can_forward, url) = state.tabs.get(active).map_or_else(
+            || (false, false, String::new()),
+            |tab| {
+                let nav = tab.session.nav();
+                (nav.can_back, nav.can_forward, nav.url.clone())
+            },
+        );
+        if let Some(action) = page_context_menu(&resp, can_back, can_forward, &url) {
+            state.apply_page_context_action(active, action);
+        }
+    }
+
+    let ppp = ui.ctx().pixels_per_point();
+    let target = frame_target_device_px(rect, ppp);
+    if let Some(tab) = state.tabs.get_mut(active) {
+        if let Some((w, h)) = tab.resizer.observe(target, Instant::now(), RESIZE_DEBOUNCE) {
+            tab.session.resize(w, h);
+        }
+        if tab.resizer.is_settling() {
+            ui.ctx().request_repaint_after(RESIZE_DEBOUNCE);
+        }
+    }
+
+    if state.capture_region_mode {
+        handle_region_capture_drag(ui, state, &resp, image_rect, frame_size);
+    }
+    if resp.clicked() {
+        resp.request_focus();
+    }
+
+    if state.capture_region_mode {
+        return;
+    }
+
+    let mut page_focused = state.tabs.get(active).is_some_and(|tab| tab.page_focused)
+        || resp.has_focus()
+        || resp.clicked()
+        || resp.dragged();
+    for event in ui.input(|i| i.events.clone()) {
+        if let egui::Event::PointerButton { pos, pressed, .. } = &event {
+            if *pressed {
+                if image_rect.contains(*pos) {
+                    page_focused = true;
+                    resp.request_focus();
+                } else if !rect.contains(*pos) {
+                    page_focused = false;
+                }
+            }
+        }
+        if page_focused {
+            if let egui::Event::Ime(ime) = &event {
+                if let Some(tab) = state.tabs.get_mut(active) {
+                    match ime {
+                        egui::ImeEvent::Preedit(text) => {
+                            tab.session.ime_set_composition(text.clone());
+                        }
+                        egui::ImeEvent::Commit(text) => {
+                            tab.session.ime_commit_text(text.clone());
+                        }
+                        egui::ImeEvent::Disabled => tab.session.ime_finish_composition(),
+                        egui::ImeEvent::Enabled => {}
+                    }
+                    tab.last_activity = Instant::now();
+                    tab.idle_suspended = false;
+                }
+                continue;
+            }
+        }
+        if let Some(event) = browser_input_event(&event, image_rect, frame_size, page_focused) {
+            if let Some(tab) = state.tabs.get_mut(active) {
+                tab.last_activity = Instant::now();
+                tab.idle_suspended = false;
+                tab.session.send_input(&event, ppp);
+            }
+        }
+    }
+    if let Some(tab) = state.tabs.get_mut(active) {
+        tab.page_focused = page_focused;
+    }
+    if page_focused {
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect: image_rect,
+                cursor_rect: egui::Rect::from_min_size(
+                    image_rect.left_top(),
+                    egui::vec2(1.0, 18.0),
+                ),
+            });
+        });
+    }
+    if let Some(tab) = state.tabs.get(active) {
+        install_browser_page_accessibility(ui.ctx(), image_rect, tab, page_focused);
+    }
+}
+
+fn handle_region_capture_drag(
+    ui: &mut egui::Ui,
+    state: &mut WebState,
+    resp: &egui::Response,
+    image_rect: egui::Rect,
+    frame_size: [usize; 2],
+) {
+    if frame_size[0] == 0 || frame_size[1] == 0 {
+        state.cancel_region_capture();
+        state.capture_notice = Some("Capture failed: no painted page".to_owned());
+        return;
+    }
+    let pointer_to_frame = |pos: egui::Pos2| map_pointer_to_frame(pos, image_rect, frame_size);
+    if resp.drag_started() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let pos = pointer_to_frame(pos);
+            state.capture_region_start = Some(pos);
+            state.capture_region_current = Some(pos);
+        }
+    } else if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            state.capture_region_current = Some(pointer_to_frame(pos));
+        }
+    }
+
+    if let (Some(start), Some(current)) = (state.capture_region_start, state.capture_region_current)
+    {
+        if let Some(region) = PixelRegion::from_points(start, current, frame_size) {
+            let overlay = region.rect_on_image(image_rect, frame_size);
+            ui.painter()
+                .rect_filled(overlay, 0.0, Style::selection_wash());
+            ui.painter().rect_stroke(
+                overlay,
+                0.0,
+                egui::Stroke::new(1.0, Style::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    if resp.drag_stopped() {
+        let result = state
+            .capture_region_start
+            .zip(state.capture_region_current)
+            .and_then(|(start, current)| PixelRegion::from_points(start, current, frame_size))
+            .ok_or_else(|| "selection is too small".to_owned())
+            .and_then(|region| state.capture_active_region_to_dir(browser_capture_dir(), region));
+        match result {
+            Ok(path) => state.record_capture_success("Captured region", &path),
+            Err(err) => state.capture_notice = Some(format!("Capture failed: {err}")),
+        }
+        state.cancel_region_capture();
+    }
+}
+
+fn fit_rect_preserving_aspect(outer: egui::Rect, content_size: egui::Vec2) -> egui::Rect {
+    if content_size.x <= 0.0
+        || content_size.y <= 0.0
+        || outer.width() <= 0.0
+        || outer.height() <= 0.0
+    {
+        return outer;
+    }
+    let scale = (outer.width() / content_size.x).min(outer.height() / content_size.y);
+    let size = content_size * scale;
+    egui::Rect::from_center_size(outer.center(), size)
+}
+
+/// Convert page-owned egui input into helper-frame coordinates.
+pub(super) fn browser_input_event(
+    event: &egui::Event,
+    rect: egui::Rect,
+    frame_size: [usize; 2],
+    browser_focused: bool,
+) -> Option<egui::Event> {
+    match event {
+        egui::Event::PointerMoved(pos) => {
+            if rect.contains(*pos) {
+                Some(egui::Event::PointerMoved(map_pointer_to_frame(
+                    *pos, rect, frame_size,
+                )))
+            } else if browser_focused {
+                Some(egui::Event::PointerGone)
+            } else {
+                None
+            }
+        }
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers,
+        } => {
+            if rect.contains(*pos) || browser_focused {
+                Some(egui::Event::PointerButton {
+                    pos: map_pointer_to_frame(*pos, rect, frame_size),
+                    button: *button,
+                    pressed: *pressed,
+                    modifiers: *modifiers,
+                })
+            } else {
+                None
+            }
+        }
+        egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } => browser_focused.then_some(egui::Event::MouseWheel {
+            unit: *unit,
+            delta: *delta,
+            modifiers: *modifiers,
+        }),
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat,
+            modifiers,
+        } => browser_focused.then_some(egui::Event::Key {
+            key: *key,
+            physical_key: *physical_key,
+            pressed: *pressed,
+            repeat: *repeat,
+            modifiers: *modifiers,
+        }),
+        egui::Event::Text(text) => browser_focused.then_some(egui::Event::Text(text.clone())),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

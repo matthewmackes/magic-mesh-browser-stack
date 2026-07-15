@@ -28,7 +28,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
 use mde_editor_egui::spell::{self, SpellMiss};
-use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
+use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{ChipTone, Style};
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
@@ -6400,7 +6400,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
         Some((false, None, _, true, _, _)) => chrome_ui::new_tab_dashboard(ui, state),
-        Some((false, None, true, false, _, _)) => paint_body(ui, state, active),
+        Some((false, None, true, false, _, _)) => chrome_ui::paint_body(ui, state, active),
         Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet — an honest loading note, never a blank.
             centered(ui, |ui| {
@@ -7711,283 +7711,6 @@ const fn download_state_color(state: TransferState) -> egui::Color32 {
     }
 }
 
-/// Map a pointer position from egui panel space into the helper frame's **device
-/// pixels** — the ONE transform both the live-input forward and the region-capture
-/// drag flow through (browser-1).
-///
-/// The decoded frame is painted to *fill* `image_rect`, which sits below the tab
-/// strip + nav chrome (so its origin is non-zero) and whose size — reported in egui
-/// points — differs from the frame's device-pixel size on any non-1:1 seat (`HiDPI`,
-/// maximized, 4K, a non-frame aspect). A pointer at fraction `f` across `image_rect`
-/// maps to the same fraction across the `frame_size` device grid, so the transform
-///
-/// 1. clamps the pointer into `image_rect`,
-/// 2. subtracts the rect origin and divides by the rect size for a `0..1` fraction
-///    (both pointer and rect are egui points, so `pixels_per_point` cancels — the
-///    mapping is DPI-independent), then
-/// 3. multiplies by `frame_size` to land in frame device pixels, bounded to
-///    `[0, frame_w] × [0, frame_h]`.
-///
-/// The old live path instead multiplied `pos - image_rect.min` by `pixels_per_point`
-/// against a *fixed* 1280×800 frame, so clicks landed at the wrong page coordinate
-/// on every seat whose displayed rect wasn't exactly 1280×800 device px.
-fn map_pointer_to_frame(
-    pos: egui::Pos2,
-    image_rect: egui::Rect,
-    frame_size: [usize; 2],
-) -> egui::Pos2 {
-    let clamped = pos.clamp(image_rect.min, image_rect.max);
-    let rel = clamped - image_rect.min;
-    egui::pos2(
-        rel.x * frame_size[0] as f32 / image_rect.width().max(1.0),
-        rel.y * frame_size[1] as f32 / image_rect.height().max(1.0),
-    )
-}
-
-/// The device-pixel size the helper's frame should track — the browser panel `rect`
-/// (egui points) scaled by `pixels_per_point`, clamped to [`MAX_CHANNEL_DIM`] so a
-/// resize can never exceed the pre-sized channel. Rounded to whole pixels and at
-/// least 1×1 (browser-1, item 2).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "device extent is scaled, rounded, then clamped into [1, MAX_CHANNEL_DIM]"
-)]
-fn frame_target_device_px(rect: egui::Rect, ppp: f32) -> (u32, u32) {
-    let dim = |v: f32| -> u32 {
-        if v.is_finite() {
-            (v * ppp).round().clamp(1.0, MAX_CHANNEL_DIM as f32) as u32
-        } else {
-            1
-        }
-    };
-    (dim(rect.width()), dim(rect.height()))
-}
-
-/// Paint the active tab's decoded frame to fill the body and forward this frame's
-/// egui input to the session. Pointer geometry is mapped into frame device pixels
-/// via [`map_pointer_to_frame`], and the helper's viewport is re-sized (debounced)
-/// to track the real panel (browser-1).
-/// Map the engine-neutral [`CursorKind`] onto the shell's [`egui::CursorIcon`].
-fn cursor_icon_for(kind: mde_web_preview_client::CursorKind) -> egui::CursorIcon {
-    use mde_web_preview_client::CursorKind as K;
-    match kind {
-        K::Default => egui::CursorIcon::Default,
-        K::Pointer => egui::CursorIcon::PointingHand,
-        K::Text => egui::CursorIcon::Text,
-        K::Crosshair => egui::CursorIcon::Crosshair,
-        K::Wait => egui::CursorIcon::Wait,
-        K::Progress => egui::CursorIcon::Progress,
-        K::Help => egui::CursorIcon::Help,
-        K::Move => egui::CursorIcon::Move,
-        K::Grab => egui::CursorIcon::Grab,
-        K::Grabbing => egui::CursorIcon::Grabbing,
-        K::NotAllowed => egui::CursorIcon::NotAllowed,
-        K::ResizeHorizontal => egui::CursorIcon::ResizeHorizontal,
-        K::ResizeVertical => egui::CursorIcon::ResizeVertical,
-        K::ResizeNeSw => egui::CursorIcon::ResizeNeSw,
-        K::ResizeNwSe => egui::CursorIcon::ResizeNwSe,
-        K::ZoomIn => egui::CursorIcon::ZoomIn,
-        K::ZoomOut => egui::CursorIcon::ZoomOut,
-    }
-}
-
-fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
-    let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
-        let texture = tab.texture.as_ref()?;
-        Some((
-            texture.id(),
-            texture.size_vec2(),
-            tab.last_frame.as_ref().map_or([0, 0], |frame| frame.size),
-        ))
-    }) else {
-        return;
-    };
-    let size = ui.available_size();
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let image_rect = fit_rect_preserving_aspect(rect, texture_size);
-    ui.painter().rect_filled(rect, 0.0, Style::SURFACE);
-    egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
-        .paint_at(ui, image_rect);
-
-    // Reflect the engine's cursor (hand over links, I-beam over text, resize
-    // edges, …) while the pointer is over the page canvas.
-    if !state.capture_region_mode && resp.hovered() {
-        if let Some(kind) = state.tabs.get(active).map(|tab| tab.session.cursor()) {
-            ui.output_mut(|o| o.cursor_icon = cursor_icon_for(kind));
-        }
-    }
-
-    // In-page right-click context menu: navigation + native clipboard/edit
-    // commands on the focused element (driven through the engine, not JS).
-    if !state.capture_region_mode {
-        let (can_back, can_forward, url) = state.tabs.get(active).map_or_else(
-            || (false, false, String::new()),
-            |tab| {
-                let nav = tab.session.nav();
-                (nav.can_back, nav.can_forward, nav.url.clone())
-            },
-        );
-        let action = chrome_ui::page_context_menu(&resp, can_back, can_forward, &url);
-        if let Some(action) = action {
-            state.apply_page_context_action(active, action);
-        }
-    }
-
-    // Drive the helper's CSS viewport to the real panel size (device px), debounced
-    // so a drag-resize sends ONE settled resize instead of one per frame — this
-    // makes the page track the panel instead of a fixed 1280×800 breakpoint
-    // (browser-1, item 2). Runs every frame, in capture mode too, so the tracked
-    // size never drifts. Repaint while settling so the debounce fires without input.
-    let ppp = ui.ctx().pixels_per_point();
-    let target = frame_target_device_px(rect, ppp);
-    if let Some(tab) = state.tabs.get_mut(active) {
-        if let Some((w, h)) = tab.resizer.observe(target, Instant::now(), RESIZE_DEBOUNCE) {
-            tab.session.resize(w, h);
-        }
-        if tab.resizer.is_settling() {
-            ui.ctx().request_repaint_after(RESIZE_DEBOUNCE);
-        }
-    }
-
-    if state.capture_region_mode {
-        handle_region_capture_drag(ui, state, &resp, image_rect, frame_size);
-    }
-    if resp.clicked() {
-        resp.request_focus();
-    }
-
-    if state.capture_region_mode {
-        return;
-    }
-    // Forward only page-owned input. Pointer geometry is mapped into frame device
-    // pixels (via `map_pointer_to_frame` inside `browser_input_event`); keyboard/text
-    // belongs to the page only after the image has focus, so address-bar/chrome
-    // typing does not leak into the helper.
-    let mut page_focused = state.tabs.get(active).is_some_and(|tab| tab.page_focused)
-        || resp.has_focus()
-        || resp.clicked()
-        || resp.dragged();
-    for event in ui.input(|i| i.events.clone()) {
-        if let egui::Event::PointerButton { pos, pressed, .. } = &event {
-            if *pressed {
-                if image_rect.contains(*pos) {
-                    page_focused = true;
-                    resp.request_focus();
-                } else if !rect.contains(*pos) {
-                    page_focused = false;
-                }
-            }
-        }
-        // IME composition (CJK / dead-key input) routes to the focused page via the
-        // browser-host IME methods, NOT `send_input` — so it never reaches chrome.
-        if page_focused {
-            if let egui::Event::Ime(ime) = &event {
-                if let Some(tab) = state.tabs.get_mut(active) {
-                    match ime {
-                        egui::ImeEvent::Preedit(text) => {
-                            tab.session.ime_set_composition(text.clone());
-                        }
-                        egui::ImeEvent::Commit(text) => {
-                            tab.session.ime_commit_text(text.clone());
-                        }
-                        egui::ImeEvent::Disabled => tab.session.ime_finish_composition(),
-                        egui::ImeEvent::Enabled => {}
-                    }
-                    tab.last_activity = Instant::now();
-                    tab.idle_suspended = false;
-                }
-                continue;
-            }
-        }
-        if let Some(event) = browser_input_event(&event, image_rect, frame_size, page_focused) {
-            if let Some(tab) = state.tabs.get_mut(active) {
-                tab.last_activity = Instant::now();
-                tab.idle_suspended = false;
-                tab.session.send_input(&event, ppp);
-            }
-        }
-    }
-    if let Some(tab) = state.tabs.get_mut(active) {
-        tab.page_focused = page_focused;
-    }
-    // While the page body owns input, ask the OS to route IME to it (anchored to the
-    // body — the shell has no page-caret feedback, so the candidate window sits at the
-    // body's top-left). Only set when the body is focused, so a focused omnibox keeps
-    // its own IME. This is what makes the OS emit the `Event::Ime` stream handled above.
-    if page_focused {
-        ui.ctx().output_mut(|o| {
-            o.ime = Some(egui::output::IMEOutput {
-                rect: image_rect,
-                cursor_rect: egui::Rect::from_min_size(
-                    image_rect.left_top(),
-                    egui::vec2(1.0, 18.0),
-                ),
-            });
-        });
-    }
-    if let Some(tab) = state.tabs.get(active) {
-        install_browser_page_accessibility(ui.ctx(), image_rect, tab, page_focused);
-    }
-}
-
-fn handle_region_capture_drag(
-    ui: &mut egui::Ui,
-    state: &mut WebState,
-    resp: &egui::Response,
-    image_rect: egui::Rect,
-    frame_size: [usize; 2],
-) {
-    if frame_size[0] == 0 || frame_size[1] == 0 {
-        state.cancel_region_capture();
-        state.capture_notice = Some("Capture failed: no painted page".to_owned());
-        return;
-    }
-    // The SAME transform the live-input path uses (browser-1 dedup).
-    let pointer_to_frame = |pos: egui::Pos2| map_pointer_to_frame(pos, image_rect, frame_size);
-    if resp.drag_started() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let pos = pointer_to_frame(pos);
-            state.capture_region_start = Some(pos);
-            state.capture_region_current = Some(pos);
-        }
-    } else if resp.dragged() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            state.capture_region_current = Some(pointer_to_frame(pos));
-        }
-    }
-
-    if let (Some(start), Some(current)) = (state.capture_region_start, state.capture_region_current)
-    {
-        if let Some(region) = PixelRegion::from_points(start, current, frame_size) {
-            let overlay = region.rect_on_image(image_rect, frame_size);
-            ui.painter()
-                .rect_filled(overlay, 0.0, Style::selection_wash());
-            ui.painter().rect_stroke(
-                overlay,
-                0.0,
-                egui::Stroke::new(1.0, Style::ACCENT),
-                egui::StrokeKind::Inside,
-            );
-        }
-    }
-
-    if resp.drag_stopped() {
-        let result = state
-            .capture_region_start
-            .zip(state.capture_region_current)
-            .and_then(|(start, current)| PixelRegion::from_points(start, current, frame_size))
-            .ok_or_else(|| "selection is too small".to_owned())
-            .and_then(|region| state.capture_active_region_to_dir(browser_capture_dir(), region));
-        match result {
-            Ok(path) => state.record_capture_success("Captured region", &path),
-            Err(err) => state.capture_notice = Some(format!("Capture failed: {err}")),
-        }
-        state.cancel_region_capture();
-    }
-}
-
 fn spellcheck_results_text(misses: &[SpellMiss]) -> String {
     misses
         .iter()
@@ -8060,19 +7783,6 @@ fn offline_cache_viewport_display_size(
     let max = egui::vec2(ui.available_width().max(1.0), 180.0);
     let scale = (max.x / natural.x).min(max.y / natural.y).min(1.0);
     natural * scale
-}
-
-fn fit_rect_preserving_aspect(outer: egui::Rect, content_size: egui::Vec2) -> egui::Rect {
-    if content_size.x <= 0.0
-        || content_size.y <= 0.0
-        || outer.width() <= 0.0
-        || outer.height() <= 0.0
-    {
-        return outer;
-    }
-    let scale = (outer.width() / content_size.x).min(outer.height() / content_size.y);
-    let size = content_size * scale;
-    egui::Rect::from_center_size(outer.center(), size)
 }
 
 fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
@@ -8224,75 +7934,6 @@ fn install_browser_page_accessibility(
     });
 }
 
-/// Translate one egui event into the page-local event forwarded to the helper.
-///
-/// Pointer positions are mapped from panel space into frame device pixels via the
-/// shared [`map_pointer_to_frame`] (`rect` = the displayed image rect, `frame_size`
-/// = the current decoded frame). Only pointer positions are rewritten; wheel, keys,
-/// and text pass through unchanged (gated on page focus). A pointer that leaves the
-/// image while the page is focused reports `PointerGone` so the page's hover clears.
-fn browser_input_event(
-    event: &egui::Event,
-    rect: egui::Rect,
-    frame_size: [usize; 2],
-    browser_focused: bool,
-) -> Option<egui::Event> {
-    match event {
-        egui::Event::PointerMoved(pos) => {
-            if rect.contains(*pos) {
-                Some(egui::Event::PointerMoved(map_pointer_to_frame(
-                    *pos, rect, frame_size,
-                )))
-            } else if browser_focused {
-                Some(egui::Event::PointerGone)
-            } else {
-                None
-            }
-        }
-        egui::Event::PointerButton {
-            pos,
-            button,
-            pressed,
-            modifiers,
-        } => {
-            if rect.contains(*pos) || browser_focused {
-                Some(egui::Event::PointerButton {
-                    pos: map_pointer_to_frame(*pos, rect, frame_size),
-                    button: *button,
-                    pressed: *pressed,
-                    modifiers: *modifiers,
-                })
-            } else {
-                None
-            }
-        }
-        egui::Event::MouseWheel {
-            unit,
-            delta,
-            modifiers,
-        } => browser_focused.then_some(egui::Event::MouseWheel {
-            unit: *unit,
-            delta: *delta,
-            modifiers: *modifiers,
-        }),
-        egui::Event::Key {
-            key,
-            physical_key,
-            pressed,
-            repeat,
-            modifiers,
-        } => browser_focused.then_some(egui::Event::Key {
-            key: *key,
-            physical_key: *physical_key,
-            pressed: *pressed,
-            repeat: *repeat,
-            modifiers: *modifiers,
-        }),
-        egui::Event::Text(text) => browser_focused.then_some(egui::Event::Text(text.clone())),
-        _ => None,
-    }
-}
-
 /// Center `content` vertically + horizontally in the remaining body.
 fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     ui.vertical_centered(|ui| {
@@ -8306,6 +7947,7 @@ mod menubar;
 
 #[cfg(test)]
 mod tests {
+    use super::chrome_ui::{browser_input_event, frame_target_device_px, map_pointer_to_frame};
     use super::*;
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_web_preview_client::{scm, testkit, wire};
