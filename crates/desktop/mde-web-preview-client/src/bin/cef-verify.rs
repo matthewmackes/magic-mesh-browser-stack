@@ -19,6 +19,7 @@
 //! Usage: `cef-verify <helper_bin> <url> [seconds]`
 //!   e.g. `cef-verify /usr/bin/mde-web-cef https://example.com/ 20`
 
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use mde_web_preview_client::egui::{self, pos2};
@@ -53,11 +54,17 @@ fn main() {
     let mut nav_events = 0u32;
     let mut title_events = 0u32;
     let mut frame_events = 0u32;
-    let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some();
-    let mut input_probe_step = InputProbeStep::WaitingForFrame;
+    let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some()
+        || std::env::var_os("MDE_BROWSER_VERIFY_INPUT").is_some();
+    let page_text_input_probe = std::env::var_os("MDE_BROWSER_VERIFY_PAGE_TEXT_INPUT").is_some();
+    let mut input_probe_state = InputProbeState::new(page_text_input_probe);
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
         sess.poll();
+        if input_probe {
+            input_probe_state.drain_page_text(&mut sess);
+            input_probe_state.maybe_request_page_text(&mut sess);
+        }
         if let Some(frame) = sess.take_frame() {
             println!(
                 "VERIFY on_paint_ready view={}x{} pixels={}",
@@ -89,7 +96,14 @@ fn main() {
             }
         }
         if input_probe {
-            drive_input_probe(&mut sess, frame_events, &mut input_probe_step);
+            drive_input_probe(&mut sess, frame_events, &mut input_probe_state);
+        }
+        if input_probe
+            && nav_events > 0
+            && frame_events > 0
+            && input_probe_state.is_complete(sess.title())
+        {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -99,11 +113,7 @@ fn main() {
         sess.nav().url,
         sess.title(),
     );
-    let input_ok = !input_probe
-        || (input_probe_step == InputProbeStep::SentText
-            && sess.title().contains("p1")
-            && sess.title().contains("k1")
-            && sess.title().contains("tm"));
+    let input_ok = !input_probe || input_probe_state.is_complete(sess.title());
     if nav_events > 0 && frame_events > 0 && input_ok {
         if input_probe {
             println!("VERIFY RESULT=PASS display/load/input handlers fired over the wire");
@@ -114,8 +124,10 @@ fn main() {
         }
     } else {
         println!("VERIFY RESULT=FAIL missing NavState, frame, or input response over the wire");
+        let _ = std::io::stdout().flush();
         std::process::exit(1);
     }
+    let _ = std::io::stdout().flush();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,22 +138,113 @@ enum InputProbeStep {
     SentText,
 }
 
-fn drive_input_probe(sess: &mut WebSession, frame_events: u32, step: &mut InputProbeStep) {
-    match *step {
-        InputProbeStep::WaitingForFrame if frame_events > 0 && sess.title().contains("p0") => {
+#[derive(Debug)]
+struct InputProbeState {
+    step: InputProbeStep,
+    page_text: bool,
+    last_page_text: String,
+    next_page_text_id: u64,
+    last_page_text_request: Instant,
+}
+
+impl InputProbeState {
+    fn new(page_text: bool) -> Self {
+        Self {
+            step: InputProbeStep::WaitingForFrame,
+            page_text,
+            last_page_text: String::new(),
+            next_page_text_id: 1,
+            last_page_text_request: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    fn drain_page_text(&mut self, sess: &mut WebSession) {
+        for event in sess.drain_page_text_events() {
+            println!(
+                "VERIFY on_page_text id={} bytes={} text={}",
+                event.id,
+                event.text.len(),
+                compact_text(&event.text),
+            );
+            self.last_page_text = event.text;
+        }
+    }
+
+    fn maybe_request_page_text(&mut self, sess: &mut WebSession) {
+        if !self.page_text || self.is_complete(sess.title()) {
+            return;
+        }
+        if self.last_page_text_request.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        let id = self.next_page_text_id;
+        self.next_page_text_id = self.next_page_text_id.saturating_add(1);
+        self.last_page_text_request = Instant::now();
+        sess.request_page_text(id, 2048);
+        println!("VERIFY page_text_probe_requested id={id}");
+    }
+
+    fn saw_initial(&self, title: &str) -> bool {
+        title.contains("p0") || self.last_page_text.contains("P:0")
+    }
+
+    fn saw_pointer(&self, title: &str) -> bool {
+        title.contains("p1") || self.last_page_text.contains("P:1")
+    }
+
+    fn saw_key(&self, title: &str) -> bool {
+        title.contains("k1") || self.last_page_text.contains("K:1")
+    }
+
+    fn saw_text(&self, title: &str) -> bool {
+        title.contains("tm") || self.last_page_text.contains("T:m")
+    }
+
+    fn is_complete(&self, title: &str) -> bool {
+        self.step == InputProbeStep::SentText
+            && self.saw_pointer(title)
+            && self.saw_key(title)
+            && self.saw_text(title)
+    }
+}
+
+fn drive_input_probe(sess: &mut WebSession, frame_events: u32, state: &mut InputProbeState) {
+    match state.step {
+        InputProbeStep::WaitingForFrame if frame_events > 0 && state.saw_initial(sess.title()) => {
             send_pointer_probe(sess);
-            *step = InputProbeStep::SentPointer;
+            state.step = InputProbeStep::SentPointer;
         }
-        InputProbeStep::SentPointer if sess.title().contains("p1") => {
+        InputProbeStep::SentPointer if state.saw_pointer(sess.title()) => {
             send_key_probe(sess);
-            *step = InputProbeStep::SentKey;
+            state.step = InputProbeStep::SentKey;
         }
-        InputProbeStep::SentKey if sess.title().contains("k1") => {
+        InputProbeStep::SentKey if state.saw_key(sess.title()) => {
             send_text_probe(sess);
-            *step = InputProbeStep::SentText;
+            state.step = InputProbeStep::SentText;
         }
         _ => {}
     }
+}
+
+fn compact_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+        if out.len() >= 240 {
+            out.push_str("...");
+            break;
+        }
+    }
+    out.trim().to_owned()
 }
 
 fn send_pointer_probe(sess: &mut WebSession) {
