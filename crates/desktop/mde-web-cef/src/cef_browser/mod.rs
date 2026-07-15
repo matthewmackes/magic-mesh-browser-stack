@@ -4795,11 +4795,12 @@ fn send_char(host: *mut c_void, character: u16, modifiers: Modifiers) {
     let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET) else {
         return;
     };
+    let key_code = char_windows_key_code(character);
     let event = CefKeyEvent::new(
         KEYEVENT_CHAR,
         cef_modifiers(modifiers),
-        i32::from(character),
-        i32::from(character),
+        key_code,
+        key_code,
         character,
         character,
     );
@@ -4809,6 +4810,17 @@ fn send_char(host: *mut c_void, character: u16, modifiers: Modifiers) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF and `event` lives for the duration of the call.
     unsafe { callback(host, event.as_ptr()) };
+}
+
+fn char_windows_key_code(character: u16) -> i32 {
+    match char::from_u32(u32::from(character)) {
+        Some(ch @ 'a'..='z') => ch.to_ascii_uppercase() as i32,
+        Some(ch @ ('A'..='Z' | '0'..='9')) => ch as i32,
+        Some(' ') => 32,
+        Some('\t') => 9,
+        Some('\n' | '\r') => 13,
+        _ => i32::from(character),
+    }
 }
 
 fn cef_mouse_button(button: PointerButton) -> c_int {

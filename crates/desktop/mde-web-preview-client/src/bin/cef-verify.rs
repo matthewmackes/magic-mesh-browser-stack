@@ -10,14 +10,15 @@
 //!   * `on_favicon_urlchange`   → `favicon()` bytes arrive
 //!   * `on_paint_ready`         → a shm frame decoded through `WebSession`
 //!
-//! This is the honest end-to-end proof that the CEF display + load handler blocks
-//! are dispatched by the real CEF vtable under real navigation — captured through
+//! This is the honest end-to-end proof that a real Browser helper responds over
 //! the same AF_UNIX wire the shell consumes, with NO shell and NO reboot. The
-//! callbacks fire inside the OS-sandboxed CEF host (no writable host FS), so the
-//! wire is the only observable channel — which is exactly what this reads.
+//! binary name is historical (`cef-verify`) because the first live use was CEF
+//! display/load verification, but the harness also works against `mde-web-preview`
+//! (Servo) and can prove mouse+keyboard response with `MDE_BROWSER_VERIFY_INPUT=1`.
 //!
 //! Usage: `cef-verify <helper_bin> <url> [seconds]`
 //!   e.g. `cef-verify /usr/bin/mde-web-cef https://example.com/ 20`
+//!   e.g. `MDE_BROWSER_VERIFY_INPUT=1 cef-verify /usr/bin/mde-web-preview`
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -30,7 +31,15 @@ fn main() {
     let helper = args
         .next()
         .unwrap_or_else(|| "/usr/bin/mde-web-cef".to_string());
-    let url = args.next().unwrap_or_else(|| "about:blank".to_string());
+    let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some()
+        || std::env::var_os("MDE_BROWSER_VERIFY_INPUT").is_some();
+    let url = args.next().unwrap_or_else(|| {
+        if input_probe {
+            input_probe_url()
+        } else {
+            "about:blank".to_string()
+        }
+    });
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
 
     let spec = SpawnSpec {
@@ -54,9 +63,10 @@ fn main() {
     let mut nav_events = 0u32;
     let mut title_events = 0u32;
     let mut frame_events = 0u32;
-    let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some()
-        || std::env::var_os("MDE_BROWSER_VERIFY_INPUT").is_some();
-    let page_text_input_probe = std::env::var_os("MDE_BROWSER_VERIFY_PAGE_TEXT_INPUT").is_some();
+    // Servo's minimal helper currently does not publish dynamic title changes,
+    // so page-text polling is the cross-engine observable for input response.
+    let page_text_input_probe =
+        input_probe || std::env::var_os("MDE_BROWSER_VERIFY_PAGE_TEXT_INPUT").is_some();
     let mut input_probe_state = InputProbeState::new(page_text_input_probe);
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -116,7 +126,7 @@ fn main() {
     let input_ok = !input_probe || input_probe_state.is_complete(sess.title());
     if nav_events > 0 && frame_events > 0 && input_ok {
         if input_probe {
-            println!("VERIFY RESULT=PASS display/load/input handlers fired over the wire");
+            println!("VERIFY RESULT=PASS display/load/input response observed over the wire");
         } else {
             println!(
                 "VERIFY RESULT=PASS display/load handler fired and a frame arrived over the wire"
@@ -306,4 +316,94 @@ fn send_text_probe(sess: &mut WebSession) {
     sess.send_input(&egui::Event::Text("m".to_owned()), 1.0);
     send_key_release(sess);
     println!("VERIFY input_probe_sent text=true mode=key-char");
+}
+
+fn input_probe_url() -> String {
+    data_url(INPUT_PROBE_HTML)
+}
+
+fn data_url(html: &str) -> String {
+    let mut out = String::from("data:text/html;charset=utf-8,");
+    for byte in html.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte))
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+const INPUT_PROBE_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>mde-browser-verify-p0-k0-t_</title>
+<style>
+html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-serif}
+#probe{position:absolute;left:32px;top:48px;width:320px;height:96px}
+#typed{position:absolute;left:40px;top:64px;width:220px;height:36px;font:18px sans-serif}
+#status{position:absolute;left:40px;top:112px}
+</style>
+<div id="probe">
+  <input id="typed" autocomplete="off" value="" aria-label="Browser verify input">
+  <div id="status">P:0 K:0 T:_</div>
+</div>
+<script>
+(function(){
+  var state={p:0,k:0,t:"_"};
+  var typed=document.getElementById("typed");
+  var status=document.getElementById("status");
+  function render(){
+    document.title="mde-browser-verify-p"+state.p+"-k"+state.k+"-t"+state.t;
+    status.textContent="P:"+state.p+" K:"+state.k+" T:"+state.t;
+  }
+  function focusInput(){ try { typed.focus(); } catch(_e) {} }
+  document.addEventListener("pointerdown",function(){ state.p=1; focusInput(); render(); },true);
+  document.addEventListener("mousedown",function(){ state.p=1; focusInput(); render(); },true);
+  document.addEventListener("keydown",function(e){
+    if (e && e.key && e.key.toLowerCase && e.key.toLowerCase()==="m") state.k=1;
+    render();
+  },true);
+  document.addEventListener("keypress",function(e){
+    if (e && e.key && e.key.length===1) state.t=e.key.toLowerCase();
+    render();
+  },true);
+  typed.addEventListener("input",function(){
+    var value=typed.value || "";
+    state.t=(value.slice(-1) || "_").toLowerCase();
+    render();
+  },true);
+  window.addEventListener("load",function(){ focusInput(); render(); },true);
+  focusInput();
+  render();
+})();
+</script>
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::{data_url, input_probe_url};
+
+    #[test]
+    fn input_probe_url_is_a_self_contained_data_page_with_expected_markers() {
+        let url = input_probe_url();
+        assert!(url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(url.contains("mde-browser-verify-p0-k0-t_"));
+        assert!(url.contains("P%3A0%20K%3A0%20T%3A_"));
+        assert!(url.contains("pointerdown"));
+        assert!(url.contains("keydown"));
+        assert!(url.contains("input"));
+    }
+
+    #[test]
+    fn data_url_percent_encodes_html_without_losing_ascii_markers() {
+        assert_eq!(
+            data_url("<title>x y</title>"),
+            "data:text/html;charset=utf-8,%3Ctitle%3Ex%20y%3C%2Ftitle%3E"
+        );
+    }
 }

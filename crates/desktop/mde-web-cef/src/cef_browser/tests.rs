@@ -898,11 +898,15 @@ fn text_input_event_sends_cef_character_key_event() {
         KEY_EVENT_LAST_TYPE.load(AtomicOrdering::SeqCst),
         KEYEVENT_CHAR
     );
-    assert_eq!(
-        KEY_EVENT_LAST_WINDOWS_CODE.load(AtomicOrdering::SeqCst),
-        109
-    );
+    assert_eq!(KEY_EVENT_LAST_WINDOWS_CODE.load(AtomicOrdering::SeqCst), 77);
     assert_eq!(KEY_EVENT_LAST_CHAR.load(AtomicOrdering::SeqCst), 109);
+}
+
+#[test]
+fn text_input_uses_virtual_key_code_for_ascii_letters() {
+    assert_eq!(super::char_windows_key_code(b'm' as u16), 77);
+    assert_eq!(super::char_windows_key_code(b'M' as u16), 77);
+    assert_eq!(super::char_windows_key_code(b'7' as u16), 55);
 }
 
 #[test]
