@@ -9179,16 +9179,8 @@ fn omnibox_display(url: &str) -> OmniboxDisplay {
 fn omnibox_layout_job(url: &str, font_id: egui::FontId) -> egui::text::LayoutJob {
     let display = omnibox_display(url);
     let mut job = egui::text::LayoutJob::default();
-    let dim = egui::TextFormat {
-        font_id: font_id.clone(),
-        color: Style::TEXT_DIM,
-        ..Default::default()
-    };
-    let strong = egui::TextFormat {
-        font_id: font_id.clone(),
-        color: Style::TEXT_STRONG,
-        ..Default::default()
-    };
+    let dim = chrome_ui::omnibox_dim_format(font_id.clone());
+    let strong = chrome_ui::omnibox_strong_format(font_id);
     if display.host.is_empty() {
         // No parsed `scheme://host` authority (`about:`, `data:`, …) — one
         // neutral, unmodified run.
@@ -9218,14 +9210,17 @@ fn paint_omnibox_inline_completion(ui: &mut egui::Ui, rect: egui::Rect, draft: &
     if draft.is_empty() || tail.is_empty() {
         return;
     }
-    let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
-    let typed = ui.fonts(|f| f.layout_no_wrap(draft.to_owned(), font_id.clone(), Style::TEXT));
-    let ghost = ui.fonts(|f| f.layout_no_wrap(tail.to_owned(), font_id, Style::TEXT_DIM));
+    let font_id = chrome_ui::font_id(CHROME_FONT);
+    let typed =
+        ui.fonts(|f| f.layout_no_wrap(draft.to_owned(), font_id.clone(), chrome_ui::CHROME_TEXT));
+    let ghost =
+        ui.fonts(|f| f.layout_no_wrap(tail.to_owned(), font_id, chrome_ui::CHROME_TEXT_DIM));
     let text_pos = egui::pos2(
         rect.left() + 4.0 + typed.size().x,
         rect.center().y - ghost.size().y / 2.0,
     );
-    ui.painter().galley(text_pos, ghost, Style::TEXT_DIM);
+    ui.painter()
+        .galley(text_pos, ghost, chrome_ui::CHROME_TEXT_DIM);
 }
 
 /// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`], shown
@@ -9912,7 +9907,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 paint_omnibox_inline_completion(ui, resp.rect, &state.address, &tail);
             }
         } else if has_tab && !crashed && !state.address.trim().is_empty() {
-            let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+            let font_id = chrome_ui::font_id(CHROME_FONT);
             let job = omnibox_layout_job(&state.address, font_id);
             if !job.is_empty() {
                 let galley = ui.fonts(|f| f.layout_job(job));
@@ -9923,7 +9918,8 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                     resp.rect.left() + 4.0,
                     resp.rect.center().y - galley.size().y / 2.0,
                 );
-                ui.painter().galley(text_pos, galley, Style::TEXT);
+                ui.painter()
+                    .galley(text_pos, galley, chrome_ui::CHROME_TEXT);
             }
         }
         // Keyboard-navigate the suggestion dropdown: a single-line TextEdit ignores
@@ -19452,13 +19448,37 @@ mod tests {
 
     #[test]
     fn omnibox_layout_job_covers_the_full_text_for_an_elided_https_url() {
-        let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+        let font_id = chrome_ui::font_id(CHROME_FONT);
         let job = omnibox_layout_job("https://www.example.com/x", font_id);
         // The elided job's text is shorter than the raw address (no `https://`,
         // no `www.`) — that mismatch is exactly why the styled read-out is
         // painted as an overlay rather than fed into the TextEdit's own
         // layouter (which must stay 1:1 with the buffer for cursor mapping).
         assert_eq!(job.text, "example.com/x");
+    }
+
+    #[test]
+    fn omnibox_layout_job_uses_browser_material_text_runs() {
+        let font_id = chrome_ui::font_id(CHROME_FONT);
+        let job = omnibox_layout_job("https://www.sub.example.com/x", font_id);
+        let colors: Vec<egui::Color32> = job
+            .sections
+            .iter()
+            .map(|section| section.format.color)
+            .collect();
+
+        assert!(
+            colors.contains(&chrome_ui::CHROME_TEXT_DIM),
+            "scheme, subdomain, and path should use Browser dim text: {colors:?}"
+        );
+        assert!(
+            colors.contains(&chrome_ui::CHROME_TEXT),
+            "registrable domain should use Browser primary text: {colors:?}"
+        );
+        assert!(
+            !colors.contains(&Style::TEXT_DIM) && !colors.contains(&Style::TEXT_STRONG),
+            "omnibox read-out must not fall back to shared shell text tokens: {colors:?}"
+        );
     }
 
     #[test]
@@ -21957,7 +21977,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|(text, color)| text == "mple.com/" && *color == Style::TEXT_DIM),
+                .any(|(text, color)| text == "mple.com/" && *color == chrome_ui::CHROME_TEXT_DIM),
             "focused omnibox should paint the grey inline completion tail: {texts:?}"
         );
     }

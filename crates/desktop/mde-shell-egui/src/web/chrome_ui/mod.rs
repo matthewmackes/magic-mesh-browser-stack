@@ -100,6 +100,26 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
     }
 }
 
+pub(super) fn font_id(size: f32) -> FontId {
+    FontId::new(size, CHROME_FONT_FAMILY.clone())
+}
+
+pub(super) fn omnibox_dim_format(font_id: FontId) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id,
+        color: CHROME_TEXT_DIM,
+        ..Default::default()
+    }
+}
+
+pub(super) fn omnibox_strong_format(font_id: FontId) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id,
+        color: CHROME_TEXT,
+        ..Default::default()
+    }
+}
+
 fn state_layer(base: Color32, layer: Color32, alpha: u8) -> Color32 {
     fn blend_channel(base: u8, layer: u8, alpha: u8) -> u8 {
         let alpha = u16::from(alpha);
@@ -184,5 +204,12 @@ mod tests {
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
         assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
+    }
+
+    #[test]
+    fn omnibox_formats_use_browser_material_text_roles() {
+        let font = font_id(13.0);
+        assert_eq!(omnibox_dim_format(font.clone()).color, CHROME_TEXT_DIM);
+        assert_eq!(omnibox_strong_format(font).color, CHROME_TEXT);
     }
 }
