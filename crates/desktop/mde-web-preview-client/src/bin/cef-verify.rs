@@ -27,28 +27,20 @@ use mde_web_preview_client::egui::{self, pos2};
 use mde_web_preview_client::session::{SpawnSpec, WebSession};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let helper = args
-        .next()
-        .unwrap_or_else(|| "/usr/bin/mde-web-cef".to_string());
     let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some()
         || std::env::var_os("MDE_BROWSER_VERIFY_INPUT").is_some();
-    let url = args.next().unwrap_or_else(|| {
-        if input_probe {
-            input_probe_url()
-        } else {
-            "about:blank".to_string()
-        }
-    });
-    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let args = VerifyArgs::parse(std::env::args().skip(1), input_probe);
 
     let spec = SpawnSpec {
-        helper_bin: helper.clone().into(),
-        url: url.clone(),
+        helper_bin: args.helper.clone().into(),
+        url: args.url.clone(),
         width: 1280,
         height: 800,
     };
-    println!("VERIFY spawn helper={helper} url={url} budget={secs}s");
+    println!(
+        "VERIFY spawn helper={} url={} budget={}s",
+        args.helper, args.url, args.secs
+    );
     let mut sess = match WebSession::spawn(&spec) {
         Ok(s) => s,
         Err(e) => {
@@ -68,7 +60,7 @@ fn main() {
     let page_text_input_probe =
         input_probe || std::env::var_os("MDE_BROWSER_VERIFY_PAGE_TEXT_INPUT").is_some();
     let mut input_probe_state = InputProbeState::new(page_text_input_probe);
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = Instant::now() + Duration::from_secs(args.secs);
     while Instant::now() < deadline {
         sess.poll();
         if input_probe {
@@ -138,6 +130,37 @@ fn main() {
         std::process::exit(1);
     }
     let _ = std::io::stdout().flush();
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VerifyArgs {
+    helper: String,
+    url: String,
+    secs: u64,
+}
+
+impl VerifyArgs {
+    fn parse(args: impl IntoIterator<Item = String>, input_probe: bool) -> Self {
+        let mut args = args.into_iter();
+        let helper = args
+            .next()
+            .filter(|arg| !arg.trim().is_empty())
+            .unwrap_or_else(|| "/usr/bin/mde-web-cef".to_string());
+        let url = args
+            .next()
+            .filter(|arg| !arg.trim().is_empty())
+            .unwrap_or_else(|| default_verify_url(input_probe));
+        let secs = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+        Self { helper, url, secs }
+    }
+}
+
+fn default_verify_url(input_probe: bool) -> String {
+    if input_probe {
+        input_probe_url()
+    } else {
+        "about:blank".to_string()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,7 +409,7 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
 
 #[cfg(test)]
 mod tests {
-    use super::{data_url, input_probe_url};
+    use super::{data_url, input_probe_url, VerifyArgs};
 
     #[test]
     fn input_probe_url_is_a_self_contained_data_page_with_expected_markers() {
@@ -405,5 +428,47 @@ mod tests {
             data_url("<title>x y</title>"),
             "data:text/html;charset=utf-8,%3Ctitle%3Ex%20y%3C%2Ftitle%3E"
         );
+    }
+
+    #[test]
+    fn args_default_to_the_input_probe_page_when_probe_mode_has_no_url() {
+        let args = VerifyArgs::parse(vec!["/usr/bin/mde-web-preview".to_owned()], true);
+
+        assert_eq!(args.helper, "/usr/bin/mde-web-preview");
+        assert!(args.url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(args.url.contains("mde-browser-verify-p0-k0-t_"));
+        assert_eq!(args.secs, 20);
+    }
+
+    #[test]
+    fn args_treat_blank_url_as_missing_without_losing_timeout() {
+        let args = VerifyArgs::parse(
+            vec![
+                "/usr/bin/mde-web-cef".to_owned(),
+                " ".to_owned(),
+                "30".to_owned(),
+            ],
+            true,
+        );
+
+        assert_eq!(args.helper, "/usr/bin/mde-web-cef");
+        assert!(args.url.starts_with("data:text/html;charset=utf-8,"));
+        assert_eq!(args.secs, 30);
+    }
+
+    #[test]
+    fn args_keep_explicit_url_and_timeout() {
+        let args = VerifyArgs::parse(
+            vec![
+                "/usr/bin/mde-web-cef".to_owned(),
+                "https://example.com/".to_owned(),
+                "7".to_owned(),
+            ],
+            false,
+        );
+
+        assert_eq!(args.helper, "/usr/bin/mde-web-cef");
+        assert_eq!(args.url, "https://example.com/");
+        assert_eq!(args.secs, 7);
     }
 }
