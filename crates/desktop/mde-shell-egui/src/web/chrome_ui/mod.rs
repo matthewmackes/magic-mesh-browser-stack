@@ -73,6 +73,8 @@ pub(super) const CHROME_TOOLBAR: Color32 = Color32::from_rgb(255, 255, 255);
 pub(super) const CHROME_PRIMARY: Color32 = Color32::from_rgb(11, 87, 208);
 pub(super) const CHROME_PRIMARY_CONTAINER: Color32 = Color32::from_rgb(211, 227, 253);
 pub(super) const CHROME_ON_PRIMARY_CONTAINER: Color32 = Color32::from_rgb(4, 30, 73);
+pub(super) const CHROME_SUCCESS_CONTAINER: Color32 = Color32::from_rgb(196, 238, 208);
+pub(super) const CHROME_ON_SUCCESS_CONTAINER: Color32 = Color32::from_rgb(8, 65, 30);
 pub(super) const CHROME_OUTLINE: Color32 = Color32::from_rgb(218, 220, 224);
 pub(super) const CHROME_TEXT: Color32 = Color32::from_rgb(32, 33, 36);
 pub(super) const CHROME_TEXT_DIM: Color32 = Color32::from_rgb(95, 99, 104);
@@ -83,9 +85,12 @@ pub(super) const CHROME_ERROR: Color32 = Color32::from_rgb(179, 38, 30);
 const STATE_HOVER_ALPHA: u8 = 20;
 const STATE_FOCUS_ALPHA: u8 = 26;
 const STATE_PRESSED_ALPHA: u8 = 26;
-const ENGINE_NEW_TAB_W: f32 = 34.0;
-const ENGINE_SEGMENT_W: f32 = 78.0;
-const ENGINE_SEGMENT_RADIUS: f32 = 8.0;
+const CHROME_TAB_RADIUS: f32 = 8.0;
+const ENGINE_NEW_TAB_W: f32 = 86.0;
+const ENGINE_SEGMENT_W: f32 = 92.0;
+const ENGINE_CONTROL_H: f32 = 24.0;
+const ENGINE_SEGMENT_RADIUS: f32 = 10.0;
+const ACTION_BUTTON_RADIUS: f32 = 8.0;
 
 /// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
 /// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
@@ -139,6 +144,14 @@ pub(super) const fn page_action_star(
 pub(super) const fn tab_fill(active: bool) -> Color32 {
     if active {
         CHROME_TOOLBAR
+    } else {
+        CHROME_SURFACE_CONTAINER
+    }
+}
+
+pub(super) const fn tab_stroke(active: bool) -> Color32 {
+    if active {
+        CHROME_OUTLINE
     } else {
         CHROME_SURFACE_CONTAINER_HIGH
     }
@@ -195,11 +208,29 @@ pub(super) const fn engine_marker(engine: BrowserEngine) -> &'static str {
     }
 }
 
-const fn engine_accent(engine: BrowserEngine) -> Color32 {
+pub(super) const fn engine_accent(engine: BrowserEngine) -> Color32 {
     match engine {
         BrowserEngine::Cef => CHROME_PRIMARY,
         BrowserEngine::Servo => CHROME_SUCCESS,
     }
+}
+
+pub(super) const fn engine_container(engine: BrowserEngine) -> Color32 {
+    match engine {
+        BrowserEngine::Cef => CHROME_PRIMARY_CONTAINER,
+        BrowserEngine::Servo => CHROME_SUCCESS_CONTAINER,
+    }
+}
+
+pub(super) const fn engine_on_container(engine: BrowserEngine) -> Color32 {
+    match engine {
+        BrowserEngine::Cef => CHROME_ON_PRIMARY_CONTAINER,
+        BrowserEngine::Servo => CHROME_ON_SUCCESS_CONTAINER,
+    }
+}
+
+pub(super) const fn engine_new_tab_fill(engine: BrowserEngine) -> Color32 {
+    engine_accent(engine)
 }
 
 pub(super) const fn engine_segment_fill(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
@@ -207,7 +238,7 @@ pub(super) const fn engine_segment_fill(engine: BrowserEngine, selected: Browser
         (engine, selected),
         (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
     ) {
-        CHROME_PRIMARY_CONTAINER
+        engine_container(engine)
     } else {
         CHROME_TOOLBAR
     }
@@ -218,9 +249,23 @@ pub(super) const fn engine_segment_text(engine: BrowserEngine, selected: Browser
         (engine, selected),
         (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
     ) {
-        CHROME_ON_PRIMARY_CONTAINER
+        engine_on_container(engine)
     } else {
         CHROME_TEXT
+    }
+}
+
+pub(super) const fn engine_segment_stroke(
+    engine: BrowserEngine,
+    selected: BrowserEngine,
+) -> Color32 {
+    if matches!(
+        (engine, selected),
+        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
+    ) {
+        engine_accent(engine)
+    } else {
+        CHROME_OUTLINE
     }
 }
 
@@ -234,6 +279,50 @@ pub(super) const fn download_state_color(
         mde_files_egui::transfers::TransferState::Queued
         | mde_files_egui::transfers::TransferState::Running => CHROME_TEXT_DIM,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrowserActionRole {
+    Primary,
+    Secondary,
+    Warning,
+    Quiet,
+}
+
+pub(super) const fn action_button_fill(role: BrowserActionRole) -> Color32 {
+    match role {
+        BrowserActionRole::Primary => CHROME_PRIMARY,
+        BrowserActionRole::Secondary | BrowserActionRole::Quiet => CHROME_TOOLBAR,
+        BrowserActionRole::Warning => CHROME_WARN,
+    }
+}
+
+pub(super) const fn action_button_text(role: BrowserActionRole) -> Color32 {
+    match role {
+        BrowserActionRole::Primary | BrowserActionRole::Warning => CHROME_TOOLBAR,
+        BrowserActionRole::Secondary => CHROME_TEXT,
+        BrowserActionRole::Quiet => CHROME_TEXT_DIM,
+    }
+}
+
+pub(super) const fn action_button_stroke(role: BrowserActionRole) -> Color32 {
+    match role {
+        BrowserActionRole::Primary => CHROME_PRIMARY,
+        BrowserActionRole::Secondary | BrowserActionRole::Quiet => CHROME_OUTLINE,
+        BrowserActionRole::Warning => CHROME_WARN,
+    }
+}
+
+fn action_button(label: impl Into<String>, role: BrowserActionRole) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(label.into())
+            .size(CHROME_FONT)
+            .color(action_button_text(role)),
+    )
+    .fill(action_button_fill(role))
+    .stroke(egui::Stroke::new(1.0, action_button_stroke(role)))
+    .corner_radius(ACTION_BUTTON_RADIUS)
+    .min_size(egui::vec2(72.0, CHROME_BUTTON))
 }
 
 fn selection_wash() -> Color32 {
@@ -348,19 +437,45 @@ pub(super) fn tab_pill_sized(
     label: &str,
     active: bool,
     width: f32,
+    engine: BrowserEngine,
 ) -> egui::Response {
     // `click_and_drag` keeps activation, middle-click close, and drag-reorder on
     // the same browser-tab affordance while egui handles the click/drag threshold.
-    ui.add(
+    let response = ui.add(
         egui::Button::new(
             egui::RichText::new(label)
                 .size(CHROME_FONT)
                 .color(tab_text(active)),
         )
         .fill(tab_fill(active))
+        .stroke(egui::Stroke::new(1.0, tab_stroke(active)))
+        .corner_radius(CHROME_TAB_RADIUS)
         .min_size(egui::vec2(width, CHROME_TAB_H))
         .sense(egui::Sense::click_and_drag()),
-    )
+    );
+    let accent = engine_accent(engine);
+    let r = response.rect;
+    let indicator = if active {
+        egui::Rect::from_min_max(
+            egui::pos2(r.left() + 7.0, r.top()),
+            egui::pos2(r.right() - 7.0, r.top() + 2.0),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(r.left() + 7.0, r.top()),
+            egui::pos2((r.left() + 25.0).min(r.right() - 7.0), r.top() + 2.0),
+        )
+    };
+    ui.painter().rect_filled(
+        indicator,
+        1.0,
+        if active {
+            accent
+        } else {
+            accent.gamma_multiply(0.55)
+        },
+    );
+    response
 }
 
 pub(super) fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
@@ -737,9 +852,21 @@ pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, ve
     };
 
     if vertical {
-        ui.vertical(|ui| controls(ui, true));
+        egui::Frame::NONE
+            .fill(CHROME_SURFACE_CONTAINER_HIGH)
+            .corner_radius(ENGINE_SEGMENT_RADIUS)
+            .inner_margin(egui::Margin::symmetric(3, 3))
+            .show(ui, |ui| {
+                ui.vertical(|ui| controls(ui, true));
+            });
     } else {
-        ui.horizontal(|ui| controls(ui, false));
+        egui::Frame::NONE
+            .fill(CHROME_SURFACE_CONTAINER_HIGH)
+            .corner_radius(ENGINE_SEGMENT_RADIUS)
+            .inner_margin(egui::Margin::symmetric(3, 2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| controls(ui, false));
+            });
     }
 
     if let Some(engine) = selected_engine {
@@ -753,14 +880,14 @@ pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, ve
 fn engine_new_tab_button(ui: &mut egui::Ui, engine: BrowserEngine, width: f32) -> egui::Response {
     ui.add(
         egui::Button::new(
-            egui::RichText::new("+")
-                .size(CHROME_FONT + 4.0)
+            egui::RichText::new("+ New tab")
+                .size(CHROME_FONT)
                 .color(CHROME_TOOLBAR),
         )
-        .fill(CHROME_PRIMARY)
+        .fill(engine_new_tab_fill(engine))
         .stroke(egui::Stroke::new(1.0, engine_accent(engine)))
         .corner_radius(ENGINE_SEGMENT_RADIUS)
-        .min_size(egui::vec2(width, CHROME_TAB_H)),
+        .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
     )
     .on_hover_text(format!("New {} tab", engine_display_name(engine)))
 }
@@ -772,7 +899,7 @@ fn engine_segment_button(
     width: f32,
 ) -> egui::Response {
     let is_selected = engine == selected;
-    ui.add(
+    let response = ui.add(
         egui::Button::new(
             egui::RichText::new(engine_display_name(engine))
                 .size(CHROME_FONT)
@@ -781,16 +908,18 @@ fn engine_segment_button(
         .fill(engine_segment_fill(engine, selected))
         .stroke(egui::Stroke::new(
             if is_selected { 1.5 } else { 1.0 },
-            if is_selected {
-                engine_accent(engine)
-            } else {
-                CHROME_OUTLINE
-            },
+            engine_segment_stroke(engine, selected),
         ))
         .corner_radius(ENGINE_SEGMENT_RADIUS)
-        .min_size(egui::vec2(width, CHROME_TAB_H)),
-    )
-    .on_hover_text(format!(
+        .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
+    );
+    let r = response.rect;
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(r.left() + 4.0, r.top() + 5.0),
+        egui::pos2(r.left() + 7.0, r.bottom() - 5.0),
+    );
+    ui.painter().rect_filled(rail, 1.5, engine_accent(engine));
+    response.on_hover_text(format!(
         "Use {} for future Browser tabs",
         engine_display_name(engine)
     ))
@@ -862,7 +991,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         pill_width
                     };
                     tab_favicon_image(ui, favicon_textures.get(idx).and_then(Option::as_ref));
-                    let tab_response = tab_pill_sized(ui, &label, active, pill_w);
+                    let tab_response = tab_pill_sized(ui, &label, active, pill_w, tab.engine);
                     pill_rects.push((idx, tab_response.rect));
                     if tab_response.clicked() {
                         select = Some(idx);
@@ -1164,7 +1293,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
                                     .max(CHROME_NEW_TAB_W)
                             };
-                            let resp = tab_pill_sized(ui, &label, active, width);
+                            let resp = tab_pill_sized(ui, &label, active, width, tab.engine);
                             pill_rects.push((idx, resp.rect));
                             if resp.clicked() {
                                 select = Some(idx);
@@ -3007,8 +3136,9 @@ fn password_menu(
                         if ui
                             .add_enabled(
                                 has_page && can_fill,
-                                egui::Button::new(
-                                    RichText::new(format!("Fill {username}")).size(CHROME_FONT),
+                                action_button(
+                                    format!("Fill {username}"),
+                                    BrowserActionRole::Primary,
                                 ),
                             )
                             .clicked()
@@ -3017,9 +3147,7 @@ fn password_menu(
                             ui.close_menu();
                         }
                         if ui
-                            .add(egui::Button::new(
-                                RichText::new("\u{00D7}").size(CHROME_FONT),
-                            ))
+                            .add(action_button("\u{00D7}", BrowserActionRole::Quiet))
                             .on_hover_text("Delete saved login")
                             .clicked()
                         {
@@ -3043,7 +3171,7 @@ fn password_menu(
                     .desired_width(f32::INFINITY),
             );
             if ui
-                .add(egui::Button::new(RichText::new("Save").size(CHROME_FONT)))
+                .add(action_button("Save", BrowserActionRole::Primary))
                 .clicked()
             {
                 save = true;
@@ -3076,33 +3204,21 @@ pub(super) fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
         );
         ui.label(RichText::new(ellipsize(&url, 64)).color(CHROME_TEXT_DIM));
         if ui
-            .add(egui::Button::new(
-                RichText::new("Use HTTPS")
-                    .size(CHROME_FONT)
-                    .color(CHROME_TEXT),
-            ))
+            .add(action_button("Use HTTPS", BrowserActionRole::Primary))
             .on_hover_text("Upgrade this navigation to HTTPS")
             .clicked()
         {
             state.upgrade_insecure_load();
         }
         if ui
-            .add(egui::Button::new(
-                RichText::new("Continue HTTP")
-                    .size(CHROME_FONT)
-                    .color(CHROME_WARN),
-            ))
+            .add(action_button("Continue HTTP", BrowserActionRole::Warning))
             .on_hover_text("Continue with the insecure HTTP URL")
             .clicked()
         {
             state.continue_insecure_load();
         }
         if ui
-            .add(egui::Button::new(
-                RichText::new("Cancel")
-                    .size(CHROME_FONT)
-                    .color(CHROME_TEXT_DIM),
-            ))
+            .add(action_button("Cancel", BrowserActionRole::Quiet))
             .clicked()
         {
             state.cancel_insecure_load();
@@ -3131,7 +3247,10 @@ pub(super) fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
                 ui.colored_label(tone, RichText::new(notice).size(Style::SMALL));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .small_button("\u{00D7}")
+                        .add(
+                            action_button("\u{00D7}", BrowserActionRole::Quiet)
+                                .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+                        )
                         .on_hover_text("Dismiss capture notice")
                         .clicked()
                     {
@@ -3319,15 +3438,13 @@ pub(super) fn passkey_consent_prompt_bar(
                         .color(CHROME_TEXT),
                 );
                 if ui
-                    .add(egui::Button::new(
-                        RichText::new("Approve").color(CHROME_TEXT),
-                    ))
+                    .add(action_button("Approve", BrowserActionRole::Primary))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("Deny").color(CHROME_TEXT)))
+                    .add(action_button("Deny", BrowserActionRole::Secondary))
                     .clicked()
                 {
                     decision = Some(false);
@@ -3361,13 +3478,13 @@ pub(super) fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -
                         .color(CHROME_TEXT),
                 );
                 if ui
-                    .add(egui::Button::new(RichText::new("Allow").color(CHROME_TEXT)))
+                    .add(action_button("Allow", BrowserActionRole::Primary))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("Block").color(CHROME_TEXT)))
+                    .add(action_button("Block", BrowserActionRole::Secondary))
                     .clicked()
                 {
                     decision = Some(false);
@@ -3389,15 +3506,16 @@ pub(super) fn before_unload_prompt_bar(
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(before_unload_prompt_text(prompt)).color(CHROME_TEXT));
                 if ui
-                    .add(egui::Button::new(
-                        RichText::new(before_unload_primary_label(prompt)).color(CHROME_TEXT),
+                    .add(action_button(
+                        before_unload_primary_label(prompt),
+                        BrowserActionRole::Primary,
                     ))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("Stay").color(CHROME_TEXT)))
+                    .add(action_button("Stay", BrowserActionRole::Secondary))
                     .clicked()
                 {
                     decision = Some(false);
@@ -3419,15 +3537,13 @@ pub(super) fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &st
                         .color(CHROME_TEXT),
                 );
                 if ui
-                    .add(egui::Button::new(RichText::new("Save").color(CHROME_TEXT)))
+                    .add(action_button("Save", BrowserActionRole::Primary))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(
-                        RichText::new("Not now").color(CHROME_TEXT),
-                    ))
+                    .add(action_button("Not now", BrowserActionRole::Secondary))
                     .clicked()
                 {
                     decision = Some(false);
@@ -3913,11 +4029,50 @@ mod tests {
     #[test]
     fn browser_chrome_tokens_are_local_material_roles() {
         assert_eq!(tab_fill(true), CHROME_TOOLBAR);
-        assert_eq!(tab_fill(false), CHROME_SURFACE_CONTAINER_HIGH);
+        assert_eq!(tab_fill(false), CHROME_SURFACE_CONTAINER);
+        assert_eq!(tab_stroke(true), CHROME_OUTLINE);
+        assert_eq!(tab_stroke(false), CHROME_SURFACE_CONTAINER_HIGH);
         assert_eq!(tab_text(false), CHROME_TEXT_DIM);
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
         assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
+    }
+
+    #[test]
+    fn browser_action_buttons_use_material_roles() {
+        assert_eq!(
+            action_button_fill(BrowserActionRole::Primary),
+            CHROME_PRIMARY
+        );
+        assert_eq!(
+            action_button_text(BrowserActionRole::Primary),
+            CHROME_TOOLBAR
+        );
+        assert_eq!(
+            action_button_stroke(BrowserActionRole::Primary),
+            CHROME_PRIMARY
+        );
+        assert_eq!(
+            action_button_fill(BrowserActionRole::Secondary),
+            CHROME_TOOLBAR
+        );
+        assert_eq!(
+            action_button_text(BrowserActionRole::Secondary),
+            CHROME_TEXT
+        );
+        assert_eq!(
+            action_button_stroke(BrowserActionRole::Secondary),
+            CHROME_OUTLINE
+        );
+        assert_eq!(action_button_fill(BrowserActionRole::Warning), CHROME_WARN);
+        assert_eq!(
+            action_button_text(BrowserActionRole::Warning),
+            CHROME_TOOLBAR
+        );
+        assert_eq!(
+            action_button_text(BrowserActionRole::Quiet),
+            CHROME_TEXT_DIM
+        );
     }
 
     #[test]
@@ -3935,6 +4090,22 @@ mod tests {
             CHROME_ON_PRIMARY_CONTAINER
         );
         assert_eq!(
+            engine_segment_stroke(BrowserEngine::Cef, BrowserEngine::Cef),
+            CHROME_PRIMARY
+        );
+        assert_eq!(
+            engine_segment_fill(BrowserEngine::Servo, BrowserEngine::Servo),
+            CHROME_SUCCESS_CONTAINER
+        );
+        assert_eq!(
+            engine_segment_text(BrowserEngine::Servo, BrowserEngine::Servo),
+            CHROME_ON_SUCCESS_CONTAINER
+        );
+        assert_eq!(
+            engine_segment_stroke(BrowserEngine::Servo, BrowserEngine::Servo),
+            CHROME_SUCCESS
+        );
+        assert_eq!(
             engine_segment_fill(BrowserEngine::Servo, BrowserEngine::Cef),
             CHROME_TOOLBAR
         );
@@ -3942,6 +4113,12 @@ mod tests {
             engine_segment_text(BrowserEngine::Servo, BrowserEngine::Cef),
             CHROME_TEXT
         );
+        assert_eq!(
+            engine_segment_stroke(BrowserEngine::Servo, BrowserEngine::Cef),
+            CHROME_OUTLINE
+        );
+        assert_eq!(engine_new_tab_fill(BrowserEngine::Cef), CHROME_PRIMARY);
+        assert_eq!(engine_new_tab_fill(BrowserEngine::Servo), CHROME_SUCCESS);
     }
 
     #[test]

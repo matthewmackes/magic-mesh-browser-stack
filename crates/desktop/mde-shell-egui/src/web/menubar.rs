@@ -414,7 +414,7 @@ const fn reload_label(crashed: bool) -> &'static str {
 /// seam), Edit (Copy URL), View (Reload, zoom, find, and the named BROWSER-DD-8
 /// Power-mode toggle), History (Back/Forward, gated on the live history),
 /// Privacy, and Bookmarks (add plus share). New-tab engine choice is handled by
-/// the tab strip's explicit `+ Servo` and `+ CEF` buttons.
+/// the tab strip's Browser-local segmented engine selector.
 fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
     let has_page = s.has_page();
     let can_tools = s.has_tab && !s.crashed;

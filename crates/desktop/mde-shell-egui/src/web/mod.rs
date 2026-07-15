@@ -12239,8 +12239,8 @@ mod tests {
             "engine picker should keep Servo visible as the fallback segment: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "+"),
-            "engine picker should use one familiar new-tab plus affordance: {texts:?}"
+            texts.iter().any(|text| text == "+ New tab"),
+            "engine picker should use one clear primary new-tab affordance: {texts:?}"
         );
         assert!(
             !texts
@@ -13692,6 +13692,52 @@ mod tests {
                 text == "Error code -202" && *color == chrome_ui::CHROME_TEXT_DIM
             }),
             "cert interstitial metadata must use Browser Material dim text: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_prompt_bars_use_material_action_buttons() {
+        let prompt = BeforeUnloadDialog {
+            id: 7,
+            message: "Unsaved work".to_owned(),
+            origin: "https://docs.example.com/edit".to_owned(),
+            is_reload: false,
+        };
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::scope(ui, |ui| {
+                    chrome_ui::permission_prompt_bar(ui, "https://camera.example", 3);
+                    chrome_ui::before_unload_prompt_bar(ui, &prompt);
+                    chrome_ui::login_save_prompt_bar(ui, "docs.example.com", "mm");
+                });
+            });
+        });
+        let texts = painted_text(&out.shapes);
+
+        for label in ["Allow", "Leave", "Save"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == chrome_ui::CHROME_TOOLBAR),
+                "primary prompt action `{label}` must use Browser primary-on color: {texts:?}"
+            );
+        }
+        for label in ["Block", "Stay", "Not now"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == chrome_ui::CHROME_TEXT),
+                "secondary prompt action `{label}` must use Browser text color: {texts:?}"
+            );
+        }
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "Allow" && *color == Style::TEXT),
+            "prompt buttons must not fall back to shared shell text tokens: {texts:?}"
         );
     }
 
