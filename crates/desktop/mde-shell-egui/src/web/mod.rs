@@ -1496,6 +1496,9 @@ pub(crate) struct WebState {
     /// Last time the Browser scanned the daemon-owned send-tab outbox for concrete
     /// node-addressed records.
     incoming_send_tab_last_poll: Option<Instant>,
+    /// Send-tab records this shell already processed. Backed by durable
+    /// tombstones so surviving/unlinkable outbox files cannot replay on restart.
+    consumed_send_tab_records: BTreeSet<String>,
     /// Last `event/browser-voice-command/<node>` ULID applied by this shell.
     voice_command_result_cursor: Option<String>,
     /// Last time the Browser scanned voice-command transcript results.
@@ -1740,6 +1743,7 @@ impl Default for WebState {
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
             incoming_send_tab_last_poll: None,
+            consumed_send_tab_records: BTreeSet::new(),
             voice_command_result_cursor: None,
             voice_command_result_last_poll: None,
             latest_read_aloud_status: None,
@@ -2427,20 +2431,27 @@ impl WebState {
                     .strip_prefix(&inbox)
                     .map(|rel| rel.to_string_lossy().to_string())
                     .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                if !seen.insert(key) {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
                 let Ok(body) = std::fs::read_to_string(&path) else {
                     continue;
                 };
+                let record_id = send_tab_consumed_record_id(&key, &body);
+                if !seen.insert(record_id.clone())
+                    || self.consumed_send_tab_records.contains(&record_id)
+                    || send_tab_record_is_consumed(&self.session_restore_roots, &host, &record_id)
+                {
+                    self.consumed_send_tab_records.insert(record_id);
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
                 match browser_send_tab_open_intent(&body, &sanitized_host) {
                     Ok(BrowserSendTabOpenDecision::Open(engine, url)) => {
                         self.request_new_tab_with_url(engine, url);
+                        self.remember_consumed_send_tab(&host, &record_id);
                         let _ = std::fs::remove_file(&path);
                         opened += 1;
                     }
                     Ok(BrowserSendTabOpenDecision::Consume) => {
+                        self.remember_consumed_send_tab(&host, &record_id);
                         let _ = std::fs::remove_file(&path);
                     }
                     Err(_) => continue,
@@ -2448,6 +2459,11 @@ impl WebState {
             }
         }
         opened
+    }
+
+    fn remember_consumed_send_tab(&mut self, host: &str, record_id: &str) {
+        self.consumed_send_tab_records.insert(record_id.to_owned());
+        let _ = write_send_tab_consumed_marker(&self.session_restore_roots, host, record_id);
     }
 
     fn poll_incoming_send_tabs(&mut self) {
@@ -6517,6 +6533,11 @@ const SESSION_SYNC_LATEST_FILE: &str = "latest.json";
 /// `mackesd::workers::browser_session_sync::SEND_TAB_OUTBOX_SUBDIR`.
 const SEND_TAB_OUTBOX_SUBDIR: &str = "browser-send-tab";
 
+/// Shell-owned replay ledger for processed send-tab records. This is intentionally
+/// separate from the daemon outbox so a surviving or unlinkable JSON record cannot
+/// reopen tabs after the shell restarts.
+const SEND_TAB_CONSUMED_SUBDIR: &str = "browser-send-tab-consumed";
+
 /// Browser idle-tab suspension handoff for deeper engine/process orchestration.
 const ACTION_BROWSER_TAB_SUSPEND: &str = "action/browser/tab-suspend";
 
@@ -7287,6 +7308,56 @@ fn send_tab_inbox_dir(root: &Path, host: &str) -> PathBuf {
     root.join(SEND_TAB_OUTBOX_SUBDIR)
         .join("node")
         .join(sanitize_session_host(host))
+}
+
+fn send_tab_consumed_dir(root: &Path, host: &str) -> PathBuf {
+    root.join(SEND_TAB_CONSUMED_SUBDIR)
+        .join(sanitize_session_host(host))
+}
+
+fn send_tab_consumed_path(root: &Path, host: &str, record_id: &str) -> PathBuf {
+    send_tab_consumed_dir(root, host).join(format!("{record_id}.seen"))
+}
+
+fn send_tab_record_is_consumed(roots: &[PathBuf], host: &str, record_id: &str) -> bool {
+    roots
+        .iter()
+        .any(|root| send_tab_consumed_path(root, host, record_id).is_file())
+}
+
+fn write_send_tab_consumed_marker(roots: &[PathBuf], host: &str, record_id: &str) -> bool {
+    for root in roots {
+        let path = send_tab_consumed_path(root, host, record_id);
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            continue;
+        }
+        if std::fs::write(&path, b"processed\n").is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn send_tab_consumed_record_id(relative_key: &str, body: &str) -> String {
+    let mut hash = FNV1A64_OFFSET;
+    hash = fnv1a64_update(hash, relative_key.as_bytes());
+    hash = fnv1a64_update(hash, b"\0");
+    hash = fnv1a64_update(hash, body.as_bytes());
+    format!("{hash:016x}")
+}
+
+const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
 }
 
 fn sanitize_session_host(host: &str) -> String {
@@ -15691,6 +15762,110 @@ mod tests {
         assert_eq!(state.take_open_request(), None);
         assert!(!local_path.exists());
         assert!(!share_path.exists());
+    }
+
+    #[test]
+    fn browser_send_tab_outbox_tombstone_prevents_surviving_record_replay() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let body = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "target_id": host,
+            "engine": "cef",
+            "url": "https://survives-unlink.mesh/",
+            "host": "source-node"
+        })
+        .to_string();
+        let share_path = send_tab_inbox_dir(share.path(), &host)
+            .join("source-node")
+            .join("01Replay.json");
+        std::fs::create_dir_all(share_path.parent().unwrap()).unwrap();
+        std::fs::write(&share_path, &body).unwrap();
+        let roots = vec![local.path().to_path_buf(), share.path().to_path_buf()];
+        let mut state = WebState::default().with_session_restore_roots(roots.clone());
+
+        assert_eq!(state.drain_incoming_send_tabs(), 1);
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: "https://survives-unlink.mesh/".to_owned(),
+            })
+        );
+
+        let rel_key = PathBuf::from("source-node")
+            .join("01Replay.json")
+            .to_string_lossy()
+            .to_string();
+        let record_id = send_tab_consumed_record_id(&rel_key, &body);
+        assert!(
+            send_tab_consumed_path(local.path(), &host, &record_id).is_file(),
+            "processed send-tab records get a local replay tombstone"
+        );
+
+        std::fs::create_dir_all(share_path.parent().unwrap()).unwrap();
+        std::fs::write(&share_path, &body).unwrap();
+        let mut restarted = WebState::default().with_session_restore_roots(roots);
+
+        assert_eq!(restarted.drain_incoming_send_tabs(), 0);
+        assert_eq!(restarted.take_open_request(), None);
+        assert!(
+            !share_path.exists(),
+            "a replay-suppressed surviving record is still unlinked when possible"
+        );
+    }
+
+    #[test]
+    fn browser_send_tab_tombstone_does_not_hide_a_new_body_at_the_same_path() {
+        let local = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let path = send_tab_inbox_dir(local.path(), &host)
+            .join("source-node")
+            .join("01StablePath.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "target_id": host,
+            "engine": "servo",
+            "url": "https://first.mesh/",
+            "host": "source-node"
+        })
+        .to_string();
+        std::fs::write(&path, &first).unwrap();
+        let roots = vec![local.path().to_path_buf()];
+        let mut state = WebState::default().with_session_restore_roots(roots.clone());
+        assert_eq!(state.drain_incoming_send_tabs(), 1);
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Servo,
+                url: "https://first.mesh/".to_owned(),
+            })
+        );
+
+        let second = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "target_id": host,
+            "engine": "cef",
+            "url": "https://second.mesh/",
+            "host": "source-node"
+        })
+        .to_string();
+        std::fs::write(&path, &second).unwrap();
+        let mut restarted = WebState::default().with_session_restore_roots(roots);
+
+        assert_eq!(restarted.drain_incoming_send_tabs(), 1);
+        assert_eq!(
+            restarted.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: "https://second.mesh/".to_owned(),
+            })
+        );
     }
 
     #[test]
