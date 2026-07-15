@@ -9,13 +9,14 @@
 use std::sync::Arc;
 
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
-use mde_egui::ChipTone;
+use mde_egui::{ChipTone, Style};
 use mde_web_preview_client::SessionState;
 
 use super::{
-    ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
-    DisplayTarget, Tab, UserAgentOverride, WebState, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W,
-    CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_W,
+    centered, ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
+    DisplayTarget, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
+    CHROME_NEW_TAB_W, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_W,
+    PRIVATE_MODE_EXPLAINER,
 };
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
@@ -522,6 +523,86 @@ pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, ve
     };
     button(ui, BrowserEngine::Servo);
     button(ui, BrowserEngine::Cef);
+}
+
+pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
+    let mut submit_search = false;
+    let mut open_service: Option<String> = None;
+    centered(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Quasar Browser")
+                .size(Style::HEADING)
+                .color(CHROME_TEXT),
+        );
+        // Private-by-default explainer — the browser has no persistent profile
+        // (sandbox has no writable $HOME); make that posture legible on the front
+        // door instead of only in the Privacy menu.
+        ui.label(
+            egui::RichText::new(PRIVATE_MODE_EXPLAINER)
+                .small()
+                .color(CHROME_TEXT_DIM),
+        );
+        ui.add_space(Style::SP_M);
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut state.dashboard_query)
+                    .desired_width(420.0)
+                    .hint_text("Search the mesh")
+                    .text_color(CHROME_TEXT),
+            );
+            state.chrome_edit_focus |= resp.has_focus();
+            submit_search = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Search").color(CHROME_TEXT),
+                ))
+                .clicked()
+            {
+                submit_search = true;
+            }
+        });
+        ui.add_space(Style::SP_M);
+        ui.horizontal_wrapped(|ui| {
+            for service in &state.speed_dial {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(service.label.as_str())
+                                .size(Style::BODY)
+                                .color(CHROME_TEXT),
+                        )
+                        .min_size(egui::vec2(112.0, Style::SP_XL)),
+                    )
+                    .on_hover_text(service.hint.as_str())
+                    .clicked()
+                {
+                    open_service = Some(service.url.clone());
+                }
+            }
+        });
+    });
+    if submit_search {
+        state.submit_dashboard_search();
+    }
+    if let Some(url) = open_service {
+        state.open_mesh_service(url);
+    }
+}
+
+/// A compact Browser chrome button in the local Material palette.
+pub(super) fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(
+            egui::RichText::new(glyph)
+                .size(CHROME_FONT)
+                .color(button_text(enabled)),
+        )
+        .fill(control_fill(false))
+        .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+    )
+    .on_hover_text(tip)
+    .clicked()
 }
 
 #[cfg(test)]

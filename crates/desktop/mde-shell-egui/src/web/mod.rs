@@ -6453,7 +6453,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
                 }
             }
         }
-        Some((false, None, _, true, _, _)) => new_tab_dashboard(ui, state),
+        Some((false, None, _, true, _, _)) => chrome_ui::new_tab_dashboard(ui, state),
         Some((false, None, true, false, _, _)) => paint_body(ui, state, active),
         Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet — an honest loading note, never a blank.
@@ -9421,12 +9421,12 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let mut toolbar_action: Option<menubar::MenuAction> = None;
     ui.horizontal(|ui| {
         // Back / forward — enabled only when the live session offers the history.
-        if nav_button(ui, "\u{2039}", "Back", has_tab && !crashed && nav.can_back) {
+        if chrome_ui::nav_button(ui, "\u{2039}", "Back", has_tab && !crashed && nav.can_back) {
             if let Some(tab) = state.active_tab() {
                 tab.session.go_back();
             }
         }
-        if nav_button(
+        if chrome_ui::nav_button(
             ui,
             "\u{203A}",
             "Forward",
@@ -9448,7 +9448,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         } else {
             ("\u{21BB}", "Reload")
         };
-        if nav_button(ui, nav_label, nav_tip, has_tab) {
+        if chrome_ui::nav_button(ui, nav_label, nav_tip, has_tab) {
             if crashed {
                 state.respawn_requested = true;
             } else if can_stop {
@@ -9484,7 +9484,7 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             active_engine == Some(BrowserEngine::Cef),
         );
 
-        if nav_button(
+        if chrome_ui::nav_button(
             ui,
             "\u{25A3}",
             if state.capture_region_mode {
@@ -9834,13 +9834,13 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 } else if enter {
                     submit_forward = true;
                 }
-                if nav_button(ui, "\u{2191}", "Previous match", enabled) {
+                if chrome_ui::nav_button(ui, "\u{2191}", "Previous match", enabled) {
                     submit_backward = true;
                 }
-                if nav_button(ui, "\u{2193}", "Next match", enabled) {
+                if chrome_ui::nav_button(ui, "\u{2193}", "Next match", enabled) {
                     submit_forward = true;
                 }
-                if nav_button(ui, "\u{00D7}", "Close find", true) {
+                if chrome_ui::nav_button(ui, "\u{00D7}", "Close find", true) {
                     state.close_find_bar();
                 }
             });
@@ -10015,86 +10015,6 @@ fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
             state.cancel_insecure_load();
         }
     });
-}
-
-fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
-    let mut submit_search = false;
-    let mut open_service: Option<String> = None;
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("Quasar Browser")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_TEXT),
-        );
-        // Private-by-default explainer — the browser has no persistent profile
-        // (sandbox has no writable $HOME); make that posture legible on the front
-        // door instead of only in the Privacy menu (industry-grade "private mode UX").
-        ui.label(
-            RichText::new(PRIVATE_MODE_EXPLAINER)
-                .small()
-                .color(chrome_ui::CHROME_TEXT_DIM),
-        );
-        ui.add_space(Style::SP_M);
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut state.dashboard_query)
-                    .desired_width(420.0)
-                    .hint_text("Search the mesh")
-                    .text_color(chrome_ui::CHROME_TEXT),
-            );
-            state.chrome_edit_focus |= resp.has_focus();
-            submit_search = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui
-                .add(egui::Button::new(
-                    RichText::new("Search").color(chrome_ui::CHROME_TEXT),
-                ))
-                .clicked()
-            {
-                submit_search = true;
-            }
-        });
-        ui.add_space(Style::SP_M);
-        ui.horizontal_wrapped(|ui| {
-            for service in &state.speed_dial {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(service.label.as_str())
-                                .size(Style::BODY)
-                                .color(chrome_ui::CHROME_TEXT),
-                        )
-                        .min_size(egui::vec2(112.0, Style::SP_XL)),
-                    )
-                    .on_hover_text(service.hint.as_str())
-                    .clicked()
-                {
-                    open_service = Some(service.url.clone());
-                }
-            }
-        });
-    });
-    if submit_search {
-        state.submit_dashboard_search();
-    }
-    if let Some(url) = open_service {
-        state.open_mesh_service(url);
-    }
-}
-
-/// A compact chrome button in the §4 palette, returning whether it was clicked.
-fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(
-            RichText::new(glyph)
-                .size(CHROME_FONT)
-                .color(chrome_ui::button_text(enabled)),
-        )
-        .fill(chrome_ui::control_fill(false))
-        .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-    )
-    .on_hover_text(tip)
-    .clicked()
 }
 
 /// Map a pointer position from egui panel space into the helper frame's **device
