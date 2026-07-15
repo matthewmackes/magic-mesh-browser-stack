@@ -14,13 +14,19 @@ use std::{
     sync::Arc,
 };
 
-use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle, TextureHandle, TextureOptions};
+use mde_egui::egui::{
+    self, Color32, FontFamily, FontId, RichText, TextStyle, TextureHandle, TextureOptions,
+};
 use mde_egui::{muted_note, ChipTone, Style};
-use mde_web_preview_client::{confusable_reason, host_of, ConfusableReason, SessionState};
+use mde_web_preview_client::{
+    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, JsDialog,
+    SessionState,
+};
 
 use super::{
-    centered, ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
-    DisplayTarget, FaviconCache, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT,
+    centered, ellipsize, media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult,
+    ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock,
+    PendingPasskeyConsent, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT,
     CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H,
     CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_W, PRIVATE_MODE_EXPLAINER,
 };
@@ -1422,7 +1428,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             &page_url,
             &page_title,
         );
-        super::password_menu(
+        password_menu(
             ui,
             state,
             &page_url,
@@ -2470,6 +2476,628 @@ pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     } else if submit_forward {
         state.submit_find(false);
     }
+}
+
+/// The toolbar password menu: fill a saved login into the current site's form, or
+/// save a new credential for it. Session-only store, user-initiated fill.
+fn password_menu(
+    ui: &mut egui::Ui,
+    state: &mut WebState,
+    page_url: &str,
+    has_page: bool,
+    can_fill: bool,
+) {
+    let host = host_of(page_url).unwrap_or_default();
+    let mut fill: Option<(String, String)> = None;
+    let mut remove: Option<usize> = None;
+    let mut save = false;
+    let matches: Vec<(usize, String, String)> = if host.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .session_logins
+            .iter()
+            .enumerate()
+            .filter(|(_, login)| login.host == host)
+            .map(|(idx, login)| (idx, login.username.clone(), login.password.clone()))
+            .collect()
+    };
+    ui.menu_button(
+        RichText::new("\u{1F511}")
+            .size(CHROME_FONT)
+            .color(CHROME_TEXT_DIM),
+        |ui| {
+            ui.set_min_width(260.0);
+            if host.is_empty() {
+                ui.weak("No site loaded");
+                return;
+            }
+            ui.label(
+                RichText::new("Saved logins (this session)")
+                    .size(CHROME_FONT)
+                    .strong(),
+            );
+            if matches.is_empty() {
+                ui.weak(format!("None saved for {host}"));
+            } else {
+                for (idx, username, password) in &matches {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                has_page && can_fill,
+                                egui::Button::new(
+                                    RichText::new(format!("Fill {username}")).size(CHROME_FONT),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            fill = Some((username.clone(), password.clone()));
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("\u{00D7}").size(CHROME_FONT),
+                            ))
+                            .on_hover_text("Delete saved login")
+                            .clicked()
+                        {
+                            remove = Some(*idx);
+                            ui.close_menu();
+                        }
+                    });
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new(format!("Save a login for {host}")).size(CHROME_FONT));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.login_user_draft)
+                    .hint_text("username")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut state.login_pass_draft)
+                    .password(true)
+                    .hint_text("password")
+                    .desired_width(f32::INFINITY),
+            );
+            if ui
+                .add(egui::Button::new(RichText::new("Save").size(CHROME_FONT)))
+                .clicked()
+            {
+                save = true;
+                ui.close_menu();
+            }
+        },
+    );
+    if let Some((user, pass)) = fill {
+        state.fill_active_login(host.clone(), user, pass);
+    }
+    if let Some(idx) = remove {
+        state.remove_login(idx);
+    }
+    if save {
+        let user = std::mem::take(&mut state.login_user_draft);
+        let pass = std::mem::take(&mut state.login_pass_draft);
+        state.save_login(&host, &user, &pass);
+    }
+}
+
+pub(super) fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(url) = state.insecure_prompt.clone() else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("HTTP connection")
+                .size(CHROME_FONT)
+                .color(CHROME_WARN),
+        );
+        ui.label(RichText::new(ellipsize(&url, 64)).color(CHROME_TEXT_DIM));
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Use HTTPS")
+                    .size(CHROME_FONT)
+                    .color(CHROME_TEXT),
+            ))
+            .on_hover_text("Upgrade this navigation to HTTPS")
+            .clicked()
+        {
+            state.upgrade_insecure_load();
+        }
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Continue HTTP")
+                    .size(CHROME_FONT)
+                    .color(CHROME_WARN),
+            ))
+            .on_hover_text("Continue with the insecure HTTP URL")
+            .clicked()
+        {
+            state.continue_insecure_load();
+        }
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Cancel")
+                    .size(CHROME_FONT)
+                    .color(CHROME_TEXT_DIM),
+            ))
+            .clicked()
+        {
+            state.cancel_insecure_load();
+        }
+    });
+}
+
+pub(super) fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(notice) = state.capture_notice.clone() else {
+        return;
+    };
+    let tone = if notice.starts_with("Capture failed:")
+        || notice.starts_with("PDF failed")
+        || notice.starts_with("PDF viewer failed:")
+        || notice.starts_with("Print failed:")
+    {
+        CHROME_ERROR
+    } else {
+        CHROME_PRIMARY
+    };
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(tone, RichText::new(notice).size(Style::SMALL));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{00D7}")
+                        .on_hover_text("Dismiss capture notice")
+                        .clicked()
+                    {
+                        state.capture_notice = None;
+                    }
+                });
+            });
+        });
+}
+
+pub(super) fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool) {
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("This page crashed")
+                .size(Style::HEADING)
+                .color(CHROME_ERROR),
+        );
+        ui.add_space(Style::SP_S);
+        if !reason.is_empty() {
+            browser_body_note(ui, reason);
+        }
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("\u{21BB} Reload").color(CHROME_TEXT),
+            ))
+            .clicked()
+        {
+            *respawn_requested = true;
+        }
+    });
+}
+
+pub(super) fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
+    let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
+    let mut back = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("\u{26A0} Unsafe site blocked")
+                .size(Style::HEADING)
+                .color(CHROME_ERROR),
+        );
+        ui.add_space(Style::SP_M);
+        ui.label(
+            RichText::new(format!(
+                "{host} is on the mesh safe-browsing blocklist. This page was not loaded."
+            ))
+            .color(CHROME_TEXT),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Back to safety").color(CHROME_TEXT),
+            ))
+            .clicked()
+        {
+            back = true;
+        }
+    });
+    back
+}
+
+pub(super) fn managed_policy_interstitial_body(
+    ui: &mut egui::Ui,
+    block: &ManagedPolicyBlock,
+) -> bool {
+    let host = host_of(&block.url).unwrap_or_else(|| block.url.trim().to_owned());
+    let mut back = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("\u{26D4} Blocked by policy")
+                .size(Style::HEADING)
+                .color(CHROME_ERROR),
+        );
+        ui.add_space(Style::SP_M);
+        ui.label(
+            RichText::new(format!(
+                "{host} is blocked by managed Browser policy. Rule: {}",
+                block.rule
+            ))
+            .color(CHROME_TEXT),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("Back to safety").color(CHROME_TEXT),
+            ))
+            .clicked()
+        {
+            back = true;
+        }
+    });
+    back
+}
+
+fn js_dialog_action_label(kind: u8) -> (&'static str, &'static str) {
+    match kind {
+        0 => ("alert", "accepted"),
+        1 => ("confirm", "cancelled"),
+        2 => ("prompt", "cancelled"),
+        _ => ("dialog", "dismissed"),
+    }
+}
+
+pub(super) fn js_dialog_notice(dialog: &JsDialog) -> String {
+    let (kind, action) = js_dialog_action_label(dialog.kind);
+    let origin = origin_label(&dialog.origin);
+    let message = dialog.message.trim();
+    let message = if message.is_empty() {
+        "(empty message)".to_owned()
+    } else {
+        ellipsize(message, 96)
+    };
+    format!("Page {kind} from {origin} was {action}: {message}")
+}
+
+pub(super) fn origin_label(origin: &str) -> String {
+    host_of(origin).unwrap_or_else(|| {
+        let origin = origin.trim();
+        if origin.is_empty() {
+            "unknown origin".to_owned()
+        } else {
+            origin.to_owned()
+        }
+    })
+}
+
+pub(super) fn before_unload_prompt_text(prompt: &BeforeUnloadDialog) -> String {
+    let origin = origin_label(&prompt.origin);
+    let action = if prompt.is_reload { "reload" } else { "leave" };
+    let message = prompt.message.trim();
+    let message = if message.is_empty() {
+        "(empty message)".to_owned()
+    } else {
+        ellipsize(message, 96)
+    };
+    format!("{origin} wants to {action} this page: {message}")
+}
+
+pub(super) fn before_unload_primary_label(prompt: &BeforeUnloadDialog) -> &'static str {
+    if prompt.is_reload {
+        "Reload"
+    } else {
+        "Leave"
+    }
+}
+
+pub(super) fn passkey_consent_prompt_text(
+    pending: &PendingPasskeyConsent,
+    active_tab_id: Option<u64>,
+) -> String {
+    let origin = pending.display_origin();
+    let background = if active_tab_id == Some(pending.tab_id) {
+        ""
+    } else {
+        "Background tab: "
+    };
+    let account = pending
+        .user_name
+        .as_deref()
+        .map(|name| format!(" for {}", ellipsize(name, 48)))
+        .unwrap_or_default();
+    format!(
+        "{background}{origin} wants to {}{} on {} via {}",
+        pending.verb(),
+        account,
+        pending.rp_id,
+        pending.engine.label()
+    )
+}
+
+pub(super) fn passkey_consent_prompt_bar(
+    ui: &mut egui::Ui,
+    pending: &PendingPasskeyConsent,
+    active_tab_id: Option<u64>,
+) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(passkey_consent_prompt_text(pending, active_tab_id))
+                        .color(CHROME_TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Approve").color(CHROME_TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Deny").color(CHROME_TEXT)))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
+pub(super) fn permission_kind_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "know your location",
+        1 => "show notifications",
+        2 => "access the clipboard",
+        3 => "use your camera",
+        4 => "use your microphone",
+        5 => "use your camera and microphone",
+        _ => "use a device capability",
+    }
+}
+
+pub(super) fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{origin} wants to {}", permission_kind_label(kind)))
+                        .color(CHROME_TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("Allow").color(CHROME_TEXT)))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Block").color(CHROME_TEXT)))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
+pub(super) fn before_unload_prompt_bar(
+    ui: &mut egui::Ui,
+    prompt: &BeforeUnloadDialog,
+) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(before_unload_prompt_text(prompt)).color(CHROME_TEXT));
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(before_unload_primary_label(prompt)).color(CHROME_TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Stay").color(CHROME_TEXT)))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
+pub(super) fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &str) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Save login for {host} ({username})?"))
+                        .color(CHROME_TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("Save").color(CHROME_TEXT)))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Not now").color(CHROME_TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
+}
+
+pub(super) fn cert_error_host(err: &CertError) -> String {
+    host_of(&err.url).unwrap_or_else(|| err.url.clone())
+}
+
+pub(super) fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
+    let mut back_to_safety = false;
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("Your connection is not private")
+                .size(Style::HEADING)
+                .color(CHROME_ERROR),
+        );
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(cert_error_host(err))
+                .size(Style::HEADING)
+                .color(CHROME_TEXT),
+        );
+        ui.add_space(Style::SP_S);
+        browser_body_note(ui, err.message.as_str());
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(format!("Error code {}", err.code))
+                .size(Style::SMALL)
+                .color(CHROME_TEXT_DIM),
+        );
+        ui.add_space(Style::SP_M);
+        if ui
+            .add(egui::Button::new(
+                RichText::new("\u{2190} Back to safety").color(CHROME_TEXT),
+            ))
+            .clicked()
+        {
+            back_to_safety = true;
+        }
+        if !can_back {
+            ui.add_space(Style::SP_XS);
+            browser_body_note(ui, "No history to return to - this closes the tab.");
+        }
+    });
+    back_to_safety
+}
+
+pub(super) fn browser_body_note(ui: &mut egui::Ui, msg: impl Into<String>) -> egui::Response {
+    ui.label(
+        RichText::new(msg.into())
+            .size(Style::SMALL)
+            .color(CHROME_TEXT_DIM),
+    )
+}
+
+pub(super) fn cached_offline_body(
+    ui: &mut egui::Ui,
+    result: &BrowserOfflineCacheResult,
+    unavailable_reason: Option<&str>,
+) {
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Offline copy")
+                        .size(Style::HEADING)
+                        .color(CHROME_TEXT),
+                );
+                ui.label(
+                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
+                        .size(Style::SMALL)
+                        .color(CHROME_TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy cached page text")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(result.text.clone());
+                    }
+                });
+            });
+            if let Some(reason) = unavailable_reason
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(format!("Live page unavailable: {reason}"))
+                        .size(Style::SMALL)
+                        .color(CHROME_WARN),
+                );
+            }
+            ui.add_space(Style::SP_XS);
+            let page = if result.title.trim().is_empty() {
+                result.url.as_str()
+            } else {
+                result.title.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(page)
+                        .size(Style::SMALL)
+                        .color(CHROME_TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} chars from {}",
+                        result.text.chars().count(),
+                        result.engine.label()
+                    ))
+                    .size(Style::SMALL)
+                    .color(CHROME_TEXT_DIM),
+                );
+            });
+            ui.add_space(Style::SP_S);
+            egui::ScrollArea::vertical()
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(result.text.as_str())
+                            .size(Style::SMALL)
+                            .color(CHROME_TEXT),
+                    );
+                });
+        });
+}
+
+pub(super) fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
+    centered(ui, |ui| {
+        ui.label(
+            RichText::new("Sandboxed browser")
+                .size(Style::HEADING)
+                .color(CHROME_TEXT),
+        );
+        ui.add_space(Style::SP_S);
+        browser_body_note(
+            ui,
+            notice.unwrap_or(
+                "The sandboxed Servo browser renders here in the shell. A live session \
+                 attaches on a GPU seat (BOOKMARKS-5/6 live path is gated).",
+            ),
+        );
+    });
 }
 
 #[cfg(test)]

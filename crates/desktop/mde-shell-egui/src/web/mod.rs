@@ -28,7 +28,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
 use mde_editor_egui::spell::{self, SpellMiss};
-use mde_egui::egui::{self, RichText, Sense, TextureHandle, TextureOptions};
+use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 use mde_egui::{ChipTone, Style};
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
@@ -546,7 +546,7 @@ impl PendingPasskeyConsent {
     }
 
     fn display_origin(&self) -> String {
-        origin_label(&self.origin)
+        chrome_ui::origin_label(&self.origin)
     }
 }
 
@@ -4543,7 +4543,7 @@ impl WebState {
     }
 
     fn handle_js_dialog_event(&mut self, tab_index: usize, dialog: &JsDialog) {
-        let mut notice = js_dialog_notice(dialog);
+        let mut notice = chrome_ui::js_dialog_notice(dialog);
         if tab_index != self.active {
             notice = format!("Background tab: {notice}");
         }
@@ -6230,8 +6230,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                     chrome_ui::bookmarks_bar(ui, state);
                     chrome_ui::find_chrome(ui, state);
                 });
-                insecure_prompt(ui, state);
-                capture_notice(ui, state);
+                chrome_ui::insecure_prompt(ui, state);
+                chrome_ui::capture_notice(ui, state);
                 qr_share_drawer(ui, state);
                 spellcheck_drawer(ui, state);
                 speech_status_drawer(ui, state);
@@ -6259,8 +6259,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             chrome_ui::bookmarks_bar(ui, state);
             chrome_ui::find_chrome(ui, state);
         });
-        insecure_prompt(ui, state);
-        capture_notice(ui, state);
+        chrome_ui::insecure_prompt(ui, state);
+        chrome_ui::capture_notice(ui, state);
         qr_share_drawer(ui, state);
         spellcheck_drawer(ui, state);
         speech_status_drawer(ui, state);
@@ -6297,7 +6297,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         }
     }
     if let Some(block) = state.managed_policy_block.clone() {
-        if managed_policy_interstitial_body(ui, &block) {
+        if chrome_ui::managed_policy_interstitial_body(ui, &block) {
             state.managed_policy_block = None;
             if let Some(tab) = state.active_tab() {
                 tab.session.clear_managed_policy_block();
@@ -6315,7 +6315,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         .get(active)
         .and_then(|t| t.session.safe_browsing_block().map(str::to_owned));
     if let Some(url) = sb_block {
-        if safe_browsing_interstitial_body(ui, &url) {
+        if chrome_ui::safe_browsing_interstitial_body(ui, &url) {
             if let Some(tab) = state.active_tab() {
                 tab.session.go_back();
             }
@@ -6336,22 +6336,22 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     if !interstitial_below {
         if let Some(pending) = state.pending_passkey_consent.clone() {
             let active_tab_id = state.tabs.get(active).map(|tab| tab.id);
-            match passkey_consent_prompt_bar(ui, &pending, active_tab_id) {
+            match chrome_ui::passkey_consent_prompt_bar(ui, &pending, active_tab_id) {
                 Some(true) => state.approve_pending_passkey(),
                 Some(false) => state.deny_pending_passkey(),
                 None => {}
             }
         } else if let Some(prompt) = state.pending_before_unload_prompt() {
-            if let Some(proceed) = before_unload_prompt_bar(ui, &prompt) {
+            if let Some(proceed) = chrome_ui::before_unload_prompt_bar(ui, &prompt) {
                 state.answer_active_before_unload(prompt.id, proceed);
             }
         } else if let Some((origin, kind)) = state.pending_permission_prompt() {
-            if let Some(allow) = permission_prompt_bar(ui, &origin, kind) {
+            if let Some(allow) = chrome_ui::permission_prompt_bar(ui, &origin, kind) {
                 state.answer_active_permission(&origin, kind, allow);
             }
         } else if let Some(pending) = state.active_pending_login_save().cloned() {
             // "Save password?" offer for an auto-captured login submit.
-            match login_save_prompt_bar(ui, &pending.host, &pending.username) {
+            match chrome_ui::login_save_prompt_bar(ui, &pending.host, &pending.username) {
                 Some(true) => state.accept_pending_login_save(),
                 Some(false) => state.dismiss_pending_login_save(),
                 None => {}
@@ -6378,9 +6378,9 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     match status {
         Some((true, _, _, _, reason, _)) => {
             if let Some(snapshot) = state.offline_cache_fallback_for_unavailable().cloned() {
-                cached_offline_body(ui, &snapshot, Some(reason.as_str()));
+                chrome_ui::cached_offline_body(ui, &snapshot, Some(reason.as_str()));
             } else {
-                crashed_body(ui, reason, &mut state.respawn_requested);
+                chrome_ui::crashed_body(ui, reason, &mut state.respawn_requested);
             }
         }
         // The engine blocks the navigation by default on a TLS/certificate
@@ -6388,7 +6388,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         // this takes precedence over a normal frame/dashboard the same way
         // `is_crashed` does — checked right beside it, one arm down.
         Some((false, Some(err), _, _, _, can_back)) => {
-            if cert_error_body(ui, &err, can_back) {
+            if chrome_ui::cert_error_body(ui, &err, can_back) {
                 match cert_error_back_action(can_back) {
                     CertErrorBackAction::GoBack => {
                         if let Some(tab) = state.active_tab() {
@@ -6405,7 +6405,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet — an honest loading note, never a blank.
             centered(ui, |ui| {
-                browser_body_note(ui, "Loading the page\u{2026}");
+                chrome_ui::browser_body_note(ui, "Loading the page\u{2026}");
             });
         }
         None => {
@@ -6418,9 +6418,9 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             #[cfg(not(feature = "live-helper"))]
             let notice: Option<&str> = None;
             if let Some(snapshot) = cached {
-                cached_offline_body(ui, &snapshot, notice);
+                chrome_ui::cached_offline_body(ui, &snapshot, notice);
             } else {
-                empty_body(ui, notice);
+                chrome_ui::empty_body(ui, notice);
             }
         }
     }
@@ -6479,14 +6479,6 @@ fn crash_reason(session: &WebSession) -> String {
 /// from the egui paint path.
 fn shows_cert_interstitial(is_crashed: bool, cert_error: Option<&CertError>) -> bool {
     !is_crashed && cert_error.is_some()
-}
-
-/// The host to name in the cert-error interstitial, reusing the same
-/// dependency-free `host_of` parser the ad filter and third-party checks use
-/// (BOOKMARKS-7). Falls back to the raw blocked URL on the rare shape with no
-/// `scheme://host` authority, rather than showing a blank domain.
-fn cert_error_host(err: &CertError) -> String {
-    host_of(&err.url).unwrap_or_else(|| err.url.clone())
 }
 
 /// What "Back to safety" does on the cert-error interstitial — go back if the
@@ -7671,114 +7663,6 @@ use capture::*;
 mod drawers;
 use drawers::*;
 
-/// The toolbar 🔑 password menu: fill a saved login into the current site's form, or
-/// save a new credential for it. Session-only store, user-initiated fill (the engine
-/// injects the fill script). Deferred actions are applied after the popup closure so
-/// the store borrow ends before the save-form's mutable draft edit.
-fn password_menu(
-    ui: &mut egui::Ui,
-    state: &mut WebState,
-    page_url: &str,
-    has_page: bool,
-    can_fill: bool,
-) {
-    let host = host_of(page_url).unwrap_or_default();
-    let mut fill: Option<(String, String)> = None;
-    let mut remove: Option<usize> = None;
-    let mut save = false;
-    // Clone matches out (index, user, pass) so the store borrow does not outlive into
-    // the save-form's `&mut login_*_draft`.
-    let matches: Vec<(usize, String, String)> = if host.is_empty() {
-        Vec::new()
-    } else {
-        state
-            .session_logins
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.host == host)
-            .map(|(i, l)| (i, l.username.clone(), l.password.clone()))
-            .collect()
-    };
-    ui.menu_button(
-        RichText::new("\u{1F511}") // 🔑
-            .size(CHROME_FONT)
-            .color(Style::TEXT_DIM),
-        |ui| {
-            ui.set_min_width(260.0);
-            if host.is_empty() {
-                ui.weak("No site loaded");
-                return;
-            }
-            ui.label(
-                RichText::new("Saved logins (this session)")
-                    .size(CHROME_FONT)
-                    .strong(),
-            );
-            if matches.is_empty() {
-                ui.weak(format!("None saved for {host}"));
-            } else {
-                for (idx, username, password) in &matches {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                has_page && can_fill,
-                                egui::Button::new(
-                                    RichText::new(format!("Fill {username}")).size(CHROME_FONT),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            fill = Some((username.clone(), password.clone()));
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("\u{00D7}").size(CHROME_FONT),
-                            ))
-                            .on_hover_text("Delete saved login")
-                            .clicked()
-                        {
-                            remove = Some(*idx);
-                            ui.close_menu();
-                        }
-                    });
-                }
-            }
-            ui.separator();
-            ui.label(RichText::new(format!("Save a login for {host}")).size(CHROME_FONT));
-            ui.add(
-                egui::TextEdit::singleline(&mut state.login_user_draft)
-                    .hint_text("username")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut state.login_pass_draft)
-                    .password(true)
-                    .hint_text("password")
-                    .desired_width(f32::INFINITY),
-            );
-            if ui
-                .add(egui::Button::new(RichText::new("Save").size(CHROME_FONT)))
-                .clicked()
-            {
-                save = true;
-                ui.close_menu();
-            }
-        },
-    );
-    if let Some((user, pass)) = fill {
-        state.fill_active_login(host.clone(), user, pass);
-    }
-    if let Some(idx) = remove {
-        state.remove_login(idx);
-    }
-    if save {
-        let user = std::mem::take(&mut state.login_user_draft);
-        let pass = std::mem::take(&mut state.login_pass_draft);
-        state.save_login(&host, &user, &pass);
-    }
-}
-
 /// Whether the compact toolbar's reload slot should present as a real Stop
 /// control instead of Reload.
 ///
@@ -8025,52 +7909,6 @@ const fn download_state_color(state: TransferState) -> egui::Color32 {
         TransferState::Paused => Style::WARN,
         TransferState::Queued | TransferState::Running => Style::TEXT_DIM,
     }
-}
-
-fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
-    let Some(url) = state.insecure_prompt.clone() else {
-        return;
-    };
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new("HTTP connection")
-                .size(CHROME_FONT)
-                .color(chrome_ui::CHROME_WARN),
-        );
-        ui.label(RichText::new(ellipsize(&url, 64)).color(chrome_ui::CHROME_TEXT_DIM));
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Use HTTPS")
-                    .size(CHROME_FONT)
-                    .color(chrome_ui::CHROME_TEXT),
-            ))
-            .on_hover_text("Upgrade this navigation to HTTPS")
-            .clicked()
-        {
-            state.upgrade_insecure_load();
-        }
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Continue HTTP")
-                    .size(CHROME_FONT)
-                    .color(chrome_ui::CHROME_WARN),
-            ))
-            .on_hover_text("Continue with the insecure HTTP URL")
-            .clicked()
-        {
-            state.continue_insecure_load();
-        }
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Cancel")
-                    .size(CHROME_FONT)
-                    .color(chrome_ui::CHROME_TEXT_DIM),
-            ))
-            .clicked()
-        {
-            state.cancel_insecure_load();
-        }
-    });
 }
 
 /// Map a pointer position from egui panel space into the helper frame's **device
@@ -8404,38 +8242,6 @@ fn handle_region_capture_drag(
     }
 }
 
-fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
-    let Some(notice) = state.capture_notice.clone() else {
-        return;
-    };
-    let tone = if notice.starts_with("Capture failed:")
-        || notice.starts_with("PDF failed")
-        || notice.starts_with("PDF viewer failed:")
-        || notice.starts_with("Print failed:")
-    {
-        chrome_ui::CHROME_ERROR
-    } else {
-        chrome_ui::CHROME_PRIMARY
-    };
-    egui::Frame::NONE
-        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(tone, RichText::new(notice).size(Style::SMALL));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Dismiss capture notice")
-                        .clicked()
-                    {
-                        state.capture_notice = None;
-                    }
-                });
-            });
-        });
-}
-
 fn spellcheck_results_text(misses: &[SpellMiss]) -> String {
     misses
         .iter()
@@ -8739,481 +8545,6 @@ fn browser_input_event(
         egui::Event::Text(text) => browser_focused.then_some(egui::Event::Text(text.clone())),
         _ => None,
     }
-}
-
-/// The honest "page crashed" body: a danger caption naming the reason plus a
-/// Reload that respawns the tab (setting `respawn_requested`). Never a fake page.
-fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool) {
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("This page crashed")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_ERROR),
-        );
-        ui.add_space(Style::SP_S);
-        if !reason.is_empty() {
-            browser_body_note(ui, reason);
-        }
-        ui.add_space(Style::SP_M);
-        if ui
-            .add(egui::Button::new(
-                RichText::new("\u{21BB} Reload").color(chrome_ui::CHROME_TEXT),
-            ))
-            .clicked()
-        {
-            *respawn_requested = true;
-        }
-    });
-}
-
-/// The honest TLS/certificate-error interstitial: a full-content-area "sad
-/// tab" painted instead of the page frame when the engine blocked a load for
-/// a bad certificate (mirrors `crashed_body`'s pattern exactly). The engine
-/// blocks by default and there is no "proceed anyway" affordance here — only
-/// a way back. Returns `true` when "Back to safety" was clicked; the caller
-/// decides go-back vs. close-tab from `can_back` (this fn has no session
-/// access to act on it directly).
-///
-/// `TODO(security)`: an optional advanced "proceed anyway" override is a
-/// deliberate follow-up — the blocking-by-default posture stays as-is here.
-/// The full-page "unsafe site" interstitial for a safe-browsing block (mesh policy
-/// source). A red warning naming the blocked host + a "Back to safety" button;
-/// returns `true` when it's clicked. The blocked request was already dropped.
-fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
-    let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
-    let mut back = false;
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("\u{26A0} Unsafe site blocked")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_ERROR),
-        );
-        ui.add_space(Style::SP_M);
-        ui.label(
-            RichText::new(format!(
-                "{host} is on the mesh safe-browsing blocklist. This page was not loaded."
-            ))
-            .color(chrome_ui::CHROME_TEXT),
-        );
-        ui.add_space(Style::SP_M);
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Back to safety").color(chrome_ui::CHROME_TEXT),
-            ))
-            .clicked()
-        {
-            back = true;
-        }
-    });
-    back
-}
-
-/// Full-page interstitial for an operator-managed URL policy block. The request
-/// was already denied before network; this names the rule instead of leaving the
-/// previous page frame visible.
-fn managed_policy_interstitial_body(ui: &mut egui::Ui, block: &ManagedPolicyBlock) -> bool {
-    let host = host_of(&block.url).unwrap_or_else(|| block.url.trim().to_owned());
-    let mut back = false;
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("\u{26D4} Blocked by policy")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_ERROR),
-        );
-        ui.add_space(Style::SP_M);
-        ui.label(
-            RichText::new(format!(
-                "{host} is blocked by managed Browser policy. Rule: {}",
-                block.rule
-            ))
-            .color(chrome_ui::CHROME_TEXT),
-        );
-        ui.add_space(Style::SP_M);
-        if ui
-            .add(egui::Button::new(
-                RichText::new("Back to safety").color(chrome_ui::CHROME_TEXT),
-            ))
-            .clicked()
-        {
-            back = true;
-        }
-    });
-    back
-}
-
-fn js_dialog_action_label(kind: u8) -> (&'static str, &'static str) {
-    match kind {
-        0 => ("alert", "accepted"),
-        1 => ("confirm", "cancelled"),
-        2 => ("prompt", "cancelled"),
-        _ => ("dialog", "dismissed"),
-    }
-}
-
-fn js_dialog_notice(dialog: &JsDialog) -> String {
-    let (kind, action) = js_dialog_action_label(dialog.kind);
-    let origin = origin_label(&dialog.origin);
-    let message = dialog.message.trim();
-    let message = if message.is_empty() {
-        "(empty message)".to_owned()
-    } else {
-        ellipsize(message, 96)
-    };
-    format!("Page {kind} from {origin} was {action}: {message}")
-}
-
-fn origin_label(origin: &str) -> String {
-    host_of(origin).unwrap_or_else(|| {
-        let origin = origin.trim();
-        if origin.is_empty() {
-            "unknown origin".to_owned()
-        } else {
-            origin.to_owned()
-        }
-    })
-}
-
-fn before_unload_prompt_text(prompt: &BeforeUnloadDialog) -> String {
-    let origin = origin_label(&prompt.origin);
-    let action = if prompt.is_reload { "reload" } else { "leave" };
-    let message = prompt.message.trim();
-    let message = if message.is_empty() {
-        "(empty message)".to_owned()
-    } else {
-        ellipsize(message, 96)
-    };
-    format!("{origin} wants to {action} this page: {message}")
-}
-
-fn before_unload_primary_label(prompt: &BeforeUnloadDialog) -> &'static str {
-    if prompt.is_reload {
-        "Reload"
-    } else {
-        "Leave"
-    }
-}
-
-fn passkey_consent_prompt_text(
-    pending: &PendingPasskeyConsent,
-    active_tab_id: Option<u64>,
-) -> String {
-    let origin = pending.display_origin();
-    let background = if active_tab_id == Some(pending.tab_id) {
-        ""
-    } else {
-        "Background tab: "
-    };
-    let account = pending
-        .user_name
-        .as_deref()
-        .map(|name| format!(" for {}", ellipsize(name, 48)))
-        .unwrap_or_default();
-    format!(
-        "{background}{origin} wants to {}{} on {} via {}",
-        pending.verb(),
-        account,
-        pending.rp_id,
-        pending.engine.label()
-    )
-}
-
-fn passkey_consent_prompt_bar(
-    ui: &mut egui::Ui,
-    pending: &PendingPasskeyConsent,
-    active_tab_id: Option<u64>,
-) -> Option<bool> {
-    let mut decision = None;
-    egui::Frame::NONE
-        .fill(chrome_ui::prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(passkey_consent_prompt_text(pending, active_tab_id))
-                        .color(chrome_ui::CHROME_TEXT),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Approve").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Deny").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
-        });
-    decision
-}
-
-/// Human label for an engine-neutral permission kind (matches
-/// `EventMsg::PermissionRequest`: 0 geolocation, 1 notifications, 2 clipboard,
-/// 3 camera, 4 microphone, 5 camera + microphone).
-fn permission_kind_label(kind: u8) -> &'static str {
-    match kind {
-        0 => "know your location",
-        1 => "show notifications",
-        2 => "access the clipboard",
-        3 => "use your camera",
-        4 => "use your microphone",
-        5 => "use your camera and microphone",
-        _ => "use a device capability",
-    }
-}
-
-/// A permission prompt bar shown atop the page when an origin requests a capability
-/// ("<origin> wants to <capability>  [Allow] [Block]"). Returns `Some(true)` on
-/// Allow, `Some(false)` on Block, `None` while undecided. Mirrors Chrome's origin
-/// permission bar; a grant is remembered session-only by the caller.
-fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
-    let mut decision = None;
-    egui::Frame::NONE
-        .fill(chrome_ui::prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("{origin} wants to {}", permission_kind_label(kind)))
-                        .color(chrome_ui::CHROME_TEXT),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Allow").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Block").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
-        });
-    decision
-}
-
-/// A blocking beforeunload prompt shown atop the page. Returns `Some(true)` for
-/// Leave/Reload and `Some(false)` for Stay.
-fn before_unload_prompt_bar(ui: &mut egui::Ui, prompt: &BeforeUnloadDialog) -> Option<bool> {
-    let mut decision = None;
-    egui::Frame::NONE
-        .fill(chrome_ui::prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(before_unload_prompt_text(prompt)).color(chrome_ui::CHROME_TEXT),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(before_unload_primary_label(prompt))
-                            .color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Stay").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
-        });
-    decision
-}
-
-/// A "Save password?" bar for an auto-captured login. Returns `Some(true)` to save,
-/// `Some(false)` to dismiss, `None` while undecided. Mirrors the permission bar.
-fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &str) -> Option<bool> {
-    let mut decision = None;
-    egui::Frame::NONE
-        .fill(chrome_ui::prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("Save login for {host} ({username})?"))
-                        .color(chrome_ui::CHROME_TEXT),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Save").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Not now").color(chrome_ui::CHROME_TEXT),
-                    ))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
-        });
-    decision
-}
-
-fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
-    let mut back_to_safety = false;
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("Your connection is not private")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_ERROR),
-        );
-        ui.add_space(Style::SP_S);
-        ui.label(
-            RichText::new(cert_error_host(err))
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_TEXT),
-        );
-        ui.add_space(Style::SP_S);
-        browser_body_note(ui, err.message.as_str());
-        ui.add_space(Style::SP_XS);
-        ui.label(
-            RichText::new(format!("Error code {}", err.code))
-                .size(Style::SMALL)
-                .color(chrome_ui::CHROME_TEXT_DIM),
-        );
-        ui.add_space(Style::SP_M);
-        if ui
-            .add(egui::Button::new(
-                RichText::new("\u{2190} Back to safety").color(chrome_ui::CHROME_TEXT),
-            ))
-            .clicked()
-        {
-            back_to_safety = true;
-        }
-        if !can_back {
-            ui.add_space(Style::SP_XS);
-            browser_body_note(ui, "No history to return to — this closes the tab.");
-        }
-    });
-    back_to_safety
-}
-
-fn browser_body_note(ui: &mut egui::Ui, msg: impl Into<String>) -> egui::Response {
-    ui.label(
-        RichText::new(msg.into())
-            .size(Style::SMALL)
-            .color(chrome_ui::CHROME_TEXT_DIM),
-    )
-}
-
-/// Render a daemon-owned private offline copy when the live page is unavailable.
-fn cached_offline_body(
-    ui: &mut egui::Ui,
-    result: &BrowserOfflineCacheResult,
-    unavailable_reason: Option<&str>,
-) {
-    egui::Frame::NONE
-        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Offline copy")
-                        .size(Style::HEADING)
-                        .color(chrome_ui::CHROME_TEXT),
-                );
-                ui.label(
-                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
-                        .size(Style::SMALL)
-                        .color(chrome_ui::CHROME_TEXT_DIM),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy cached page text")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(result.text.clone());
-                    }
-                });
-            });
-            if let Some(reason) = unavailable_reason
-                .map(str::trim)
-                .filter(|reason| !reason.is_empty())
-            {
-                ui.add_space(Style::SP_XS);
-                ui.label(
-                    RichText::new(format!("Live page unavailable: {reason}"))
-                        .size(Style::SMALL)
-                        .color(chrome_ui::CHROME_WARN),
-                );
-            }
-            ui.add_space(Style::SP_XS);
-            let page = if result.title.trim().is_empty() {
-                result.url.as_str()
-            } else {
-                result.title.as_str()
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(page)
-                        .size(Style::SMALL)
-                        .color(chrome_ui::CHROME_TEXT_DIM),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{} chars from {}",
-                        result.text.chars().count(),
-                        result.engine.label()
-                    ))
-                    .size(Style::SMALL)
-                    .color(chrome_ui::CHROME_TEXT_DIM),
-                );
-            });
-            ui.add_space(Style::SP_S);
-            egui::ScrollArea::vertical()
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(result.text.as_str())
-                            .size(Style::SMALL)
-                            .color(chrome_ui::CHROME_TEXT),
-                    );
-                });
-        });
-}
-
-/// The no-session `EmptyState` — an honest gated caption (or the NAMED live-path
-/// notice when one is passed), never a placeholder page.
-fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
-    centered(ui, |ui| {
-        ui.label(
-            RichText::new("Sandboxed browser")
-                .size(Style::HEADING)
-                .color(chrome_ui::CHROME_TEXT),
-        );
-        ui.add_space(Style::SP_S);
-        browser_body_note(
-            ui,
-            notice.unwrap_or(
-                "The sandboxed Servo browser renders here in the shell. A live session \
-                 attaches on a GPU seat (BOOKMARKS-5/6 live path is gated).",
-            ),
-        );
-    });
 }
 
 /// Center `content` vertically + horizontally in the remaining body.
@@ -12069,11 +11400,14 @@ mod tests {
 
     #[test]
     fn permission_grant_is_remembered_and_auto_allows_next_time() {
-        assert_eq!(permission_kind_label(0), "know your location");
-        assert_eq!(permission_kind_label(2), "access the clipboard");
-        assert_eq!(permission_kind_label(3), "use your camera");
-        assert_eq!(permission_kind_label(4), "use your microphone");
-        assert_eq!(permission_kind_label(5), "use your camera and microphone");
+        assert_eq!(chrome_ui::permission_kind_label(0), "know your location");
+        assert_eq!(chrome_ui::permission_kind_label(2), "access the clipboard");
+        assert_eq!(chrome_ui::permission_kind_label(3), "use your camera");
+        assert_eq!(chrome_ui::permission_kind_label(4), "use your microphone");
+        assert_eq!(
+            chrome_ui::permission_kind_label(5),
+            "use your camera and microphone"
+        );
         assert_eq!(chrome_ui::permission_kind_site_info_label(3), "camera");
         assert_eq!(chrome_ui::permission_kind_site_info_label(4), "microphone");
         assert_eq!(
@@ -12753,7 +12087,7 @@ mod tests {
             origin: "https://app.example/settings".to_owned(),
         };
         assert_eq!(
-            js_dialog_notice(&confirm),
+            chrome_ui::js_dialog_notice(&confirm),
             "Page confirm from app.example was cancelled: Delete this item?"
         );
 
@@ -12763,7 +12097,7 @@ mod tests {
             origin: String::new(),
         };
         assert_eq!(
-            js_dialog_notice(&alert),
+            chrome_ui::js_dialog_notice(&alert),
             "Page alert from unknown origin was accepted: Saved"
         );
 
@@ -12773,7 +12107,7 @@ mod tests {
             origin: "not-a-url".to_owned(),
         };
         assert_eq!(
-            js_dialog_notice(&prompt),
+            chrome_ui::js_dialog_notice(&prompt),
             "Page prompt from not-a-url was cancelled: (empty message)"
         );
     }
@@ -12816,10 +12150,10 @@ mod tests {
             is_reload: false,
         };
         assert_eq!(
-            before_unload_prompt_text(&leave),
+            chrome_ui::before_unload_prompt_text(&leave),
             "editor.example wants to leave this page: You have unsaved changes"
         );
-        assert_eq!(before_unload_primary_label(&leave), "Leave");
+        assert_eq!(chrome_ui::before_unload_primary_label(&leave), "Leave");
 
         let reload = BeforeUnloadDialog {
             id: 2,
@@ -12828,10 +12162,10 @@ mod tests {
             is_reload: true,
         };
         assert_eq!(
-            before_unload_prompt_text(&reload),
+            chrome_ui::before_unload_prompt_text(&reload),
             "unknown origin wants to reload this page: (empty message)"
         );
-        assert_eq!(before_unload_primary_label(&reload), "Reload");
+        assert_eq!(chrome_ui::before_unload_primary_label(&reload), "Reload");
     }
 
     #[test]
@@ -14762,7 +14096,7 @@ mod tests {
             code: -202,
             message: "The certificate authority is not trusted".to_owned(),
         };
-        assert_eq!(cert_error_host(&err), "bad.example.com");
+        assert_eq!(chrome_ui::cert_error_host(&err), "bad.example.com");
     }
 
     #[test]
@@ -14772,7 +14106,7 @@ mod tests {
             code: -202,
             message: "x".to_owned(),
         };
-        assert_eq!(cert_error_host(&err), "not-a-url");
+        assert_eq!(chrome_ui::cert_error_host(&err), "not-a-url");
     }
 
     #[test]
@@ -15054,7 +14388,7 @@ mod tests {
 
         let out = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                cert_error_body(ui, &err, false);
+                chrome_ui::cert_error_body(ui, &err, false);
             });
         });
         let texts = painted_text(&out.shapes);
@@ -18802,7 +18136,7 @@ mod tests {
         assert_eq!(pending.client_request_id, "mde-pk-test-2");
         assert_eq!(pending.rp_id, "login.example");
         assert_eq!(
-            passkey_consent_prompt_text(pending, Some(tab_id)),
+            chrome_ui::passkey_consent_prompt_text(pending, Some(tab_id)),
             "login.example wants to use a passkey on login.example via CEF"
         );
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
