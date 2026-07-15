@@ -6458,7 +6458,7 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet — an honest loading note, never a blank.
             centered(ui, |ui| {
-                muted_note(ui, "Loading the page\u{2026}");
+                browser_body_note(ui, "Loading the page\u{2026}");
             });
         }
         None => {
@@ -10284,14 +10284,14 @@ fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
         ui.label(
             RichText::new("HTTP connection")
                 .size(CHROME_FONT)
-                .color(Style::WARN),
+                .color(chrome_ui::CHROME_WARN),
         );
-        ui.label(RichText::new(ellipsize(&url, 64)).color(Style::TEXT_DIM));
+        ui.label(RichText::new(ellipsize(&url, 64)).color(chrome_ui::CHROME_TEXT_DIM));
         if ui
             .add(egui::Button::new(
                 RichText::new("Use HTTPS")
                     .size(CHROME_FONT)
-                    .color(Style::TEXT),
+                    .color(chrome_ui::CHROME_TEXT),
             ))
             .on_hover_text("Upgrade this navigation to HTTPS")
             .clicked()
@@ -10302,7 +10302,7 @@ fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
             .add(egui::Button::new(
                 RichText::new("Continue HTTP")
                     .size(CHROME_FONT)
-                    .color(Style::WARN),
+                    .color(chrome_ui::CHROME_WARN),
             ))
             .on_hover_text("Continue with the insecure HTTP URL")
             .clicked()
@@ -10313,7 +10313,7 @@ fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
             .add(egui::Button::new(
                 RichText::new("Cancel")
                     .size(CHROME_FONT)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
             ))
             .clicked()
         {
@@ -10329,7 +10329,7 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
         ui.label(
             RichText::new("Quasar Browser")
                 .size(Style::HEADING)
-                .color(Style::TEXT),
+                .color(chrome_ui::CHROME_TEXT),
         );
         // Private-by-default explainer — the browser has no persistent profile
         // (sandbox has no writable $HOME); make that posture legible on the front
@@ -10337,7 +10337,7 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
         ui.label(
             RichText::new(PRIVATE_MODE_EXPLAINER)
                 .small()
-                .color(Style::TEXT_DIM),
+                .color(chrome_ui::CHROME_TEXT_DIM),
         );
         ui.add_space(Style::SP_M);
         ui.horizontal(|ui| {
@@ -10345,13 +10345,13 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
                 egui::TextEdit::singleline(&mut state.dashboard_query)
                     .desired_width(420.0)
                     .hint_text("Search the mesh")
-                    .text_color(Style::TEXT),
+                    .text_color(chrome_ui::CHROME_TEXT),
             );
             state.chrome_edit_focus |= resp.has_focus();
             submit_search = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
                 .add(egui::Button::new(
-                    RichText::new("Search").color(Style::TEXT),
+                    RichText::new("Search").color(chrome_ui::CHROME_TEXT),
                 ))
                 .clicked()
             {
@@ -10366,7 +10366,7 @@ fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
                         egui::Button::new(
                             RichText::new(service.label.as_str())
                                 .size(Style::BODY)
-                                .color(Style::TEXT),
+                                .color(chrome_ui::CHROME_TEXT),
                         )
                         .min_size(egui::vec2(112.0, Style::SP_XL)),
                     )
@@ -11077,16 +11077,16 @@ fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool)
         ui.label(
             RichText::new("This page crashed")
                 .size(Style::HEADING)
-                .color(Style::DANGER),
+                .color(chrome_ui::CHROME_ERROR),
         );
         ui.add_space(Style::SP_S);
         if !reason.is_empty() {
-            muted_note(ui, reason);
+            browser_body_note(ui, reason);
         }
         ui.add_space(Style::SP_M);
         if ui
             .add(egui::Button::new(
-                RichText::new("\u{21BB} Reload").color(Style::TEXT),
+                RichText::new("\u{21BB} Reload").color(chrome_ui::CHROME_TEXT),
             ))
             .clicked()
         {
@@ -11115,19 +11115,19 @@ fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
         ui.label(
             RichText::new("\u{26A0} Unsafe site blocked")
                 .size(Style::HEADING)
-                .color(Style::DANGER),
+                .color(chrome_ui::CHROME_ERROR),
         );
         ui.add_space(Style::SP_M);
         ui.label(
             RichText::new(format!(
                 "{host} is on the mesh safe-browsing blocklist. This page was not loaded."
             ))
-            .color(Style::TEXT),
+            .color(chrome_ui::CHROME_TEXT),
         );
         ui.add_space(Style::SP_M);
         if ui
             .add(egui::Button::new(
-                RichText::new("Back to safety").color(Style::TEXT),
+                RichText::new("Back to safety").color(chrome_ui::CHROME_TEXT),
             ))
             .clicked()
         {
@@ -11147,7 +11147,7 @@ fn managed_policy_interstitial_body(ui: &mut egui::Ui, block: &ManagedPolicyBloc
         ui.label(
             RichText::new("\u{26D4} Blocked by policy")
                 .size(Style::HEADING)
-                .color(Style::DANGER),
+                .color(chrome_ui::CHROME_ERROR),
         );
         ui.add_space(Style::SP_M);
         ui.label(
@@ -11155,12 +11155,12 @@ fn managed_policy_interstitial_body(ui: &mut egui::Ui, block: &ManagedPolicyBloc
                 "{host} is blocked by managed Browser policy. Rule: {}",
                 block.rule
             ))
-            .color(Style::TEXT),
+            .color(chrome_ui::CHROME_TEXT),
         );
         ui.add_space(Style::SP_M);
         if ui
             .add(egui::Button::new(
-                RichText::new("Back to safety").color(Style::TEXT),
+                RichText::new("Back to safety").color(chrome_ui::CHROME_TEXT),
             ))
             .clicked()
         {
@@ -11407,26 +11407,26 @@ fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
         ui.label(
             RichText::new("Your connection is not private")
                 .size(Style::HEADING)
-                .color(Style::DANGER),
+                .color(chrome_ui::CHROME_ERROR),
         );
         ui.add_space(Style::SP_S);
         ui.label(
             RichText::new(cert_error_host(err))
                 .size(Style::HEADING)
-                .color(Style::TEXT),
+                .color(chrome_ui::CHROME_TEXT),
         );
         ui.add_space(Style::SP_S);
-        muted_note(ui, err.message.as_str());
+        browser_body_note(ui, err.message.as_str());
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(format!("Error code {}", err.code))
                 .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
+                .color(chrome_ui::CHROME_TEXT_DIM),
         );
         ui.add_space(Style::SP_M);
         if ui
             .add(egui::Button::new(
-                RichText::new("\u{2190} Back to safety").color(Style::TEXT),
+                RichText::new("\u{2190} Back to safety").color(chrome_ui::CHROME_TEXT),
             ))
             .clicked()
         {
@@ -11434,10 +11434,18 @@ fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
         }
         if !can_back {
             ui.add_space(Style::SP_XS);
-            muted_note(ui, "No history to return to — this closes the tab.");
+            browser_body_note(ui, "No history to return to — this closes the tab.");
         }
     });
     back_to_safety
+}
+
+fn browser_body_note(ui: &mut egui::Ui, msg: impl Into<String>) -> egui::Response {
+    ui.label(
+        RichText::new(msg.into())
+            .size(Style::SMALL)
+            .color(chrome_ui::CHROME_TEXT_DIM),
+    )
 }
 
 /// Render a daemon-owned private offline copy when the live page is unavailable.
@@ -11527,7 +11535,7 @@ fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
                 .color(chrome_ui::CHROME_TEXT),
         );
         ui.add_space(Style::SP_S);
-        muted_note(
+        browser_body_note(
             ui,
             notice.unwrap_or(
                 "The sandboxed Servo browser renders here in the shell. A live session \
@@ -11675,10 +11683,25 @@ mod tests {
     }
 
     fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
             match shape {
                 egui::Shape::Text(text) => {
-                    out.push((text.galley.text().to_owned(), text.fallback_color));
+                    out.push((text.galley.text().to_owned(), text_color(text)));
                 }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
@@ -17252,6 +17275,43 @@ mod tests {
             CertErrorBackAction::CloseTab => state.close_tab(0),
         }
         assert!(state.tabs.is_empty(), "the tab closed");
+    }
+
+    #[test]
+    fn browser_body_interstitials_use_browser_material_tokens() {
+        let err = CertError {
+            url: "https://bad.example.com/".to_owned(),
+            code: -202,
+            message: "not trusted".to_owned(),
+        };
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                cert_error_body(ui, &err, false);
+            });
+        });
+        let texts = painted_text(&out.shapes);
+
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == "Your connection is not private" && *color == chrome_ui::CHROME_ERROR
+            }),
+            "cert interstitial heading must use Browser Material error color: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == "bad.example.com" && *color == chrome_ui::CHROME_TEXT
+            }),
+            "cert interstitial host must use Browser Material text color: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == "Error code -202" && *color == chrome_ui::CHROME_TEXT_DIM
+            }),
+            "cert interstitial metadata must use Browser Material dim text: {texts:?}"
+        );
     }
 
     #[test]
