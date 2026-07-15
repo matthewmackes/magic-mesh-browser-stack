@@ -25,11 +25,7 @@ use mde_web_preview_client::{
     EditCommand, JsDialog, SessionState,
 };
 
-use super::drawers::{
-    downloads_drawer, history_drawer, offline_cache_drawer, print_settings_drawer, qr_share_drawer,
-    security_update_drawer, site_styles_drawer, speech_status_drawer, spellcheck_drawer,
-    translation_drawer,
-};
+mod drawers;
 use super::{
     browser_capture_dir, centered, ellipsize, install_browser_page_accessibility,
     media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult, ContainerProfile,
@@ -37,6 +33,11 @@ use super::{
     PixelRegion, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
     CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
     CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
+};
+use drawers::{
+    downloads_drawer, history_drawer, offline_cache_drawer, print_settings_drawer, qr_share_drawer,
+    security_update_drawer, site_styles_drawer, speech_status_drawer, spellcheck_drawer,
+    translation_drawer,
 };
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s

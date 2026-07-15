@@ -7641,7 +7641,6 @@ fn unix_ms() -> u64 {
 
 mod capture;
 use capture::*;
-mod drawers;
 
 /// Whether the compact toolbar's reload slot should present as a real Stop
 /// control instead of Reload.
