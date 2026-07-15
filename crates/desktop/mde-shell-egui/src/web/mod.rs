@@ -6575,7 +6575,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let favicon_textures = resolve_tab_favicon_textures(ui.ctx(), &mut state.tabs);
 
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
             ui.set_width(184.0);
@@ -6879,7 +6879,7 @@ fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
     ui.menu_button(
         RichText::new("\u{1F50D}") // 🔍
             .size(CHROME_FONT)
-            .color(Style::TEXT_DIM),
+            .color(chrome_ui::CHROME_TEXT_DIM),
         |ui| {
             ui.set_min_width(300.0);
             ui.add(
@@ -6898,12 +6898,14 @@ fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
                     for idx in matches {
                         let active = idx == state.active;
                         let label = tab_search_row_label(&state.tabs[idx]);
-                        let color = if active { Style::TEXT } else { Style::TEXT_DIM };
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(label).size(CHROME_FONT).color(color),
+                                    RichText::new(label)
+                                        .size(CHROME_FONT)
+                                        .color(chrome_ui::selected_text(active)),
                                 )
+                                .fill(chrome_ui::row_fill(active))
                                 .min_size(egui::vec2(288.0, CHROME_TAB_H)),
                             )
                             .clicked()
@@ -6926,10 +6928,13 @@ fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
 fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: bool) {
     let mut button = |ui: &mut egui::Ui, engine: BrowserEngine| {
         let label = format!("+{}", engine.label());
-        let mut widget =
-            egui::Button::new(RichText::new(label).size(CHROME_FONT).color(Style::TEXT))
-                .fill(Style::SURFACE)
-                .min_size(egui::vec2(CHROME_NEW_TAB_W, CHROME_TAB_H));
+        let mut widget = egui::Button::new(
+            RichText::new(label)
+                .size(CHROME_FONT)
+                .color(chrome_ui::CHROME_TEXT),
+        )
+        .fill(chrome_ui::control_fill(false))
+        .min_size(egui::vec2(CHROME_NEW_TAB_W, CHROME_TAB_H));
         if vertical {
             widget = widget.min_size(egui::vec2(ui.available_width(), CHROME_TAB_H));
         }
@@ -7008,20 +7013,18 @@ fn tab_pill_rects_id() -> egui::Id {
 }
 
 fn tab_pill_sized(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
-    let color = if active { Style::TEXT } else { Style::TEXT_DIM };
-    let fill = if active {
-        Style::SURFACE_HI
-    } else {
-        Style::SURFACE
-    };
     // `click_and_drag` so the same pill activates on a plain click, closes on a
     // middle-click, AND reorders on a horizontal/vertical drag. egui's built-in
     // click-vs-drag threshold (`max_click_dist`, 6pt) keeps a click a click.
     ui.add(
-        egui::Button::new(RichText::new(label).size(CHROME_FONT).color(color))
-            .fill(fill)
-            .min_size(egui::vec2(width, CHROME_TAB_H))
-            .sense(Sense::click_and_drag()),
+        egui::Button::new(
+            RichText::new(label)
+                .size(CHROME_FONT)
+                .color(chrome_ui::tab_text(active)),
+        )
+        .fill(chrome_ui::tab_fill(active))
+        .min_size(egui::vec2(width, CHROME_TAB_H))
+        .sense(Sense::click_and_drag()),
     )
 }
 
@@ -7030,9 +7033,9 @@ fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
         egui::Button::new(
             RichText::new("\u{00D7}")
                 .size(CHROME_FONT)
-                .color(Style::TEXT_DIM),
+                .color(chrome_ui::CHROME_TEXT_DIM),
         )
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::control_fill(false))
         .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
     )
     .on_hover_text("Close tab")
@@ -7063,9 +7066,9 @@ fn tab_audio_glyph(ui: &mut egui::Ui, audible: bool, muted: bool) -> Option<egui
             egui::Button::new(
                 RichText::new(glyph)
                     .size(CHROME_FONT)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
             )
-            .fill(Style::SURFACE)
+            .fill(chrome_ui::control_fill(false))
             .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
         )
         .on_hover_text(hover),
@@ -7073,8 +7076,12 @@ fn tab_audio_glyph(ui: &mut egui::Ui, audible: bool, muted: bool) -> Option<egui
 }
 
 fn compact_menu_item(label: &str) -> egui::Button<'_> {
-    egui::Button::new(RichText::new(label).size(CHROME_FONT).color(Style::TEXT))
-        .min_size(egui::vec2(124.0, CHROME_TAB_H))
+    egui::Button::new(
+        RichText::new(label)
+            .size(CHROME_FONT)
+            .color(chrome_ui::CHROME_TEXT),
+    )
+    .min_size(egui::vec2(124.0, CHROME_TAB_H))
 }
 
 fn tab_label(tab: &Tab) -> String {
@@ -9209,7 +9216,7 @@ fn site_info_panel(
                         resources.managed_policy_rules.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -9724,7 +9731,7 @@ fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
     // (url, open_in_new_tab) chosen this frame, applied once after the layout.
     let mut chosen: Option<(String, bool)> = None;
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             if links.is_empty() {
@@ -9749,9 +9756,9 @@ fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                             egui::Button::new(
                                 RichText::new(ellipsize(&link.title, BOOKMARK_TITLE_CHARS))
                                     .size(CHROME_FONT)
-                                    .color(Style::TEXT),
+                                    .color(chrome_ui::CHROME_TEXT),
                             )
-                            .fill(Style::SURFACE)
+                            .fill(chrome_ui::control_fill(false))
                             .min_size(egui::vec2(BOOKMARK_BTN_W, CHROME_BUTTON)),
                         )
                         .on_hover_text(format!("{}\n{}", link.title, link.url));
@@ -9765,7 +9772,7 @@ fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.menu_button(
                         RichText::new("\u{00BB}")
                             .size(CHROME_FONT)
-                            .color(Style::TEXT),
+                            .color(chrome_ui::CHROME_TEXT),
                         |ui| {
                             for link in &links[visible..] {
                                 let resp = ui
@@ -9773,9 +9780,9 @@ fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                                         egui::Button::new(
                                             RichText::new(ellipsize(&link.title, 40))
                                                 .size(CHROME_FONT)
-                                                .color(Style::TEXT),
+                                                .color(chrome_ui::CHROME_TEXT),
                                         )
-                                        .fill(Style::SURFACE),
+                                        .fill(chrome_ui::control_fill(false)),
                                     )
                                     .on_hover_text(link.url.clone());
                                 if resp.clicked() {
@@ -9811,21 +9818,21 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let mut submit_forward = false;
     let mut submit_backward = false;
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Find")
                         .size(CHROME_FONT)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 let resp = ui.add_enabled(
                     enabled,
                     egui::TextEdit::singleline(&mut state.find_query)
                         .desired_width(220.0)
                         .hint_text("Find in page")
-                        .text_color(Style::TEXT)
+                        .text_color(chrome_ui::CHROME_TEXT)
                         .font(egui::TextStyle::Small)
                         .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
                 );
@@ -9839,7 +9846,7 @@ fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                     ui.label(
                         RichText::new(label)
                             .size(CHROME_FONT)
-                            .color(Style::TEXT_DIM),
+                            .color(chrome_ui::CHROME_TEXT_DIM),
                     );
                 }
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -9909,9 +9916,9 @@ fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
     let mut idx = 0usize;
     let fill_for = |idx: usize| {
         if Some(idx) == selected {
-            Style::SURFACE_HI
+            chrome_ui::row_fill(true)
         } else {
-            Style::SURFACE
+            chrome_ui::row_fill(false)
         }
     };
     ui.horizontal_wrapped(|ui| {
@@ -9924,7 +9931,7 @@ fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
                         egui::Button::new(
                             RichText::new(format!("\u{2605} {}", ellipsize(&bm.title, 32)))
                                 .size(CHROME_FONT)
-                                .color(Style::ACCENT),
+                                .color(chrome_ui::CHROME_PRIMARY),
                         )
                         .fill(fill_for(idx))
                         .min_size(egui::vec2(96.0, CHROME_BUTTON)),
@@ -9945,7 +9952,7 @@ fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
                         egui::Button::new(
                             RichText::new(ellipsize(url, 36))
                                 .size(CHROME_FONT)
-                                .color(Style::TEXT),
+                                .color(chrome_ui::CHROME_TEXT),
                         )
                         .fill(fill_for(idx))
                         .min_size(egui::vec2(96.0, CHROME_BUTTON)),
@@ -9964,7 +9971,7 @@ fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
                     egui::Button::new(
                         RichText::new(ellipsize(suggestion, 36))
                             .size(CHROME_FONT)
-                            .color(Style::TEXT),
+                            .color(chrome_ui::CHROME_TEXT),
                     )
                     .fill(fill_for(idx))
                     .min_size(egui::vec2(96.0, CHROME_BUTTON)),
@@ -10104,6 +10111,7 @@ fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool 
                 .size(CHROME_FONT)
                 .color(chrome_ui::button_text(enabled)),
         )
+        .fill(chrome_ui::control_fill(false))
         .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
     )
     .on_hover_text(tip)

@@ -1102,7 +1102,7 @@ fn render_chrome_menu_entries(
                             .size(super::CHROME_FONT)
                             .color(super::chrome_ui::button_text(item.enabled)),
                     )
-                    .fill(super::chrome_ui::CHROME_TOOLBAR),
+                    .fill(super::chrome_ui::menu_item_fill(item.checked == Some(true))),
                 );
                 if response.clicked() && item.enabled {
                     *picked = Some(item.id);
