@@ -407,7 +407,7 @@ pub fn apply_with_binds(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf])
     // SAFETY: single-threaded at this point (no engine threads exist yet); the
     // parent path only performs async-signal-safe work (see `supervise_child`).
     match unsafe { fork() }.context("fork into pid namespace")? {
-        ForkResult::Parent { child } => supervise_child(child), // never returns
+        ForkResult::Parent { child } => supervise_child(child, rootfs_path), // never returns
         ForkResult::Child => {}
     }
 
@@ -454,7 +454,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 /// Supervise the confined child: forward graceful-termination signals to it, reap
 /// it, and exit with its status. Never returns — the pre-fork process's sole job
 /// from here is to be a faithful proxy for the sandboxed engine's lifetime.
-fn supervise_child(child: Pid) -> ! {
+fn supervise_child(child: Pid, rootfs_path: PathBuf) -> ! {
     SUPERVISED_CHILD.store(child.as_raw(), Ordering::SeqCst);
     // Forward the signals a helper supervisor is expected to relay so the engine
     // can shut down cleanly when the shell stops the tab.
@@ -488,7 +488,20 @@ fn supervise_child(child: Pid) -> ! {
         }
         // Stopped/continued — keep waiting for a terminal status.
     };
+    cleanup_rootfs_mountpoint(&rootfs_path);
     std::process::exit(code);
+}
+
+/// Best-effort cleanup of the host-visible per-run rootfs mountpoint.
+///
+/// The supervisor is the right owner: the confined child has pivoted into the
+/// tmpfs root and then detached its old root, while the supervisor still tracks
+/// the host-side mountpoint and can remove it after the engine exits. A hard
+/// `SIGKILL` can still strand a directory, which is why mountpoints remain
+/// per-run and collision-safe.
+fn cleanup_rootfs_mountpoint(rootfs_path: &Path) {
+    let _ = umount2(rootfs_path, MntFlags::MNT_DETACH);
+    let _ = std::fs::remove_dir(rootfs_path);
 }
 
 /// Create + enter a per-process child cgroup with the policy's memory/CPU caps.
@@ -668,10 +681,21 @@ fn build_rootfs(
     std::fs::create_dir_all(&oldroot)?;
     pivot_root(newroot, &oldroot).context("pivot_root")?;
     nix::unistd::chdir("/").context("chdir /")?;
+    cleanup_oldroot_mountpoint(rootfs_path);
     umount2("/oldroot", MntFlags::MNT_DETACH).context("detach oldroot")?;
     // Best-effort tidy of the now-empty mountpoint.
     let _ = std::fs::remove_dir("/oldroot");
     Ok(())
+}
+
+/// Remove the old-root view of the host-visible rootfs mountpoint before
+/// detaching `/oldroot`. After the detach, the child can no longer reach the
+/// host path, and the supervisor may be resolving paths from a detached root.
+fn cleanup_oldroot_mountpoint(rootfs_path: &Path) {
+    let Ok(relative) = rootfs_path.strip_prefix("/") else {
+        return;
+    };
+    let _ = std::fs::remove_dir(Path::new("/oldroot").join(relative));
 }
 
 fn validate_rootfs_mountpoint(policy: SandboxPolicy, path: &Path) -> Result<()> {
@@ -938,6 +962,28 @@ mod tests {
             .expect_err("wrong engine prefix rejected");
         validate_rootfs_mountpoint(p, Path::new("/var/tmp/.mde-web-cef-root-77-88"))
             .expect_err("rootfs path outside /tmp rejected");
+    }
+
+    #[test]
+    fn cleanup_rootfs_mountpoint_removes_normal_empty_run_dirs() {
+        let path = std::env::temp_dir().join(format!(
+            ".mde-web-cef-root-test-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("create cleanup fixture");
+
+        cleanup_rootfs_mountpoint(&path);
+
+        assert!(
+            !path.exists(),
+            "normal sandbox exits must not leak host-visible rootfs dirs"
+        );
+    }
+
+    #[test]
+    fn cleanup_oldroot_mountpoint_ignores_relative_paths_without_panicking() {
+        cleanup_oldroot_mountpoint(Path::new("tmp/.mde-web-cef-root-1-2"));
     }
 
     #[test]
