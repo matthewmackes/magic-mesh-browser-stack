@@ -188,17 +188,10 @@ struct TabGroup {
     color: egui::Color32,
 }
 
-/// A distinct group color, cycled by group index over a fixed accent palette so
-/// successive groups are visually separable. Pure so the cycling is unit-tested.
+/// A distinct Browser-local group color, cycled by group index over the chrome
+/// Material palette so successive groups are visually separable.
 fn tab_group_color(index: usize) -> egui::Color32 {
-    const PALETTE: [egui::Color32; 5] = [
-        Style::ACCENT,
-        Style::ACCENT_COMMS,
-        Style::ACCENT_WORKLOADS,
-        Style::ACCENT_TERMINALS,
-        Style::WARN,
-    ];
-    PALETTE[index % PALETTE.len()]
+    chrome_ui::tab_group_color(index)
 }
 
 struct Tab {
@@ -10439,6 +10432,7 @@ mod tests {
 
         // The strip must paint the speaker glyph without panicking, muted or not.
         let ctx = egui::Context::default();
+        Style::install(&ctx);
         run_tab_strip_frame(&ctx, &mut state, body_input());
         state.tabs[0].muted = true;
         run_tab_strip_frame(&ctx, &mut state, body_input());
@@ -12193,16 +12187,9 @@ mod tests {
             texts.iter().any(|text| text == "Servo"),
             "engine picker should keep Servo visible as the fallback segment: {texts:?}"
         );
-        let selected_action = chrome_ui::engine_new_tab_text(state.engine);
         assert!(
-            texts.iter().any(|text| text == selected_action),
-            "engine picker should keep one clean primary new-tab action ({selected_action}): {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text == chrome_ui::engine_new_tab_supporting_text(state.engine)),
-            "engine picker should show the selected engine as action context: {texts:?}"
+            texts.iter().any(|text| text == "+"),
+            "engine picker should use a compact icon-sized new-tab action: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "Default"),
@@ -12228,12 +12215,12 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New tab"),
-            "engine picker should keep the primary action clean for CEF: {texts:?}"
+            texts.iter().any(|text| text == "+"),
+            "engine picker should keep the compact new-tab action for CEF: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "CEF / Chromium"),
-            "engine picker should show CEF/Chromium as selected action context: {texts:?}"
+            texts.iter().any(|text| text == "Default"),
+            "engine picker should mark CEF as the selected future-tab runtime: {texts:?}"
         );
 
         state.select_engine(BrowserEngine::Servo);
@@ -12245,12 +12232,12 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New tab"),
-            "engine picker should keep the primary action clean for Servo: {texts:?}"
+            texts.iter().any(|text| text == "+"),
+            "engine picker should keep the compact new-tab action for Servo: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "Servo"),
-            "engine picker should show Servo as selected action context: {texts:?}"
+            texts.iter().any(|text| text == "Default"),
+            "engine picker should mark Servo as the selected future-tab runtime: {texts:?}"
         );
     }
 
@@ -18786,6 +18773,8 @@ mod tests {
     #[test]
     fn tab_group_color_cycles_over_the_palette() {
         // Distinct colors for successive groups, wrapping at the palette length (5).
+        assert_eq!(tab_group_color(0), chrome_ui::tab_group_color(0));
+        assert_eq!(tab_group_color(4), chrome_ui::tab_group_color(4));
         assert_ne!(tab_group_color(0), tab_group_color(1));
         assert_eq!(tab_group_color(0), tab_group_color(5));
         assert_eq!(tab_group_color(1), tab_group_color(6));
