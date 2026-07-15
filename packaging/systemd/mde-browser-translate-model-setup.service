@@ -7,7 +7,6 @@ ConditionPathExists=!/usr/share/magic-mesh/translate/browser-translate.model
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
 SuccessExitStatus=78
 ExecCondition=/usr/bin/mackesd role-gate --min-rank 1
 ExecStart=/usr/libexec/mackesd/install-browser-translate-model
