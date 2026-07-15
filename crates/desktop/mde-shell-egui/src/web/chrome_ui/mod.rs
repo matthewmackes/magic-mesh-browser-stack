@@ -26,6 +26,7 @@ use mde_web_preview_client::{
 };
 
 mod accessibility;
+mod body;
 mod drawers;
 use super::{
     browser_capture_dir, ellipsize, media_metadata_chip_label, BrowserEngine,
@@ -52,6 +53,10 @@ pub(super) fn install_browser_accessibility(
 
 pub(super) fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     accessibility::centered(ui, content);
+}
+
+pub(super) fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
+    body::active_body(ui, state);
 }
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
