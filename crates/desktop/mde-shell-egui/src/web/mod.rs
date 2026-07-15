@@ -11625,6 +11625,61 @@ mod tests {
         !prims.is_empty()
     }
 
+    fn run_panel_page_image_rect(
+        ctx: &egui::Context,
+        state: &mut WebState,
+        input: egui::RawInput,
+    ) -> Option<egui::Rect> {
+        let texture_id = state
+            .tabs
+            .get(state.active)
+            .and_then(|tab| tab.texture.as_ref())
+            .map(|texture| texture.id())?;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "Browser panel produced no egui output");
+        page_texture_rect(&prims, texture_id)
+    }
+
+    fn page_texture_rect(
+        prims: &[egui::epaint::ClippedPrimitive],
+        texture_id: egui::TextureId,
+    ) -> Option<egui::Rect> {
+        let mut rect = egui::Rect::NOTHING;
+        for clipped in prims {
+            if let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive {
+                if mesh.texture_id != texture_id {
+                    continue;
+                }
+                for vertex in &mesh.vertices {
+                    rect.extend_with(vertex.pos);
+                }
+            }
+        }
+        rect.is_positive().then_some(rect)
+    }
+
+    fn live_page_panel_point_for_frame(
+        ctx: &egui::Context,
+        state: &mut WebState,
+        frame_point: egui::Pos2,
+    ) -> Option<egui::Pos2> {
+        let frame_size = state
+            .tabs
+            .get(state.active)
+            .and_then(|tab| tab.last_frame.as_ref())
+            .map(|frame| frame.size)?;
+        let image_rect = run_panel_page_image_rect(ctx, state, body_input())?;
+        Some(pos2(
+            image_rect.left()
+                + frame_point.x * image_rect.width() / (frame_size[0] as f32).max(1.0),
+            image_rect.top()
+                + frame_point.y * image_rect.height() / (frame_size[1] as f32).max(1.0),
+        ))
+    }
+
     fn run_panel_output(
         ctx: &egui::Context,
         state: &mut WebState,
@@ -24465,8 +24520,73 @@ mod tests {
     }
 
     #[cfg(feature = "live-helper")]
+    #[test]
+    fn servo_live_browser_ui_renders_and_operates_a_real_page_when_farm_smoke_is_enabled() {
+        let _env = browser_env_lock();
+        if std::env::var_os("MDE_SERVO_LIVE_UI_SMOKE").is_none() {
+            return;
+        }
+
+        let helper_bin = helper_bin_path(BrowserEngine::Servo);
+        assert!(
+            helper_bin.exists(),
+            "MDE_WEB_PREVIEW_BIN must point at a built mde-web-preview helper for the live smoke: {}",
+            helper_bin.display()
+        );
+
+        let server = LiveHttpServer::start();
+        let url = server.url.clone();
+        let mut state = WebState::default();
+        state.select_engine(BrowserEngine::Servo);
+        state.open_with(
+            true,
+            BrowserEngine::Servo,
+            START_URL.to_owned(),
+            helper_bin,
+            WebSession::spawn,
+        );
+
+        assert_eq!(state.tabs.len(), 1, "Servo live smoke attached one tab");
+        assert_eq!(state.tabs[0].engine, BrowserEngine::Servo);
+        assert!(
+            run_until_texture_for(&mut state, 900),
+            "Servo did not produce the initial Browser UI frame"
+        );
+
+        state.tabs[0].texture = None;
+        state.address = url.clone();
+        state.submit_address();
+        assert!(
+            state.insecure_prompt.is_some(),
+            "the live HTTP smoke should exercise the Browser HTTPS prompt seam"
+        );
+        state.continue_insecure_load();
+        assert!(
+            run_until_texture_for(&mut state, 900),
+            "Servo did not render the live HTTP page through the Browser UI texture path"
+        );
+        assert!(
+            server.hits() > 0,
+            "Servo did not fetch the live smoke page at {url}"
+        );
+        assert!(
+            wait_for_live_page_text_contains(&mut state, "P:0 K:0 T:_", 400),
+            "Servo live Browser UI smoke did not read the input-probe page text"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        drive_live_page_input_from_shell_ui(&ctx, &mut state);
+        assert!(
+            wait_for_live_page_text_contains(&mut state, "P:1 K:1 T:m", 400),
+            "Servo live Browser UI smoke did not observe pointer/key/text response through the shell panel"
+        );
+    }
+
+    #[cfg(feature = "live-helper")]
     fn drive_live_page_input_from_shell_ui(ctx: &egui::Context, state: &mut WebState) {
-        let page_point = pos2(480.0, 420.0);
+        let page_point = live_page_panel_point_for_frame(ctx, state, pos2(80.0, 80.0))
+            .expect("live Browser UI smoke could not locate the painted page image");
         let modifiers = egui::Modifiers::default();
         let mut click_input = body_input();
         click_input.events = vec![
@@ -24491,6 +24611,10 @@ mod tests {
         assert!(
             state.tabs[state.active].page_focused,
             "clicking the live page canvas must latch Browser page focus"
+        );
+        assert!(
+            wait_for_live_page_text_contains(state, "P:1 K:0 T:_", 200),
+            "live Browser UI smoke click did not reach the page before keyboard input"
         );
 
         let mut text_input = body_input();
@@ -24533,17 +24657,26 @@ mod tests {
 
     #[cfg(feature = "live-helper")]
     fn wait_for_live_page_text_contains(state: &mut WebState, needle: &str, frames: usize) -> bool {
-        let request_id = 0xCE_F1;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_LIVE_PAGE_TEXT_ID: AtomicU64 = AtomicU64::new(0xCE_F1);
+        let first_request_id = NEXT_LIVE_PAGE_TEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut request_id = first_request_id;
         if let Some(tab) = state.tabs.get_mut(state.active) {
+            let _ = tab.session.drain_page_text_events();
             tab.session.request_page_text(request_id, 2048);
         }
-        for _ in 0..frames {
+        for frame in 0..frames {
             if let Some(tab) = state.tabs.get_mut(state.active) {
                 tab.session.poll();
                 for event in tab.session.drain_page_text_events() {
-                    if event.id == request_id && event.text.contains(needle) {
+                    if event.id >= first_request_id && event.text.contains(needle) {
                         return true;
                     }
+                }
+                if frame % 5 == 4 {
+                    request_id = NEXT_LIVE_PAGE_TEXT_ID.fetch_add(1, Ordering::Relaxed);
+                    tab.session.request_page_text(request_id, 2048);
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -24655,7 +24788,7 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
 #status{position:absolute;left:40px;top:112px}
 </style>
 <div id="probe">
-  <h1>CEF Browser UI live smoke</h1>
+  <h1>Browser UI live smoke</h1>
   <input id="typed" autocomplete="off" value="" aria-label="Browser UI smoke input">
   <div id="status">P:0 K:0 T:_</div>
 </div>
