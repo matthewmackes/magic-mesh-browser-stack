@@ -11,6 +11,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use crate::browser_power_mode_enabled;
+
 /// `sizeof(cef_main_args_t)` for pinned Linux CEF 149.
 pub const CEF_MAIN_ARGS_SIZE: usize = 16;
 /// `offsetof(cef_main_args_t, argc)`.
@@ -95,6 +97,22 @@ pub const CEF_REMOTE_DEBUGGING_PORT: i32 = 9222;
 /// Environment variable that opts the Chromium DevTools Protocol (CDP)
 /// remote-debugging endpoint in at launch. Absent/off by default.
 pub const CEF_REMOTE_DEBUG_ENV: &str = "MDE_CEF_REMOTE_DEBUG";
+
+fn disabled_chromium_features(browser_power_mode: bool) -> String {
+    let mut features = vec![
+        "AutofillServerCommunication",
+        "DevicePosture",
+        "InterestCohort",
+        "MediaRouter",
+        "PaymentRequest",
+        "PrivacySandboxAdsAPIs",
+        "Translate",
+    ];
+    if !browser_power_mode {
+        features.extend(["WebBluetooth", "WebGPU", "WebUSB"]);
+    }
+    format!("--disable-features={}", features.join(","))
+}
 
 /// Resolved opt-in state for the CDP remote-debugging endpoint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -383,8 +401,6 @@ impl CefInitPaths {
             // See the function doc: Chromium's internal sandbox is off ON PURPOSE
             // — the OS sandbox (mde-web-sandbox) is the operative confinement.
             "--no-sandbox".to_owned(),
-            "--disable-gpu".to_owned(),
-            "--disable-gpu-compositing".to_owned(),
             "--ozone-platform=headless".to_owned(),
             format!("--lang={CEF_GENERIC_LOCALE}"),
             format!("--user-agent={CEF_GENERIC_USER_AGENT}"),
@@ -400,6 +416,11 @@ impl CefInitPaths {
                 self.resources_dir_path.join("icudtl.dat").display()
             ),
         ];
+        let browser_power_mode = browser_power_mode_enabled();
+        if !browser_power_mode {
+            switches.push("--disable-gpu".to_owned());
+            switches.push("--disable-gpu-compositing".to_owned());
+        }
         // SECURITY (security-4): only expose the unauthenticated CDP
         // remote-debugging endpoint when explicitly opted in — never on the
         // default/shipped launch path. See [`remote_debugging_port`].
@@ -420,7 +441,7 @@ impl CefInitPaths {
             switches.push(format!("--load-extension={dirs}"));
             switches.push("--disable-component-extensions-with-background-pages".to_owned());
         }
-        switches.extend(chromium_privacy_switches().map(str::to_owned));
+        switches.extend(chromium_privacy_switches(browser_power_mode));
         switches
     }
 }
@@ -459,8 +480,8 @@ impl CefInitPaths {
 /// real IP-handling switch above plus native media permission prompts. Operators
 /// can still restore the legacy best-effort JS removal with
 /// `MDE_CEF_WEBRTC_BLOCKED=1` — see `cef_browser::webrtc_block_script`.
-fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
-    [
+fn chromium_privacy_switches(browser_power_mode: bool) -> impl Iterator<Item = String> {
+    let mut switches = [
         "--disable-background-networking",
         "--disable-breakpad",
         "--disable-client-side-phishing-detection",
@@ -474,9 +495,12 @@ fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
         "--disable-speech-api",
         "--disable-sync",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-        "--disable-features=AutofillServerCommunication,DevicePosture,InterestCohort,MediaRouter,PaymentRequest,PrivacySandboxAdsAPIs,Translate,WebBluetooth,WebGPU,WebUSB",
     ]
     .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    switches.push(disabled_chromium_features(browser_power_mode));
+    switches.into_iter()
 }
 
 /// Owned settings storage with backing UTF-16 strings kept alive for CEF.
@@ -620,7 +644,41 @@ impl std::error::Error for CefInitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CEF_BROWSER_POWER_MODE_ENV;
     use std::mem::{align_of, offset_of, size_of};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn linux_main_args_layout_matches_pinned_cef_headers() {
@@ -758,6 +816,9 @@ mod tests {
 
     #[test]
     fn init_paths_emit_early_chromium_resource_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
@@ -782,6 +843,9 @@ mod tests {
 
     #[test]
     fn init_paths_emit_cef_privacy_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
@@ -806,6 +870,28 @@ mod tests {
                 && s.contains("WebGPU")
                 && s.contains("WebUSB")
         }));
+    }
+
+    #[test]
+    fn browser_power_mode_preserves_advanced_cef_runtime_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::set_var(CEF_BROWSER_POWER_MODE_ENV, "true");
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(!switches.contains(&"--disable-gpu".to_owned()));
+        assert!(!switches.contains(&"--disable-gpu-compositing".to_owned()));
+        let disabled = switches
+            .iter()
+            .find(|s| s.starts_with("--disable-features="))
+            .expect("disable-features switch");
+        assert!(disabled.contains("PrivacySandboxAdsAPIs"));
+        assert!(!disabled.contains("WebGPU"));
+        assert!(!disabled.contains("WebUSB"));
+        assert!(!disabled.contains("WebBluetooth"));
     }
 
     #[test]

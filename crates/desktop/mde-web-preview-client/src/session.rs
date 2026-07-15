@@ -1203,6 +1203,8 @@ impl Drop for WebSession {
 pub struct SpawnSpec {
     /// Path to the browser helper binary (`mde-web-preview` or `mde-web-cef`).
     pub helper_bin: std::path::PathBuf,
+    /// Environment values to add to the helper process.
+    pub env: Vec<(String, String)>,
     /// The first URL to load.
     pub url: String,
     /// Initial view width in device pixels.
@@ -1235,6 +1237,7 @@ impl WebSession {
                 "--height",
                 &spec.height.to_string(),
             ])
+            .envs(spec.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
             .spawn()?;
         Self::from_stream(shell_end, Some(child))

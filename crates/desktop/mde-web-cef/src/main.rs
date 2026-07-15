@@ -4,9 +4,9 @@ use std::process::Command;
 use std::process::ExitCode;
 
 use mde_web_cef::{
-    configured_bridge_bin, configured_cef_root, configured_extension_registry,
-    configured_widevine_root, detect_extension_registry, detect_runtime, detect_widevine,
-    extension_power_mode_enabled, parse_mode, CefLaunchPlan, Mode,
+    browser_power_mode_enabled, configured_bridge_bin, configured_cef_root,
+    configured_extension_registry, configured_widevine_root, detect_extension_registry,
+    detect_runtime, detect_widevine, extension_power_mode_enabled, parse_mode, CefLaunchPlan, Mode,
 };
 
 fn main() -> ExitCode {
@@ -28,6 +28,9 @@ fn main() -> ExitCode {
     println!("{}", runtime.status_line());
     println!("{}", widevine.status_line());
     println!("{}", extensions.status_line());
+    if browser_power_mode_enabled() {
+        println!("CEF_BROWSER_POWER_MODE enabled=1");
+    }
     if let Some(line) = extensions.power_mode_gate_line(extension_power_mode) {
         println!("{line}");
     }

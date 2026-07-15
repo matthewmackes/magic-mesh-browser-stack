@@ -55,6 +55,12 @@ pub const CEF_BRIDGE_EXTENSION_REGISTRY_ENV: &str = "MDE_CEF_BRIDGE_EXTENSION_RE
 pub const CEF_EXTENSION_REGISTRY_ENV: &str = "MDE_CEF_EXTENSION_REGISTRY";
 /// Env toggle enabling Power Mode sideload entries from the curated registry.
 pub const CEF_EXTENSION_POWER_MODE_ENV: &str = "MDE_CEF_EXTENSION_POWER_MODE";
+/// Env toggle enabling the broader CEF browser power surface for a launched tab.
+///
+/// The shipped default remains conservative. Browser Power Mode sets this for
+/// newly spawned CEF helpers so advanced page/runtime APIs can be exposed at
+/// process start without weakening the normal enterprise profile.
+pub const CEF_BROWSER_POWER_MODE_ENV: &str = "MDE_CEF_BROWSER_POWER_MODE";
 /// Lab-only override that re-enables the experimental CEF WebExtensions handoff.
 ///
 /// V1 intentionally skips WebExtensions: native ad/tracker blocking, passkeys,
@@ -356,6 +362,15 @@ pub fn configured_extension_registry() -> PathBuf {
 #[must_use]
 pub fn extension_power_mode_enabled() -> bool {
     std::env::var(CEF_EXTENSION_POWER_MODE_ENV)
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false)
+}
+
+/// Whether the broader CEF browser Power Mode launch profile is enabled.
+#[must_use]
+pub fn browser_power_mode_enabled() -> bool {
+    std::env::var(CEF_BROWSER_POWER_MODE_ENV)
         .ok()
         .and_then(|value| parse_bool(&value))
         .unwrap_or(false)
@@ -1118,6 +1133,14 @@ impl CefLaunchPlan {
                     "false"
                 }),
             ),
+            (
+                CEF_BROWSER_POWER_MODE_ENV,
+                OsString::from(if browser_power_mode_enabled() {
+                    "true"
+                } else {
+                    "false"
+                }),
+            ),
         ];
         if let Some((root, lib)) = &self.widevine {
             env.push((CEF_BRIDGE_WIDEVINE_ROOT_ENV, root.clone().into_os_string()));
@@ -1216,6 +1239,39 @@ mod tests {
     use super::*;
     use crate::wire::{frame, take_frame, ControlMsg};
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn missing_runtime_names_the_checked_root() {
@@ -1333,6 +1389,9 @@ mod tests {
 
     #[test]
     fn launch_plan_names_the_bridge_and_runtime_environment() {
+        let _env = env_lock();
+        let _browser_power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::set_var(CEF_BROWSER_POWER_MODE_ENV, "true");
         let dir =
             std::env::temp_dir().join(format!("mde-web-cef-plan-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(CEF_RELEASE_DIR)).expect("mkdir release");
@@ -1405,6 +1464,9 @@ mod tests {
         }));
         assert!(env.iter().any(|(key, value)| {
             *key == CEF_EXTENSION_POWER_MODE_ENV && value == &OsString::from("true")
+        }));
+        assert!(env.iter().any(|(key, value)| {
+            *key == CEF_BROWSER_POWER_MODE_ENV && value == &OsString::from("true")
         }));
         let _ = std::fs::remove_dir_all(dir);
     }

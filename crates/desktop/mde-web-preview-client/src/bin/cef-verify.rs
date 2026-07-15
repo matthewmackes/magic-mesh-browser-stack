@@ -33,6 +33,7 @@ fn main() {
 
     let spec = SpawnSpec {
         helper_bin: args.helper.clone().into(),
+        env: Vec::new(),
         url: args.url.clone(),
         width: 1280,
         height: 800,

@@ -74,6 +74,16 @@ const DEFAULT_CEF_HELPER_BIN: &str = "/usr/bin/mde-web-cef";
 #[cfg(feature = "live-helper")]
 const CEF_HELPER_BIN_ENV: &str = "MDE_WEB_CEF_BIN";
 
+/// CEF process env toggled from Browser Power Mode. The helper forwards this to
+/// the native renderer bridge before Chromium switches are assembled.
+#[cfg(feature = "live-helper")]
+const CEF_BROWSER_POWER_MODE_ENV: &str = "MDE_CEF_BROWSER_POWER_MODE";
+
+/// Existing CEF extension gate env; Browser Power Mode also unlocks the curated
+/// sideload entries for newly spawned CEF helpers.
+#[cfg(feature = "live-helper")]
+const CEF_EXTENSION_POWER_MODE_ENV: &str = "MDE_CEF_EXTENSION_POWER_MODE";
+
 const CEF_DEVTOOLS_URL: &str = "http://127.0.0.1:9222/";
 const CEF_DEVTOOLS_LIST_URL: &str = "http://127.0.0.1:9222/json/list";
 const CEF_DEVTOOLS_TIMEOUT: Duration = Duration::from_millis(450);
@@ -5928,6 +5938,7 @@ impl WebState {
         let (width, height) = self.seat_px;
         let spec = SpawnSpec {
             helper_bin,
+            env: helper_env_for(engine, self.power_mode),
             url,
             width,
             height,
@@ -5973,6 +5984,17 @@ impl WebState {
             status.state, expected, installed, reason
         ))
     }
+}
+
+#[cfg(feature = "live-helper")]
+fn helper_env_for(engine: BrowserEngine, power_mode: bool) -> Vec<(String, String)> {
+    if engine != BrowserEngine::Cef || !power_mode {
+        return Vec::new();
+    }
+    vec![
+        (CEF_BROWSER_POWER_MODE_ENV.to_owned(), "true".to_owned()),
+        (CEF_EXTENSION_POWER_MODE_ENV.to_owned(), "true".to_owned()),
+    ]
 }
 
 /// The browser-reserved tab accelerators (Chrome's tab-strip keyboard UX),
@@ -20954,6 +20976,43 @@ mod tests {
 
     #[cfg(feature = "live-helper")]
     #[test]
+    fn cef_power_mode_launch_env_reaches_new_helper_spawns() {
+        use std::cell::RefCell;
+        let _env = browser_env_lock();
+        let _cef_root = EnvRestore::capture(CEF_ROOT_ENV);
+        let dir = make_fake_cef_runtime("mde-shell-cef-power-env-test");
+        std::env::set_var(CEF_ROOT_ENV, &dir);
+
+        let helpers: RefCell<Vec<testkit::FakeHelper>> = RefCell::new(Vec::new());
+        let mut state = WebState::default();
+        state.power_mode = true;
+        let bin = std::env::current_exe().expect("test exe path");
+        state.open_with(
+            true,
+            BrowserEngine::Cef,
+            START_URL.to_owned(),
+            bin,
+            |spec| {
+                assert!(spec
+                    .env
+                    .iter()
+                    .any(|(key, value)| { key == CEF_BROWSER_POWER_MODE_ENV && value == "true" }));
+                assert!(spec.env.iter().any(|(key, value)| {
+                    key == CEF_EXTENSION_POWER_MODE_ENV && value == "true"
+                }));
+                let (session, helper) = testkit::connect()?;
+                helpers.borrow_mut().push(helper);
+                Ok(session)
+            },
+        );
+        assert_eq!(state.tabs.len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+        std::env::remove_var(CEF_ROOT_ENV);
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
     fn cef_live_open_uses_the_browser_ui_spawn_path_and_pumps_a_frame() {
         use std::cell::RefCell;
         let _env = browser_env_lock();
@@ -20975,6 +21034,7 @@ mod tests {
                 assert_eq!(spec.helper_bin, expected_bin);
                 assert_eq!(spec.url, START_URL);
                 assert_eq!((spec.width, spec.height), (INIT_W, INIT_H));
+                assert!(spec.env.is_empty(), "default CEF spawn stays conservative");
                 let (session, helper) = testkit::connect()?;
                 helpers.borrow_mut().push(helper);
                 Ok(session)
