@@ -37,7 +37,8 @@ use mde_files_egui::transfers::{
 
 use mde_web_preview_client::{
     host_of, BeforeUnloadDialog, CertError, EditCommand, FilterListSource, FilterListStore,
-    JsDialog, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist, SessionState, WebSession,
+    JsDialog, LoginCaptureStatus, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist,
+    SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -446,6 +447,20 @@ struct CertificateErrorAudit {
     engine: BrowserEngine,
     title: String,
     error: CertError,
+}
+
+#[derive(Default)]
+struct BrowserTabPollEvents {
+    pdf_events: Vec<(String, bool)>,
+    page_text_events: Vec<(u64, String)>,
+    page_scrape_events: Vec<(u64, String)>,
+    passkey_events: Vec<(u64, BrowserEngine, String)>,
+    js_dialog_events: Vec<(usize, JsDialog)>,
+    popup_opens: Vec<(BrowserEngine, String)>,
+    download_submits: Vec<(u64, String, String)>,
+    login_captures: Vec<(u64, LoginCaptureStatus)>,
+    mixed_content_blocks: Vec<MixedContentBlockAudit>,
+    certificate_errors: Vec<CertificateErrorAudit>,
 }
 
 /// One saved login in the SESSION-ONLY credential store. Keyed by normalized host
@@ -2022,6 +2037,170 @@ impl WebState {
             return;
         }
         self.refresh_downloads();
+    }
+
+    fn poll_browser_services_before_tabs(&mut self) {
+        self.poll_suggestions();
+        self.poll_downloads();
+        self.poll_incoming_send_tabs();
+        self.poll_voice_command_results();
+        self.poll_media_control_actions();
+        self.poll_speech_statuses();
+        self.poll_passkey_status();
+        self.poll_passkey_results();
+        self.poll_share_results();
+        self.poll_translation_results();
+        self.poll_offline_cache_results();
+        self.poll_security_update_status();
+        self.poll_bookmarks_collection();
+        self.poll_safe_browsing_hosts();
+        self.poll_managed_url_policy();
+        self.suspend_idle_tabs(Instant::now());
+    }
+
+    /// Poll every tab so background tabs keep receiving events and one tab's
+    /// crash/interstitial/download signal is observed without disturbing the
+    /// others. UI-visible side effects are applied after the mutable tab pass.
+    fn poll_tabs_for_panel(&mut self) -> BrowserTabPollEvents {
+        let mut events = BrowserTabPollEvents::default();
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.idle_suspended && idx != self.active {
+                continue;
+            }
+            tab.session.poll();
+            if let Some(error) = tab.session.cert_error().cloned() {
+                if tab.last_audited_cert_error.as_ref() != Some(&error) {
+                    events.certificate_errors.push(CertificateErrorAudit {
+                        engine: tab.engine,
+                        title: tab.session.title().to_owned(),
+                        error: error.clone(),
+                    });
+                    tab.last_audited_cert_error = Some(error);
+                }
+            } else {
+                tab.last_audited_cert_error = None;
+            }
+
+            let resources = tab.session.recent_resource_requests();
+            let mut max_resource_seq = tab.last_audited_resource_seq;
+            for resource in resources
+                .iter()
+                .filter(|resource| resource.seq > tab.last_audited_resource_seq)
+            {
+                max_resource_seq = max_resource_seq.max(resource.seq);
+                if resource.blocked_by.as_deref() == Some("mixed-content:http") {
+                    events.mixed_content_blocks.push(MixedContentBlockAudit {
+                        engine: tab.engine,
+                        page_url: tab.session.nav().url.clone(),
+                        title: tab.session.title().to_owned(),
+                        url: resource.url.clone(),
+                        resource: resource.resource,
+                    });
+                }
+            }
+            tab.last_audited_resource_seq = max_resource_seq;
+
+            for event in tab.session.drain_pdf_events() {
+                events.pdf_events.push((event.path, event.ok));
+            }
+            for event in tab.session.drain_page_text_events() {
+                events.page_text_events.push((event.id, event.text));
+            }
+            for event in tab.session.drain_page_scrape_events() {
+                events.page_scrape_events.push((event.id, event.body));
+            }
+            for event in tab.session.drain_passkey_events() {
+                events.passkey_events.push((tab.id, tab.engine, event.body));
+            }
+            // window.open / target=_blank the engine cancelled → open as a real
+            // tab on the same engine (EventMsg::PopupRequested).
+            for request in tab.session.drain_popup_requests() {
+                events.popup_opens.push((tab.engine, request.url));
+            }
+            // Downloads the engine intercepted → submit to the mesh Transfers
+            // ledger after this mutable tab pass.
+            for event in tab.session.drain_download_events() {
+                events
+                    .download_submits
+                    .push((event.id, event.url, event.filename));
+            }
+            // A submitted login (auto-capture) → offer to save it (session-only).
+            for capture in tab.session.drain_login_captures() {
+                events.login_captures.push((tab.id, capture));
+            }
+            // JavaScript dialogs were auto-resolved by the engine; surface them
+            // as passive Browser notices so pages do not silently surprise the
+            // operator.
+            for dialog in tab.session.drain_js_dialog_events() {
+                events.js_dialog_events.push((idx, dialog));
+            }
+        }
+        events
+    }
+
+    fn apply_tab_poll_events(&mut self, events: BrowserTabPollEvents) {
+        for (engine, url) in events.popup_opens {
+            self.request_new_tab_with_url(engine, url);
+        }
+        for (id, url, filename) in events.download_submits {
+            self.submit_download_to_ledger(id, &url, &filename);
+        }
+        let mut pdf_notice = None;
+        for (path, ok) in events.pdf_events {
+            pdf_notice = Some(self.handle_pdf_event(path, ok));
+        }
+        if let Some(notice) = pdf_notice {
+            self.capture_notice = Some(notice);
+        }
+        for (id, text) in events.page_text_events {
+            self.handle_page_text_event(id, text);
+        }
+        for (id, body) in events.page_scrape_events {
+            self.handle_page_scrape_event(id, body);
+        }
+        for (tab_id, engine, body) in events.passkey_events {
+            self.handle_passkey_event(tab_id, engine, &body);
+        }
+        for (tab_index, dialog) in events.js_dialog_events {
+            self.handle_js_dialog_event(tab_index, &dialog);
+        }
+        for (tab_id, capture) in events.login_captures {
+            self.handle_login_capture_from_tab(tab_id, &capture.origin, &capture.body);
+        }
+        for block in events.mixed_content_blocks {
+            self.publish_mixed_content_block(&block, unix_ms());
+        }
+        for audit in events.certificate_errors {
+            self.publish_certificate_error(&audit, unix_ms());
+        }
+    }
+
+    fn finish_browser_panel_poll(&mut self) {
+        self.poll_spellcheck();
+        // Engine-driven navigations (redirects, page scripts) land in the address
+        // bar here; the tab poll has already drained this frame's nav events, and
+        // the focus guard keeps operator edits intact.
+        self.sync_address_on_engine_nav();
+        self.publish_media_status_if_changed();
+        self.poll_session_snapshot();
+    }
+
+    /// Upload the active tab's pending frame only when one is present, so an idle
+    /// page never triggers a texture re-upload.
+    fn upload_active_frame(&mut self, ctx: &egui::Context) {
+        if let Some(tab) = self.active_tab() {
+            if let Some(img) = tab.session.take_frame() {
+                // Share one Arc<ColorImage> between the retained CPU frame and the
+                // GPU upload instead of deep-copying full-resolution pixels on
+                // every decoded frame.
+                let img = std::sync::Arc::new(img);
+                tab.last_frame = Some(img.clone());
+                match tab.texture.as_mut() {
+                    Some(handle) => handle.set(img, BROWSER_TEX),
+                    None => tab.texture = Some(ctx.load_texture("web-preview", img, BROWSER_TEX)),
+                }
+            }
+        }
     }
 
     fn mark_tab_active(&mut self, index: usize) {
@@ -6004,160 +6183,11 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     // neither chrome widgets nor the page-canvas forwarding in `paint_body`
     // ever see them.
     chrome_ui::handle_tab_keyboard(ui.ctx(), state);
-    state.poll_suggestions();
-    state.poll_downloads();
-    state.poll_incoming_send_tabs();
-    state.poll_voice_command_results();
-    state.poll_media_control_actions();
-    state.poll_speech_statuses();
-    state.poll_passkey_status();
-    state.poll_passkey_results();
-    state.poll_share_results();
-    state.poll_translation_results();
-    state.poll_offline_cache_results();
-    state.poll_security_update_status();
-    state.poll_bookmarks_collection();
-    state.poll_safe_browsing_hosts();
-    state.poll_managed_url_policy();
-    state.suspend_idle_tabs(Instant::now());
-
-    // 1. Poll every tab so background tabs keep receiving — and so ONE tab's crash
-    //    is observed here without disturbing the others (per-session isolation).
-    let mut pdf_events = Vec::new();
-    let mut page_text_events = Vec::new();
-    let mut page_scrape_events = Vec::new();
-    let mut passkey_events = Vec::new();
-    let mut js_dialog_events = Vec::new();
-    let mut popup_opens = Vec::new();
-    let mut download_submits = Vec::new();
-    let mut login_captures = Vec::new();
-    let mut mixed_content_blocks = Vec::new();
-    let mut certificate_errors = Vec::new();
-    for (idx, tab) in state.tabs.iter_mut().enumerate() {
-        if tab.idle_suspended && idx != state.active {
-            continue;
-        }
-        tab.session.poll();
-        if let Some(error) = tab.session.cert_error().cloned() {
-            if tab.last_audited_cert_error.as_ref() != Some(&error) {
-                certificate_errors.push(CertificateErrorAudit {
-                    engine: tab.engine,
-                    title: tab.session.title().to_owned(),
-                    error: error.clone(),
-                });
-                tab.last_audited_cert_error = Some(error);
-            }
-        } else {
-            tab.last_audited_cert_error = None;
-        }
-        let resources = tab.session.recent_resource_requests();
-        let mut max_resource_seq = tab.last_audited_resource_seq;
-        for resource in resources
-            .iter()
-            .filter(|resource| resource.seq > tab.last_audited_resource_seq)
-        {
-            max_resource_seq = max_resource_seq.max(resource.seq);
-            if resource.blocked_by.as_deref() == Some("mixed-content:http") {
-                mixed_content_blocks.push(MixedContentBlockAudit {
-                    engine: tab.engine,
-                    page_url: tab.session.nav().url.clone(),
-                    title: tab.session.title().to_owned(),
-                    url: resource.url.clone(),
-                    resource: resource.resource,
-                });
-            }
-        }
-        tab.last_audited_resource_seq = max_resource_seq;
-        for event in tab.session.drain_pdf_events() {
-            pdf_events.push((event.path, event.ok));
-        }
-        for event in tab.session.drain_page_text_events() {
-            page_text_events.push((event.id, event.text));
-        }
-        for event in tab.session.drain_page_scrape_events() {
-            page_scrape_events.push((event.id, event.body));
-        }
-        for event in tab.session.drain_passkey_events() {
-            passkey_events.push((tab.id, tab.engine, event.body));
-        }
-        // window.open / target=_blank the engine cancelled → open as a real tab
-        // on the same engine (the popup-producer chain, EventMsg::PopupRequested).
-        for request in tab.session.drain_popup_requests() {
-            popup_opens.push((tab.engine, request.url));
-        }
-        // Downloads the engine intercepted (B2) → submit to the mesh Transfers
-        // ledger (the daemon fetches into the mesh share).
-        for event in tab.session.drain_download_events() {
-            download_submits.push((event.id, event.url, event.filename));
-        }
-        // A submitted login (auto-capture) → offer to save it (session-only).
-        for capture in tab.session.drain_login_captures() {
-            login_captures.push((tab.id, capture));
-        }
-        // JavaScript dialogs were auto-resolved by the engine; surface them as
-        // passive Browser notices so pages do not silently surprise the user.
-        for dialog in tab.session.drain_js_dialog_events() {
-            js_dialog_events.push((idx, dialog));
-        }
-    }
-    for (engine, url) in popup_opens {
-        state.request_new_tab_with_url(engine, url);
-    }
-    for (id, url, filename) in download_submits {
-        state.submit_download_to_ledger(id, &url, &filename);
-    }
-    let mut pdf_notice = None;
-    for (path, ok) in pdf_events {
-        pdf_notice = Some(state.handle_pdf_event(path, ok));
-    }
-    if let Some(notice) = pdf_notice {
-        state.capture_notice = Some(notice);
-    }
-    for (id, text) in page_text_events {
-        state.handle_page_text_event(id, text);
-    }
-    for (id, body) in page_scrape_events {
-        state.handle_page_scrape_event(id, body);
-    }
-    for (tab_id, engine, body) in passkey_events {
-        state.handle_passkey_event(tab_id, engine, &body);
-    }
-    for (tab_index, dialog) in js_dialog_events {
-        state.handle_js_dialog_event(tab_index, &dialog);
-    }
-    for (tab_id, capture) in login_captures {
-        state.handle_login_capture_from_tab(tab_id, &capture.origin, &capture.body);
-    }
-    for block in mixed_content_blocks {
-        state.publish_mixed_content_block(&block, unix_ms());
-    }
-    for audit in certificate_errors {
-        state.publish_certificate_error(&audit, unix_ms());
-    }
-    state.poll_spellcheck();
-    // Engine-driven navigations (redirects, page scripts) land in the address
-    // bar here — the tab poll above has already drained this frame's nav
-    // events, and the focus guard keeps operator edits intact.
-    state.sync_address_on_engine_nav();
-    state.publish_media_status_if_changed();
-    state.poll_session_snapshot();
-
-    // 2. Upload the active tab's pending frame — ONLY when one is present, so an
-    //    idle page never triggers a re-upload.
-    if let Some(tab) = state.active_tab() {
-        if let Some(img) = tab.session.take_frame() {
-            // Share one `Arc<ColorImage>` between the retained CPU frame and the
-            // GPU upload instead of deep-copying the full-resolution pixels on
-            // every decoded frame: the retain is a refcount bump, and the upload
-            // moves the same `Arc` (`egui::ImageData` already stores it as one).
-            let img = std::sync::Arc::new(img);
-            tab.last_frame = Some(img.clone());
-            match tab.texture.as_mut() {
-                Some(handle) => handle.set(img, BROWSER_TEX),
-                None => tab.texture = Some(ui.ctx().load_texture("web-preview", img, BROWSER_TEX)),
-            }
-        }
-    }
+    state.poll_browser_services_before_tabs();
+    let tab_events = state.poll_tabs_for_panel();
+    state.apply_tab_poll_events(tab_events);
+    state.finish_browser_panel_poll();
+    state.upload_active_frame(ui.ctx());
     chrome_ui::install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
 
     // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
