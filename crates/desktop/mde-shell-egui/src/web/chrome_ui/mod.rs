@@ -178,6 +178,18 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
     }
 }
 
+pub(super) const fn download_state_color(
+    state: mde_files_egui::transfers::TransferState,
+) -> Color32 {
+    match state {
+        mde_files_egui::transfers::TransferState::Done => CHROME_SUCCESS,
+        mde_files_egui::transfers::TransferState::Failed => CHROME_ERROR,
+        mde_files_egui::transfers::TransferState::Paused => CHROME_WARN,
+        mde_files_egui::transfers::TransferState::Queued
+        | mde_files_egui::transfers::TransferState::Running => CHROME_TEXT_DIM,
+    }
+}
+
 fn selection_wash() -> Color32 {
     CHROME_PRIMARY.gamma_multiply(0.16)
 }
@@ -3794,6 +3806,20 @@ mod tests {
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
         assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
+    }
+
+    #[test]
+    fn download_drawer_status_uses_browser_material_roles() {
+        use mde_files_egui::transfers::TransferState;
+
+        assert_eq!(download_state_color(TransferState::Done), CHROME_SUCCESS);
+        assert_eq!(download_state_color(TransferState::Failed), CHROME_ERROR);
+        assert_eq!(download_state_color(TransferState::Paused), CHROME_WARN);
+        assert_eq!(download_state_color(TransferState::Queued), CHROME_TEXT_DIM);
+        assert_eq!(
+            download_state_color(TransferState::Running),
+            CHROME_TEXT_DIM
+        );
     }
 
     #[test]

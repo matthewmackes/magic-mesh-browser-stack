@@ -7669,15 +7669,6 @@ fn short_transfer_name(job: &TransferJob) -> String {
         .map_or_else(|| job.id.clone(), ToOwned::to_owned)
 }
 
-const fn download_state_color(state: TransferState) -> egui::Color32 {
-    match state {
-        TransferState::Done => Style::OK,
-        TransferState::Failed => Style::DANGER,
-        TransferState::Paused => Style::WARN,
-        TransferState::Queued | TransferState::Running => Style::TEXT_DIM,
-    }
-}
-
 fn spellcheck_results_text(misses: &[SpellMiss]) -> String {
     misses
         .iter()

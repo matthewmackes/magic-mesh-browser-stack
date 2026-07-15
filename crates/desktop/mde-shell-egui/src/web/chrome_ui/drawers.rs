@@ -7,8 +7,8 @@
 //! shared [`WebState`] through the existing Browser state/action seams.
 
 use super::super::{
-    download_state_color, offline_cache_viewport_display_size, offline_cache_viewport_texture,
-    plural, short_transfer_name, spellcheck_occurrence_index, spellcheck_results_text,
+    offline_cache_viewport_display_size, offline_cache_viewport_texture, plural,
+    short_transfer_name, spellcheck_occurrence_index, spellcheck_results_text,
     BrowserReadAloudStatus, BrowserVoiceCommandStatus, PaperSize, PrintOrientation,
 };
 use super::*;
