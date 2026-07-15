@@ -2435,10 +2435,13 @@ impl WebState {
                     continue;
                 };
                 match browser_send_tab_open_intent(&body, &sanitized_host) {
-                    Ok((engine, url)) => {
+                    Ok(BrowserSendTabOpenDecision::Open(engine, url)) => {
                         self.request_new_tab_with_url(engine, url);
                         let _ = std::fs::remove_file(&path);
                         opened += 1;
+                    }
+                    Ok(BrowserSendTabOpenDecision::Consume) => {
+                        let _ = std::fs::remove_file(&path);
                     }
                     Err(_) => continue,
                 }
@@ -7300,7 +7303,16 @@ fn sanitize_session_host(host: &str) -> String {
         .collect()
 }
 
-fn browser_send_tab_open_intent(body: &str, host: &str) -> Result<(BrowserEngine, String), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserSendTabOpenDecision {
+    Open(BrowserEngine, String),
+    Consume,
+}
+
+fn browser_send_tab_open_intent(
+    body: &str,
+    host: &str,
+) -> Result<BrowserSendTabOpenDecision, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|err| format!("send-tab JSON: {err}"))?;
     if v.get("op").and_then(serde_json::Value::as_str) != Some("browser_send_tab") {
@@ -7318,6 +7330,16 @@ fn browser_send_tab_open_intent(body: &str, host: &str) -> Result<(BrowserEngine
     if sanitize_session_host(target_id) != sanitize_session_host(host) {
         return Err("send-tab is for a different node".to_owned());
     }
+    if v.get("host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|source_host| !source_host.is_empty())
+        .is_some_and(|source_host| {
+            sanitize_session_host(source_host) == sanitize_session_host(host)
+        })
+    {
+        return Ok(BrowserSendTabOpenDecision::Consume);
+    }
     let engine = v
         .get("engine")
         .and_then(serde_json::Value::as_str)
@@ -7329,7 +7351,7 @@ fn browser_send_tab_open_intent(body: &str, host: &str) -> Result<(BrowserEngine
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| "send-tab is missing url".to_owned())?;
-    Ok((engine, url.to_owned()))
+    Ok(BrowserSendTabOpenDecision::Open(engine, url.to_owned()))
 }
 
 fn incoming_send_tab_files(root: &Path, host: &str) -> Vec<PathBuf> {
@@ -14468,7 +14490,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_send_tab_preview_falls_back_to_the_url_when_the_title_is_blank() {
+    fn browser_send_tab_node_body_has_no_default_self_destination() {
         let _env = browser_env_lock();
         let _node_target = EnvRestore::capture("MDE_BROWSER_SEND_NODE_TARGET");
         let _node_label = EnvRestore::capture("MDE_BROWSER_SEND_NODE_LABEL");
@@ -14482,11 +14504,54 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(v["target"], "node");
-        assert_eq!(v["target_id"], local_hostname());
-        assert_eq!(v["target_label"], local_hostname());
+        assert!(v.get("target_id").is_none());
+        assert!(v.get("target_label").is_none());
         assert_eq!(v["engine"], "servo");
         assert_eq!(v["title"], "");
         assert_eq!(v["preview"], "https://example.com/");
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        assert!(
+            !publish_browser_send_tab(
+                Some(bus.path()),
+                BrowserSendTabTarget::Node,
+                BrowserEngine::Servo,
+                "https://example.com/",
+                "Example",
+            ),
+            "without a remote node target, Send Tab to Node is a no-op"
+        );
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        assert!(
+            persist
+                .list_since(ACTION_BROWSER_SEND_TAB, None)
+                .expect("list send-tab")
+                .is_empty(),
+            "self-target node sends must not enter the durable handoff stream"
+        );
+    }
+
+    #[test]
+    fn browser_send_tab_node_publish_rejects_configured_self_target() {
+        let _env = browser_env_lock();
+        let _node_target = EnvRestore::capture("MDE_BROWSER_SEND_NODE_TARGET");
+        let _node_label = EnvRestore::capture("MDE_BROWSER_SEND_NODE_LABEL");
+        std::env::set_var("MDE_BROWSER_SEND_NODE_TARGET", local_hostname());
+        std::env::set_var("MDE_BROWSER_SEND_NODE_LABEL", "This node");
+        let bus = tempfile::tempdir().expect("temp bus");
+
+        assert!(!publish_browser_send_tab(
+            Some(bus.path()),
+            BrowserSendTabTarget::Node,
+            BrowserEngine::Cef,
+            "https://example.com/",
+            "Example",
+        ));
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        assert!(persist
+            .list_since(ACTION_BROWSER_SEND_TAB, None)
+            .expect("list send-tab")
+            .is_empty());
     }
 
     #[test]
@@ -15500,6 +15565,53 @@ mod tests {
     }
 
     #[test]
+    fn browser_send_tab_outbox_consumes_self_originated_records_without_opening_tabs() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let source = sanitize_session_host(&host);
+        let body = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "target_id": host.clone(),
+            "target_label": host.clone(),
+            "engine": "cef",
+            "url": "https://self-loop.mesh/",
+            "title": "Self loop",
+            "preview": "Self loop",
+            "source": "browser",
+            "host": host.clone()
+        })
+        .to_string();
+        let local_path = send_tab_inbox_dir(local.path(), &host)
+            .join(&source)
+            .join("01Self.json");
+        let share_path = send_tab_inbox_dir(share.path(), &host)
+            .join(&source)
+            .join("01Self.json");
+        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(share_path.parent().unwrap()).unwrap();
+        std::fs::write(&local_path, &body).unwrap();
+        std::fs::write(&share_path, &body).unwrap();
+        let mut state = WebState::default().with_session_restore_roots(vec![
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        ]);
+
+        assert_eq!(state.drain_incoming_send_tabs(), 0);
+
+        assert_eq!(state.take_open_request(), None);
+        assert!(
+            !local_path.exists(),
+            "local self-send poison is consumed during drain"
+        );
+        assert!(
+            !share_path.exists(),
+            "shared duplicate self-send poison is consumed during drain"
+        );
+    }
+
+    #[test]
     fn browser_send_tab_outbox_rejects_phone_and_other_node_records() {
         let root = tempfile::tempdir().unwrap();
         let host = local_hostname();
@@ -15716,19 +15828,22 @@ mod tests {
     }
 
     #[test]
-    fn security_level_tones_use_design_tokens_not_raw_literals() {
+    fn security_level_tones_map_to_browser_material_colors() {
         assert_eq!(
-            chrome_ui::SecurityLevel::Secure.tone().color(),
-            Style::TEXT_DIM
+            chrome_ui::tone_color(chrome_ui::SecurityLevel::Secure.tone()),
+            chrome_ui::CHROME_TEXT_DIM
         );
         assert_eq!(
-            chrome_ui::SecurityLevel::NotSecure.tone().color(),
-            Style::WARN
+            chrome_ui::tone_color(chrome_ui::SecurityLevel::NotSecure.tone()),
+            chrome_ui::CHROME_WARN
         );
-        assert_eq!(chrome_ui::SecurityLevel::Mesh.tone().color(), Style::ACCENT);
         assert_eq!(
-            chrome_ui::SecurityLevel::Neutral.tone().color(),
-            Style::TEXT_DIM
+            chrome_ui::tone_color(chrome_ui::SecurityLevel::Mesh.tone()),
+            chrome_ui::CHROME_PRIMARY
+        );
+        assert_eq!(
+            chrome_ui::tone_color(chrome_ui::SecurityLevel::Neutral.tone()),
+            chrome_ui::CHROME_TEXT_DIM
         );
     }
 
@@ -15990,7 +16105,7 @@ mod tests {
             },
         ];
         let permissions = chrome_ui::SiteInfoPermissionSummary {
-            host: "portal.example.test".to_owned(),
+            host: "example.test".to_owned(),
             forgotten: true,
             session_grants: vec!["geolocation".to_owned()],
             denied_prompts: vec!["camera denied".to_owned()],
@@ -16000,14 +16115,54 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 chrome_ui::site_info_panel(
                     ui,
-                    "https://portal.example.test/",
+                    "https://example.test/",
                     &recent,
                     Some(&permissions),
                 );
             });
         });
+        let texts = painted_text(&out.shapes);
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty());
+
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == "Connection is secure" && *color == chrome_ui::CHROME_TEXT_DIM
+            }),
+            "security headline should use Browser dim token: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text == "example.test" && *color == chrome_ui::CHROME_TEXT
+            }),
+            "site host emphasis should use Browser text token: {texts:?}"
+        );
+        for warning in [
+            "Insecure content blocked",
+            "Unsafe content blocked",
+            "Managed policy blocked",
+            "permissions were forgotten",
+        ] {
+            assert!(
+                texts.iter().any(|(text, color)| {
+                    text.contains(warning) && *color == chrome_ui::CHROME_WARN
+                }),
+                "`{warning}` should use Browser warn token: {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text.contains("Sensitive capabilities default to deny")
+                    && *color == chrome_ui::CHROME_TEXT_DIM
+            }),
+            "site-info explanatory copy should use Browser dim token: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(_, color)| *color == Style::TEXT_DIM
+                || *color == Style::TEXT_STRONG
+                || *color == Style::WARN),
+            "site-info panel must not fall back to shared shell text tokens: {texts:?}"
+        );
     }
 
     #[test]

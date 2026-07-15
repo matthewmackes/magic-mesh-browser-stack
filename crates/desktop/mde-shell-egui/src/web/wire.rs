@@ -160,31 +160,45 @@ impl BrowserSendTabTarget {
 
     fn destination(self) -> Option<(String, String)> {
         match self {
-            Self::Node => Some(browser_node_target_destination()),
+            Self::Node => browser_node_target_destination(),
             Self::Phone => browser_phone_target_destination(),
         }
     }
 }
 
-fn browser_node_target_destination() -> (String, String) {
+fn browser_node_target_destination() -> Option<(String, String)> {
     std::env::var("MDE_BROWSER_SEND_NODE_TARGET")
         .ok()
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
-        .map_or_else(
-            || {
-                let host = local_hostname();
-                (host.clone(), host)
-            },
-            |id| {
+        .and_then(|id| {
+            let local = local_hostname();
+            if sanitize_endpoint_id(&id) == sanitize_endpoint_id(&local) {
+                None
+            } else {
                 let label = std::env::var("MDE_BROWSER_SEND_NODE_LABEL")
                     .ok()
                     .map(|label| label.trim().to_owned())
                     .filter(|label| !label.is_empty())
                     .unwrap_or_else(|| id.clone());
-                (id, label)
-            },
-        )
+                Some((id, label))
+            }
+        })
+}
+
+fn sanitize_endpoint_id(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn browser_phone_target_destination() -> Option<(String, String)> {
@@ -276,13 +290,17 @@ pub(super) fn publish_browser_send_tab(
     engine: BrowserEngine,
     url: &str,
     title: &str,
-) {
+) -> bool {
+    if matches!(target, BrowserSendTabTarget::Node) && target.destination().is_none() {
+        return false;
+    }
     let body = browser_send_tab_body(target, engine, url, title);
     if root.is_some() {
         publish_to_bus(root, ACTION_BROWSER_SEND_TAB, &body);
     } else {
         publish(ACTION_BROWSER_SEND_TAB, &body);
     }
+    true
 }
 
 pub(super) fn browser_permission_prompt_body(

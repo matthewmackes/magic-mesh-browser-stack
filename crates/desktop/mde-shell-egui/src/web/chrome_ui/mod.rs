@@ -178,6 +178,10 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
     }
 }
 
+fn selection_wash() -> Color32 {
+    CHROME_PRIMARY.gamma_multiply(0.16)
+}
+
 pub(super) fn font_id(size: f32) -> FontId {
     FontId::new(size, chrome_font_family())
 }
@@ -1817,7 +1821,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 egui::RichText::new(downloads_label)
                     .size(CHROME_FONT)
                     .color(if state.downloads_open {
-                        Style::ACCENT
+                        CHROME_PRIMARY
                     } else {
                         CHROME_TEXT
                     }),
@@ -1859,7 +1863,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                         ui.label(
                             egui::RichText::new(format!("{count}\u{00D7}  {domain}"))
                                 .small()
-                                .color(Style::TEXT_DIM),
+                                .color(CHROME_TEXT_DIM),
                         );
                     }
                 }
@@ -2281,32 +2285,33 @@ pub(super) fn site_info_panel(
 ) {
     let summary = site_info_summary(page_url);
     let resources = site_info_resource_summary(recent_resources);
+    let security_color = tone_color(summary.security.tone());
     ui.set_max_width(300.0);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(summary.security.glyph())
                 .size(CHROME_FONT)
-                .color(summary.security.tone().color()),
+                .color(security_color),
         );
         ui.label(
             egui::RichText::new(summary.headline)
-                .color(summary.security.tone().color())
+                .color(security_color)
                 .strong(),
         );
     });
     if summary.host.is_empty() {
-        ui.label(egui::RichText::new("No page is currently loaded").color(Style::TEXT_DIM));
+        ui.label(egui::RichText::new("No page is currently loaded").color(CHROME_TEXT_DIM));
     } else {
         let font_id = font_id(CHROME_FONT);
         let mut job = egui::text::LayoutJob::default();
         let dim = egui::TextFormat {
             font_id: font_id.clone(),
-            color: Style::TEXT_DIM,
+            color: CHROME_TEXT_DIM,
             ..Default::default()
         };
         let strong = egui::TextFormat {
             font_id,
-            color: Style::TEXT_STRONG,
+            color: CHROME_TEXT,
             ..Default::default()
         };
         let Range { start, end } = summary.host_emphasis;
@@ -2323,14 +2328,14 @@ pub(super) fn site_info_panel(
         ui.label(
             egui::RichText::new(format!("\u{26A0} {warn}"))
                 .small()
-                .color(Style::WARN),
+                .color(CHROME_WARN),
         );
     }
     if let Some(cert_line) = summary.cert_line {
         ui.label(
             egui::RichText::new(cert_line)
                 .small()
-                .color(Style::TEXT_DIM),
+                .color(CHROME_TEXT_DIM),
         );
     }
     if resources.managed_policy_blocks > 0 {
@@ -2345,7 +2350,7 @@ pub(super) fn site_info_panel(
                 resources.managed_policy_blocks
             ))
             .small()
-            .color(Style::WARN),
+            .color(CHROME_WARN),
         );
         if !resources.managed_policy_rules.is_empty() {
             ui.add(
@@ -2373,7 +2378,7 @@ pub(super) fn site_info_panel(
                 resources.safe_browsing_blocks
             ))
             .small()
-            .color(Style::WARN),
+            .color(CHROME_WARN),
         );
         if !resources.safe_browsing_hosts.is_empty() {
             ui.add(
@@ -2383,7 +2388,7 @@ pub(super) fn site_info_panel(
                         resources.safe_browsing_hosts.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -2401,7 +2406,7 @@ pub(super) fn site_info_panel(
                 resources.mixed_content_blocks
             ))
             .small()
-            .color(Style::WARN),
+            .color(CHROME_WARN),
         );
         if !resources.mixed_content_hosts.is_empty() {
             ui.add(
@@ -2411,7 +2416,7 @@ pub(super) fn site_info_panel(
                         resources.mixed_content_hosts.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -2429,7 +2434,7 @@ pub(super) fn site_info_panel(
                 resources.tracker_blocks
             ))
             .small()
-            .color(Style::TEXT_DIM),
+            .color(CHROME_TEXT_DIM),
         );
         if !resources.tracker_hosts.is_empty() {
             ui.add(
@@ -2439,7 +2444,7 @@ pub(super) fn site_info_panel(
                         resources.tracker_hosts.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -2447,12 +2452,17 @@ pub(super) fn site_info_panel(
     }
     if let Some(permissions) = permissions {
         ui.separator();
-        ui.label(egui::RichText::new("Permissions").small().strong());
+        ui.label(
+            egui::RichText::new("Permissions")
+                .small()
+                .strong()
+                .color(CHROME_TEXT),
+        );
         ui.add(
             egui::Label::new(
                 egui::RichText::new("Sensitive capabilities default to deny")
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
             )
             .wrap(),
         );
@@ -2464,7 +2474,7 @@ pub(super) fn site_info_panel(
                         permissions.session_grants.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -2477,7 +2487,7 @@ pub(super) fn site_info_panel(
                         permissions.denied_prompts.join(", ")
                     ))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(CHROME_TEXT_DIM),
                 )
                 .wrap(),
             );
@@ -2490,7 +2500,7 @@ pub(super) fn site_info_panel(
                         permissions.host
                     ))
                     .small()
-                    .color(Style::WARN),
+                    .color(CHROME_WARN),
                 )
                 .wrap(),
             );
@@ -2500,7 +2510,7 @@ pub(super) fn site_info_panel(
     ui.label(
         egui::RichText::new("Cookies & site data clear when you close the browser")
             .small()
-            .color(Style::TEXT_DIM),
+            .color(CHROME_TEXT_DIM),
     );
 }
 
@@ -2518,7 +2528,7 @@ pub(super) fn security_chip(
             egui::Button::new(
                 egui::RichText::new(security.glyph())
                     .size(CHROME_FONT)
-                    .color(security.tone().color()),
+                    .color(tone_color(security.tone())),
             )
             .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
         )
@@ -3658,12 +3668,11 @@ fn handle_region_capture_drag(
     {
         if let Some(region) = PixelRegion::from_points(start, current, frame_size) {
             let overlay = region.rect_on_image(image_rect, frame_size);
-            ui.painter()
-                .rect_filled(overlay, 0.0, Style::selection_wash());
+            ui.painter().rect_filled(overlay, 0.0, selection_wash());
             ui.painter().rect_stroke(
                 overlay,
                 0.0,
-                egui::Stroke::new(1.0, Style::ACCENT),
+                egui::Stroke::new(1.0, CHROME_PRIMARY),
                 egui::StrokeKind::Inside,
             );
         }
