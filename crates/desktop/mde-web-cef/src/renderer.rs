@@ -7,7 +7,9 @@
 //! boundary instead of stopping at a missing bridge binary.
 
 use std::ffi::OsString;
+use std::fs;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,6 +35,10 @@ const CEF_TEXT_PROBE_EXPECT_ENV: &str = "MDE_CEF_TEXT_PROBE_EXPECT";
 const CEF_ATTACH_STDIN_ENV: &str = "MDE_CEF_ATTACH_STDIN";
 const CEF_ALLOW_ALLOY_EXTENSION_SMOKE_ENV: &str = "MDE_CEF_ALLOW_ALLOY_EXTENSION_SMOKE";
 const SESSION_SOCKET_FD: i32 = 0;
+const CEF_PRIVATE_HOME: &str = "/tmp/mde-web-cef/home";
+const CEF_PRIVATE_CACHE_HOME: &str = "/tmp/mde-web-cef/cache";
+const CEF_PRIVATE_CONFIG_HOME: &str = "/tmp/mde-web-cef/config";
+const CEF_PRIVATE_RUNTIME_DIR: &str = "/tmp/mde-web-cef/runtime";
 
 fn main() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
@@ -90,6 +96,19 @@ fn main() -> ExitCode {
         if let Err(reason) = apply_os_sandbox(&contract, &bridge_exe) {
             eprintln!("CEF_OS_SANDBOX_FAILED reason={reason}");
             return ExitCode::from(78);
+        }
+    }
+    if will_run_cef {
+        match prepare_private_desktop_runtime_env() {
+            Ok(env) => {
+                if !is_cef_subprocess {
+                    println!("{}", env.status_line());
+                }
+            }
+            Err(reason) => {
+                eprintln!("CEF_PRIVATE_RUNTIME_ENV_FAILED reason={reason}");
+                return ExitCode::from(78);
+            }
         }
     }
 
@@ -246,6 +265,64 @@ fn apply_os_sandbox(contract: &BridgeContract, bridge_exe: &Path) -> Result<(), 
         binds.len(),
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrivateDesktopRuntimeEnv {
+    home: PathBuf,
+    cache_home: PathBuf,
+    config_home: PathBuf,
+    runtime_dir: PathBuf,
+}
+
+impl PrivateDesktopRuntimeEnv {
+    fn status_line(&self) -> String {
+        format!(
+            "CEF_PRIVATE_RUNTIME_ENV home={} xdg_cache={} xdg_config={} xdg_runtime={} tmpfs=1",
+            self.home.display(),
+            self.cache_home.display(),
+            self.config_home.display(),
+            self.runtime_dir.display(),
+        )
+    }
+}
+
+fn private_desktop_runtime_env() -> PrivateDesktopRuntimeEnv {
+    PrivateDesktopRuntimeEnv {
+        home: PathBuf::from(CEF_PRIVATE_HOME),
+        cache_home: PathBuf::from(CEF_PRIVATE_CACHE_HOME),
+        config_home: PathBuf::from(CEF_PRIVATE_CONFIG_HOME),
+        runtime_dir: PathBuf::from(CEF_PRIVATE_RUNTIME_DIR),
+    }
+}
+
+fn prepare_private_desktop_runtime_env() -> Result<PrivateDesktopRuntimeEnv, String> {
+    let env = private_desktop_runtime_env();
+    create_private_desktop_runtime_dirs(&env)?;
+    install_private_desktop_runtime_env(&env);
+    Ok(env)
+}
+
+fn create_private_desktop_runtime_dirs(env: &PrivateDesktopRuntimeEnv) -> Result<(), String> {
+    for dir in [
+        &env.home,
+        &env.cache_home,
+        &env.config_home,
+        &env.runtime_dir,
+    ] {
+        fs::create_dir_all(dir).map_err(|err| format!("mkdir {}: {err}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("chmod 0700 {}: {err}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn install_private_desktop_runtime_env(env: &PrivateDesktopRuntimeEnv) {
+    std::env::set_var("HOME", &env.home);
+    std::env::set_var("XDG_CACHE_HOME", &env.cache_home);
+    std::env::set_var("XDG_CONFIG_HOME", &env.config_home);
+    std::env::set_var("XDG_RUNTIME_DIR", &env.runtime_dir);
+    std::env::set_var("TMPDIR", "/tmp");
 }
 
 /// The extra read-only paths the CEF browser tree needs visible after
@@ -465,6 +542,7 @@ fn session_socket_from_stdin() -> UnixStream {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -609,6 +687,65 @@ mod tests {
             cef_subprocess_bridge_path(&PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer")),
             PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer")
         );
+    }
+
+    #[test]
+    fn private_runtime_env_uses_only_the_sandbox_tmpfs() {
+        let env = private_desktop_runtime_env();
+        for dir in [
+            &env.home,
+            &env.cache_home,
+            &env.config_home,
+            &env.runtime_dir,
+        ] {
+            assert!(dir.is_absolute(), "private runtime path must be absolute");
+            assert!(
+                dir.starts_with("/tmp/mde-web-cef"),
+                "private runtime path must stay in sandbox tmpfs: {}",
+                dir.display()
+            );
+            let text = dir.to_string_lossy();
+            assert!(!text.starts_with("/home"), "host home leaked: {text}");
+            assert!(!text.starts_with("/root"), "root home leaked: {text}");
+            assert!(!text.starts_with("/var"), "persistent state leaked: {text}");
+            assert!(!text.contains("ssh"), "ssh path leaked: {text}");
+            assert!(!text.contains("nebula"), "mesh key path leaked: {text}");
+        }
+        let line = env.status_line();
+        assert!(line.contains("CEF_PRIVATE_RUNTIME_ENV"));
+        assert!(line.contains("tmpfs=1"));
+        assert!(line.contains("xdg_cache=/tmp/mde-web-cef/cache"));
+    }
+
+    #[test]
+    fn private_runtime_env_dirs_are_created_private() {
+        let root = temp_root("mde-web-cef-private-env");
+        let env = PrivateDesktopRuntimeEnv {
+            home: root.join("home"),
+            cache_home: root.join("cache"),
+            config_home: root.join("config"),
+            runtime_dir: root.join("runtime"),
+        };
+
+        create_private_desktop_runtime_dirs(&env).expect("create private runtime dirs");
+
+        for dir in [
+            &env.home,
+            &env.cache_home,
+            &env.config_home,
+            &env.runtime_dir,
+        ] {
+            let meta = fs::metadata(dir).expect("private runtime dir metadata");
+            assert!(meta.is_dir(), "{} is a directory", dir.display());
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "{} has private permissions",
+                dir.display()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
