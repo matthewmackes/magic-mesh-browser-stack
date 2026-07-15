@@ -25,20 +25,34 @@ use mde_web_preview_client::{
     EditCommand, JsDialog, SessionState,
 };
 
+mod accessibility;
 mod drawers;
 use super::{
-    browser_capture_dir, centered, ellipsize, install_browser_page_accessibility,
-    media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult, ContainerProfile,
-    DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock, PendingPasskeyConsent,
-    PixelRegion, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
-    CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
-    CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
+    browser_capture_dir, ellipsize, media_metadata_chip_label, BrowserEngine,
+    BrowserOfflineCacheResult, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
+    ManagedPolicyBlock, PendingPasskeyConsent, PixelRegion, Tab, UserAgentOverride, WebState,
+    CHROME_BUTTON, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE,
+    CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM,
+    PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
 };
+use accessibility::install_browser_page_accessibility;
 use drawers::{
     downloads_drawer, history_drawer, offline_cache_drawer, print_settings_drawer, qr_share_drawer,
     security_update_drawer, site_styles_drawer, speech_status_drawer, spellcheck_drawer,
     translation_drawer,
 };
+
+pub(super) fn install_browser_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    state: &WebState,
+) {
+    accessibility::install_browser_accessibility(ctx, rect, state);
+}
+
+pub(super) fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    accessibility::centered(ui, content);
+}
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
 /// shared font installer. Keeping it named, not proportional, preserves Inter as
