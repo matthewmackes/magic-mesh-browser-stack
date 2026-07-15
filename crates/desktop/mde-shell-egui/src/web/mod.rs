@@ -6219,7 +6219,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     if state.vertical_tabs {
         ui.horizontal(|ui| {
             chrome_ui::scope(ui, |ui| {
-                tab_strip(ui, state);
+                chrome_ui::tab_strip(ui, state);
             });
             ui.add_space(CHROME_GAP);
             ui.vertical(|ui| {
@@ -6250,7 +6250,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         chrome_ui::scope(ui, |ui| {
             // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
             // sessions and expose a real new-tab intent for the live-helper path.
-            tab_strip(ui, state);
+            chrome_ui::tab_strip(ui, state);
             ui.add_space(CHROME_GAP);
 
             // The navigation chrome (back / forward / reload / address bar), wired
@@ -6424,754 +6424,6 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
     }
-}
-
-fn tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
-    if state.vertical_tabs {
-        vertical_tab_strip(ui, state);
-    } else {
-        horizontal_tab_strip(ui, state);
-    }
-}
-
-fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
-    let mut select: Option<usize> = None;
-    let mut close: Option<usize> = None;
-    let mut move_tab: Option<(usize, usize)> = None;
-    let mut group_tab: Option<usize> = None;
-    let mut ungroup_tab_idx: Option<usize> = None;
-    let mut mute_tab: Option<(usize, bool)> = None;
-    let mut autoplay_tab: Option<(usize, bool)> = None;
-    let mut force_dark_tab: Option<(usize, bool)> = None;
-    let mut reader_tab: Option<(usize, bool)> = None;
-    let mut user_scripts_tab: Option<(usize, bool)> = None;
-    let mut container_tab: Option<(usize, ContainerProfile)> = None;
-    let mut display_tab: Option<(usize, DisplayTarget)> = None;
-    let mut pin_tab: Option<(usize, bool)> = None;
-    let mut duplicate_tab_idx: Option<usize> = None;
-    let mut close_others_idx: Option<usize> = None;
-    let mut close_right_idx: Option<usize> = None;
-
-    // Overflow (BROWSER tabstrip): pills shrink toward a floor as they multiply;
-    // once at the floor the strip scrolls horizontally in ONE row instead of
-    // wrapping onto stacked rows.
-    let pill_width = chrome_ui::horizontal_tab_pill_width(ui.available_width(), state.tabs.len());
-
-    // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
-    // below — see `resolve_tab_favicon_textures`.
-    let favicon_textures = resolve_tab_favicon_textures(ui.ctx(), &mut state.tabs);
-
-    // Scroll the active pill into view only when the active tab actually CHANGED,
-    // so the operator can still scroll the strip freely while a tab stays selected.
-    let last_active_id = egui::Id::new("browser-horizontal-tabs-last-active");
-    let active_changed =
-        ui.ctx().data(|d| d.get_temp::<usize>(last_active_id)) != Some(state.active);
-
-    // Drag-reorder bookkeeping: every pill's laid-out rect (in tab order), plus the
-    // pill under a settled drag and where it was dropped.
-    let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
-    let mut drag_from: Option<usize> = None;
-    let mut drop_pointer: Option<egui::Pos2> = None;
-
-    egui::ScrollArea::horizontal()
-        .id_salt("browser-horizontal-tabs")
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (idx, tab) in state.tabs.iter().enumerate() {
-                    let active = idx == state.active;
-                    // Pinned tabs collapse to a compact favicon-only pill (no title).
-                    let label = if tab.pinned {
-                        String::new()
-                    } else {
-                        chrome_ui::tab_label(tab)
-                    };
-                    let pill_w = if tab.pinned {
-                        CHROME_TAB_PINNED_W
-                    } else {
-                        pill_width
-                    };
-                    chrome_ui::tab_favicon_image(
-                        ui,
-                        favicon_textures.get(idx).and_then(Option::as_ref),
-                    );
-                    let tab_response = chrome_ui::tab_pill_sized(ui, &label, active, pill_w);
-                    pill_rects.push((idx, tab_response.rect));
-                    if tab_response.clicked() {
-                        select = Some(idx);
-                    }
-                    // Middle-click closes the tab under the pointer (the ubiquitous
-                    // desktop-browser gesture) — same seam as the inline × button.
-                    if tab_response.middle_clicked() {
-                        close = Some(idx);
-                    }
-                    // A settled horizontal drag reorders the tab to where it was
-                    // dropped; egui's own click/drag threshold keeps a plain click
-                    // (activate) and a middle-click (close) intact.
-                    if tab_response.drag_stopped() {
-                        drag_from = Some(idx);
-                        drop_pointer = tab_response.interact_pointer_pos();
-                    }
-                    if active && active_changed {
-                        tab_response.scroll_to_me(Some(egui::Align::Center));
-                    }
-                    // Tab-group indicator: a colored strip along the pill's bottom edge
-                    // (Chrome's grouped-tab color band), painted from the response rect
-                    // so it never disturbs the click/drag interaction above.
-                    if let Some(color) = tab
-                        .group
-                        .and_then(|g| state.tab_groups.get(g))
-                        .map(|g| g.color)
-                    {
-                        let r = tab_response.rect;
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
-                                egui::pos2(r.right() - 2.0, r.bottom()),
-                            ),
-                            0.0,
-                            color,
-                        );
-                    }
-                    tab_response
-                        .on_hover_ui(|ui| chrome_ui::tab_hover_card(ui, tab))
-                        .context_menu(|ui| {
-                            if ui
-                                .add_enabled(idx > 0, chrome_ui::compact_menu_item("Move tab left"))
-                                .clicked()
-                            {
-                                move_tab = Some((idx, idx - 1));
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add_enabled(
-                                    idx + 1 < state.tabs.len(),
-                                    chrome_ui::compact_menu_item("Move tab right"),
-                                )
-                                .clicked()
-                            {
-                                move_tab = Some((idx, idx + 1));
-                                ui.close_menu();
-                            }
-                            let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                            if ui.add(chrome_ui::compact_menu_item(pin_label)).clicked() {
-                                pin_tab = Some((idx, !tab.pinned));
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add(chrome_ui::compact_menu_item("Duplicate tab"))
-                                .clicked()
-                            {
-                                duplicate_tab_idx = Some(idx);
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add_enabled(
-                                    state.tabs.len() > 1,
-                                    chrome_ui::compact_menu_item("Close other tabs"),
-                                )
-                                .clicked()
-                            {
-                                close_others_idx = Some(idx);
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add_enabled(
-                                    idx + 1 < state.tabs.len(),
-                                    chrome_ui::compact_menu_item("Close tabs to the right"),
-                                )
-                                .clicked()
-                            {
-                                close_right_idx = Some(idx);
-                                ui.close_menu();
-                            }
-                            if tab.group.is_none() {
-                                if ui
-                                    .add(chrome_ui::compact_menu_item("Add tab to new group"))
-                                    .clicked()
-                                {
-                                    group_tab = Some(idx);
-                                    ui.close_menu();
-                                }
-                            } else if ui
-                                .add(chrome_ui::compact_menu_item("Remove from group"))
-                                .clicked()
-                            {
-                                ungroup_tab_idx = Some(idx);
-                                ui.close_menu();
-                            }
-                            let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                            if ui.add(chrome_ui::compact_menu_item(mute_label)).clicked() {
-                                mute_tab = Some((idx, !tab.muted));
-                                ui.close_menu();
-                            }
-                            let autoplay_label = if tab.autoplay_blocked {
-                                "Allow autoplay"
-                            } else {
-                                "Block autoplay"
-                            };
-                            if ui
-                                .add(chrome_ui::compact_menu_item(autoplay_label))
-                                .clicked()
-                            {
-                                autoplay_tab = Some((idx, !tab.autoplay_blocked));
-                                ui.close_menu();
-                            }
-                            let dark_label = if tab.force_dark {
-                                "Disable force dark"
-                            } else {
-                                "Enable force dark"
-                            };
-                            if ui.add(chrome_ui::compact_menu_item(dark_label)).clicked() {
-                                force_dark_tab = Some((idx, !tab.force_dark));
-                                ui.close_menu();
-                            }
-                            let reader_label = if tab.reader_mode {
-                                "Disable reader mode"
-                            } else {
-                                "Enable reader mode"
-                            };
-                            if ui.add(chrome_ui::compact_menu_item(reader_label)).clicked() {
-                                reader_tab = Some((idx, !tab.reader_mode));
-                                ui.close_menu();
-                            }
-                            let scripts_label = if tab.user_scripts {
-                                "Disable userscripts"
-                            } else {
-                                "Enable userscripts"
-                            };
-                            if ui
-                                .add(chrome_ui::compact_menu_item(scripts_label))
-                                .clicked()
-                            {
-                                user_scripts_tab = Some((idx, !tab.user_scripts));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            for container in ContainerProfile::ALL {
-                                if ui
-                                    .add_enabled(
-                                        tab.container != container,
-                                        chrome_ui::compact_menu_item(container.label()),
-                                    )
-                                    .clicked()
-                                {
-                                    container_tab = Some((idx, container));
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.separator();
-                            for display_target in DisplayTarget::ALL {
-                                if ui
-                                    .add_enabled(
-                                        tab.display_target != display_target,
-                                        chrome_ui::compact_menu_item(display_target.label()),
-                                    )
-                                    .clicked()
-                                {
-                                    display_tab = Some((idx, display_target));
-                                    ui.close_menu();
-                                }
-                            }
-                            if ui.add(chrome_ui::compact_menu_item("Close tab")).clicked() {
-                                close = Some(idx);
-                                ui.close_menu();
-                            }
-                        });
-                    // Speaker glyph for an audible/muted tab, click-to-mute.
-                    if let Some(audio) =
-                        chrome_ui::tab_audio_glyph(ui, tab.session.audible(), tab.muted)
-                    {
-                        if audio.clicked() {
-                            mute_tab = Some((idx, !tab.muted));
-                        }
-                    }
-                    // Pinned tabs hide the inline × (Chrome's affordance); they
-                    // still close via middle-click or the context menu.
-                    if !tab.pinned && chrome_ui::inline_close_button(ui).clicked() {
-                        close = Some(idx);
-                    }
-                }
-                chrome_ui::engine_new_tab_buttons(ui, state, false);
-                chrome_ui::tab_search_menu(ui, state);
-            });
-        });
-
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(last_active_id, state.active));
-
-    // Resolve a settled drag to a concrete reorder against the laid-out pills.
-    if let (Some(from), Some(pointer)) = (drag_from, drop_pointer) {
-        if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Horizontal) {
-            if to != from {
-                move_tab = Some((from, to));
-            }
-        }
-    }
-
-    #[cfg(test)]
-    {
-        let rects: Vec<egui::Rect> = pill_rects.iter().map(|(_, r)| *r).collect();
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(tab_pill_rects_id(), rects));
-    }
-
-    if let Some((idx, muted)) = mute_tab {
-        state.select_tab(idx);
-        state.set_active_tab_muted(muted);
-    } else if let Some((idx, blocked)) = autoplay_tab {
-        state.select_tab(idx);
-        state.set_active_tab_autoplay_blocked(blocked);
-    } else if let Some((idx, enabled)) = force_dark_tab {
-        state.select_tab(idx);
-        state.set_active_tab_force_dark(enabled);
-    } else if let Some((idx, enabled)) = reader_tab {
-        state.select_tab(idx);
-        state.set_active_tab_reader_mode(enabled);
-    } else if let Some((idx, enabled)) = user_scripts_tab {
-        state.select_tab(idx);
-        state.set_active_tab_user_scripts(enabled);
-    } else if let Some((idx, container)) = container_tab {
-        state.select_tab(idx);
-        state.set_active_tab_container(container);
-    } else if let Some((idx, display_target)) = display_tab {
-        state.select_tab(idx);
-        state.set_active_tab_display_target(display_target);
-    } else if let Some((idx, pinned)) = pin_tab {
-        state.set_tab_pinned(idx, pinned);
-    } else if let Some(idx) = duplicate_tab_idx {
-        state.duplicate_tab(idx);
-    } else if let Some(idx) = close_others_idx {
-        state.close_other_tabs(idx);
-    } else if let Some(idx) = close_right_idx {
-        state.close_tabs_to_the_right(idx);
-    } else if let Some(idx) = group_tab {
-        state.new_group_from_tab(idx);
-    } else if let Some(idx) = ungroup_tab_idx {
-        state.ungroup_tab(idx);
-    } else if let Some((from, to)) = move_tab {
-        state.move_tab(from, to);
-    } else if let Some(idx) = close {
-        state.close_tab(idx);
-    } else if let Some(idx) = select {
-        state.select_tab(idx);
-    }
-}
-
-fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
-    let mut select: Option<usize> = None;
-    let mut close: Option<usize> = None;
-    let mut move_tab: Option<(usize, usize)> = None;
-    let mut group_tab: Option<usize> = None;
-    let mut ungroup_tab_idx: Option<usize> = None;
-    let mut mute_tab: Option<(usize, bool)> = None;
-    let mut autoplay_tab: Option<(usize, bool)> = None;
-    let mut force_dark_tab: Option<(usize, bool)> = None;
-    let mut reader_tab: Option<(usize, bool)> = None;
-    let mut user_scripts_tab: Option<(usize, bool)> = None;
-    let mut container_tab: Option<(usize, ContainerProfile)> = None;
-    let mut display_tab: Option<(usize, DisplayTarget)> = None;
-    let mut pin_tab: Option<(usize, bool)> = None;
-    let mut duplicate_tab_idx: Option<usize> = None;
-    let mut close_others_idx: Option<usize> = None;
-    let mut close_right_idx: Option<usize> = None;
-
-    // Drag-reorder bookkeeping mirrors the horizontal strip, but the drop point is
-    // matched along Y — a vertical drag reorders the stacked pills.
-    let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
-    let mut drag_from: Option<usize> = None;
-    let mut drop_pointer: Option<egui::Pos2> = None;
-
-    // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
-    // below — see `resolve_tab_favicon_textures`.
-    let favicon_textures = resolve_tab_favicon_textures(ui.ctx(), &mut state.tabs);
-
-    egui::Frame::NONE
-        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
-        .inner_margin(egui::Margin::same(4))
-        .show(ui, |ui| {
-            ui.set_width(184.0);
-            egui::ScrollArea::vertical()
-                .id_salt("browser-vertical-tabs")
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    for (idx, tab) in state.tabs.iter().enumerate() {
-                        let active = idx == state.active;
-                        // Pinned tabs collapse to a compact favicon-only pill.
-                        let label = if tab.pinned {
-                            String::new()
-                        } else {
-                            chrome_ui::tab_label(tab)
-                        };
-                        ui.horizontal(|ui| {
-                            chrome_ui::tab_favicon_image(
-                                ui,
-                                favicon_textures.get(idx).and_then(Option::as_ref),
-                            );
-                            let width = if tab.pinned {
-                                CHROME_TAB_PINNED_W
-                            } else {
-                                (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
-                                    .max(CHROME_NEW_TAB_W)
-                            };
-                            let resp = chrome_ui::tab_pill_sized(ui, &label, active, width);
-                            pill_rects.push((idx, resp.rect));
-                            if resp.clicked() {
-                                select = Some(idx);
-                            }
-                            // Middle-click closes this tab — same gesture as the
-                            // horizontal strip.
-                            if resp.middle_clicked() {
-                                close = Some(idx);
-                            }
-                            // A settled vertical drag reorders this pill to where it
-                            // was dropped (matched along Y).
-                            if resp.drag_stopped() {
-                                drag_from = Some(idx);
-                                drop_pointer = resp.interact_pointer_pos();
-                            }
-                            // Tab-group indicator: a colored strip along the pill's LEFT
-                            // edge (the vertical-strip analogue of the horizontal band).
-                            if let Some(color) = tab
-                                .group
-                                .and_then(|g| state.tab_groups.get(g))
-                                .map(|g| g.color)
-                            {
-                                let r = resp.rect;
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(r.left(), r.top() + 2.0),
-                                        egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
-                                    ),
-                                    0.0,
-                                    color,
-                                );
-                            }
-                            resp.on_hover_text(chrome_ui::tab_hover(tab))
-                                .context_menu(|ui| {
-                                    if ui
-                                        .add_enabled(
-                                            idx > 0,
-                                            chrome_ui::compact_menu_item("Move tab up"),
-                                        )
-                                        .clicked()
-                                    {
-                                        move_tab = Some((idx, idx - 1));
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            idx + 1 < state.tabs.len(),
-                                            chrome_ui::compact_menu_item("Move tab down"),
-                                        )
-                                        .clicked()
-                                    {
-                                        move_tab = Some((idx, idx + 1));
-                                        ui.close_menu();
-                                    }
-                                    let pin_label =
-                                        if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                                    if ui.add(chrome_ui::compact_menu_item(pin_label)).clicked() {
-                                        pin_tab = Some((idx, !tab.pinned));
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add(chrome_ui::compact_menu_item("Duplicate tab"))
-                                        .clicked()
-                                    {
-                                        duplicate_tab_idx = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            state.tabs.len() > 1,
-                                            chrome_ui::compact_menu_item("Close other tabs"),
-                                        )
-                                        .clicked()
-                                    {
-                                        close_others_idx = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            idx + 1 < state.tabs.len(),
-                                            chrome_ui::compact_menu_item("Close tabs to the right"),
-                                        )
-                                        .clicked()
-                                    {
-                                        close_right_idx = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                    if tab.group.is_none() {
-                                        if ui
-                                            .add(chrome_ui::compact_menu_item(
-                                                "Add tab to new group",
-                                            ))
-                                            .clicked()
-                                        {
-                                            group_tab = Some(idx);
-                                            ui.close_menu();
-                                        }
-                                    } else if ui
-                                        .add(chrome_ui::compact_menu_item("Remove from group"))
-                                        .clicked()
-                                    {
-                                        ungroup_tab_idx = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                    let mute_label =
-                                        if tab.muted { "Unmute tab" } else { "Mute tab" };
-                                    if ui.add(chrome_ui::compact_menu_item(mute_label)).clicked() {
-                                        mute_tab = Some((idx, !tab.muted));
-                                        ui.close_menu();
-                                    }
-                                    let autoplay_label = if tab.autoplay_blocked {
-                                        "Allow autoplay"
-                                    } else {
-                                        "Block autoplay"
-                                    };
-                                    if ui
-                                        .add(chrome_ui::compact_menu_item(autoplay_label))
-                                        .clicked()
-                                    {
-                                        autoplay_tab = Some((idx, !tab.autoplay_blocked));
-                                        ui.close_menu();
-                                    }
-                                    let dark_label = if tab.force_dark {
-                                        "Disable force dark"
-                                    } else {
-                                        "Enable force dark"
-                                    };
-                                    if ui.add(chrome_ui::compact_menu_item(dark_label)).clicked() {
-                                        force_dark_tab = Some((idx, !tab.force_dark));
-                                        ui.close_menu();
-                                    }
-                                    let reader_label = if tab.reader_mode {
-                                        "Disable reader mode"
-                                    } else {
-                                        "Enable reader mode"
-                                    };
-                                    if ui.add(chrome_ui::compact_menu_item(reader_label)).clicked()
-                                    {
-                                        reader_tab = Some((idx, !tab.reader_mode));
-                                        ui.close_menu();
-                                    }
-                                    let scripts_label = if tab.user_scripts {
-                                        "Disable userscripts"
-                                    } else {
-                                        "Enable userscripts"
-                                    };
-                                    if ui
-                                        .add(chrome_ui::compact_menu_item(scripts_label))
-                                        .clicked()
-                                    {
-                                        user_scripts_tab = Some((idx, !tab.user_scripts));
-                                        ui.close_menu();
-                                    }
-                                    ui.separator();
-                                    for container in ContainerProfile::ALL {
-                                        if ui
-                                            .add_enabled(
-                                                tab.container != container,
-                                                chrome_ui::compact_menu_item(container.label()),
-                                            )
-                                            .clicked()
-                                        {
-                                            container_tab = Some((idx, container));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                    ui.separator();
-                                    for display_target in DisplayTarget::ALL {
-                                        if ui
-                                            .add_enabled(
-                                                tab.display_target != display_target,
-                                                chrome_ui::compact_menu_item(
-                                                    display_target.label(),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            display_tab = Some((idx, display_target));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                    if ui.add(chrome_ui::compact_menu_item("Close tab")).clicked() {
-                                        close = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                });
-                            // Speaker glyph for an audible/muted tab, click-to-mute.
-                            if let Some(audio) =
-                                chrome_ui::tab_audio_glyph(ui, tab.session.audible(), tab.muted)
-                            {
-                                if audio.clicked() {
-                                    mute_tab = Some((idx, !tab.muted));
-                                }
-                            }
-                            // Pinned tabs hide the × (close via middle-click / menu).
-                            if !tab.pinned && chrome_ui::inline_close_button(ui).clicked() {
-                                close = Some(idx);
-                            }
-                        });
-                    }
-                    chrome_ui::engine_new_tab_buttons(ui, state, true);
-                    chrome_ui::tab_search_menu(ui, state);
-                });
-        });
-
-    // Resolve a settled vertical drag to a concrete reorder against the pills.
-    if let (Some(from), Some(pointer)) = (drag_from, drop_pointer) {
-        if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Vertical) {
-            if to != from {
-                move_tab = Some((from, to));
-            }
-        }
-    }
-
-    #[cfg(test)]
-    {
-        let rects: Vec<egui::Rect> = pill_rects.iter().map(|(_, r)| *r).collect();
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(tab_pill_rects_id(), rects));
-    }
-
-    if let Some((idx, muted)) = mute_tab {
-        state.select_tab(idx);
-        state.set_active_tab_muted(muted);
-    } else if let Some((idx, blocked)) = autoplay_tab {
-        state.select_tab(idx);
-        state.set_active_tab_autoplay_blocked(blocked);
-    } else if let Some((idx, enabled)) = force_dark_tab {
-        state.select_tab(idx);
-        state.set_active_tab_force_dark(enabled);
-    } else if let Some((idx, enabled)) = reader_tab {
-        state.select_tab(idx);
-        state.set_active_tab_reader_mode(enabled);
-    } else if let Some((idx, enabled)) = user_scripts_tab {
-        state.select_tab(idx);
-        state.set_active_tab_user_scripts(enabled);
-    } else if let Some((idx, container)) = container_tab {
-        state.select_tab(idx);
-        state.set_active_tab_container(container);
-    } else if let Some((idx, display_target)) = display_tab {
-        state.select_tab(idx);
-        state.set_active_tab_display_target(display_target);
-    } else if let Some((idx, pinned)) = pin_tab {
-        state.set_tab_pinned(idx, pinned);
-    } else if let Some(idx) = duplicate_tab_idx {
-        state.duplicate_tab(idx);
-    } else if let Some(idx) = close_others_idx {
-        state.close_other_tabs(idx);
-    } else if let Some(idx) = close_right_idx {
-        state.close_tabs_to_the_right(idx);
-    } else if let Some(idx) = group_tab {
-        state.new_group_from_tab(idx);
-    } else if let Some(idx) = ungroup_tab_idx {
-        state.ungroup_tab(idx);
-    } else if let Some((from, to)) = move_tab {
-        state.move_tab(from, to);
-    } else if let Some(idx) = close {
-        state.close_tab(idx);
-    } else if let Some(idx) = select {
-        state.select_tab(idx);
-    }
-}
-
-/// Which way a tab strip runs, so the shared drag-reorder hit-test knows whether
-/// to compare drop points along X (horizontal strip) or Y (vertical strip).
-#[derive(Clone, Copy)]
-enum TabAxis {
-    Horizontal,
-    Vertical,
-}
-
-/// Distance from a pill rect's centre to `point` along the strip's running axis.
-fn tab_axis_distance(rect: egui::Rect, point: egui::Pos2, axis: TabAxis) -> f32 {
-    match axis {
-        TabAxis::Horizontal => (rect.center().x - point.x).abs(),
-        TabAxis::Vertical => (rect.center().y - point.y).abs(),
-    }
-}
-
-/// Given the laid-out tab pill rects (in tab order) and where a drag was
-/// released, return the tab index whose slot the dragged tab should take — the
-/// pill whose centre is nearest the drop point along the strip's axis. Reused by
-/// both strip variants so horizontal and vertical drag-reorder share one rule.
-fn tab_drag_target_index(
-    pills: &[(usize, egui::Rect)],
-    drop: egui::Pos2,
-    axis: TabAxis,
-) -> Option<usize> {
-    pills
-        .iter()
-        .min_by(|(_, a), (_, b)| {
-            let da = tab_axis_distance(*a, drop, axis);
-            let db = tab_axis_distance(*b, drop, axis);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(idx, _)| *idx)
-}
-
-/// The egui temp-memory key under which the horizontal/vertical strips stash the
-/// laid-out pill rects, so egui-driven tests can aim pointer drags at real pill
-/// centres (Buttons have no stable id to `read_response`).
-#[cfg(test)]
-fn tab_pill_rects_id() -> egui::Id {
-    egui::Id::new("browser-test-tab-pill-rects")
-}
-
-/// A cheap fingerprint of a favicon's PNG bytes, so [`tab_favicon_texture`] can
-/// tell "the same favicon as last frame" from "the page just reported a new one"
-/// without diffing the byte vector itself on every frame.
-fn favicon_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Resolve this tab's favicon texture for the current frame.
-///
-/// Reuses [`Tab::favicon_cache`] when the underlying PNG bytes are unchanged from
-/// last frame; otherwise PNG-decodes via the same `png`-crate path the boot
-/// splash / offline-cache viewport already use ([`crate::chooser::decode_png_rgba`])
-/// and caches the result. A decode failure caches an honest `None` rather than
-/// panicking or re-attempting the decode every frame (§7).
-fn tab_favicon_texture(ctx: &egui::Context, tab: &mut Tab) -> Option<TextureHandle> {
-    let bytes = tab.session.favicon()?;
-    let fingerprint = favicon_fingerprint(bytes);
-    if let Some(cache) = &tab.favicon_cache {
-        if cache.fingerprint == fingerprint {
-            return cache.texture.clone();
-        }
-    }
-    let texture = crate::chooser::decode_png_rgba(bytes).map(|image| {
-        ctx.load_texture(
-            format!("browser-tab-favicon::{fingerprint:x}"),
-            image,
-            TextureOptions::LINEAR,
-        )
-    });
-    tab.favicon_cache = Some(FaviconCache {
-        fingerprint,
-        texture: texture.clone(),
-    });
-    texture
-}
-
-/// Resolve (and cache) every tab's favicon texture for this frame, in tab order.
-///
-/// One mutable pass over `tabs` up front, so the tab-strip render loops below —
-/// which already borrow each `Tab` by shared reference while building its pill
-/// label + context menu — can index into the returned slice instead of fighting
-/// this cache for a second `&mut Tab`.
-fn resolve_tab_favicon_textures(
-    ctx: &egui::Context,
-    tabs: &mut [Tab],
-) -> Vec<Option<TextureHandle>> {
-    tabs.iter_mut()
-        .map(|tab| tab_favicon_texture(ctx, tab))
-        .collect()
 }
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
@@ -14060,13 +13312,13 @@ mod tests {
     /// panel's polling), mirroring `middle_clicking_a_tab_pill_closes_that_tab`.
     fn run_tab_strip_frame(ctx: &egui::Context, state: &mut WebState, input: egui::RawInput) {
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| tab_strip(ui, state));
+            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, state));
         });
     }
 
     /// The laid-out pill centres the strip stashed on its last frame, in tab order.
     fn tab_pill_centers(ctx: &egui::Context) -> Vec<egui::Pos2> {
-        ctx.data(|d| d.get_temp::<Vec<Rect>>(tab_pill_rects_id()))
+        ctx.data(|d| d.get_temp::<Vec<Rect>>(chrome_ui::tab_pill_rects_id()))
             .unwrap_or_default()
             .iter()
             .map(|r| r.center())
@@ -14111,15 +13363,27 @@ mod tests {
         ];
         // Horizontal centres sit at x = 50, 150, 250.
         assert_eq!(
-            tab_drag_target_index(&pills, pos2(260.0, 10.0), TabAxis::Horizontal),
+            chrome_ui::tab_drag_target_index(
+                &pills,
+                pos2(260.0, 10.0),
+                chrome_ui::TabAxis::Horizontal
+            ),
             Some(2)
         );
         assert_eq!(
-            tab_drag_target_index(&pills, pos2(160.0, 10.0), TabAxis::Horizontal),
+            chrome_ui::tab_drag_target_index(
+                &pills,
+                pos2(160.0, 10.0),
+                chrome_ui::TabAxis::Horizontal
+            ),
             Some(1)
         );
         assert_eq!(
-            tab_drag_target_index(&pills, pos2(40.0, 10.0), TabAxis::Horizontal),
+            chrome_ui::tab_drag_target_index(
+                &pills,
+                pos2(40.0, 10.0),
+                chrome_ui::TabAxis::Horizontal
+            ),
             Some(0)
         );
         // The vertical axis compares Y instead of X.
@@ -14128,11 +13392,15 @@ mod tests {
             (1, Rect::from_min_size(pos2(0.0, 20.0), vec2(100.0, 20.0))),
         ];
         assert_eq!(
-            tab_drag_target_index(&stacked, pos2(50.0, 38.0), TabAxis::Vertical),
+            chrome_ui::tab_drag_target_index(
+                &stacked,
+                pos2(50.0, 38.0),
+                chrome_ui::TabAxis::Vertical
+            ),
             Some(1)
         );
         assert_eq!(
-            tab_drag_target_index(&[], pos2(0.0, 0.0), TabAxis::Horizontal),
+            chrome_ui::tab_drag_target_index(&[], pos2(0.0, 0.0), chrome_ui::TabAxis::Horizontal),
             None
         );
     }
@@ -14335,7 +13603,7 @@ mod tests {
         let _ = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let top = ui.next_widget_position().y;
-                tab_strip(ui, &mut state);
+                chrome_ui::tab_strip(ui, &mut state);
                 used_h = ui.next_widget_position().y - top;
             });
         });
@@ -14417,7 +13685,7 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         assert!(
-            tab_favicon_texture(&ctx, &mut state.tabs[0]).is_none(),
+            chrome_ui::tab_favicon_texture(&ctx, &mut state.tabs[0]).is_none(),
             "a garbage favicon resolves to no texture, falling back to the pill's own glyph"
         );
         // The failed decode is still cached (fingerprint recorded, texture None) so
@@ -14447,9 +13715,10 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
 
-        let first = tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon A decodes");
-        let second =
-            tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon A decodes again");
+        let first =
+            chrome_ui::tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon A decodes");
+        let second = chrome_ui::tab_favicon_texture(&ctx, &mut state.tabs[0])
+            .expect("favicon A decodes again");
         assert_eq!(
             first.id(),
             second.id(),
@@ -14461,7 +13730,8 @@ mod tests {
         // permanent "decoded once, ever" latch.
         send_favicon(&peer, &png_b);
         state.tabs[0].session.poll();
-        let third = tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon B decodes");
+        let third =
+            chrome_ui::tab_favicon_texture(&ctx, &mut state.tabs[0]).expect("favicon B decodes");
         assert_ne!(
             second.id(),
             third.id(),
@@ -14748,7 +14018,7 @@ mod tests {
         let _ = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 origin.set(ui.next_widget_position());
-                tab_strip(ui, &mut state);
+                chrome_ui::tab_strip(ui, &mut state);
             });
         });
         let point = origin.get() + vec2(CHROME_TAB_W * 0.5, CHROME_TAB_H * 0.5);
@@ -14770,7 +14040,7 @@ mod tests {
             },
         ];
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| tab_strip(ui, &mut state));
+            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
         });
         assert_eq!(state.tabs.len(), 1, "middle-click closes the pill's tab");
         assert!(
