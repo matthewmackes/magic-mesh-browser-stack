@@ -2439,7 +2439,7 @@ impl WebState {
                     || self.consumed_send_tab_records.contains(&record_id)
                     || send_tab_record_is_consumed(&self.session_restore_roots, &host, &record_id)
                 {
-                    self.consumed_send_tab_records.insert(record_id);
+                    self.remember_consumed_send_tab(&host, &record_id);
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -2454,9 +2454,13 @@ impl WebState {
                         self.remember_consumed_send_tab(&host, &record_id);
                         let _ = std::fs::remove_file(&path);
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.remember_consumed_send_tab(&host, &record_id);
+                        let _ = std::fs::remove_file(&path);
+                    }
                 }
             }
+            cleanup_empty_send_tab_source_dirs(&root, &host);
         }
         opened
     }
@@ -7448,6 +7452,25 @@ fn incoming_send_tab_files(root: &Path, host: &str) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+fn cleanup_empty_send_tab_source_dirs(root: &Path, host: &str) {
+    let inbox = send_tab_inbox_dir(root, host);
+    let Ok(sources) = std::fs::read_dir(&inbox) else {
+        return;
+    };
+    for source in sources.filter_map(Result::ok) {
+        let source_path = source.path();
+        if !source_path.is_dir() {
+            continue;
+        }
+        let is_empty = std::fs::read_dir(&source_path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = std::fs::remove_dir(&source_path);
+        }
+    }
 }
 
 fn speed_dial_from_settings(settings: &serde_json::Value) -> Option<Vec<SpeedDialEntry>> {
@@ -15717,8 +15740,14 @@ mod tests {
 
         assert_eq!(state.drain_incoming_send_tabs(), 0);
         assert_eq!(state.take_open_request(), None);
-        assert!(local_dir.join("phone.json").exists());
-        assert!(local_dir.join("other.json").exists());
+        assert!(
+            !local_dir.join("phone.json").exists(),
+            "wrong-inbox phone records are tombstoned instead of retried forever"
+        );
+        assert!(
+            !local_dir.join("other.json").exists(),
+            "misrouted node records are tombstoned instead of retried forever"
+        );
     }
 
     #[test]
@@ -15855,6 +15884,7 @@ mod tests {
             "host": "source-node"
         })
         .to_string();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &second).unwrap();
         let mut restarted = WebState::default().with_session_restore_roots(roots);
 
@@ -15865,6 +15895,49 @@ mod tests {
                 engine: BrowserEngine::Cef,
                 url: "https://second.mesh/".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn browser_send_tab_outbox_tombstones_malformed_self_loop_records() {
+        let root = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let source = sanitize_session_host(&host);
+        let path = send_tab_inbox_dir(root.path(), &host)
+            .join(&source)
+            .join("01BadSelf.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = serde_json::json!({
+            "op": "browser_send_tab",
+            "target": "node",
+            "engine": "cef",
+            "url": "https://self-loop.mesh/",
+            "source": "browser",
+            "host": host.clone()
+        })
+        .to_string();
+        std::fs::write(&path, &body).unwrap();
+        let rel_key = PathBuf::from(&source)
+            .join("01BadSelf.json")
+            .to_string_lossy()
+            .to_string();
+        let record_id = send_tab_consumed_record_id(&rel_key, &body);
+        let mut state =
+            WebState::default().with_session_restore_roots(vec![root.path().to_path_buf()]);
+
+        assert_eq!(state.drain_incoming_send_tabs(), 0);
+
+        assert_eq!(state.take_open_request(), None);
+        assert!(!path.exists(), "malformed self-send poison is removed");
+        assert!(
+            send_tab_consumed_path(root.path(), &host, &record_id).is_file(),
+            "malformed self-send poison is tombstoned for restart"
+        );
+        assert!(
+            !send_tab_inbox_dir(root.path(), &host)
+                .join(&source)
+                .exists(),
+            "empty self-source inbox dirs are cleaned up"
         );
     }
 

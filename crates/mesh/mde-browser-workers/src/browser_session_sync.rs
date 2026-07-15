@@ -284,7 +284,7 @@ impl BrowserSessionSyncWorker {
         if !self.share_writable() {
             return;
         }
-        for (rel, body) in local_outbox_entries(&self.local_root) {
+        for (rel, src, body) in local_outbox_entries(&self.local_root) {
             let dst = self.share_root.join(SEND_TAB_OUTBOX_SUBDIR).join(rel);
             if let Err(e) = write_atomic(&dst, &body) {
                 tracing::debug!(
@@ -293,6 +293,10 @@ impl BrowserSessionSyncWorker {
                     error = %e,
                     "browser send-tab outbox mirror skipped"
                 );
+                continue;
+            }
+            if src != dst {
+                let _ = std::fs::remove_file(src);
             }
         }
     }
@@ -424,7 +428,9 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|target_id| !target_id.is_empty())
-        .unwrap_or(target);
+        .map(str::to_owned)
+        .or_else(|| (target == "phone").then(|| target.to_owned()))
+        .ok_or_else(|| "node send-tab is missing concrete target_id".to_owned())?;
     let url = v
         .get("url")
         .and_then(serde_json::Value::as_str)
@@ -442,7 +448,7 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
     if source_host.is_empty() {
         return Err("host has no safe path characters".to_owned());
     }
-    let target_id = sanitize_host(target_id);
+    let target_id = sanitize_host(&target_id);
     if target_id.is_empty() {
         return Err("target_id has no safe path characters".to_owned());
     }
@@ -499,7 +505,7 @@ pub fn send_tab_path(
         .join(format!("{}.json", sanitize_host(id)))
 }
 
-fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, String)> {
+fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, PathBuf, String)> {
     let base = root.join(SEND_TAB_OUTBOX_SUBDIR);
     let Ok(targets) = std::fs::read_dir(&base) else {
         return Vec::new();
@@ -538,7 +544,7 @@ fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, String)> {
                         continue;
                     };
                     if let Ok(rel) = path.strip_prefix(&base) {
-                        out.push((rel.to_path_buf(), body));
+                        out.push((rel.to_path_buf(), path, body));
                     }
                 }
             }
@@ -667,6 +673,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_send_tab_requires_concrete_node_target_id() {
+        let err = parse_send_tab(
+            &send_tab("node", "node-a", "https://example.test/"),
+            "01ABC",
+        )
+        .expect_err("node send-tab needs a concrete target node");
+        assert!(err.contains("target_id"), "{err}");
+    }
+
+    #[test]
     fn parse_send_tab_rejects_unrouteable_handoffs() {
         assert!(parse_send_tab("{}", "01").is_err());
         assert!(
@@ -756,30 +772,26 @@ mod tests {
         )
         .with_share_gate(gate);
         let handoff = parse_send_tab(
-            &send_tab("node", "node-a", "https://mesh.test/"),
+            &send_tab_with_target_id("node", "node-b", "node-a", "https://mesh.test/"),
             "01Handoff",
         )
         .unwrap();
 
         worker.apply_send_tab(handoff, &persist);
 
-        let local_body = std::fs::read_to_string(send_tab_path(
-            local.path(),
-            "node",
-            "node",
-            "node-a",
-            "01Handoff",
-        ))
-        .unwrap();
+        let local_path = send_tab_path(local.path(), "node", "node-b", "node-a", "01Handoff");
         let share_body = std::fs::read_to_string(send_tab_path(
             share.path(),
             "node",
-            "node",
+            "node-b",
             "node-a",
             "01Handoff",
         ))
         .unwrap();
-        assert_eq!(local_body, share_body);
+        assert!(
+            !local_path.exists(),
+            "successfully mirrored node send-tab records are one-shot locally"
+        );
         let v: serde_json::Value = serde_json::from_str(&share_body).unwrap();
         assert_eq!(v["url"], "https://mesh.test/");
         assert!(
@@ -816,6 +828,10 @@ mod tests {
         assert!(!send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").exists());
         gate.store(true, Ordering::SeqCst);
         worker.mirror_send_tab_outbox();
+        assert!(
+            !send_tab_path(local.path(), "phone", "pixel-8", "node-a", "01Phone").exists(),
+            "successfully mirrored pending send-tab records are removed locally"
+        );
         assert!(send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").is_file());
     }
 
