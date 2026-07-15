@@ -106,7 +106,8 @@ fn main() -> ExitCode {
             return ExitCode::from(78);
         }
     };
-    let paths = CefInitPaths::new(bridge_exe, &contract.resources_dir)
+    let subprocess_bridge = cef_subprocess_bridge_path(&bridge_exe);
+    let paths = CefInitPaths::new(subprocess_bridge, &contract.resources_dir)
         .with_extension_dirs(contract.extensions.clone());
     let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
     println!("{}", settings.status_line());
@@ -270,6 +271,22 @@ fn cef_extra_readonly_binds(
         binds.push(bridge_exe.to_path_buf());
     }
     binds
+}
+
+/// Path handed to Chromium for zygote/renderer subprocess re-exec.
+///
+/// Packaged builds use the real `/usr/libexec/...` path, which the sandbox binds
+/// through with `/usr`. Farm/dev overrides often live under `$HOME`; those are
+/// intentionally not broadly visible after `pivot_root`, and exact file binds can
+/// still be brittle for Chromium's zygote. `/proc/self/exe` reliably re-execs the
+/// already-running bridge from inside the confined process while preserving the
+/// same env contract and inherited sandbox.
+fn cef_subprocess_bridge_path(bridge_exe: &Path) -> PathBuf {
+    if bridge_exe.is_absolute() && !bridge_exe.starts_with("/usr") {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        bridge_exe.to_path_buf()
+    }
 }
 
 struct BridgeContract {
@@ -578,6 +595,20 @@ mod tests {
             &PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer"),
         );
         assert_eq!(binds, vec![PathBuf::from("/opt/mde/cef")]);
+    }
+
+    #[test]
+    fn cef_subprocess_path_uses_proc_self_exe_for_non_packaged_bridge_overrides() {
+        assert_eq!(
+            cef_subprocess_bridge_path(&PathBuf::from(
+                "/home/mm/magic-mesh/target/debug/mde-web-cef-renderer"
+            )),
+            PathBuf::from("/proc/self/exe")
+        );
+        assert_eq!(
+            cef_subprocess_bridge_path(&PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer")),
+            PathBuf::from("/usr/libexec/mackesd/mde-web-cef-renderer")
+        );
     }
 
     #[test]
