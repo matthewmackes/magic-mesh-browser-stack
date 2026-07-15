@@ -1,10 +1,10 @@
-//! Browser command model and menu renderers.
+//! Browser command model and shared menu renderer.
 //!
 //! The command tree is Browser-owned: Page / Edit / View / History / Privacy /
 //! Bookmarks bind to real `WebSession` and page-action seams (§6 glue, no new
 //! behaviour). BROWSER-CHROME retires the default shared MENUBAR-ALL top strip for
-//! this surface, so [`show_chrome_menu`] renders the same state-gated actions under
-//! the toolbar's Chrome-style menu button. [`show`] remains only for legacy
+//! this surface, so `chrome_ui` renders these same state-gated actions under the
+//! toolbar's Chrome-style menu button. [`show`] remains only for legacy
 //! MENUBAR-SWEEP tests and any caller that explicitly wants the shared bar.
 
 use super::{
@@ -15,7 +15,7 @@ use super::{
     DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
     ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
 };
-use mde_egui::egui::{self, RichText};
+use mde_egui::egui;
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{ChipTone, StatusChip, Style};
 use mde_web_preview_client::SessionState;
@@ -1061,83 +1061,10 @@ pub(super) fn show(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
     MenuBar::show(ui, &model)
 }
 
-/// Render the Browser-local Chrome toolbar menu and return any picked action.
-pub(super) fn show_chrome_menu(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
+/// Build the state-gated Browser command menus for chrome-owned presentation.
+pub(super) fn chrome_menus(state: &WebState) -> Vec<Menu<MenuAction>> {
     let snap = snapshot(state);
-    let menus = build_menus(&snap);
-    let mut picked = None;
-    ui.menu_button(
-        RichText::new("\u{22EE}")
-            .size(super::CHROME_FONT + 2.0)
-            .color(super::chrome_ui::CHROME_TEXT),
-        |ui| {
-            ui.set_min_width(220.0);
-            for menu in &menus {
-                ui.menu_button(
-                    RichText::new(menu.title.as_str())
-                        .size(super::CHROME_FONT)
-                        .color(super::chrome_ui::CHROME_TEXT),
-                    |ui| render_chrome_menu_entries(ui, &menu.entries, &mut picked),
-                );
-            }
-        },
-    )
-    .response
-    .on_hover_text("Customize and control Browser");
-    picked
-}
-
-fn render_chrome_menu_entries(
-    ui: &mut egui::Ui,
-    entries: &[Entry<MenuAction>],
-    picked: &mut Option<MenuAction>,
-) {
-    for entry in entries {
-        match entry {
-            Entry::Item(item) => {
-                let mut label = String::new();
-                if item.checked == Some(true) {
-                    label.push_str("\u{2713} ");
-                }
-                label.push_str(&item.label);
-                if let Some(shortcut) = &item.shortcut {
-                    label.push_str("    ");
-                    label.push_str(shortcut);
-                }
-                let response = ui.add_enabled(
-                    item.enabled,
-                    egui::Button::new(
-                        RichText::new(label)
-                            .size(super::CHROME_FONT)
-                            .color(super::chrome_ui::button_text(item.enabled)),
-                    )
-                    .fill(super::chrome_ui::menu_item_fill(item.checked == Some(true))),
-                );
-                if response.clicked() && item.enabled {
-                    *picked = Some(item.id);
-                    ui.close_menu();
-                }
-            }
-            Entry::Submenu { label, entries, .. } => {
-                ui.menu_button(
-                    RichText::new(label.as_str())
-                        .size(super::CHROME_FONT)
-                        .color(super::chrome_ui::CHROME_TEXT),
-                    |ui| render_chrome_menu_entries(ui, entries, picked),
-                );
-            }
-            Entry::Separator => {
-                ui.separator();
-            }
-            Entry::Caption(caption) => {
-                ui.label(
-                    RichText::new(caption.as_str())
-                        .size(super::CHROME_FONT)
-                        .color(super::chrome_ui::CHROME_TEXT_DIM),
-                );
-            }
-        }
-    }
+    build_menus(&snap)
 }
 
 /// The active tab's committed URL, or empty with no tab.

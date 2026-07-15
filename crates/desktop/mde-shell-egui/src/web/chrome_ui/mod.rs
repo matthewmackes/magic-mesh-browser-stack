@@ -18,6 +18,7 @@ use std::{
 use mde_egui::egui::{
     self, Color32, FontFamily, FontId, RichText, TextStyle, TextureHandle, TextureOptions,
 };
+use mde_egui::menubar::Entry;
 use mde_egui::{muted_note, ChipTone, Style};
 use mde_web_preview_client::{
     confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, CursorKind,
@@ -311,6 +312,84 @@ pub(super) fn compact_menu_item(label: &str) -> egui::Button<'_> {
             .color(CHROME_TEXT),
     )
     .min_size(egui::vec2(124.0, CHROME_TAB_H))
+}
+
+/// Render the Browser-local toolbar command menu and return any picked action.
+fn chrome_menu_button(state: &WebState, ui: &mut egui::Ui) -> Option<super::menubar::MenuAction> {
+    let menus = super::menubar::chrome_menus(state);
+    let mut picked = None;
+    ui.menu_button(
+        RichText::new("\u{22EE}")
+            .size(CHROME_FONT + 2.0)
+            .color(CHROME_TEXT),
+        |ui| {
+            ui.set_min_width(220.0);
+            for menu in &menus {
+                ui.menu_button(
+                    RichText::new(menu.title.as_str())
+                        .size(CHROME_FONT)
+                        .color(CHROME_TEXT),
+                    |ui| render_chrome_menu_entries(ui, &menu.entries, &mut picked),
+                );
+            }
+        },
+    )
+    .response
+    .on_hover_text("Customize and control Browser");
+    picked
+}
+
+fn render_chrome_menu_entries(
+    ui: &mut egui::Ui,
+    entries: &[Entry<super::menubar::MenuAction>],
+    picked: &mut Option<super::menubar::MenuAction>,
+) {
+    for entry in entries {
+        match entry {
+            Entry::Item(item) => {
+                let mut label = String::new();
+                if item.checked == Some(true) {
+                    label.push_str("\u{2713} ");
+                }
+                label.push_str(&item.label);
+                if let Some(shortcut) = &item.shortcut {
+                    label.push_str("    ");
+                    label.push_str(shortcut);
+                }
+                let response = ui.add_enabled(
+                    item.enabled,
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(CHROME_FONT)
+                            .color(button_text(item.enabled)),
+                    )
+                    .fill(menu_item_fill(item.checked == Some(true))),
+                );
+                if response.clicked() && item.enabled {
+                    *picked = Some(item.id);
+                    ui.close_menu();
+                }
+            }
+            Entry::Submenu { label, entries, .. } => {
+                ui.menu_button(
+                    RichText::new(label.as_str())
+                        .size(CHROME_FONT)
+                        .color(CHROME_TEXT),
+                    |ui| render_chrome_menu_entries(ui, entries, picked),
+                );
+            }
+            Entry::Separator => {
+                ui.separator();
+            }
+            Entry::Caption(caption) => {
+                ui.label(
+                    RichText::new(caption.as_str())
+                        .size(CHROME_FONT)
+                        .color(CHROME_TEXT_DIM),
+                );
+            }
+        }
+    }
 }
 
 pub(super) fn tab_label(tab: &Tab) -> String {
@@ -1854,7 +1933,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             state.submit_address();
         }
 
-        toolbar_action = super::menubar::show_chrome_menu(state, ui);
+        toolbar_action = chrome_menu_button(state, ui);
     });
     if let Some(action) = toolbar_action {
         super::menubar::apply(ui.ctx(), state, action);
