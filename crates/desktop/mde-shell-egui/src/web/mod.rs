@@ -12224,8 +12224,8 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New tab"),
-            "engine picker should keep the primary action stable when CEF is selected: {texts:?}"
+            texts.iter().any(|text| text == "New CEF tab"),
+            "engine picker should make the CEF primary action explicit: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "CEF / Chromium"),
@@ -12241,8 +12241,8 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New tab"),
-            "engine picker should keep the primary action stable when Servo is selected: {texts:?}"
+            texts.iter().any(|text| text == "New Servo tab"),
+            "engine picker should make the Servo primary action explicit: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "Servo"),
