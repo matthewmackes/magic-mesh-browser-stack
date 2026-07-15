@@ -7372,8 +7372,8 @@ const ACTION_BROWSER_PROTOCOL: &str = "action/browser/protocol";
 const ACTION_BROWSER_SHARE: &str = "action/browser/share";
 
 /// Browser follow-me/send-tab handoff. The session-sync owner drains this stream
-/// and delivers the live tab to a mesh node or a paired phone; Browser only owns
-/// the tab metadata and stable user action.
+/// and routes by concrete `target_id` into the node or paired-phone handoff
+/// substrate; Browser only owns the tab metadata and stable user action.
 const ACTION_BROWSER_SEND_TAB: &str = "action/browser/send-tab";
 
 /// Browser passkey/WebAuthn ceremony handoff. The helper observes page WebAuthn
@@ -17607,6 +17607,11 @@ mod tests {
 
     #[test]
     fn browser_send_tab_preview_falls_back_to_the_url_when_the_title_is_blank() {
+        let _env = browser_env_lock();
+        let _node_target = EnvRestore::capture("MDE_BROWSER_SEND_NODE_TARGET");
+        let _node_label = EnvRestore::capture("MDE_BROWSER_SEND_NODE_LABEL");
+        std::env::remove_var("MDE_BROWSER_SEND_NODE_TARGET");
+        std::env::remove_var("MDE_BROWSER_SEND_NODE_LABEL");
         let body = browser_send_tab_body(
             BrowserSendTabTarget::Node,
             BrowserEngine::Servo,
@@ -17620,6 +17625,29 @@ mod tests {
         assert_eq!(v["engine"], "servo");
         assert_eq!(v["title"], "");
         assert_eq!(v["preview"], "https://example.com/");
+    }
+
+    #[test]
+    fn browser_send_tab_node_destination_can_target_a_remote_mesh_node() {
+        let _env = browser_env_lock();
+        let _node_target = EnvRestore::capture("MDE_BROWSER_SEND_NODE_TARGET");
+        let _node_label = EnvRestore::capture("MDE_BROWSER_SEND_NODE_LABEL");
+        std::env::set_var("MDE_BROWSER_SEND_NODE_TARGET", "eagle seat/1");
+        std::env::set_var("MDE_BROWSER_SEND_NODE_LABEL", "Eagle Seat");
+
+        let body = browser_send_tab_body(
+            BrowserSendTabTarget::Node,
+            BrowserEngine::Cef,
+            "https://mesh.example/",
+            "Mesh",
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(v["target"], "node");
+        assert_eq!(v["target_id"], "eagle seat/1");
+        assert_eq!(v["target_label"], "Eagle Seat");
+        assert_eq!(v["host"], local_hostname());
+        assert_eq!(v["url"], "https://mesh.example/");
     }
 
     #[test]
@@ -19296,6 +19324,11 @@ mod tests {
 
     #[test]
     fn browser_send_tab_menu_actions_publish_follow_me_handoffs() {
+        let _env = browser_env_lock();
+        let _node_target = EnvRestore::capture("MDE_BROWSER_SEND_NODE_TARGET");
+        let _node_label = EnvRestore::capture("MDE_BROWSER_SEND_NODE_LABEL");
+        std::env::set_var("MDE_BROWSER_SEND_NODE_TARGET", "eagle seat/1");
+        std::env::set_var("MDE_BROWSER_SEND_NODE_LABEL", "Eagle Seat");
         let bus = tempfile::tempdir().expect("temp bus");
         let (session, _helper, _writer) = live_page_session();
         let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
@@ -19322,8 +19355,8 @@ mod tests {
                 assert_eq!(v["engine"], "cef");
                 assert_eq!(v["url"], "https://example.test/");
                 if v["target"] == "node" {
-                    assert_eq!(v["target_id"], local_hostname());
-                    assert_eq!(v["target_label"], local_hostname());
+                    assert_eq!(v["target_id"], "eagle seat/1");
+                    assert_eq!(v["target_label"], "Eagle Seat");
                 }
                 v["target"].as_str().expect("target").to_owned()
             })

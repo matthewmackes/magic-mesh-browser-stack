@@ -160,13 +160,31 @@ impl BrowserSendTabTarget {
 
     fn destination(self) -> Option<(String, String)> {
         match self {
-            Self::Node => {
-                let host = local_hostname();
-                Some((host.clone(), host))
-            }
+            Self::Node => Some(browser_node_target_destination()),
             Self::Phone => browser_phone_target_destination(),
         }
     }
+}
+
+fn browser_node_target_destination() -> (String, String) {
+    std::env::var("MDE_BROWSER_SEND_NODE_TARGET")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .map_or_else(
+            || {
+                let host = local_hostname();
+                (host.clone(), host)
+            },
+            |id| {
+                let label = std::env::var("MDE_BROWSER_SEND_NODE_LABEL")
+                    .ok()
+                    .map(|label| label.trim().to_owned())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                (id, label)
+            },
+        )
 }
 
 fn browser_phone_target_destination() -> Option<(String, String)> {
