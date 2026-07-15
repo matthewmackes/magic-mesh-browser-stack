@@ -50,6 +50,9 @@ use nix::sched::{unshare, CloneFlags};
 use nix::sys::prctl;
 use nix::unistd::{fork, pivot_root, sethostname, ForkResult, Gid, Pid, Uid};
 
+const CGROUP_FS: &str = "/sys/fs/cgroup";
+const DELEGATE_SUBGROUP_ENV: &str = "MDE_WEB_SANDBOX_DELEGATE_SUBGROUP";
+
 /// The confinement limits + identity for one sandboxed tab process.
 ///
 /// The numeric limits are the policy defaults; a launcher may lower them per
@@ -353,7 +356,21 @@ fn supervise_child(child: Pid) -> ! {
 fn enter_cgroup(policy: SandboxPolicy) -> Result<()> {
     // cgroup v2 unified hierarchy only.
     let current = current_cgroup_path().context("read /proc/self/cgroup")?;
-    let base = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
+    let delegate_subgroup = std::env::var(DELEGATE_SUBGROUP_ENV).ok();
+    let candidates = cgroup_base_candidates(&current, delegate_subgroup.as_deref());
+
+    let mut errors = Vec::new();
+    for base in candidates {
+        match enter_cgroup_at_base(policy, &base) {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(format!("{}: {e:#}", base.display())),
+        }
+    }
+
+    Err(anyhow::anyhow!("{}", errors.join("; ")))
+}
+
+fn enter_cgroup_at_base(policy: SandboxPolicy, base: &Path) -> Result<()> {
     let leaf = base.join(format!("mde-web-preview-{}", std::process::id()));
 
     // Ask the parent to delegate memory+cpu to child cgroups (best-effort).
@@ -365,6 +382,39 @@ fn enter_cgroup(policy: SandboxPolicy) -> Result<()> {
     std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string())
         .context("cgroup.procs")?;
     Ok(())
+}
+
+fn cgroup_base_candidates(current: &str, delegate_subgroup: Option<&str>) -> Vec<PathBuf> {
+    let current_base = Path::new(CGROUP_FS).join(current.trim_start_matches('/'));
+    let mut candidates = Vec::with_capacity(2);
+
+    if let Some(subgroup) = valid_delegate_subgroup(delegate_subgroup) {
+        if current_base.file_name().and_then(|name| name.to_str()) == Some(subgroup) {
+            if let Some(parent) = current_base.parent() {
+                if parent != Path::new(CGROUP_FS) {
+                    candidates.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    candidates.push(current_base);
+    candidates.dedup();
+    candidates
+}
+
+fn valid_delegate_subgroup(raw: Option<&str>) -> Option<&str> {
+    let subgroup = raw?.trim();
+    if subgroup.is_empty()
+        || subgroup == "."
+        || subgroup == ".."
+        || subgroup.contains('/')
+        || subgroup.contains('\\')
+    {
+        None
+    } else {
+        Some(subgroup)
+    }
 }
 
 /// Parse the unified-hierarchy path out of `/proc/self/cgroup` (`0::/...`).
@@ -648,6 +698,31 @@ mod tests {
         let p = SandboxPolicy::tab();
         assert_eq!(p.cgroup_memory_max(), (1024u64 * 1024 * 1024).to_string());
         assert_eq!(p.cgroup_cpu_max(), "80000 100000");
+    }
+
+    #[test]
+    fn cgroup_base_uses_delegated_parent_when_process_lives_in_unit_subgroup() {
+        let candidates =
+            cgroup_base_candidates("/system.slice/mde-shell-egui.service/shell", Some("shell"));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/sys/fs/cgroup/system.slice/mde-shell-egui.service"),
+                PathBuf::from("/sys/fs/cgroup/system.slice/mde-shell-egui.service/shell"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cgroup_base_stays_local_without_a_matching_safe_delegate_subgroup() {
+        for subgroup in [None, Some("main"), Some("../shell"), Some("shell/nested")] {
+            assert_eq!(
+                cgroup_base_candidates("/system.slice/mde-shell-egui.service/shell", subgroup,),
+                vec![PathBuf::from(
+                    "/sys/fs/cgroup/system.slice/mde-shell-egui.service/shell"
+                )]
+            );
+        }
     }
 
     #[test]
