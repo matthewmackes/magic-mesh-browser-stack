@@ -21,11 +21,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use embedder_traits::JSValue;
 use euclid::{Box2D, Point2D};
-use mde_web_wire::MediaTransportAction;
+use mde_web_wire::{
+    InputEvent as WireInputEvent, KeyCode as WireKeyCode, MediaTransportAction,
+    Modifiers as WireModifiers, PointerButton as WirePointerButton,
+};
 use servo::{
-    EventLoopWaker, LoadStatus, PermissionRequest, Preferences, RenderingContext, Servo,
-    ServoBuilder, ServoDelegate, SoftwareRenderingContext, WebView, WebViewBuilder,
-    WebViewDelegate,
+    Code, CompositionEvent, CompositionState, DevicePoint, EventLoopWaker, ImeEvent,
+    InputEvent as ServoInputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers as ServoModifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NamedKey, PermissionRequest, Preferences,
+    RenderingContext, Servo, ServoBuilder, ServoDelegate, SoftwareRenderingContext, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 
 use crate::shm::{FrameChannel, PixelFormat};
@@ -205,6 +211,8 @@ pub struct Engine {
     shared: Rc<Shared>,
     width: u32,
     height: u32,
+    pointer_x: Cell<f32>,
+    pointer_y: Cell<f32>,
     /// When the engine booted — the `MDE_WEB_DEBUG` trace timebase.
     booted: Instant,
 }
@@ -251,6 +259,8 @@ impl Engine {
             shared,
             width,
             height,
+            pointer_x: Cell::new(0.0),
+            pointer_y: Cell::new(0.0),
             booted: Instant::now(),
         })
     }
@@ -545,6 +555,76 @@ impl Engine {
     /// Go forward `amount` history entries.
     pub fn go_forward(&self, amount: usize) {
         let _ = self.webview.go_forward(amount);
+    }
+
+    /// Forward one shell input event into Servo's native webview input API.
+    pub fn apply_input(&self, event: &WireInputEvent) {
+        match event {
+            WireInputEvent::PointerMoved { x, y } => {
+                self.pointer_x.set(*x);
+                self.pointer_y.set(*y);
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseMove(MouseMoveEvent::new(
+                        servo_point(*x, *y),
+                    )));
+            }
+            WireInputEvent::PointerButton {
+                x,
+                y,
+                button,
+                pressed,
+                modifiers: _,
+            } => {
+                self.pointer_x.set(*x);
+                self.pointer_y.set(*y);
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseButton(MouseButtonEvent::new(
+                        if *pressed {
+                            MouseButtonAction::Down
+                        } else {
+                            MouseButtonAction::Up
+                        },
+                        servo_mouse_button(*button),
+                        servo_point(*x, *y),
+                    )));
+            }
+            WireInputEvent::PointerGone => {
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+            }
+            WireInputEvent::Scroll {
+                delta_x,
+                delta_y,
+                modifiers: _,
+            } => {
+                self.webview
+                    .notify_input_event(ServoInputEvent::Wheel(WheelEvent::new(
+                        WheelDelta {
+                            x: f64::from(*delta_x),
+                            y: f64::from(*delta_y),
+                            z: 0.0,
+                            mode: WheelMode::DeltaPixel,
+                        },
+                        servo_point(self.pointer_x.get(), self.pointer_y.get()),
+                    )));
+            }
+            WireInputEvent::Key {
+                key,
+                pressed,
+                modifiers,
+            } => {
+                if let Some(event) = servo_keyboard_event(*key, *pressed, *modifiers) {
+                    self.webview.notify_input_event(event);
+                }
+            }
+            WireInputEvent::Text(text) => {
+                for event in servo_text_events(text) {
+                    self.webview.notify_input_event(event);
+                }
+            }
+        }
     }
 
     /// Set page zoom through Servo's page script seam. This is intentionally the
@@ -1167,6 +1247,153 @@ fn clamp_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
+fn servo_point(x: f32, y: f32) -> WebViewPoint {
+    WebViewPoint::Device(DevicePoint::new(x, y))
+}
+
+const fn servo_mouse_button(button: WirePointerButton) -> MouseButton {
+    match button {
+        WirePointerButton::Primary => MouseButton::Left,
+        WirePointerButton::Secondary => MouseButton::Right,
+        WirePointerButton::Middle => MouseButton::Middle,
+    }
+}
+
+fn servo_modifiers(modifiers: WireModifiers) -> ServoModifiers {
+    let mut servo_modifiers = ServoModifiers::empty();
+    if modifiers.has(WireModifiers::CTRL) {
+        servo_modifiers |= ServoModifiers::CONTROL;
+    }
+    if modifiers.has(WireModifiers::SHIFT) {
+        servo_modifiers |= ServoModifiers::SHIFT;
+    }
+    if modifiers.has(WireModifiers::ALT) {
+        servo_modifiers |= ServoModifiers::ALT;
+    }
+    if modifiers.has(WireModifiers::COMMAND) {
+        servo_modifiers |= ServoModifiers::META;
+    }
+    servo_modifiers
+}
+
+fn servo_keyboard_event(
+    key: WireKeyCode,
+    pressed: bool,
+    modifiers: WireModifiers,
+) -> Option<ServoInputEvent> {
+    let (key, code) = servo_key_and_code(key, modifiers)?;
+    Some(ServoInputEvent::Keyboard(KeyboardEvent::new_without_event(
+        if pressed {
+            KeyState::Down
+        } else {
+            KeyState::Up
+        },
+        key,
+        code,
+        Location::Standard,
+        servo_modifiers(modifiers),
+        false,
+        false,
+    )))
+}
+
+fn servo_text_events(text: &str) -> Vec<ServoInputEvent> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ServoInputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: CompositionState::Start,
+            data: String::new(),
+        })),
+        ServoInputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: CompositionState::End,
+            data: text.to_owned(),
+        })),
+    ]
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat wire-key to DOM-key/code table is easier to audit"
+)]
+fn servo_key_and_code(key: WireKeyCode, modifiers: WireModifiers) -> Option<(Key, Code)> {
+    let shift = modifiers.has(WireModifiers::SHIFT);
+    Some(match key {
+        WireKeyCode::Enter => (Key::Named(NamedKey::Enter), Code::Enter),
+        WireKeyCode::Escape => (Key::Named(NamedKey::Escape), Code::Escape),
+        WireKeyCode::Backspace => (Key::Named(NamedKey::Backspace), Code::Backspace),
+        WireKeyCode::Tab => (Key::Named(NamedKey::Tab), Code::Tab),
+        WireKeyCode::Space => (Key::Character(" ".to_owned()), Code::Space),
+        WireKeyCode::Delete => (Key::Named(NamedKey::Delete), Code::Delete),
+        WireKeyCode::Insert => (Key::Named(NamedKey::Insert), Code::Insert),
+        WireKeyCode::Home => (Key::Named(NamedKey::Home), Code::Home),
+        WireKeyCode::End => (Key::Named(NamedKey::End), Code::End),
+        WireKeyCode::PageUp => (Key::Named(NamedKey::PageUp), Code::PageUp),
+        WireKeyCode::PageDown => (Key::Named(NamedKey::PageDown), Code::PageDown),
+        WireKeyCode::ArrowUp => (Key::Named(NamedKey::ArrowUp), Code::ArrowUp),
+        WireKeyCode::ArrowDown => (Key::Named(NamedKey::ArrowDown), Code::ArrowDown),
+        WireKeyCode::ArrowLeft => (Key::Named(NamedKey::ArrowLeft), Code::ArrowLeft),
+        WireKeyCode::ArrowRight => (Key::Named(NamedKey::ArrowRight), Code::ArrowRight),
+        WireKeyCode::A => (letter_key('a', shift), Code::KeyA),
+        WireKeyCode::B => (letter_key('b', shift), Code::KeyB),
+        WireKeyCode::C => (letter_key('c', shift), Code::KeyC),
+        WireKeyCode::D => (letter_key('d', shift), Code::KeyD),
+        WireKeyCode::E => (letter_key('e', shift), Code::KeyE),
+        WireKeyCode::F => (letter_key('f', shift), Code::KeyF),
+        WireKeyCode::G => (letter_key('g', shift), Code::KeyG),
+        WireKeyCode::H => (letter_key('h', shift), Code::KeyH),
+        WireKeyCode::I => (letter_key('i', shift), Code::KeyI),
+        WireKeyCode::J => (letter_key('j', shift), Code::KeyJ),
+        WireKeyCode::K => (letter_key('k', shift), Code::KeyK),
+        WireKeyCode::L => (letter_key('l', shift), Code::KeyL),
+        WireKeyCode::M => (letter_key('m', shift), Code::KeyM),
+        WireKeyCode::N => (letter_key('n', shift), Code::KeyN),
+        WireKeyCode::O => (letter_key('o', shift), Code::KeyO),
+        WireKeyCode::P => (letter_key('p', shift), Code::KeyP),
+        WireKeyCode::Q => (letter_key('q', shift), Code::KeyQ),
+        WireKeyCode::R => (letter_key('r', shift), Code::KeyR),
+        WireKeyCode::S => (letter_key('s', shift), Code::KeyS),
+        WireKeyCode::T => (letter_key('t', shift), Code::KeyT),
+        WireKeyCode::U => (letter_key('u', shift), Code::KeyU),
+        WireKeyCode::V => (letter_key('v', shift), Code::KeyV),
+        WireKeyCode::W => (letter_key('w', shift), Code::KeyW),
+        WireKeyCode::X => (letter_key('x', shift), Code::KeyX),
+        WireKeyCode::Y => (letter_key('y', shift), Code::KeyY),
+        WireKeyCode::Z => (letter_key('z', shift), Code::KeyZ),
+        WireKeyCode::Num0 => (Key::Character("0".to_owned()), Code::Digit0),
+        WireKeyCode::Num1 => (Key::Character("1".to_owned()), Code::Digit1),
+        WireKeyCode::Num2 => (Key::Character("2".to_owned()), Code::Digit2),
+        WireKeyCode::Num3 => (Key::Character("3".to_owned()), Code::Digit3),
+        WireKeyCode::Num4 => (Key::Character("4".to_owned()), Code::Digit4),
+        WireKeyCode::Num5 => (Key::Character("5".to_owned()), Code::Digit5),
+        WireKeyCode::Num6 => (Key::Character("6".to_owned()), Code::Digit6),
+        WireKeyCode::Num7 => (Key::Character("7".to_owned()), Code::Digit7),
+        WireKeyCode::Num8 => (Key::Character("8".to_owned()), Code::Digit8),
+        WireKeyCode::Num9 => (Key::Character("9".to_owned()), Code::Digit9),
+        WireKeyCode::F1 => (Key::Named(NamedKey::F1), Code::F1),
+        WireKeyCode::F2 => (Key::Named(NamedKey::F2), Code::F2),
+        WireKeyCode::F3 => (Key::Named(NamedKey::F3), Code::F3),
+        WireKeyCode::F4 => (Key::Named(NamedKey::F4), Code::F4),
+        WireKeyCode::F5 => (Key::Named(NamedKey::F5), Code::F5),
+        WireKeyCode::F6 => (Key::Named(NamedKey::F6), Code::F6),
+        WireKeyCode::F7 => (Key::Named(NamedKey::F7), Code::F7),
+        WireKeyCode::F8 => (Key::Named(NamedKey::F8), Code::F8),
+        WireKeyCode::F9 => (Key::Named(NamedKey::F9), Code::F9),
+        WireKeyCode::F10 => (Key::Named(NamedKey::F10), Code::F10),
+        WireKeyCode::F11 => (Key::Named(NamedKey::F11), Code::F11),
+        WireKeyCode::F12 => (Key::Named(NamedKey::F12), Code::F12),
+    })
+}
+
+fn letter_key(ch: char, shift: bool) -> Key {
+    if shift {
+        Key::Character(ch.to_ascii_uppercase().to_string())
+    } else {
+        Key::Character(ch.to_string())
+    }
+}
+
 const fn audio_mute_script(muted: bool) -> &'static str {
     if muted {
         "(function(){var key='mdeServoAudioMuted';var apply=function(root){var list=(root||document).querySelectorAll? (root||document).querySelectorAll('audio,video') : [];for(var i=0;i<list.length;i++){list[i].muted=true;list[i].defaultMuted=true;}};document.documentElement.dataset[key]='true';apply(document);if(window.__mdeServoAudioMuteObserver)window.__mdeServoAudioMuteObserver.disconnect();window.__mdeServoAudioMuteObserver=new MutationObserver(function(records){for(var r=0;r<records.length;r++){for(var n=0;n<records[r].addedNodes.length;n++){var node=records[r].addedNodes[n];if(node&&node.matches&&node.matches('audio,video')){node.muted=true;node.defaultMuted=true;}apply(node);}}});window.__mdeServoAudioMuteObserver.observe(document.documentElement,{childList:true,subtree:true});})();"
@@ -1247,14 +1474,22 @@ fn js_string_array_literal(values: &[String]) -> String {
 mod tests {
     use super::{
         audio_mute_script, autoplay_block_script, clamp_utf8, clear_find_script,
-        device_profile_script, find_in_page_script, force_dark_script, page_scrape_script,
-        page_text_script, page_zoom_script, passkey_bridge_drain_script, passkey_complete_script,
-        print_page_script, reader_mode_script, secure_preferences, media_playback_toggle_script,
-        media_transport_script, spellcheck_correction_all_script, spellcheck_correction_at_script,
-        spellcheck_correction_script, spellcheck_highlight_script, user_agent_override_script,
-        userscript_library_script, GENERIC_USER_AGENT,
+        device_profile_script, find_in_page_script, force_dark_script,
+        media_playback_toggle_script, media_transport_script, page_scrape_script, page_text_script,
+        page_zoom_script, passkey_bridge_drain_script, passkey_complete_script, print_page_script,
+        reader_mode_script, secure_preferences, servo_keyboard_event, servo_mouse_button,
+        servo_point, servo_text_events, spellcheck_correction_all_script,
+        spellcheck_correction_at_script, spellcheck_correction_script, spellcheck_highlight_script,
+        user_agent_override_script, userscript_library_script, GENERIC_USER_AGENT,
     };
-    use mde_web_wire::MediaTransportAction;
+    use mde_web_wire::{
+        KeyCode as WireKeyCode, MediaTransportAction, Modifiers as WireModifiers,
+        PointerButton as WirePointerButton,
+    };
+    use servo::{
+        Code, CompositionState, InputEvent as ServoInputEvent, Key, KeyState,
+        Modifiers as ServoModifiers, MouseButton, WebViewPoint,
+    };
 
     #[test]
     fn secure_preferences_disable_cookie_storage_and_disk_cache() {
@@ -1294,6 +1529,63 @@ mod tests {
         let backward = find_in_page_script("mesh", true);
         assert!(backward.contains(r#"window.find("mesh",false,true"#));
         assert!(clear_find_script().contains("removeAllRanges"));
+    }
+
+    #[test]
+    fn servo_keyboard_mapping_preserves_keys_and_modifiers() {
+        let event = servo_keyboard_event(WireKeyCode::A, true, WireModifiers(WireModifiers::CTRL))
+            .expect("keyboard event");
+        let ServoInputEvent::Keyboard(event) = event else {
+            panic!("expected keyboard event")
+        };
+        assert_eq!(event.event.state, KeyState::Down);
+        assert_eq!(event.event.key, Key::Character("a".to_owned()));
+        assert_eq!(event.event.code, Code::KeyA);
+        assert!(event.event.modifiers.contains(ServoModifiers::CONTROL));
+
+        let event = servo_keyboard_event(WireKeyCode::ArrowDown, false, WireModifiers::default())
+            .expect("keyboard event");
+        let ServoInputEvent::Keyboard(event) = event else {
+            panic!("expected keyboard event")
+        };
+        assert_eq!(event.event.state, KeyState::Up);
+        assert_eq!(event.event.key, Key::Named(servo::NamedKey::ArrowDown));
+        assert_eq!(event.event.code, Code::ArrowDown);
+    }
+
+    #[test]
+    fn servo_text_mapping_commits_as_ime_composition() {
+        let events = servo_text_events("hi");
+        assert_eq!(events.len(), 2);
+        let ServoInputEvent::Ime(servo::ImeEvent::Composition(start)) = &events[0] else {
+            panic!("expected composition start")
+        };
+        assert_eq!(start.state, CompositionState::Start);
+        assert_eq!(start.data, "");
+
+        let ServoInputEvent::Ime(servo::ImeEvent::Composition(end)) = &events[1] else {
+            panic!("expected composition end")
+        };
+        assert_eq!(end.state, CompositionState::End);
+        assert_eq!(end.data, "hi");
+        assert!(servo_text_events("").is_empty());
+    }
+
+    #[test]
+    fn servo_pointer_mapping_uses_device_pixels() {
+        assert_eq!(
+            servo_mouse_button(WirePointerButton::Primary),
+            MouseButton::Left
+        );
+        assert_eq!(
+            servo_mouse_button(WirePointerButton::Secondary),
+            MouseButton::Right
+        );
+        let WebViewPoint::Device(point) = servo_point(25.0, 40.0) else {
+            panic!("expected device point")
+        };
+        assert_eq!(point.x, 25.0);
+        assert_eq!(point.y, 40.0);
     }
 
     #[test]

@@ -103,6 +103,10 @@ pub const CEF_DOWNLOAD_ITEM_GET_SUGGESTED_FILE_NAME_OFFSET: usize = 168;
 pub const CEF_FIND_HANDLER_SIZE: usize = 48;
 /// `offsetof(cef_find_handler_t, on_find_result)`.
 pub const CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET: usize = 40;
+/// `sizeof(cef_string_visitor_t)` (1 fn ptr + 40 base).
+pub const CEF_STRING_VISITOR_SIZE: usize = 48;
+/// `offsetof(cef_string_visitor_t, visit)`.
+pub const CEF_STRING_VISITOR_VISIT_OFFSET: usize = 40;
 /// `offsetof(cef_client_t, get_load_handler)` — carries loading/back/forward (B1).
 pub const CEF_CLIENT_GET_LOAD_HANDLER_OFFSET: usize = 152;
 /// `sizeof(cef_display_handler_t)` for pinned Linux CEF 149 (13 fn ptrs + 40-byte base).
@@ -328,6 +332,8 @@ pub const CEF_FRAME_PASTE_OFFSET: usize = 80;
 pub const CEF_FRAME_DELETE_OFFSET: usize = 96;
 /// `offsetof(cef_frame_t, select_all)`.
 pub const CEF_FRAME_SELECT_ALL_OFFSET: usize = 104;
+/// `offsetof(cef_frame_t, get_text)` — native visible-text extraction.
+pub const CEF_FRAME_GET_TEXT_OFFSET: usize = 128;
 /// `sizeof(cef_browser_host_t)` for pinned Linux CEF 149.
 pub const CEF_BROWSER_HOST_SIZE: usize = 592;
 /// `offsetof(cef_browser_host_t, close_browser)`.
@@ -499,6 +505,10 @@ const MAX_PENDING_PERMISSION_PROMPTS: usize = 16;
 /// Cap CEF beforeunload callbacks held while waiting for shell answers. Overflow
 /// is answered as "stay/cancel" so navigation never proceeds on backpressure.
 const MAX_PENDING_BEFORE_UNLOAD_DIALOGS: usize = 16;
+/// Cap native CEF text visitor callbacks retained while `cef_frame_t::get_text`
+/// replies asynchronously. The JS beacon remains a fallback; do not retain
+/// unbounded visitor blocks if the renderer stops answering text requests.
+const MAX_PENDING_PAGE_TEXT_VISITORS: usize = 32;
 const EVENTFLAG_SHIFT_DOWN: c_int = 2;
 const EVENTFLAG_CONTROL_DOWN: c_int = 4;
 const EVENTFLAG_ALT_DOWN: c_int = 8;
@@ -757,9 +767,11 @@ pub fn run_windowless_text_probe(
     notify_browser_view_ready(browser);
 
     let deadline = Instant::now() + timeout;
+    let probe_started = Instant::now();
     let mut rbuf = Vec::new();
     let mut first_paint = None;
     let mut last_text_bytes = 0;
+    let mut saw_loading = false;
     let mut last_text_request = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
@@ -808,8 +820,21 @@ pub fn run_windowless_text_probe(
                 last_paint_height: callbacks.last_paint_height(),
             });
         }
-        if first_paint.is_some() && last_text_request.elapsed() >= Duration::from_millis(100) {
-            request_page_text(browser, TEXT_PROBE_ID, TEXT_PROBE_MAX_BYTES);
+        if callbacks.loading() {
+            saw_loading = true;
+        }
+        let load_ready = !callbacks.loading()
+            && (saw_loading || probe_started.elapsed() >= Duration::from_millis(750));
+        if first_paint.is_some()
+            && load_ready
+            && last_text_request.elapsed() >= Duration::from_millis(250)
+        {
+            request_page_text(
+                browser,
+                &callbacks.state,
+                TEXT_PROBE_ID,
+                TEXT_PROBE_MAX_BYTES,
+            );
             last_text_request = Instant::now();
         }
         thread::sleep(Duration::from_millis(8));
@@ -1203,7 +1228,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::PrintPage => print_page(browser),
         ControlMsg::SavePdf { path } => save_pdf(browser, callbacks, path),
         ControlMsg::RequestPageText { id, max_bytes } => {
-            request_page_text(browser, *id, *max_bytes);
+            request_page_text(browser, &callbacks.state, *id, *max_bytes);
         }
         ControlMsg::RequestPageScrape {
             id,
@@ -1746,6 +1771,10 @@ impl CefBrowserCallbacks {
         self.state.navigations()
     }
 
+    fn loading(&self) -> bool {
+        self.state.nav_loading.load(Ordering::SeqCst)
+    }
+
     fn last_paint_width(&self) -> i32 {
         self.state.last_paint_width.load(Ordering::SeqCst) as i32
     }
@@ -1821,6 +1850,12 @@ impl Drop for CefBrowserCallbacks {
         }
         self.state.purge_finished_download_image_callbacks(None);
         if let Ok(callbacks) = self.state.download_image_callbacks.lock() {
+            for callback in callbacks.iter() {
+                registry.remove(&callback.as_usize());
+            }
+        }
+        self.state.purge_finished_page_text_visitors(None);
+        if let Ok(callbacks) = self.state.page_text_visitors.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
             }
@@ -1997,6 +2032,13 @@ struct CefBrowserState {
     /// Finished favicon callback pointers waiting for a safe purge pass. We avoid
     /// dropping the callback object from inside its own C callback.
     finished_download_image_callbacks: Mutex<HashSet<usize>>,
+    /// Native visible-text visitors retained until CEF replies to `get_text`.
+    /// CEF page-text is used by spellcheck/TTS/translate/offline-cache and must
+    /// not depend on page JavaScript or synthetic resource loads.
+    page_text_visitors: Mutex<Vec<Box<PageTextVisitor>>>,
+    /// Finished page-text visitor pointers waiting for a safe purge pass. We avoid
+    /// dropping the visitor object from inside its own C callback.
+    finished_page_text_visitors: Mutex<HashSet<usize>>,
     print_handler_ptr: AtomicUsize,
     /// Cached child-handler block pointers, set at `install()` time — resolved
     /// DIRECTLY (not via the size-keyed `lookup_peer`, whose `callback_size`
@@ -2113,6 +2155,8 @@ impl CefBrowserState {
             finished_pdf_callbacks: Mutex::new(HashSet::new()),
             download_image_callbacks: Mutex::new(Vec::new()),
             finished_download_image_callbacks: Mutex::new(HashSet::new()),
+            page_text_visitors: Mutex::new(Vec::new()),
+            finished_page_text_visitors: Mutex::new(HashSet::new()),
             print_handler_ptr: AtomicUsize::new(0),
             display_handler_ptr: AtomicUsize::new(0),
             load_handler_ptr: AtomicUsize::new(0),
@@ -2566,6 +2610,92 @@ impl CefBrowserState {
         self.finished_download_image_callbacks
             .lock()
             .map(|callbacks| callbacks.len())
+            .unwrap_or(0)
+    }
+
+    /// Allocate a one-shot `cef_string_visitor_t` for native visible page text.
+    /// The visitor is retained until CEF invokes `visit`; overflow declines the
+    /// native request and lets the JavaScript beacon fallback try instead.
+    fn retain_page_text_visitor(&self, id: u64, max_bytes: u32) -> *mut c_void {
+        self.purge_finished_page_text_visitors(None);
+        let Ok(mut visitors) = self.page_text_visitors.lock() else {
+            return ptr::null_mut();
+        };
+        if visitors.len() >= MAX_PENDING_PAGE_TEXT_VISITORS {
+            return ptr::null_mut();
+        }
+        let visitor = Box::new(PageTextVisitor::new(
+            id,
+            max_bytes.clamp(1, CEF_PAGE_TEXT_BEACON_MAX_BYTES),
+        ));
+        let ptr = visitor.as_mut_ptr();
+        let state = self as *const CefBrowserState as usize;
+        if let Ok(mut registry) = registry().lock() {
+            registry.insert(visitor.as_usize(), state);
+        }
+        visitors.push(visitor);
+        ptr
+    }
+
+    fn finish_page_text_visitor(&self, visitor: *mut c_void) -> Option<(u64, u32)> {
+        let key = visitor as usize;
+        if key == 0 {
+            return None;
+        }
+        let metadata = self.page_text_visitors.lock().ok().and_then(|visitors| {
+            visitors
+                .iter()
+                .find(|visitor| visitor.as_usize() == key)
+                .map(|visitor| (visitor.id, visitor.max_bytes))
+        });
+        self.purge_finished_page_text_visitors(Some(key));
+        if let Ok(mut registry) = registry().lock() {
+            registry.remove(&key);
+        }
+        if let Ok(mut finished) = self.finished_page_text_visitors.lock() {
+            finished.insert(key);
+        }
+        metadata
+    }
+
+    fn purge_finished_page_text_visitors(&self, keep: Option<usize>) {
+        let finished = self
+            .finished_page_text_visitors
+            .lock()
+            .ok()
+            .map(|mut finished| {
+                let ready: Vec<usize> = finished
+                    .iter()
+                    .copied()
+                    .filter(|key| Some(*key) != keep)
+                    .collect();
+                for key in &ready {
+                    finished.remove(key);
+                }
+                ready
+            })
+            .unwrap_or_default();
+        if finished.is_empty() {
+            return;
+        }
+        if let Ok(mut visitors) = self.page_text_visitors.lock() {
+            visitors.retain(|visitor| !finished.contains(&visitor.as_usize()));
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_page_text_visitor_count(&self) -> usize {
+        self.page_text_visitors
+            .lock()
+            .map(|visitors| visitors.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn finished_page_text_visitor_count(&self) -> usize {
+        self.finished_page_text_visitors
+            .lock()
+            .map(|visitors| visitors.len())
             .unwrap_or(0)
     }
 
@@ -3095,6 +3225,7 @@ impl CefKeyEvent {
         let mut event = Self {
             bytes: [0; CEF_KEY_EVENT_SIZE],
         };
+        event.put_usize(0, CEF_KEY_EVENT_SIZE);
         event.put_i32(CEF_KEY_EVENT_TYPE_OFFSET, event_type);
         event.put_i32(CEF_KEY_EVENT_MODIFIERS_OFFSET, modifiers);
         event.put_i32(CEF_KEY_EVENT_WINDOWS_KEY_CODE_OFFSET, windows_key_code);
@@ -3118,6 +3249,11 @@ impl CefKeyEvent {
 
     fn put_i32(&mut self, offset: usize, value: i32) {
         self.bytes[offset..offset + std::mem::size_of::<i32>()]
+            .copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn put_usize(&mut self, offset: usize, value: usize) {
+        self.bytes[offset..offset + std::mem::size_of::<usize>()]
             .copy_from_slice(&value.to_ne_bytes());
     }
 
@@ -3216,6 +3352,35 @@ impl<const N: usize> CefCallbackBlock<N> {
 
 fn fn_ptr(ptr: *const ()) -> usize {
     ptr as usize
+}
+
+struct PageTextVisitor {
+    block: CefCallbackBlock<CEF_STRING_VISITOR_SIZE>,
+    id: u64,
+    max_bytes: u32,
+}
+
+impl PageTextVisitor {
+    fn new(id: u64, max_bytes: u32) -> Self {
+        let mut block = CefCallbackBlock::new(CEF_STRING_VISITOR_SIZE);
+        block.put_fn(
+            CEF_STRING_VISITOR_VISIT_OFFSET,
+            fn_ptr(on_page_text_visited as *const ()),
+        );
+        Self {
+            block,
+            id,
+            max_bytes,
+        }
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn as_usize(&self) -> usize {
+        self.block.as_usize()
+    }
 }
 
 #[repr(C)]
@@ -3790,6 +3955,9 @@ unsafe extern "C" fn on_jsdialog(
     let message = cef_string_to_string(message_text);
     let kind = u8::try_from(dialog_type).unwrap_or(0);
     let _ = with_state(self_, |state| {
+        if publish_internal_page_beacon_from_dialog(state, &message) {
+            return;
+        }
         state.publish_js_dialog(kind, message, origin)
     });
     // Auto-resolve: accept an alert, cancel a confirm/prompt (never "OK" a
@@ -3802,6 +3970,18 @@ unsafe extern "C" fn on_jsdialog(
         unsafe { *suppress_message = 0 };
     }
     1
+}
+
+fn publish_internal_page_beacon_from_dialog(state: &CefBrowserState, message: &str) -> bool {
+    if let Some((id, text)) = decode_page_text_beacon(message) {
+        state.publish_page_text(id, text);
+        return true;
+    }
+    if let Some((id, body)) = decode_page_scrape_beacon(message) {
+        state.publish_page_scrape(id, body);
+        return true;
+    }
+    false
 }
 
 /// CEF `on_before_unload_dialog(self, browser, message_text, is_reload, callback)
@@ -4105,6 +4285,17 @@ unsafe extern "C" fn on_download_image_finished(
             state.publish_favicon(png);
         }
         state.finish_download_image_callback(self_);
+    });
+}
+
+/// CEF `cef_string_visitor_t::visit(self, const cef_string_t* string)` — native
+/// visible text extraction for page text requests.
+unsafe extern "C" fn on_page_text_visited(self_: *mut c_void, string: *const CefString) {
+    let text = cef_string_to_string(string);
+    let _ = with_state(self_, |state| {
+        if let Some((id, max_bytes)) = state.finish_page_text_visitor(self_) {
+            state.publish_page_text(id, clamp_utf8(&text, max_bytes as usize));
+        }
     });
 }
 
@@ -4856,14 +5047,41 @@ fn apply_spellcheck_correction_at(
     );
 }
 
-fn request_page_text(browser: *mut c_void, id: u64, max_bytes: u32) {
+fn request_page_text(browser: *mut c_void, state: &CefBrowserState, id: u64, max_bytes: u32) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    load_frame_url(
-        frame,
-        &format!("javascript:{}", page_text_beacon_script(id, max_bytes)),
-    );
+    let _ = request_native_page_text(frame, state, id, max_bytes);
+    // The native CEF string visitor is best-effort in the offscreen bridge: some
+    // live runtimes accept `cef_frame_t::get_text` but never call back. Always
+    // send the intercepted JS beacon too so page-text requests cannot wedge
+    // behind a synchronously accepted native request.
+    let script = page_text_beacon_script(id, max_bytes);
+    execute_java_script(frame, &script);
+    load_frame_url(frame, &javascript_url_for_script(&script));
+}
+
+fn request_native_page_text(
+    frame: *mut c_void,
+    state: &CefBrowserState,
+    id: u64,
+    max_bytes: u32,
+) -> bool {
+    let Some(callback) = read_fn(frame, CEF_FRAME_GET_TEXT_OFFSET) else {
+        return false;
+    };
+    let visitor = state.retain_page_text_visitor(id, max_bytes);
+    if visitor.is_null() {
+        return false;
+    }
+    // SAFETY: `callback` is `cef_frame_t::get_text`, whose pinned C signature is
+    // `void (*)(cef_frame_t*, cef_string_visitor_t*)`.
+    let callback: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `frame` is the live main frame and `visitor` is retained in
+    // `CefBrowserState` until CEF invokes the one-shot visit callback.
+    unsafe { callback(frame, visitor) };
+    true
 }
 
 fn request_page_scrape(
@@ -4876,12 +5094,9 @@ fn request_page_scrape(
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    load_frame_url(
+    execute_java_script(
         frame,
-        &format!(
-            "javascript:{}",
-            page_scrape_beacon_script(id, max_bytes, max_links, max_headings)
-        ),
+        &page_scrape_beacon_script(id, max_bytes, max_links, max_headings),
     );
 }
 
@@ -5158,6 +5373,38 @@ fn percent_decode(value: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(char::from(byte)),
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(byte >> 4) as usize]));
+                out.push(char::from(HEX[(byte & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+fn javascript_url_for_script(script: &str) -> String {
+    format!("javascript:{}", percent_encode_url_component(script))
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 const fn hex_value(byte: u8) -> Option<u8> {
     match byte {

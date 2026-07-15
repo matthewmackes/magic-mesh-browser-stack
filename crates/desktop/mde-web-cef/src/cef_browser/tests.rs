@@ -374,6 +374,8 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_CALLBACK_CANCEL_OFFSET, 48);
     assert_eq!(CEF_PDF_PRINT_CALLBACK_SIZE, 48);
     assert_eq!(CEF_PDF_PRINT_CALLBACK_ON_FINISHED_OFFSET, 40);
+    assert_eq!(CEF_STRING_VISITOR_SIZE, 48);
+    assert_eq!(CEF_STRING_VISITOR_VISIT_OFFSET, 40);
     assert_eq!(CEF_MOUSE_EVENT_SIZE, 12);
     assert_eq!(CEF_MOUSE_EVENT_X_OFFSET, 0);
     assert_eq!(CEF_MOUSE_EVENT_Y_OFFSET, 4);
@@ -446,16 +448,17 @@ fn mouse_event_sets_header_pinned_fields() {
 #[test]
 fn key_event_sets_header_pinned_fields() {
     let event = CefKeyEvent::new(
-        KEYEVENT_CHAR,
+        KEYEVENT_RAWKEYDOWN,
         EVENTFLAG_SHIFT_DOWN,
         65,
         65,
         b'A' as u16,
         b'A' as u16,
     );
+    assert_eq!(read_usize(&event.bytes, 0), CEF_KEY_EVENT_SIZE);
     assert_eq!(
         read_i32(&event.bytes, CEF_KEY_EVENT_TYPE_OFFSET),
-        KEYEVENT_CHAR
+        KEYEVENT_RAWKEYDOWN
     );
     assert_eq!(
         read_i32(&event.bytes, CEF_KEY_EVENT_MODIFIERS_OFFSET),
@@ -485,6 +488,10 @@ fn key_event_sets_header_pinned_fields() {
 
 static FOCUS_CALLS: AtomicI32 = AtomicI32::new(0);
 static FOCUS_LAST: AtomicI32 = AtomicI32::new(0);
+static KEY_EVENT_CALLS: AtomicI32 = AtomicI32::new(0);
+static KEY_EVENT_LAST_TYPE: AtomicI32 = AtomicI32::new(-1);
+static KEY_EVENT_LAST_WINDOWS_CODE: AtomicI32 = AtomicI32::new(-1);
+static KEY_EVENT_LAST_CHAR: AtomicI32 = AtomicI32::new(-1);
 static STOP_LOAD_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_LAST: AtomicI32 = AtomicI32::new(0);
@@ -497,6 +504,25 @@ unsafe extern "C" fn test_browser_host(_browser: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn record_focus(_host: *mut c_void, focused: c_int) {
     FOCUS_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     FOCUS_LAST.store(focused, AtomicOrdering::SeqCst);
+}
+
+unsafe extern "C" fn record_key_event(_host: *mut c_void, event: *const c_void) {
+    KEY_EVENT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    // SAFETY: `send_char` passes a live `CefKeyEvent` byte block for the
+    // duration of this synchronous fake callback.
+    let bytes = unsafe { std::slice::from_raw_parts(event.cast::<u8>(), CEF_KEY_EVENT_SIZE) };
+    KEY_EVENT_LAST_TYPE.store(
+        read_i32(bytes, CEF_KEY_EVENT_TYPE_OFFSET),
+        AtomicOrdering::SeqCst,
+    );
+    KEY_EVENT_LAST_WINDOWS_CODE.store(
+        read_i32(bytes, CEF_KEY_EVENT_WINDOWS_KEY_CODE_OFFSET),
+        AtomicOrdering::SeqCst,
+    );
+    KEY_EVENT_LAST_CHAR.store(
+        i32::from(read_u16(bytes, CEF_KEY_EVENT_CHARACTER_OFFSET)),
+        AtomicOrdering::SeqCst,
+    );
 }
 
 #[test]
@@ -827,6 +853,56 @@ fn ime_controls_drive_cef_host_ime_slots() {
     apply_control_frame(browser_ptr, &callbacks, &ControlMsg::ImeFinishComposition);
     assert_eq!(IME_FINISH_CALLS.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(IME_FINISH_KEEP.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+fn text_input_event_sends_cef_character_key_event() {
+    FOCUS_CALLS.store(0, AtomicOrdering::SeqCst);
+    FOCUS_LAST.store(0, AtomicOrdering::SeqCst);
+    KEY_EVENT_CALLS.store(0, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_TYPE.store(-1, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_WINDOWS_CODE.store(-1, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_CHAR.store(-1, AtomicOrdering::SeqCst);
+
+    let mut host = vec![0u8; CEF_BROWSER_HOST_SIZE];
+    host[CEF_BROWSER_HOST_SET_FOCUS_OFFSET..CEF_BROWSER_HOST_SET_FOCUS_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_focus as *const () as usize).to_ne_bytes());
+    host[CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET
+        ..CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_key_event as *const () as usize).to_ne_bytes());
+    TEST_HOST_PTR.store(host.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser[CEF_BROWSER_GET_HOST_OFFSET..CEF_BROWSER_GET_HOST_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_browser_host as *const () as usize).to_ne_bytes());
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+
+    apply_input_event(
+        browser.as_mut_ptr().cast(),
+        &callbacks,
+        &InputEvent::Text("m".to_owned()),
+    );
+
+    assert_eq!(FOCUS_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(FOCUS_LAST.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(KEY_EVENT_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        KEY_EVENT_LAST_TYPE.load(AtomicOrdering::SeqCst),
+        KEYEVENT_CHAR
+    );
+    assert_eq!(
+        KEY_EVENT_LAST_WINDOWS_CODE.load(AtomicOrdering::SeqCst),
+        109
+    );
+    assert_eq!(KEY_EVENT_LAST_CHAR.load(AtomicOrdering::SeqCst), 109);
 }
 
 #[test]
@@ -1223,7 +1299,8 @@ fn download_handler_offsets_reconcile_and_size_is_unique() {
 #[test]
 fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     // cef_frame_t: 40-byte base then 8-byte fn ptrs. is_valid=0(40), undo=1(48),
-    // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104).
+    // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104),
+    // get_source=10(120), get_text=11(128), load_url=13(144), execute_js=14(152).
     assert_eq!(CEF_FRAME_UNDO_OFFSET, 40 + 1 * 8);
     assert_eq!(CEF_FRAME_REDO_OFFSET, 40 + 2 * 8);
     assert_eq!(CEF_FRAME_CUT_OFFSET, 40 + 3 * 8);
@@ -1231,8 +1308,11 @@ fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     assert_eq!(CEF_FRAME_PASTE_OFFSET, 40 + 5 * 8);
     assert_eq!(CEF_FRAME_DELETE_OFFSET, 40 + 7 * 8);
     assert_eq!(CEF_FRAME_SELECT_ALL_OFFSET, 40 + 8 * 8);
-    // Reconcile with the proven get_main_frame=152 (browser field 14, unrelated
-    // struct) — the frame commands sit well before execute_java_script (field 14).
+    assert_eq!(CEF_FRAME_GET_TEXT_OFFSET, 40 + 11 * 8);
+    assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 40 + 13 * 8);
+    assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 40 + 14 * 8);
+    // Reconcile with the frame's execute_java_script slot — edit commands sit
+    // before the page-tool extraction/navigation slots.
     assert!(CEF_FRAME_SELECT_ALL_OFFSET < CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET);
 }
 
@@ -1559,6 +1639,7 @@ fn page_text_beacon_script_is_bounded_and_decodable() {
     assert!(script.contains("innerText||root.textContent"));
     assert!(script.contains("encodeURIComponent(text)"));
     assert!(script.contains("https://mde-page-text.invalid/capture/42?text="));
+    assert!(script.contains("window.alert(u)"));
 
     assert_eq!(
         decode_page_text_beacon("https://mde-page-text.invalid/capture/42?text=hello%20w%C3%B8rld"),
@@ -1571,6 +1652,16 @@ fn page_text_beacon_script_is_bounded_and_decodable() {
     assert_eq!(percent_decode("%zz+ok"), "%zz+ok");
     assert_eq!(clamp_utf8("abé", 3), "ab");
     assert_eq!(decode_page_text_beacon("https://example.com/"), None);
+}
+
+#[test]
+fn page_text_script_can_be_dispatched_as_a_javascript_url() {
+    let script = page_text_beacon_script(42, 256);
+    let url = javascript_url_for_script(&script);
+    assert!(url.starts_with("javascript:(function()%7B"));
+    assert!(url.contains("mde-page-text.invalid"));
+    assert!(!url.contains(' '));
+    assert!(!url.contains('\n'));
 }
 
 #[test]
@@ -1587,6 +1678,7 @@ fn page_scrape_beacon_script_is_bounded_and_decodable() {
     assert!(script.contains("meta[name=\"description\" i][content]"));
     assert!(script.contains("links=links.slice(0,32)"));
     assert!(script.contains("https://mde-page-scrape.invalid/capture/43?body="));
+    assert!(script.contains("window.alert(u)"));
 
     assert_eq!(
         decode_page_scrape_beacon(
@@ -2410,6 +2502,54 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
 }
 
 #[test]
+fn native_page_text_visitor_publishes_and_reclaims_callback() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let visitor = callbacks.state.retain_page_text_visitor(91, 8);
+    assert!(!visitor.is_null());
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 1);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 0);
+
+    let text = CefStringOwned::new("hello native").expect("text");
+    unsafe { on_page_text_visited(visitor, text.as_ptr().cast::<CefString>()) };
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page text recv") else {
+        panic!("expected page text")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageText {
+            id: 91,
+            text: "hello na".to_owned(),
+        }
+    );
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 1);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 1);
+
+    callbacks.state.purge_finished_page_text_visitors(None);
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 0);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 0);
+}
+
+#[test]
 fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::sock::{recv, RecvOutcome};
     use crate::wire::{take_frame, EventMsg};
@@ -2452,6 +2592,195 @@ fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() 
     assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
     assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
     assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn page_text_dialog_beacon_is_intercepted_without_user_jsdialog_event() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new("https://mde-page-text.invalid/capture/77?text=hello%20page")
+        .expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page text recv") else {
+        panic!("expected page text")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageText {
+            id: 77,
+            text: "hello page".to_owned(),
+        }
+    );
+    shell.set_nonblocking(true).expect("nonblocking shell");
+    assert!(
+        matches!(
+            recv(&shell).expect("no jsdialog event"),
+            RecvOutcome::WouldBlock
+        ),
+        "internal page-text beacons must not surface as user JS dialogs"
+    );
+}
+
+#[test]
+fn page_scrape_dialog_beacon_is_intercepted_without_user_jsdialog_event() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new(
+        "https://mde-page-scrape.invalid/capture/88?body=%7B%22text%22%3A%22hello%22%7D",
+    )
+    .expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page scrape recv") else {
+        panic!("expected page scrape")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageScrape {
+            id: 88,
+            body: r#"{"text":"hello"}"#.to_owned(),
+        }
+    );
+    shell.set_nonblocking(true).expect("nonblocking shell");
+    assert!(
+        matches!(
+            recv(&shell).expect("no jsdialog event"),
+            RecvOutcome::WouldBlock
+        ),
+        "internal page-scrape beacons must not surface as user JS dialogs"
+    );
+}
+
+#[test]
+fn user_jsdialog_still_publishes_and_auto_resolves() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new("real alert").expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("jsdialog recv") else {
+        panic!("expected jsdialog")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::JsDialog {
+            kind: 0,
+            message: "real alert".to_owned(),
+            origin: "https://doc.example/".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -3003,9 +3332,34 @@ unsafe extern "C" fn test_jsdialog_cont(
     }
 }
 
+/// `cef_jsdialog_handler_t::on_jsdialog` C signature.
+type OnJsDialogFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *const CefString,
+    c_int,
+    *const CefString,
+    *const CefString,
+    *mut c_void,
+    *mut c_int,
+) -> c_int;
+
 /// `cef_jsdialog_handler_t::on_before_unload_dialog` C signature.
 type OnBeforeUnloadFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *const CefString, c_int, *mut c_void) -> c_int;
+
+/// Resolve `on_jsdialog` through the client vtable's `get_jsdialog_handler`
+/// slot, then read the method from the installed handler.
+fn resolve_on_jsdialog(callbacks: &CefBrowserCallbacks) -> (OnJsDialogFn, *mut c_void) {
+    let handler = unsafe { get_jsdialog_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_jsdialog_handler returned null");
+    let on_jsdialog: OnJsDialogFn = unsafe {
+        std::mem::transmute(
+            read_fn(handler, CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET).expect("on_jsdialog slot"),
+        )
+    };
+    (on_jsdialog, handler)
+}
 
 /// Resolve `on_before_unload_dialog` through the client vtable's
 /// `get_jsdialog_handler` slot, then read the method from the installed handler.

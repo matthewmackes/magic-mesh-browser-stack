@@ -307,17 +307,16 @@ while((node=walker.nextNode())&&total<512){{
 pub(super) fn page_text_beacon_script(id: u64, max_bytes: u32) -> String {
     let max_bytes = max_bytes.clamp(1, CEF_PAGE_TEXT_BEACON_MAX_BYTES);
     format!(
-        "(function(){{try{{var cap={max_bytes};var root=document.body||document.documentElement;\
-var text=root?String(root.innerText||root.textContent||''):'';\
-text=text.replace(/\\s+/g,' ').trim();if(text.length>cap)text=text.slice(0,cap);\
-var img=document.createElement('img');img.alt='';img.width=1;img.height=1;\
-img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
-img.src='{}{}?text='+encodeURIComponent(text);\
-(document.body||document.documentElement).appendChild(img);}}catch(err){{\
-var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;\
-fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
-fallback.src='{}{}?text=';(document.body||document.documentElement).appendChild(fallback);}}}})();",
-        CEF_PAGE_TEXT_BEACON_PREFIX, id, CEF_PAGE_TEXT_BEACON_PREFIX, id
+        r#"(function(){{function send(u){{
+try{{if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});}}catch(_){{}}
+try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);}}catch(_){{}}
+try{{var frame=document.createElement('iframe');frame.title='';frame.setAttribute('aria-hidden','true');frame.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;border:0';frame.src=u;(document.body||document.documentElement).appendChild(frame);}}catch(_){{}}
+try{{window.alert(u);}}catch(_){{}}
+}}try{{var cap={max_bytes};var root=document.body||document.documentElement;
+var text=root?String(root.innerText||root.textContent||''):'';
+text=text.replace(/\s+/g,' ').trim();if(text.length>cap)text=text.slice(0,cap);
+send('{prefix}{id}?text='+encodeURIComponent(text));}}catch(err){{send('{prefix}{id}?text=');}}}})();"#,
+        prefix = CEF_PAGE_TEXT_BEACON_PREFIX,
     )
 }
 
@@ -355,8 +354,9 @@ function payload(){{return {{text:normalized,text_truncated:trim(raw,2147483647)
 var body=JSON.stringify(payload());
 if(body.length>bodyCap){{links=links.slice(0,32);headings=headings.slice(0,16);normalized=trim(normalized,8192);articleText=trim(articleText,4096);body=JSON.stringify(payload());}}
 if(body.length>bodyCap){{links=[];headings=[];normalized=trim(normalized,4096);articleText=trim(articleText,2048);body=JSON.stringify(payload());}}
-var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src='{prefix}{id}?body='+encodeURIComponent(body);(document.body||document.documentElement).appendChild(img);
-}}catch(err){{var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';fallback.src='{prefix}{id}?body=';(document.body||document.documentElement).appendChild(fallback);}}}})();"#,
+function send(u){{try{{if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});}}catch(_){{}}try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);}}catch(_){{}}try{{var frame=document.createElement('iframe');frame.title='';frame.setAttribute('aria-hidden','true');frame.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;border:0';frame.src=u;(document.body||document.documentElement).appendChild(frame);}}catch(_){{}}try{{window.alert(u);}}catch(_){{}}}}
+send('{prefix}{id}?body='+encodeURIComponent(body));
+}}catch(err){{try{{var u='{prefix}{id}?body=';if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);try{{window.alert(u);}}catch(_){{}}}}catch(_){{}}}}}})();"#,
         body_cap = CEF_PAGE_SCRAPE_BEACON_MAX_BYTES,
         prefix = CEF_PAGE_SCRAPE_BEACON_PREFIX,
     )

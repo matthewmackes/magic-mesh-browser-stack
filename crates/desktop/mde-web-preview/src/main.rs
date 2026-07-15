@@ -235,10 +235,10 @@ fn run_tab(args: &[String]) -> Result<()> {
 
 /// Apply one control frame from the shell to the engine. Navigation is wired to the
 /// engine's existing methods; zoom/find/force-dark/audio-mute/autoplay-block use
-/// the helper's DOM script seam. `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters` are
+/// the helper's DOM script seam. `Resize`/`ResourceVerdict`/`CosmeticFilters` are
 /// decoded (so the framed stream stays in sync) but not yet acted on — Servo
-/// currently exposes no live-resize, input-injection, or helper-side ad-filter
-/// hook here; these remain future work, not investigated limitations.
+/// currently exposes no live-resize or helper-side ad-filter hook here; these
+/// remain future work, not investigated limitations.
 ///
 /// `Stop` is decoded-and-intentionally-ignored for a DIFFERENT reason (DD-2,
 /// investigated 2026-07-10, not "not yet"): the pinned `servo` 0.3.0 crate's
@@ -265,6 +265,7 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::Reload => engine.reload(),
         ControlMsg::Back => engine.go_back(1),
         ControlMsg::Forward => engine.go_forward(1),
+        ControlMsg::Input(event) => engine.apply_input(event),
         ControlMsg::SetZoom { percent } => engine.set_zoom(*percent),
         // Servo's find has no continue-from-current hook, so `find_next` is ignored
         // (the same engine limitation as the no-cancel-load note above).
@@ -339,7 +340,6 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         // comment for the full source-level investigation (DD-2, 2026-07-10).
         ControlMsg::Stop => {}
         ControlMsg::Resize { .. }
-        | ControlMsg::Input(_)
         | ControlMsg::ResourceVerdict { .. }
         | ControlMsg::CosmeticFilters(_)
         | ControlMsg::SavePdf { .. }

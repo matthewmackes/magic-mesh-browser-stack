@@ -21,6 +21,7 @@
 
 use std::time::{Duration, Instant};
 
+use mde_web_preview_client::egui::{self, pos2};
 use mde_web_preview_client::session::{SpawnSpec, WebSession};
 
 fn main() {
@@ -52,6 +53,8 @@ fn main() {
     let mut nav_events = 0u32;
     let mut title_events = 0u32;
     let mut frame_events = 0u32;
+    let input_probe = std::env::var_os("MDE_CEF_VERIFY_INPUT").is_some();
+    let mut input_probe_step = InputProbeStep::WaitingForFrame;
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
         sess.poll();
@@ -85,6 +88,9 @@ fn main() {
                 favicon_seen = true;
             }
         }
+        if input_probe {
+            drive_input_probe(&mut sess, frame_events, &mut input_probe_step);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -93,10 +99,108 @@ fn main() {
         sess.nav().url,
         sess.title(),
     );
-    if nav_events > 0 && frame_events > 0 {
-        println!("VERIFY RESULT=PASS display/load handler fired and a frame arrived over the wire");
+    let input_ok = !input_probe
+        || (input_probe_step == InputProbeStep::SentText
+            && sess.title().contains("p1")
+            && sess.title().contains("k1")
+            && sess.title().contains("tm"));
+    if nav_events > 0 && frame_events > 0 && input_ok {
+        if input_probe {
+            println!("VERIFY RESULT=PASS display/load/input handlers fired over the wire");
+        } else {
+            println!(
+                "VERIFY RESULT=PASS display/load handler fired and a frame arrived over the wire"
+            );
+        }
     } else {
-        println!("VERIFY RESULT=FAIL missing NavState or frame over the wire");
+        println!("VERIFY RESULT=FAIL missing NavState, frame, or input response over the wire");
         std::process::exit(1);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputProbeStep {
+    WaitingForFrame,
+    SentPointer,
+    SentKey,
+    SentText,
+}
+
+fn drive_input_probe(sess: &mut WebSession, frame_events: u32, step: &mut InputProbeStep) {
+    match *step {
+        InputProbeStep::WaitingForFrame if frame_events > 0 && sess.title().contains("p0") => {
+            send_pointer_probe(sess);
+            *step = InputProbeStep::SentPointer;
+        }
+        InputProbeStep::SentPointer if sess.title().contains("p1") => {
+            send_key_probe(sess);
+            *step = InputProbeStep::SentKey;
+        }
+        InputProbeStep::SentKey if sess.title().contains("k1") => {
+            send_text_probe(sess);
+            *step = InputProbeStep::SentText;
+        }
+        _ => {}
+    }
+}
+
+fn send_pointer_probe(sess: &mut WebSession) {
+    let pos = pos2(80.0, 80.0);
+    let modifiers = egui::Modifiers::default();
+    sess.send_input(&egui::Event::PointerMoved(pos), 1.0);
+    sess.send_input(
+        &egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers,
+        },
+        1.0,
+    );
+    sess.send_input(
+        &egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        },
+        1.0,
+    );
+    println!("VERIFY input_probe_sent pointer=true");
+}
+
+fn send_key_probe(sess: &mut WebSession) {
+    let modifiers = egui::Modifiers::default();
+    sess.send_input(
+        &egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        },
+        1.0,
+    );
+    println!("VERIFY input_probe_sent key_down=true");
+}
+
+fn send_key_release(sess: &mut WebSession) {
+    let modifiers = egui::Modifiers::default();
+    sess.send_input(
+        &egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        },
+        1.0,
+    );
+    println!("VERIFY input_probe_sent key_up=true");
+}
+
+fn send_text_probe(sess: &mut WebSession) {
+    sess.send_input(&egui::Event::Text("m".to_owned()), 1.0);
+    send_key_release(sess);
+    println!("VERIFY input_probe_sent text=true mode=key-char");
 }
