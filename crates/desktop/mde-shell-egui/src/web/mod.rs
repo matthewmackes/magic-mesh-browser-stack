@@ -6231,16 +6231,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 });
                 chrome_ui::insecure_prompt(ui, state);
                 chrome_ui::capture_notice(ui, state);
-                qr_share_drawer(ui, state);
-                spellcheck_drawer(ui, state);
-                speech_status_drawer(ui, state);
-                security_update_drawer(ui, state);
-                translation_drawer(ui, state);
-                offline_cache_drawer(ui, state);
-                print_settings_drawer(ui, state);
-                site_styles_drawer(ui, state);
-                downloads_drawer(ui, state);
-                history_drawer(ui, state);
+                chrome_ui::drawer_stack(ui, state);
                 ui.add_space(CHROME_GAP);
                 active_body(ui, state);
             });
@@ -6260,16 +6251,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         });
         chrome_ui::insecure_prompt(ui, state);
         chrome_ui::capture_notice(ui, state);
-        qr_share_drawer(ui, state);
-        spellcheck_drawer(ui, state);
-        speech_status_drawer(ui, state);
-        security_update_drawer(ui, state);
-        translation_drawer(ui, state);
-        offline_cache_drawer(ui, state);
-        print_settings_drawer(ui, state);
-        site_styles_drawer(ui, state);
-        downloads_drawer(ui, state);
-        history_drawer(ui, state);
+        chrome_ui::drawer_stack(ui, state);
         ui.add_space(CHROME_GAP);
         active_body(ui, state);
     }
@@ -7660,7 +7642,6 @@ fn unix_ms() -> u64 {
 mod capture;
 use capture::*;
 mod drawers;
-use drawers::*;
 
 /// Whether the compact toolbar's reload slot should present as a real Stop
 /// control instead of Reload.

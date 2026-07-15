@@ -25,6 +25,11 @@ use mde_web_preview_client::{
     EditCommand, JsDialog, SessionState,
 };
 
+use super::drawers::{
+    downloads_drawer, history_drawer, offline_cache_drawer, print_settings_drawer, qr_share_drawer,
+    security_update_drawer, site_styles_drawer, speech_status_drawer, spellcheck_drawer,
+    translation_drawer,
+};
 use super::{
     browser_capture_dir, centered, ellipsize, install_browser_page_accessibility,
     media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult, ContainerProfile,
@@ -198,6 +203,21 @@ pub(super) fn scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
         add(ui)
     })
     .inner
+}
+
+/// Render the secondary Browser drawer stack in the same order for horizontal
+/// and vertical chrome layouts.
+pub(super) fn drawer_stack(ui: &mut egui::Ui, state: &mut WebState) {
+    qr_share_drawer(ui, state);
+    spellcheck_drawer(ui, state);
+    speech_status_drawer(ui, state);
+    security_update_drawer(ui, state);
+    translation_drawer(ui, state);
+    offline_cache_drawer(ui, state);
+    print_settings_drawer(ui, state);
+    site_styles_drawer(ui, state);
+    downloads_drawer(ui, state);
+    history_drawer(ui, state);
 }
 
 fn apply_visuals(ui: &mut egui::Ui) {
