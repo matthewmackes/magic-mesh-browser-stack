@@ -577,6 +577,7 @@ const fn plural_u32(count: u32) -> &'static str {
 const DOWNLOADS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SEND_TAB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const VOICE_COMMAND_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MEDIA_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHARE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TRANSLATION_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OFFLINE_CACHE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1535,6 +1536,10 @@ pub(crate) struct WebState {
     /// metadata polling from flooding the Bus while still clearing to idle when
     /// the helper reports that media disappeared.
     last_media_status_signature: Option<String>,
+    /// Last `action/browser/media-control/<node>` ULID applied by this shell.
+    media_control_cursor: Option<String>,
+    /// Last time the Browser scanned platform media-control actions.
+    media_control_last_poll: Option<Instant>,
     /// One-shot startup restore latch. The Browser reads the daemon-owned latest
     /// session-sync snapshot once, before the live-helper blank-tab fallback.
     startup_restore_attempted: bool,
@@ -1784,6 +1789,8 @@ impl Default for WebState {
             power_mode: false,
             last_session_sync_body: None,
             last_media_status_signature: None,
+            media_control_cursor: None,
+            media_control_last_poll: None,
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
             incoming_send_tab_last_poll: None,
@@ -1952,6 +1959,53 @@ impl WebState {
         let body = browser_media_status_body(self, unix_ms());
         publish_to_bus(self.bus_root.as_deref(), &topic, &body);
         self.last_media_status_signature = Some(signature);
+    }
+
+    fn poll_media_control_actions(&mut self) {
+        if self
+            .media_control_last_poll
+            .is_some_and(|last| last.elapsed() < MEDIA_CONTROL_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.media_control_last_poll = Some(Instant::now());
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+            return;
+        };
+        let topic = browser_media_control_topic(&local_hostname());
+        let Ok(msgs) = persist.list_since(&topic, self.media_control_cursor.as_deref()) else {
+            return;
+        };
+        for msg in msgs {
+            self.media_control_cursor = Some(msg.ulid.clone());
+            let Some(body) = msg.body.as_deref() else {
+                continue;
+            };
+            let Ok(request) = parse_browser_media_control_request(body) else {
+                continue;
+            };
+            self.apply_browser_media_control(request);
+        }
+    }
+
+    fn apply_browser_media_control(&mut self, request: BrowserMediaControlRequest) -> bool {
+        let Some(index) = request
+            .tab_id
+            .and_then(|tab_id| self.tab_index_by_id(tab_id))
+            .or_else(|| browser_media_status_tab_index(self))
+            .or_else(|| (!self.tabs.is_empty()).then_some(self.active.min(self.tabs.len() - 1)))
+        else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        tab.session.media_transport(request.action);
+        tab.last_activity = Instant::now();
+        true
     }
 
     /// Rebuild + publish the session snapshot at a UI-safe cadence. Genuine
@@ -6044,6 +6098,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.poll_downloads();
     state.poll_incoming_send_tabs();
     state.poll_voice_command_results();
+    state.poll_media_control_actions();
     state.poll_speech_statuses();
     state.poll_passkey_status();
     state.poll_passkey_results();
@@ -7623,6 +7678,11 @@ const ACTION_BROWSER_VOICE_COMMAND: &str = "action/browser/voice-command";
 /// enforce deny-all; this stream records the prompt decision and gives the later
 /// engine permission hook a typed contract.
 const ACTION_BROWSER_PERMISSION_PROMPT: &str = "action/browser/permission-prompt";
+
+/// Browser media-control action prefix. KDC/MPRIS and future desktop media
+/// surfaces publish node-addressed transport requests here; the shell applies
+/// them to the active/audible Browser media tab.
+const ACTION_BROWSER_MEDIA_CONTROL_PREFIX: &str = "action/browser/media-control/";
 
 /// Browser voice-command transcript result prefix, owned by the daemon STT worker.
 const EVENT_BROWSER_VOICE_COMMAND_PREFIX: &str = "event/browser-voice-command/";
@@ -14049,6 +14109,64 @@ mod tests {
         assert_eq!(latest["active_tab"], false);
         assert_eq!(latest["audible"], true);
         assert_eq!(latest["metadata"]["title"], "Background");
+    }
+
+    #[test]
+    fn browser_media_control_bus_action_drives_the_selected_media_tab() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        persist
+            .write(
+                &browser_media_control_topic(&local_hostname()),
+                Priority::Default,
+                None,
+                Some(&browser_media_control_body(
+                    mde_web_preview_client::MediaTransportAction::Pause,
+                    None,
+                    "test",
+                    123,
+                )),
+            )
+            .expect("write media control");
+
+        state.poll_media_control_actions();
+
+        let media_controls = drain_control_messages(&media_helper);
+        assert!(
+            media_controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport {
+                    action: mde_web_preview_client::MediaTransportAction::Pause
+                }
+            )),
+            "the background media tab should receive the pause action: {media_controls:?}"
+        );
+        let quiet_controls = drain_control_messages(&quiet_helper);
+        assert!(
+            quiet_controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport { .. }
+            )),
+            "the quiet foreground tab should not receive the media action: {quiet_controls:?}"
+        );
     }
 
     #[test]

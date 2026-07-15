@@ -1074,6 +1074,10 @@ pub(super) fn browser_voice_command_result_topic(host: &str) -> String {
     format!("{EVENT_BROWSER_VOICE_COMMAND_PREFIX}{host}")
 }
 
+pub(super) fn browser_media_control_topic(host: &str) -> String {
+    format!("{ACTION_BROWSER_MEDIA_CONTROL_PREFIX}{host}")
+}
+
 pub(super) fn browser_read_aloud_status_topic(host: &str) -> String {
     format!("{STATE_BROWSER_READ_ALOUD_PREFIX}{host}")
 }
@@ -2039,6 +2043,10 @@ fn browser_media_status_tab(state: &WebState) -> Option<(usize, &Tab)> {
         })
 }
 
+pub(super) fn browser_media_status_tab_index(state: &WebState) -> Option<usize> {
+    browser_media_status_tab(state).map(|(index, _)| index)
+}
+
 fn media_metadata_string(value: &serde_json::Value, key: &str, max_chars: usize) -> Option<String> {
     value
         .get(key)
@@ -2154,6 +2162,75 @@ pub(super) fn browser_media_status_body(state: &WebState, updated_ms: u64) -> St
         "updated_ms": updated_ms,
     })
     .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BrowserMediaControlRequest {
+    pub(super) action: mde_web_preview_client::MediaTransportAction,
+    pub(super) tab_id: Option<u64>,
+}
+
+fn media_transport_action_from_str(
+    action: &str,
+) -> Option<mde_web_preview_client::MediaTransportAction> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "playpause" | "play-pause" | "play_pause" | "toggle" => {
+            Some(mde_web_preview_client::MediaTransportAction::PlayPause)
+        }
+        "play" => Some(mde_web_preview_client::MediaTransportAction::Play),
+        "pause" => Some(mde_web_preview_client::MediaTransportAction::Pause),
+        "stop" => Some(mde_web_preview_client::MediaTransportAction::Stop),
+        "next" => Some(mde_web_preview_client::MediaTransportAction::Next),
+        "previous" | "prev" => Some(mde_web_preview_client::MediaTransportAction::Previous),
+        _ => None,
+    }
+}
+
+pub(super) fn browser_media_control_body(
+    action: mde_web_preview_client::MediaTransportAction,
+    tab_id: Option<u64>,
+    source: &str,
+    updated_ms: u64,
+) -> String {
+    let action = match action {
+        mde_web_preview_client::MediaTransportAction::PlayPause => "play-pause",
+        mde_web_preview_client::MediaTransportAction::Play => "play",
+        mde_web_preview_client::MediaTransportAction::Pause => "pause",
+        mde_web_preview_client::MediaTransportAction::Stop => "stop",
+        mde_web_preview_client::MediaTransportAction::Next => "next",
+        mde_web_preview_client::MediaTransportAction::Previous => "previous",
+    };
+    serde_json::json!({
+        "op": "browser_media_control",
+        "source": source.trim(),
+        "action": action,
+        "tab_id": tab_id,
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn parse_browser_media_control_request(
+    body: &str,
+) -> Result<BrowserMediaControlRequest, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("media control JSON: {err}"))?;
+    if value
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|op| op != "browser_media_control")
+    {
+        return Err("unexpected media control op".to_owned());
+    }
+    let action = value
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .and_then(media_transport_action_from_str)
+        .ok_or_else(|| "missing/unsupported media control action".to_owned())?;
+    Ok(BrowserMediaControlRequest {
+        action,
+        tab_id: value.get("tab_id").and_then(serde_json::Value::as_u64),
+    })
 }
 
 pub(super) fn browser_session_sync_body(state: &WebState) -> String {
