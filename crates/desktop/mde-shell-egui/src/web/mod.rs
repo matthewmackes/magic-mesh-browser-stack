@@ -1531,6 +1531,10 @@ pub(crate) struct WebState {
     /// and ledger refreshes from flooding the Bus while still making every state
     /// transition observable.
     last_session_sync_body: Option<String>,
+    /// Last retained `state/browser-media/<node>` signature published. Keeps page
+    /// metadata polling from flooding the Bus while still clearing to idle when
+    /// the helper reports that media disappeared.
+    last_media_status_signature: Option<String>,
     /// One-shot startup restore latch. The Browser reads the daemon-owned latest
     /// session-sync snapshot once, before the live-helper blank-tab fallback.
     startup_restore_attempted: bool,
@@ -1779,6 +1783,7 @@ impl Default for WebState {
             notified_downloads: BTreeSet::new(),
             power_mode: false,
             last_session_sync_body: None,
+            last_media_status_signature: None,
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
             incoming_send_tab_last_poll: None,
@@ -1935,6 +1940,18 @@ impl WebState {
         }
         publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_SESSION_SYNC, &body);
         self.last_session_sync_body = Some(body);
+    }
+
+    fn publish_media_status_if_changed(&mut self) {
+        let signature = browser_media_status_signature(self);
+        if self.last_media_status_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        let host = local_hostname();
+        let topic = browser_media_status_topic(&host);
+        let body = browser_media_status_body(self, unix_ms());
+        publish_to_bus(self.bus_root.as_deref(), &topic, &body);
+        self.last_media_status_signature = Some(signature);
     }
 
     /// Rebuild + publish the session snapshot at a UI-safe cadence. Genuine
@@ -6157,6 +6174,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     // bar here — the tab poll above has already drained this frame's nav
     // events, and the focus guard keeps operator edits intact.
     state.sync_address_on_engine_nav();
+    state.publish_media_status_if_changed();
     state.poll_session_snapshot();
 
     // 2. Upload the active tab's pending frame — ONLY when one is present, so an
@@ -7632,6 +7650,9 @@ const EVENT_BROWSER_OFFLINE_CACHE_PREFIX: &str = "event/browser-offline-cache/";
 
 /// Browser CEF security-update status prefix, owned by the daemon updater worker.
 const STATE_BROWSER_SECURITY_UPDATE_PREFIX: &str = "state/browser-security-update/";
+
+/// Browser-owned retained page/media-session status for desktop media bridges.
+const STATE_BROWSER_MEDIA_PREFIX: &str = "state/browser-media/";
 
 /// Browser safe-browsing source-read status prefix.
 const STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX: &str = "state/browser-safe-browsing-source/";
@@ -13875,6 +13896,159 @@ mod tests {
         );
         assert_eq!(media_metadata_chip_label(r#"{"title":"   "}"#), None);
         assert_eq!(media_metadata_chip_label("not-json"), None);
+    }
+
+    #[test]
+    fn browser_media_status_publishes_retained_metadata_and_dedupes() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        state.tabs[0].session.poll();
+        state.publish_media_status_if_changed();
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: serde_json::json!({
+                    "title": " Track ",
+                    "artist": " Artist ",
+                    "album": " Album ",
+                    "artwork_url": "https://media.example/art.png",
+                    "source_url": "https://media.example/track.mp3",
+                    "paused": false,
+                    "duration_ms": 120000,
+                    "position_ms": 42000,
+                })
+                .to_string(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.publish_media_status_if_changed();
+        state.publish_media_status_if_changed();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_media_status_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list browser media status");
+        assert_eq!(msgs.len(), 2, "unchanged media status is de-duped");
+        let latest: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("media body"))
+                .expect("valid media JSON");
+        assert_eq!(latest["op"], "browser_media_status");
+        assert_eq!(latest["source"], "browser");
+        assert_eq!(latest["state"], "playing");
+        assert_eq!(latest["engine"], "cef");
+        assert_eq!(latest["tab_index"], 0);
+        assert_eq!(latest["tab_id"], 1);
+        assert_eq!(latest["active_tab"], true);
+        assert_eq!(latest["url"], "https://example.test/");
+        assert_eq!(latest["page_title"], "Example");
+        assert_eq!(latest["label"], "Now: Track - Artist");
+        assert_eq!(latest["audible"], true);
+        assert_eq!(latest["muted"], false);
+        assert_eq!(latest["metadata"]["title"], "Track");
+        assert_eq!(latest["metadata"]["artist"], "Artist");
+        assert_eq!(latest["metadata"]["album"], "Album");
+        assert_eq!(
+            latest["metadata"]["artwork_url"],
+            "https://media.example/art.png"
+        );
+        assert_eq!(
+            latest["metadata"]["source_url"],
+            "https://media.example/track.mp3"
+        );
+        assert_eq!(latest["metadata"]["paused"], false);
+        assert_eq!(latest["metadata"]["duration_ms"], 120000);
+        assert_eq!(latest["metadata"]["position_ms"], 42000);
+    }
+
+    #[test]
+    fn browser_media_status_clears_to_idle_when_metadata_disappears() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        state.tabs[0].session.poll();
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Track","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.publish_media_status_if_changed();
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: String::new(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.publish_media_status_if_changed();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_media_status_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list browser media status");
+        assert_eq!(msgs.len(), 2, "clear publishes exactly one idle status");
+        let latest: serde_json::Value =
+            serde_json::from_str(msgs[1].body.as_deref().expect("media body"))
+                .expect("valid media JSON");
+        assert_eq!(latest["state"], "idle");
+        assert!(latest["tab_index"].is_null());
+        assert!(latest["tab_id"].is_null());
+        assert!(latest["engine"].is_null());
+        assert!(latest["label"].is_null());
+        assert!(latest["metadata"].is_null());
+    }
+
+    #[test]
+    fn browser_media_status_selects_audible_background_media_when_active_tab_is_quiet() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, _quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+
+        state.publish_media_status_if_changed();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_media_status_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list browser media status");
+        assert_eq!(msgs.len(), 1);
+        let latest: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("media body"))
+                .expect("valid media JSON");
+        assert_eq!(latest["state"], "playing");
+        assert_eq!(latest["tab_index"], 0);
+        assert_eq!(latest["tab_id"], 1);
+        assert_eq!(latest["engine"], "servo");
+        assert_eq!(latest["active_tab"], false);
+        assert_eq!(latest["audible"], true);
+        assert_eq!(latest["metadata"]["title"], "Background");
     }
 
     #[test]

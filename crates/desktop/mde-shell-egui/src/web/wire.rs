@@ -1106,6 +1106,10 @@ pub(super) fn browser_security_update_status_topic(host: &str) -> String {
     format!("{STATE_BROWSER_SECURITY_UPDATE_PREFIX}{host}")
 }
 
+pub(super) fn browser_media_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_MEDIA_PREFIX}{host}")
+}
+
 pub(super) fn browser_safe_browsing_source_topic(host: &str) -> String {
     format!("{STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX}{host}")
 }
@@ -2004,6 +2008,152 @@ fn session_state_wire(state: &SessionState) -> &'static str {
         SessionState::Live => "live",
         SessionState::Crashed { .. } => "crashed",
     }
+}
+
+const BROWSER_MEDIA_TEXT_MAX_CHARS: usize = 160;
+const BROWSER_MEDIA_URL_MAX_CHARS: usize = 2048;
+
+fn tab_has_media_metadata(tab: &Tab) -> bool {
+    tab.session.media_metadata().is_some()
+}
+
+fn browser_media_status_tab(state: &WebState) -> Option<(usize, &Tab)> {
+    if let Some(tab) = state
+        .tabs
+        .get(state.active)
+        .filter(|tab| tab_has_media_metadata(tab))
+    {
+        return Some((state.active, tab));
+    }
+    state
+        .tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab_has_media_metadata(tab) && tab.session.audible())
+        .or_else(|| {
+            state
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| tab_has_media_metadata(tab))
+        })
+}
+
+fn media_metadata_string(value: &serde_json::Value, key: &str, max_chars: usize) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| clamp_chars(s, max_chars))
+}
+
+fn media_metadata_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn browser_media_metadata_object(body: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(serde_json::json!({
+        "title": media_metadata_string(&value, "title", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "artist": media_metadata_string(&value, "artist", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "album": media_metadata_string(&value, "album", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "artwork_url": media_metadata_string(&value, "artwork_url", BROWSER_MEDIA_URL_MAX_CHARS).unwrap_or_default(),
+        "source_url": media_metadata_string(&value, "source_url", BROWSER_MEDIA_URL_MAX_CHARS).unwrap_or_default(),
+        "paused": value
+            .get("paused")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        "duration_ms": media_metadata_u64(&value, "duration_ms"),
+        "position_ms": media_metadata_u64(&value, "position_ms"),
+    }))
+}
+
+pub(super) fn browser_media_status_signature(state: &WebState) -> String {
+    let Some((tab_index, tab)) = browser_media_status_tab(state) else {
+        return "idle".to_owned();
+    };
+    let nav = tab.session.nav();
+    let media_body = tab
+        .session
+        .media_metadata()
+        .map(|metadata| metadata.body.trim())
+        .unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        tab_index,
+        tab.id,
+        tab.engine.wire(),
+        nav.url,
+        tab.session.title(),
+        tab.session.audible(),
+        tab.muted,
+        media_body
+    )
+}
+
+pub(super) fn browser_media_status_body(state: &WebState, updated_ms: u64) -> String {
+    let host = local_hostname();
+    let Some((tab_index, tab)) = browser_media_status_tab(state) else {
+        return serde_json::json!({
+            "op": "browser_media_status",
+            "source": "browser",
+            "node": host,
+            "host": host,
+            "state": "idle",
+            "tab_index": serde_json::Value::Null,
+            "tab_id": serde_json::Value::Null,
+            "engine": serde_json::Value::Null,
+            "active_tab": false,
+            "url": "",
+            "page_title": "",
+            "label": serde_json::Value::Null,
+            "audible": false,
+            "muted": false,
+            "metadata": serde_json::Value::Null,
+            "updated_ms": updated_ms,
+        })
+        .to_string();
+    };
+    let media_body = tab
+        .session
+        .media_metadata()
+        .map(|metadata| metadata.body.as_str())
+        .unwrap_or_default();
+    let metadata = browser_media_metadata_object(media_body);
+    let paused = metadata
+        .as_ref()
+        .and_then(|value| value.get("paused"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| !tab.session.audible());
+    let playback_state = if tab.session.audible() || !paused {
+        "playing"
+    } else {
+        "paused"
+    };
+    let nav = tab.session.nav();
+    serde_json::json!({
+        "op": "browser_media_status",
+        "source": "browser",
+        "node": host,
+        "host": host,
+        "state": playback_state,
+        "tab_index": tab_index,
+        "tab_id": tab.id,
+        "engine": tab.engine.wire(),
+        "active_tab": tab_index == state.active,
+        "url": clamp_chars(nav.url.trim(), BROWSER_MEDIA_URL_MAX_CHARS),
+        "page_title": clamp_chars(tab.session.title().trim(), BROWSER_MEDIA_TEXT_MAX_CHARS),
+        "label": media_metadata_chip_label(media_body),
+        "audible": tab.session.audible(),
+        "muted": tab.muted,
+        "metadata": metadata.unwrap_or(serde_json::Value::Null),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
 }
 
 pub(super) fn browser_session_sync_body(state: &WebState) -> String {
