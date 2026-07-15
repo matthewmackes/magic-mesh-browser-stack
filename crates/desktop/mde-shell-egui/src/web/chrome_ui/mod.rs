@@ -6,11 +6,11 @@
 //! this scope only affects shell-owned tabs, toolbar, menus, drawers, and the new
 //! tab dashboard.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, ops::Range, path::Path, sync::Arc};
 
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
 use mde_egui::{muted_note, ChipTone, Style};
-use mde_web_preview_client::SessionState;
+use mde_web_preview_client::{confusable_reason, host_of, ConfusableReason, SessionState};
 
 use super::{
     centered, ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
@@ -652,7 +652,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         .tabs
         .get(state.active)
         .map_or_else(Vec::new, |t| t.session.recent_resource_requests());
-    let permission_summary = super::site_info_permission_summary(state);
+    let permission_summary = site_info_permission_summary(state);
     let has_page = has_tab && !crashed && !page_url.trim().is_empty();
 
     let mut accepted_suggestion: Option<String> = None;
@@ -705,7 +705,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             && state
                 .bookmarked_urls
                 .contains(super::bookmark_membership_key(&page_url));
-        super::page_actions_button(
+        page_actions_button(
             ui,
             has_page,
             is_bookmarked,
@@ -808,7 +808,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
         // OMNIBOX-STYLE — the leading security chip reflects the CURRENT
         // (committed) page URL's scheme, never the in-progress edit draft.
-        super::security_chip(
+        security_chip(
             ui,
             &page_url,
             &recent_resources,
@@ -873,7 +873,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // BOOKMARKS-10 — right-click the address bar for the same page actions
         // (bookmark / copy URL / Send-in-Chat) the toolbar star exposes.
         resp.context_menu(|ui| {
-            super::page_actions_menu(
+            page_actions_menu(
                 ui,
                 state.bus_root.as_deref(),
                 active_engine,
@@ -922,6 +922,555 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some(suggestion) = accepted_suggestion {
         state.accept_suggestion(suggestion);
     }
+}
+
+/// The Browser page-actions menu (BOOKMARKS-10): the mesh-integration verbs on
+/// the current page. Rendered by both the toolbar star and the address bar's
+/// right-click context menu.
+pub(super) fn page_actions_menu(
+    ui: &mut egui::Ui,
+    bus_root: Option<&Path>,
+    engine: Option<BrowserEngine>,
+    url: &str,
+    title: &str,
+) {
+    let has_page = !url.trim().is_empty();
+    let text = page_action_text(has_page);
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(egui::RichText::new("\u{2606}  Add bookmark").color(text)),
+        )
+        .clicked()
+    {
+        super::publish(
+            super::ACTION_BOOKMARKS_ADD,
+            &super::bookmark_add_body(url, title),
+        );
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(egui::RichText::new("\u{29C9}  Copy URL").color(text)),
+        )
+        .clicked()
+    {
+        ui.ctx().copy_text(url.to_string());
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(egui::RichText::new("\u{1F4AC}  Send in Chat").color(text)),
+        )
+        .clicked()
+    {
+        super::publish(
+            super::ACTION_CHAT_SEND,
+            &super::chat_share_body(&super::local_hostname(), url, title),
+        );
+        ui.close_menu();
+    }
+    for target in [
+        super::BrowserShareTarget::Peer,
+        super::BrowserShareTarget::Phone,
+        super::BrowserShareTarget::Email,
+        super::BrowserShareTarget::Qr,
+    ] {
+        if ui
+            .add_enabled(
+                has_page,
+                egui::Button::new(
+                    egui::RichText::new(format!("{}  Share to {}", "\u{21AA}", target.label()))
+                        .color(text),
+                ),
+            )
+            .clicked()
+        {
+            super::publish_browser_share(bus_root, target, url, title);
+            ui.close_menu();
+        }
+    }
+    for target in [
+        super::BrowserSendTabTarget::Node,
+        super::BrowserSendTabTarget::Phone,
+    ] {
+        if ui
+            .add_enabled(
+                has_page,
+                egui::Button::new(
+                    egui::RichText::new(format!("{}  Send tab to {}", "\u{21E5}", target.label()))
+                        .color(text),
+                ),
+            )
+            .clicked()
+        {
+            if let Some(engine) = engine {
+                super::publish_browser_send_tab(bus_root, target, engine, url, title);
+            }
+            ui.close_menu();
+        }
+    }
+}
+
+/// The toolbar star that opens the BOOKMARKS-10 [`page_actions_menu`].
+pub(super) fn page_actions_button(
+    ui: &mut egui::Ui,
+    has_page: bool,
+    is_bookmarked: bool,
+    bus_root: Option<&Path>,
+    engine: Option<BrowserEngine>,
+    url: &str,
+    title: &str,
+) {
+    let (glyph, color) = page_action_star(has_page, is_bookmarked);
+    let tip = if is_bookmarked {
+        "Bookmarked \u{2014} page actions: edit bookmark, copy URL, share"
+    } else {
+        "Page actions \u{2014} bookmark, copy URL, share"
+    };
+    ui.menu_button(
+        egui::RichText::new(glyph).size(CHROME_FONT).color(color),
+        |ui| {
+            page_actions_menu(ui, bus_root, engine, url, title);
+        },
+    )
+    .response
+    .on_hover_text(tip);
+}
+
+/// SECURITY-INFO — the plain-language headline for a [`super::SecurityLevel`].
+pub(super) const fn security_headline(level: super::SecurityLevel) -> &'static str {
+    match level {
+        super::SecurityLevel::Secure => "Connection is secure",
+        super::SecurityLevel::NotSecure => "Your connection to this site is not secure",
+        super::SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
+        super::SecurityLevel::Neutral => "About this page",
+    }
+}
+
+/// SECURITY-INFO — the [`site_info_panel`]'s content, derived from the current
+/// page URL.
+pub(super) struct SiteInfoSummary {
+    pub(super) security: super::SecurityLevel,
+    pub(super) headline: &'static str,
+    pub(super) host: String,
+    pub(super) host_emphasis: Range<usize>,
+    pub(super) cert_line: Option<&'static str>,
+    pub(super) confusable: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct SiteInfoResourceSummary {
+    pub(super) mixed_content_blocks: usize,
+    pub(super) mixed_content_hosts: Vec<String>,
+    pub(super) tracker_blocks: usize,
+    pub(super) tracker_hosts: Vec<String>,
+    pub(super) safe_browsing_blocks: usize,
+    pub(super) safe_browsing_hosts: Vec<String>,
+    pub(super) managed_policy_blocks: usize,
+    pub(super) managed_policy_rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct SiteInfoPermissionSummary {
+    pub(super) host: String,
+    pub(super) forgotten: bool,
+    pub(super) session_grants: Vec<String>,
+    pub(super) denied_prompts: Vec<String>,
+}
+
+/// Human-readable IDN homograph/spoofing warning for `host`, or `None` when it
+/// is not a confusable/punycode risk.
+pub(super) fn confusable_warning(host: &str) -> Option<String> {
+    confusable_reason(host).map(|reason| {
+        match reason {
+            ConfusableReason::Punycode => {
+                "Punycode/IDN host (xn--) \u{2014} verify this is the site you expect"
+            }
+            ConfusableReason::ConfusableBlock => {
+                "Look-alike letters (Cyrillic/Greek) \u{2014} this host may impersonate another site"
+            }
+            ConfusableReason::MixedScript => {
+                "Mixed-script host \u{2014} letters from more than one alphabet can spoof a name"
+            }
+        }
+        .to_owned()
+    })
+}
+
+pub(super) fn site_info_resource_summary(
+    recent: &[mde_web_preview_client::ResourceRequestStatus],
+) -> SiteInfoResourceSummary {
+    let mut mixed_content_blocks = 0usize;
+    let mut mixed_content_hosts = BTreeSet::new();
+    let mut tracker_blocks = 0usize;
+    let mut tracker_hosts = BTreeSet::new();
+    let mut safe_browsing_blocks = 0usize;
+    let mut safe_browsing_hosts = BTreeSet::new();
+    let mut managed_policy_blocks = 0usize;
+    let mut managed_policy_rules = BTreeSet::new();
+    for resource in recent.iter().filter(|resource| !resource.allowed) {
+        let Some(blocked_by) = resource.blocked_by.as_deref() else {
+            continue;
+        };
+        if blocked_by == "mixed-content:http" {
+            mixed_content_blocks = mixed_content_blocks.saturating_add(1);
+            if let Some(host) = host_of(&resource.url) {
+                mixed_content_hosts.insert(host);
+            }
+        } else if let Some(rule) = blocked_by.strip_prefix("safe-browsing:") {
+            safe_browsing_blocks = safe_browsing_blocks.saturating_add(1);
+            safe_browsing_hosts.insert(rule.to_owned());
+        } else if let Some(rule) = blocked_by.strip_prefix("managed-policy:") {
+            managed_policy_blocks = managed_policy_blocks.saturating_add(1);
+            managed_policy_rules.insert(rule.to_owned());
+        } else {
+            tracker_blocks = tracker_blocks.saturating_add(1);
+            if let Some(host) = host_of(&resource.url) {
+                tracker_hosts.insert(host);
+            }
+        }
+    }
+    SiteInfoResourceSummary {
+        mixed_content_blocks,
+        mixed_content_hosts: mixed_content_hosts.into_iter().take(4).collect(),
+        tracker_blocks,
+        tracker_hosts: tracker_hosts.into_iter().take(4).collect(),
+        safe_browsing_blocks,
+        safe_browsing_hosts: safe_browsing_hosts.into_iter().take(4).collect(),
+        managed_policy_blocks,
+        managed_policy_rules: managed_policy_rules.into_iter().take(4).collect(),
+    }
+}
+
+pub(super) fn permission_kind_site_info_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "geolocation",
+        1 => "notifications",
+        2 => "clipboard",
+        3 => "camera",
+        4 => "microphone",
+        5 => "camera and microphone",
+        _ => "device capability",
+    }
+}
+
+pub(super) fn site_info_permission_summary(state: &WebState) -> Option<SiteInfoPermissionSummary> {
+    let host = state.active_first_party()?;
+    let forgotten = state
+        .forgotten_permission_sites
+        .iter()
+        .any(|site| site == &host);
+    let session_grants = state
+        .granted_permissions
+        .iter()
+        .filter(|(origin, _)| host_of(origin).as_deref() == Some(host.as_str()))
+        .map(|(_, kind)| permission_kind_site_info_label(*kind).to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(4)
+        .collect();
+    let denied_prompts = state
+        .site_permission_prompts
+        .iter()
+        .filter(|prompt| prompt.host == host)
+        .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(4)
+        .collect();
+    Some(SiteInfoPermissionSummary {
+        host,
+        forgotten,
+        session_grants,
+        denied_prompts,
+    })
+}
+
+pub(super) fn site_info_summary(page_url: &str) -> SiteInfoSummary {
+    let display = super::omnibox_display(page_url);
+    let cert_line = matches!(display.security, super::SecurityLevel::Secure)
+        .then_some("Certificate: valid \u{2014} the connection is encrypted");
+    let confusable = confusable_warning(&display.host);
+    SiteInfoSummary {
+        security: display.security,
+        headline: security_headline(display.security),
+        host: display.host,
+        host_emphasis: display.host_emphasis,
+        cert_line,
+        confusable,
+    }
+}
+
+/// Stable, ui-path-independent id for the [`site_info_panel`] popup.
+pub(super) fn security_chip_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_security_chip_popup")
+}
+
+/// SECURITY-INFO — the Chrome-style "site information" popup opened by the
+/// omnibox's security chip.
+pub(super) fn site_info_panel(
+    ui: &mut egui::Ui,
+    page_url: &str,
+    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
+    permissions: Option<&SiteInfoPermissionSummary>,
+) {
+    let summary = site_info_summary(page_url);
+    let resources = site_info_resource_summary(recent_resources);
+    ui.set_max_width(300.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(summary.security.glyph())
+                .size(CHROME_FONT)
+                .color(summary.security.tone().color()),
+        );
+        ui.label(
+            egui::RichText::new(summary.headline)
+                .color(summary.security.tone().color())
+                .strong(),
+        );
+    });
+    if summary.host.is_empty() {
+        ui.label(egui::RichText::new("No page is currently loaded").color(Style::TEXT_DIM));
+    } else {
+        let font_id = font_id(CHROME_FONT);
+        let mut job = egui::text::LayoutJob::default();
+        let dim = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: Style::TEXT_DIM,
+            ..Default::default()
+        };
+        let strong = egui::TextFormat {
+            font_id,
+            color: Style::TEXT_STRONG,
+            ..Default::default()
+        };
+        let Range { start, end } = summary.host_emphasis;
+        if start > 0 {
+            job.append(&summary.host[..start], 0.0, dim.clone());
+        }
+        job.append(&summary.host[start..end], 0.0, strong);
+        if end < summary.host.len() {
+            job.append(&summary.host[end..], 0.0, dim);
+        }
+        ui.label(job);
+    }
+    if let Some(warn) = summary.confusable.as_deref() {
+        ui.label(
+            egui::RichText::new(format!("\u{26A0} {warn}"))
+                .small()
+                .color(Style::WARN),
+        );
+    }
+    if let Some(cert_line) = summary.cert_line {
+        ui.label(
+            egui::RichText::new(cert_line)
+                .small()
+                .color(Style::TEXT_DIM),
+        );
+    }
+    if resources.managed_policy_blocks > 0 {
+        let suffix = if resources.managed_policy_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "\u{26A0} Managed policy blocked: {} resource{suffix}",
+                resources.managed_policy_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.managed_policy_rules.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Matched policy: {}",
+                        resources.managed_policy_rules.join(", ")
+                    ))
+                    .small()
+                    .color(CHROME_TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.safe_browsing_blocks > 0 {
+        let suffix = if resources.safe_browsing_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "\u{26A0} Unsafe content blocked: {} resource{suffix}",
+                resources.safe_browsing_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.safe_browsing_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Unsafe hosts: {}",
+                        resources.safe_browsing_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.mixed_content_blocks > 0 {
+        let suffix = if resources.mixed_content_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "\u{26A0} Insecure content blocked: {} public HTTP subresource{suffix}",
+                resources.mixed_content_blocks
+            ))
+            .small()
+            .color(Style::WARN),
+        );
+        if !resources.mixed_content_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Blocked content hosts: {}",
+                        resources.mixed_content_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if resources.tracker_blocks > 0 {
+        let suffix = if resources.tracker_blocks == 1 {
+            ""
+        } else {
+            "s"
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "Privacy protection blocked: {} tracker/filter resource{suffix}",
+                resources.tracker_blocks
+            ))
+            .small()
+            .color(Style::TEXT_DIM),
+        );
+        if !resources.tracker_hosts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Blocked tracker hosts: {}",
+                        resources.tracker_hosts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+    }
+    if let Some(permissions) = permissions {
+        ui.separator();
+        ui.label(egui::RichText::new("Permissions").small().strong());
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Sensitive capabilities default to deny")
+                    .small()
+                    .color(Style::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        if !permissions.session_grants.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Allowed this session: {}",
+                        permissions.session_grants.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+        if !permissions.denied_prompts.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Denied prompts: {}",
+                        permissions.denied_prompts.join(", ")
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        }
+        if permissions.forgotten {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "{} permissions were forgotten; future requests re-prompt under default deny",
+                        permissions.host
+                    ))
+                    .small()
+                    .color(Style::WARN),
+                )
+                .wrap(),
+            );
+        }
+    }
+    ui.separator();
+    ui.label(
+        egui::RichText::new("Cookies & site data clear when you close the browser")
+            .small()
+            .color(Style::TEXT_DIM),
+    );
+}
+
+/// OMNIBOX-STYLE — the leading security chip, reflecting the committed page URL.
+pub(super) fn security_chip(
+    ui: &mut egui::Ui,
+    page_url: &str,
+    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
+    permissions: Option<&SiteInfoPermissionSummary>,
+) {
+    let security = super::omnibox_display(page_url).security;
+    let popup_id = security_chip_popup_id();
+    let resp = ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new(security.glyph())
+                    .size(CHROME_FONT)
+                    .color(security.tone().color()),
+            )
+            .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
+        )
+        .on_hover_text(security.label());
+    if resp.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| site_info_panel(ui, page_url, recent_resources, permissions),
+    );
 }
 
 /// Omnibox search `items` with any entry that duplicates a history hit removed

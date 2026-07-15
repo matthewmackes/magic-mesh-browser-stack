@@ -36,9 +36,8 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, EditCommand,
-    FilterListSource, FilterListStore, JsDialog, ManagedUrlPolicy, RequestFilter,
-    SafeBrowsingBlocklist, SessionState, WebSession,
+    host_of, BeforeUnloadDialog, CertError, EditCommand, FilterListSource, FilterListStore,
+    JsDialog, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist, SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -8420,94 +8419,6 @@ use capture::*;
 mod drawers;
 use drawers::*;
 
-/// The Browser page-actions menu (BOOKMARKS-10): the three mesh-integration verbs
-/// on the current page. Rendered by BOTH the toolbar menu button and the address
-/// bar's right-click context menu (one body, two entry points). Each item greys
-/// out with no live URL to act on.
-fn page_actions_menu(
-    ui: &mut egui::Ui,
-    bus_root: Option<&Path>,
-    engine: Option<BrowserEngine>,
-    url: &str,
-    title: &str,
-) {
-    let has_page = !url.trim().is_empty();
-    let text = chrome_ui::page_action_text(has_page);
-    // Add-from-page → the mesh-synced bookmarks store (via the worker's add verb).
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(RichText::new("\u{2606}  Add bookmark").color(text)),
-        )
-        .clicked()
-    {
-        publish(ACTION_BOOKMARKS_ADD, &bookmark_add_body(url, title));
-        ui.close_menu();
-    }
-    // Copy-URL → the shell clipboard (egui's output command).
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(RichText::new("\u{29C9}  Copy URL").color(text)),
-        )
-        .clicked()
-    {
-        ui.ctx().copy_text(url.to_string());
-        ui.close_menu();
-    }
-    // Send-in-Chat → the NOTIFY-CHAT send verb.
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(RichText::new("\u{1F4AC}  Send in Chat").color(text)),
-        )
-        .clicked()
-    {
-        publish(
-            ACTION_CHAT_SEND,
-            &chat_share_body(&local_hostname(), url, title),
-        );
-        ui.close_menu();
-    }
-    for target in [
-        BrowserShareTarget::Peer,
-        BrowserShareTarget::Phone,
-        BrowserShareTarget::Email,
-        BrowserShareTarget::Qr,
-    ] {
-        if ui
-            .add_enabled(
-                has_page,
-                egui::Button::new(
-                    RichText::new(format!("{}  Share to {}", "\u{21AA}", target.label()))
-                        .color(text),
-                ),
-            )
-            .clicked()
-        {
-            publish_browser_share(bus_root, target, url, title);
-            ui.close_menu();
-        }
-    }
-    for target in [BrowserSendTabTarget::Node, BrowserSendTabTarget::Phone] {
-        if ui
-            .add_enabled(
-                has_page,
-                egui::Button::new(
-                    RichText::new(format!("{}  Send tab to {}", "\u{21E5}", target.label()))
-                        .color(text),
-                ),
-            )
-            .clicked()
-        {
-            if let Some(engine) = engine {
-                publish_browser_send_tab(bus_root, target, engine, url, title);
-            }
-            ui.close_menu();
-        }
-    }
-}
-
 /// The toolbar 🔑 password menu: fill a saved login into the current site's form, or
 /// save a new credential for it. Session-only store, user-initiated fill (the engine
 /// injects the fill script). Deferred actions are applied after the popup closure so
@@ -8614,34 +8525,6 @@ fn password_menu(
         let pass = std::mem::take(&mut state.login_pass_draft);
         state.save_login(&host, &user, &pass);
     }
-}
-
-/// The toolbar star that opens the BOOKMARKS-10 [`page_actions_menu`]; the glyph
-/// dims with no live page (the menu items disable themselves too). Split out of
-/// [`nav_chrome`] to keep that toolbar within its line budget.
-fn page_actions_button(
-    ui: &mut egui::Ui,
-    has_page: bool,
-    is_bookmarked: bool,
-    bus_root: Option<&Path>,
-    engine: Option<BrowserEngine>,
-    url: &str,
-    title: &str,
-) {
-    // Filled accent star when the current page is bookmarked (in any folder), hollow
-    // otherwise — matching Chrome's star-reflects-state. The glyph still dims when
-    // there is no live page.
-    let (glyph, color) = chrome_ui::page_action_star(has_page, is_bookmarked);
-    let tip = if is_bookmarked {
-        "Bookmarked \u{2014} page actions: edit bookmark, copy URL, share"
-    } else {
-        "Page actions \u{2014} bookmark, copy URL, share"
-    };
-    ui.menu_button(RichText::new(glyph).size(CHROME_FONT).color(color), |ui| {
-        page_actions_menu(ui, bus_root, engine, url, title);
-    })
-    .response
-    .on_hover_text(tip);
 }
 
 /// Whether the compact toolbar's reload slot should present as a real Stop
@@ -8868,461 +8751,6 @@ fn paint_omnibox_inline_completion(ui: &mut egui::Ui, rect: egui::Rect, draft: &
     );
     ui.painter()
         .galley(text_pos, ghost, chrome_ui::CHROME_TEXT_DIM);
-}
-
-/// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`], shown
-/// at the top of the [`site_info_panel`]. Pure and paint-free so the copy is
-/// directly unit-testable without driving a frame.
-const fn security_headline(level: SecurityLevel) -> &'static str {
-    match level {
-        SecurityLevel::Secure => "Connection is secure",
-        SecurityLevel::NotSecure => "Your connection to this site is not secure",
-        SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
-        SecurityLevel::Neutral => "About this page",
-    }
-}
-
-/// SECURITY-INFO — the [`site_info_panel`]'s content, derived from the current
-/// page URL. Built on top of [`omnibox_display`] rather than re-parsing the
-/// URL, so the panel's host/eTLD+1 emphasis always matches the omnibox's own
-/// read-out. Pure and paint-free, unit-tested directly.
-struct SiteInfoSummary {
-    security: SecurityLevel,
-    headline: &'static str,
-    /// The host, already `www.`-stripped — empty when the URL carries no
-    /// `scheme://host` authority (e.g. `about:blank`).
-    host: String,
-    /// Byte range of the registrable domain within [`Self::host`] — see
-    /// [`OmniboxDisplay::host_emphasis`].
-    host_emphasis: Range<usize>,
-    /// Set only for `https://` pages: this browser blocks cert-error
-    /// navigations upstream (the TLS interstitial), so a live `https` page
-    /// reaching this panel has already been certificate-validated.
-    cert_line: Option<&'static str>,
-    /// IDN homograph/punycode spoofing warning for the host, or `None` when the
-    /// host is not a confusable risk — see [`confusable_warning`].
-    confusable: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SiteInfoResourceSummary {
-    mixed_content_blocks: usize,
-    mixed_content_hosts: Vec<String>,
-    tracker_blocks: usize,
-    tracker_hosts: Vec<String>,
-    safe_browsing_blocks: usize,
-    safe_browsing_hosts: Vec<String>,
-    managed_policy_blocks: usize,
-    managed_policy_rules: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SiteInfoPermissionSummary {
-    host: String,
-    forgotten: bool,
-    session_grants: Vec<String>,
-    denied_prompts: Vec<String>,
-}
-
-/// Human-readable IDN homograph/spoofing warning for `host`, or `None` when it is
-/// not a confusable/punycode risk. Wires mde-adblock's [`confusable_reason`]
-/// detector into the site-info panel — the place users click to confirm identity,
-/// where a look-alike-domain warning belongs (the detector previously had no UI).
-fn confusable_warning(host: &str) -> Option<String> {
-    confusable_reason(host).map(|reason| {
-        match reason {
-            ConfusableReason::Punycode => {
-                "Punycode/IDN host (xn--) \u{2014} verify this is the site you expect"
-            }
-            ConfusableReason::ConfusableBlock => {
-                "Look-alike letters (Cyrillic/Greek) \u{2014} this host may impersonate another site"
-            }
-            ConfusableReason::MixedScript => {
-                "Mixed-script host \u{2014} letters from more than one alphabet can spoof a name"
-            }
-        }
-        .to_owned()
-    })
-}
-
-fn site_info_resource_summary(
-    recent: &[mde_web_preview_client::ResourceRequestStatus],
-) -> SiteInfoResourceSummary {
-    let mut mixed_content_blocks = 0usize;
-    let mut mixed_content_hosts = BTreeSet::new();
-    let mut tracker_blocks = 0usize;
-    let mut tracker_hosts = BTreeSet::new();
-    let mut safe_browsing_blocks = 0usize;
-    let mut safe_browsing_hosts = BTreeSet::new();
-    let mut managed_policy_blocks = 0usize;
-    let mut managed_policy_rules = BTreeSet::new();
-    for resource in recent.iter().filter(|resource| !resource.allowed) {
-        let Some(blocked_by) = resource.blocked_by.as_deref() else {
-            continue;
-        };
-        if blocked_by == "mixed-content:http" {
-            mixed_content_blocks = mixed_content_blocks.saturating_add(1);
-            if let Some(host) = host_of(&resource.url) {
-                mixed_content_hosts.insert(host);
-            }
-        } else if let Some(rule) = blocked_by.strip_prefix("safe-browsing:") {
-            safe_browsing_blocks = safe_browsing_blocks.saturating_add(1);
-            safe_browsing_hosts.insert(rule.to_owned());
-        } else if let Some(rule) = blocked_by.strip_prefix("managed-policy:") {
-            managed_policy_blocks = managed_policy_blocks.saturating_add(1);
-            managed_policy_rules.insert(rule.to_owned());
-        } else {
-            tracker_blocks = tracker_blocks.saturating_add(1);
-            if let Some(host) = host_of(&resource.url) {
-                tracker_hosts.insert(host);
-            }
-        }
-    }
-    SiteInfoResourceSummary {
-        mixed_content_blocks,
-        mixed_content_hosts: mixed_content_hosts.into_iter().take(4).collect(),
-        tracker_blocks,
-        tracker_hosts: tracker_hosts.into_iter().take(4).collect(),
-        safe_browsing_blocks,
-        safe_browsing_hosts: safe_browsing_hosts.into_iter().take(4).collect(),
-        managed_policy_blocks,
-        managed_policy_rules: managed_policy_rules.into_iter().take(4).collect(),
-    }
-}
-
-fn permission_kind_site_info_label(kind: u8) -> &'static str {
-    match kind {
-        0 => "geolocation",
-        1 => "notifications",
-        2 => "clipboard",
-        3 => "camera",
-        4 => "microphone",
-        5 => "camera and microphone",
-        _ => "device capability",
-    }
-}
-
-fn site_info_permission_summary(state: &WebState) -> Option<SiteInfoPermissionSummary> {
-    let host = state.active_first_party()?;
-    let forgotten = state
-        .forgotten_permission_sites
-        .iter()
-        .any(|site| site == &host);
-    let session_grants = state
-        .granted_permissions
-        .iter()
-        .filter(|(origin, _)| host_of(origin).as_deref() == Some(host.as_str()))
-        .map(|(_, kind)| permission_kind_site_info_label(*kind).to_owned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(4)
-        .collect();
-    let denied_prompts = state
-        .site_permission_prompts
-        .iter()
-        .filter(|prompt| prompt.host == host)
-        .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(4)
-        .collect();
-    Some(SiteInfoPermissionSummary {
-        host,
-        forgotten,
-        session_grants,
-        denied_prompts,
-    })
-}
-
-fn site_info_summary(page_url: &str) -> SiteInfoSummary {
-    let display = omnibox_display(page_url);
-    let cert_line = matches!(display.security, SecurityLevel::Secure)
-        .then_some("Certificate: valid \u{2014} the connection is encrypted");
-    let confusable = confusable_warning(&display.host);
-    SiteInfoSummary {
-        security: display.security,
-        headline: security_headline(display.security),
-        host: display.host,
-        host_emphasis: display.host_emphasis,
-        cert_line,
-        confusable,
-    }
-}
-
-/// A stable, ui-path-independent id for the [`site_info_panel`] popup — a
-/// single well-known key rather than [`egui::Ui::make_persistent_id`], so
-/// tests can open/close it without replaying the chrome bar's exact widget
-/// layout.
-fn security_chip_popup_id() -> egui::Id {
-    egui::Id::new("mde_web_security_chip_popup")
-}
-
-/// SECURITY-INFO — the Chrome-style "site information" popup opened by
-/// clicking the omnibox's [`security_chip`]: the security headline, the
-/// page's host (registrable domain emphasized, matching the omnibox), an
-/// `https` cert-validity line, active-page resource blocks, current-site
-/// permission posture, and the browser's session-only privacy note (B3/Q74 —
-/// cookies and site data are never persisted past the browser closing, so this
-/// stays a static fact rather than a live count).
-fn site_info_panel(
-    ui: &mut egui::Ui,
-    page_url: &str,
-    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
-    permissions: Option<&SiteInfoPermissionSummary>,
-) {
-    let summary = site_info_summary(page_url);
-    let resources = site_info_resource_summary(recent_resources);
-    ui.set_max_width(300.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(summary.security.glyph())
-                .size(CHROME_FONT)
-                .color(summary.security.tone().color()),
-        );
-        ui.label(
-            RichText::new(summary.headline)
-                .color(summary.security.tone().color())
-                .strong(),
-        );
-    });
-    if summary.host.is_empty() {
-        ui.label(RichText::new("No page is currently loaded").color(Style::TEXT_DIM));
-    } else {
-        let font_id = chrome_ui::font_id(CHROME_FONT);
-        let mut job = egui::text::LayoutJob::default();
-        let dim = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: Style::TEXT_DIM,
-            ..Default::default()
-        };
-        let strong = egui::TextFormat {
-            font_id,
-            color: Style::TEXT_STRONG,
-            ..Default::default()
-        };
-        let Range { start, end } = summary.host_emphasis;
-        if start > 0 {
-            job.append(&summary.host[..start], 0.0, dim.clone());
-        }
-        job.append(&summary.host[start..end], 0.0, strong);
-        if end < summary.host.len() {
-            job.append(&summary.host[end..], 0.0, dim);
-        }
-        ui.label(job);
-    }
-    if let Some(warn) = summary.confusable.as_deref() {
-        ui.label(
-            RichText::new(format!("\u{26A0} {warn}"))
-                .small()
-                .color(Style::WARN),
-        );
-    }
-    if let Some(cert_line) = summary.cert_line {
-        ui.label(RichText::new(cert_line).small().color(Style::TEXT_DIM));
-    }
-    if resources.managed_policy_blocks > 0 {
-        let suffix = if resources.managed_policy_blocks == 1 {
-            ""
-        } else {
-            "s"
-        };
-        ui.label(
-            RichText::new(format!(
-                "\u{26A0} Managed policy blocked: {} resource{suffix}",
-                resources.managed_policy_blocks
-            ))
-            .small()
-            .color(Style::WARN),
-        );
-        if !resources.managed_policy_rules.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Matched policy: {}",
-                        resources.managed_policy_rules.join(", ")
-                    ))
-                    .small()
-                    .color(chrome_ui::CHROME_TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-    }
-    if resources.safe_browsing_blocks > 0 {
-        let suffix = if resources.safe_browsing_blocks == 1 {
-            ""
-        } else {
-            "s"
-        };
-        ui.label(
-            RichText::new(format!(
-                "\u{26A0} Unsafe content blocked: {} resource{suffix}",
-                resources.safe_browsing_blocks
-            ))
-            .small()
-            .color(Style::WARN),
-        );
-        if !resources.safe_browsing_hosts.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Unsafe hosts: {}",
-                        resources.safe_browsing_hosts.join(", ")
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-    }
-    if resources.mixed_content_blocks > 0 {
-        let suffix = if resources.mixed_content_blocks == 1 {
-            ""
-        } else {
-            "s"
-        };
-        ui.label(
-            RichText::new(format!(
-                "\u{26A0} Insecure content blocked: {} public HTTP subresource{suffix}",
-                resources.mixed_content_blocks
-            ))
-            .small()
-            .color(Style::WARN),
-        );
-        if !resources.mixed_content_hosts.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Blocked content hosts: {}",
-                        resources.mixed_content_hosts.join(", ")
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-    }
-    if resources.tracker_blocks > 0 {
-        let suffix = if resources.tracker_blocks == 1 {
-            ""
-        } else {
-            "s"
-        };
-        ui.label(
-            RichText::new(format!(
-                "Privacy protection blocked: {} tracker/filter resource{suffix}",
-                resources.tracker_blocks
-            ))
-            .small()
-            .color(Style::TEXT_DIM),
-        );
-        if !resources.tracker_hosts.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Blocked tracker hosts: {}",
-                        resources.tracker_hosts.join(", ")
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-    }
-    if let Some(permissions) = permissions {
-        ui.separator();
-        ui.label(RichText::new("Permissions").small().strong());
-        ui.add(
-            egui::Label::new(
-                RichText::new("Sensitive capabilities default to deny")
-                    .small()
-                    .color(Style::TEXT_DIM),
-            )
-            .wrap(),
-        );
-        if !permissions.session_grants.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Allowed this session: {}",
-                        permissions.session_grants.join(", ")
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-        if !permissions.denied_prompts.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "Denied prompts: {}",
-                        permissions.denied_prompts.join(", ")
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                )
-                .wrap(),
-            );
-        }
-        if permissions.forgotten {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!(
-                        "{} permissions were forgotten; future requests re-prompt under default deny",
-                        permissions.host
-                    ))
-                    .small()
-                    .color(Style::WARN),
-                )
-                .wrap(),
-            );
-        }
-    }
-    ui.separator();
-    ui.label(
-        RichText::new("Cookies & site data clear when you close the browser")
-            .small()
-            .color(Style::TEXT_DIM),
-    );
-}
-
-/// OMNIBOX-STYLE — the leading security chip, reflecting the CURRENT
-/// (committed) page URL's scheme, not the in-progress edit draft. Clicking it
-/// opens the SECURITY-INFO [`site_info_panel`] below it, dismissed on
-/// click-away or Esc (egui's built-in popup close behavior).
-fn security_chip(
-    ui: &mut egui::Ui,
-    page_url: &str,
-    recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
-    permissions: Option<&SiteInfoPermissionSummary>,
-) {
-    let security = omnibox_display(page_url).security;
-    let popup_id = security_chip_popup_id();
-    let resp = ui
-        .add(
-            egui::Button::new(
-                RichText::new(security.glyph())
-                    .size(CHROME_FONT)
-                    .color(security.tone().color()),
-            )
-            .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-        )
-        .on_hover_text(security.label());
-    if resp.clicked() {
-        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
-    }
-    egui::popup_below_widget(
-        ui,
-        popup_id,
-        &resp,
-        egui::PopupCloseBehavior::CloseOnClickOutside,
-        |ui| site_info_panel(ui, page_url, recent_resources, permissions),
-    );
 }
 
 /// Stable egui id for the omnibox TextEdit, so its keyboard focus can be
@@ -13394,9 +12822,12 @@ mod tests {
         assert_eq!(permission_kind_label(3), "use your camera");
         assert_eq!(permission_kind_label(4), "use your microphone");
         assert_eq!(permission_kind_label(5), "use your camera and microphone");
-        assert_eq!(permission_kind_site_info_label(3), "camera");
-        assert_eq!(permission_kind_site_info_label(4), "microphone");
-        assert_eq!(permission_kind_site_info_label(5), "camera and microphone");
+        assert_eq!(chrome_ui::permission_kind_site_info_label(3), "camera");
+        assert_eq!(chrome_ui::permission_kind_site_info_label(4), "microphone");
+        assert_eq!(
+            chrome_ui::permission_kind_site_info_label(5),
+            "camera and microphone"
+        );
 
         let (shell, helper) = UnixStream::pair().expect("socketpair");
         helper.set_nonblocking(true).expect("helper nonblocking");
@@ -17207,7 +16638,7 @@ mod tests {
         let out = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 chrome_ui::scope(ui, |ui| {
-                    page_actions_menu(
+                    chrome_ui::page_actions_menu(
                         ui,
                         None,
                         Some(BrowserEngine::Cef),
@@ -18598,25 +18029,28 @@ mod tests {
     #[test]
     fn security_headline_maps_each_level_to_plain_language_copy() {
         assert_eq!(
-            security_headline(SecurityLevel::Secure),
+            chrome_ui::security_headline(SecurityLevel::Secure),
             "Connection is secure"
         );
         assert_eq!(
-            security_headline(SecurityLevel::NotSecure),
+            chrome_ui::security_headline(SecurityLevel::NotSecure),
             "Your connection to this site is not secure"
         );
         assert_eq!(
-            security_headline(SecurityLevel::Mesh),
+            chrome_ui::security_headline(SecurityLevel::Mesh),
             "Mesh service \u{2014} trusted overlay"
         );
-        assert_eq!(security_headline(SecurityLevel::Neutral), "About this page");
+        assert_eq!(
+            chrome_ui::security_headline(SecurityLevel::Neutral),
+            "About this page"
+        );
     }
 
     #[test]
     fn site_info_summary_host_matches_the_omnibox_displays_host_and_emphasis() {
         let url = "https://foo.example.com/x";
         let display = omnibox_display(url);
-        let summary = site_info_summary(url);
+        let summary = chrome_ui::site_info_summary(url);
         assert_eq!(summary.host, display.host);
         assert_eq!(summary.host_emphasis, display.host_emphasis);
         assert_eq!(summary.host, "foo.example.com");
@@ -18627,28 +18061,34 @@ mod tests {
     fn site_info_summary_surfaces_idn_homograph_warning() {
         // A punycode/IDN host (xn-- prefix) trips the spoofing warning...
         assert!(
-            site_info_summary("https://xn--pple-43d.com/")
+            chrome_ui::site_info_summary("https://xn--pple-43d.com/")
                 .confusable
                 .is_some(),
             "punycode host warns"
         );
         // ...a look-alike Cyrillic 'а' (U+0430) mixed with Latin trips it too...
-        assert!(confusable_warning("\u{0430}pple.com").is_some());
+        assert!(chrome_ui::confusable_warning("\u{0430}pple.com").is_some());
         // ...and a plain ASCII host does not.
-        assert!(site_info_summary("https://example.com/")
+        assert!(chrome_ui::site_info_summary("https://example.com/")
             .confusable
             .is_none());
-        assert!(confusable_warning("apple.com").is_none());
+        assert!(chrome_ui::confusable_warning("apple.com").is_none());
     }
 
     #[test]
     fn site_info_summary_shows_a_cert_line_only_for_https() {
-        assert!(site_info_summary("https://example.com/")
+        assert!(chrome_ui::site_info_summary("https://example.com/")
             .cert_line
             .is_some());
-        assert!(site_info_summary("http://example.com/").cert_line.is_none());
-        assert!(site_info_summary("mesh://svc.mesh/").cert_line.is_none());
-        assert!(site_info_summary("about:blank").cert_line.is_none());
+        assert!(chrome_ui::site_info_summary("http://example.com/")
+            .cert_line
+            .is_none());
+        assert!(chrome_ui::site_info_summary("mesh://svc.mesh/")
+            .cert_line
+            .is_none());
+        assert!(chrome_ui::site_info_summary("about:blank")
+            .cert_line
+            .is_none());
     }
 
     #[test]
@@ -18712,7 +18152,7 @@ mod tests {
             },
         ];
 
-        let summary = site_info_resource_summary(&recent);
+        let summary = chrome_ui::site_info_resource_summary(&recent);
 
         assert_eq!(summary.mixed_content_blocks, 2);
         assert_eq!(
@@ -18758,7 +18198,8 @@ mod tests {
             updated_ms: 8,
         });
 
-        let summary = site_info_permission_summary(&state).expect("active site permissions");
+        let summary =
+            chrome_ui::site_info_permission_summary(&state).expect("active site permissions");
 
         assert_eq!(summary.host, "example.test");
         assert!(!summary.forgotten);
@@ -18772,7 +18213,7 @@ mod tests {
             .forgotten_permission_sites
             .push("example.test".to_owned());
         assert!(
-            site_info_permission_summary(&state)
+            chrome_ui::site_info_permission_summary(&state)
                 .expect("active site permissions")
                 .forgotten
         );
@@ -18790,10 +18231,10 @@ mod tests {
         // Force the popup open the same way the chip's click handler does —
         // `security_chip_popup_id` is a fixed key, not a ui-path-derived one,
         // so the test doesn't need to replay the chrome bar's exact layout.
-        ctx.memory_mut(|mem| mem.open_popup(security_chip_popup_id()));
+        ctx.memory_mut(|mem| mem.open_popup(chrome_ui::security_chip_popup_id()));
         // A second frame with the panel open must still paint, not panic.
         assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
-        assert!(ctx.memory(|mem| mem.is_popup_open(security_chip_popup_id())));
+        assert!(ctx.memory(|mem| mem.is_popup_open(chrome_ui::security_chip_popup_id())));
     }
 
     #[test]
@@ -18840,7 +18281,7 @@ mod tests {
                 ),
             },
         ];
-        let permissions = SiteInfoPermissionSummary {
+        let permissions = chrome_ui::SiteInfoPermissionSummary {
             host: "portal.example.test".to_owned(),
             forgotten: true,
             session_grants: vec!["geolocation".to_owned()],
@@ -18849,7 +18290,7 @@ mod tests {
 
         let out = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                site_info_panel(
+                chrome_ui::site_info_panel(
                     ui,
                     "https://portal.example.test/",
                     &recent,
