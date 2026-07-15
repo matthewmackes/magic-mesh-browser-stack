@@ -55,6 +55,21 @@ pub(super) const fn selected_text(selected: bool) -> Color32 {
     }
 }
 
+pub(super) const fn page_action_text(enabled: bool) -> Color32 {
+    button_text(enabled)
+}
+
+pub(super) const fn page_action_star(
+    has_page: bool,
+    is_bookmarked: bool,
+) -> (&'static str, Color32) {
+    match (has_page, is_bookmarked) {
+        (false, _) => ("\u{2606}", CHROME_TEXT_DIM),
+        (true, true) => ("\u{2605}", CHROME_PRIMARY),
+        (true, false) => ("\u{2606}", CHROME_TEXT),
+    }
+}
+
 pub(super) const fn tab_fill(active: bool) -> Color32 {
     if active {
         CHROME_TOOLBAR
@@ -204,6 +219,18 @@ mod tests {
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
         assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
+    }
+
+    #[test]
+    fn page_action_tokens_cover_disabled_plain_and_bookmarked_states() {
+        assert_eq!(page_action_text(true), CHROME_TEXT);
+        assert_eq!(page_action_text(false), CHROME_TEXT_DIM);
+        assert_eq!(
+            page_action_star(false, false),
+            ("\u{2606}", CHROME_TEXT_DIM)
+        );
+        assert_eq!(page_action_star(true, false), ("\u{2606}", CHROME_TEXT));
+        assert_eq!(page_action_star(true, true), ("\u{2605}", CHROME_PRIMARY));
     }
 
     #[test]

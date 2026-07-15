@@ -8773,7 +8773,7 @@ use drawers::*;
 /// The Browser page-actions menu (BOOKMARKS-10): the three mesh-integration verbs
 /// on the current page. Rendered by BOTH the toolbar menu button and the address
 /// bar's right-click context menu (one body, two entry points). Each item greys
-/// out with no live URL to act on. §4 Carbon tokens on the chrome.
+/// out with no live URL to act on.
 fn page_actions_menu(
     ui: &mut egui::Ui,
     bus_root: Option<&Path>,
@@ -8782,11 +8782,12 @@ fn page_actions_menu(
     title: &str,
 ) {
     let has_page = !url.trim().is_empty();
+    let text = chrome_ui::page_action_text(has_page);
     // Add-from-page → the mesh-synced bookmarks store (via the worker's add verb).
     if ui
         .add_enabled(
             has_page,
-            egui::Button::new(RichText::new("\u{2606}  Add bookmark").color(Style::TEXT)),
+            egui::Button::new(RichText::new("\u{2606}  Add bookmark").color(text)),
         )
         .clicked()
     {
@@ -8797,7 +8798,7 @@ fn page_actions_menu(
     if ui
         .add_enabled(
             has_page,
-            egui::Button::new(RichText::new("\u{29C9}  Copy URL").color(Style::TEXT)),
+            egui::Button::new(RichText::new("\u{29C9}  Copy URL").color(text)),
         )
         .clicked()
     {
@@ -8808,7 +8809,7 @@ fn page_actions_menu(
     if ui
         .add_enabled(
             has_page,
-            egui::Button::new(RichText::new("\u{1F4AC}  Send in Chat").color(Style::TEXT)),
+            egui::Button::new(RichText::new("\u{1F4AC}  Send in Chat").color(text)),
         )
         .clicked()
     {
@@ -8829,7 +8830,7 @@ fn page_actions_menu(
                 has_page,
                 egui::Button::new(
                     RichText::new(format!("{}  Share to {}", "\u{21AA}", target.label()))
-                        .color(Style::TEXT),
+                        .color(text),
                 ),
             )
             .clicked()
@@ -8844,7 +8845,7 @@ fn page_actions_menu(
                 has_page,
                 egui::Button::new(
                     RichText::new(format!("{}  Send tab to {}", "\u{21E5}", target.label()))
-                        .color(Style::TEXT),
+                        .color(text),
                 ),
             )
             .clicked()
@@ -8980,11 +8981,7 @@ fn page_actions_button(
     // Filled accent star when the current page is bookmarked (in any folder), hollow
     // otherwise — matching Chrome's star-reflects-state. The glyph still dims when
     // there is no live page.
-    let (glyph, color) = match (has_page, is_bookmarked) {
-        (false, _) => ("\u{2606}", Style::TEXT_DIM),
-        (true, true) => ("\u{2605}", Style::ACCENT),
-        (true, false) => ("\u{2606}", Style::TEXT),
-    };
+    let (glyph, color) = chrome_ui::page_action_star(has_page, is_bookmarked);
     let tip = if is_bookmarked {
         "Bookmarked \u{2014} page actions: edit bookmark, copy URL, share"
     } else {
@@ -18129,6 +18126,42 @@ mod tests {
         assert_eq!(v["title"], "Example Domain");
         // `source` is omitted so the worker mints the default `Source::Manual`.
         assert!(v.get("source").is_none());
+    }
+
+    #[test]
+    fn page_actions_menu_uses_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::scope(ui, |ui| {
+                    page_actions_menu(
+                        ui,
+                        None,
+                        Some(BrowserEngine::Cef),
+                        "https://example.com/",
+                        "Example Domain",
+                    );
+                });
+            });
+        });
+        let texts = painted_text(&out.shapes);
+
+        for label in ["Add bookmark", "Copy URL", "Send in Chat", "Share to QR"] {
+            assert!(
+                texts.iter().any(|(text, color)| {
+                    text.contains(label) && *color == chrome_ui::CHROME_TEXT
+                }),
+                "page action `{label}` must use Browser Material text: {texts:?}"
+            );
+        }
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| { text.contains("Add bookmark") && *color == Style::TEXT }),
+            "page actions must not fall back to shared shell text tokens: {texts:?}"
+        );
     }
 
     #[test]
