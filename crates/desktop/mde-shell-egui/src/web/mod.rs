@@ -9438,7 +9438,7 @@ fn site_info_panel(
     if summary.host.is_empty() {
         ui.label(RichText::new("No page is currently loaded").color(Style::TEXT_DIM));
     } else {
-        let font_id = egui::FontId::new(CHROME_FONT, egui::FontFamily::Proportional);
+        let font_id = chrome_ui::font_id(CHROME_FONT);
         let mut job = egui::text::LayoutJob::default();
         let dim = egui::TextFormat {
             font_id: font_id.clone(),

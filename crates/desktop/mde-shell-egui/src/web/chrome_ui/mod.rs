@@ -6,12 +6,17 @@
 //! this scope only affects shell-owned tabs, toolbar, menus, drawers, and the new
 //! tab dashboard.
 
+use std::sync::Arc;
+
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
 use mde_egui::ChipTone;
 
-/// Chrome's UI face is Roboto; this slice pins the browser chrome onto egui's
-/// proportional family until the actual Roboto font asset is embedded.
-pub(super) const CHROME_FONT_FAMILY: FontFamily = FontFamily::Proportional;
+/// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
+/// shared font installer. Keeping it named, not proportional, preserves Inter as
+/// the shell-wide prose face while Browser gets its Material/Chrome exception.
+pub(super) fn chrome_font_family() -> FontFamily {
+    FontFamily::Name(Arc::from(mde_egui::fonts::BROWSER_CHROME_FAMILY))
+}
 
 pub(super) const CHROME_SURFACE: Color32 = Color32::from_rgb(248, 250, 253);
 pub(super) const CHROME_SURFACE_CONTAINER: Color32 = Color32::from_rgb(241, 243, 244);
@@ -116,7 +121,7 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
 }
 
 pub(super) fn font_id(size: f32) -> FontId {
-    FontId::new(size, CHROME_FONT_FAMILY.clone())
+    FontId::new(size, chrome_font_family())
 }
 
 pub(super) fn omnibox_dim_format(font_id: FontId) -> egui::TextFormat {
@@ -164,14 +169,12 @@ pub(super) fn scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
 
 fn apply_visuals(ui: &mut egui::Ui) {
     let style = ui.style_mut();
-    style.text_styles.insert(
-        TextStyle::Small,
-        FontId::new(12.0, CHROME_FONT_FAMILY.clone()),
-    );
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(13.0, CHROME_FONT_FAMILY.clone()),
-    );
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::new(12.0, chrome_font_family()));
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(13.0, chrome_font_family()));
 
     let visuals = &mut style.visuals;
     visuals.dark_mode = false;
@@ -238,5 +241,13 @@ mod tests {
         let font = font_id(13.0);
         assert_eq!(omnibox_dim_format(font.clone()).color, CHROME_TEXT_DIM);
         assert_eq!(omnibox_strong_format(font).color, CHROME_TEXT);
+    }
+
+    #[test]
+    fn browser_chrome_uses_the_named_roboto_family() {
+        assert_eq!(
+            font_id(13.0).family,
+            FontFamily::Name(std::sync::Arc::from(mde_egui::fonts::BROWSER_CHROME_FAMILY))
+        );
     }
 }
