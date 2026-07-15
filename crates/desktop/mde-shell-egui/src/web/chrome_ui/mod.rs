@@ -3559,7 +3559,10 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
                 continue;
             }
         }
-        if let Some(event) = browser_input_event(&event, image_rect, frame_size, page_focused) {
+        let dragging_page = resp.dragged();
+        if let Some(event) =
+            browser_input_event(&event, image_rect, frame_size, page_focused, dragging_page)
+        {
             if let Some(tab) = state.tabs.get_mut(active) {
                 tab.last_activity = Instant::now();
                 tab.idle_suspended = false;
@@ -3660,10 +3663,11 @@ pub(super) fn browser_input_event(
     rect: egui::Rect,
     frame_size: [usize; 2],
     browser_focused: bool,
+    dragging_page: bool,
 ) -> Option<egui::Event> {
     match event {
         egui::Event::PointerMoved(pos) => {
-            if rect.contains(*pos) {
+            if rect.contains(*pos) || dragging_page {
                 Some(egui::Event::PointerMoved(map_pointer_to_frame(
                     *pos, rect, frame_size,
                 )))

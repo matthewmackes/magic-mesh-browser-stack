@@ -8919,6 +8919,7 @@ mod tests {
             rect,
             frame,
             false,
+            false,
         )
         .expect("pointer inside page");
         assert_eq!(moved, egui::Event::PointerMoved(pos2(50.0, 50.0)));
@@ -8931,17 +8932,23 @@ mod tests {
             modifiers: egui::Modifiers::default(),
         };
         assert_eq!(
-            browser_input_event(&key, rect, frame, false),
+            browser_input_event(&key, rect, frame, false, false),
             None,
             "address-bar/chrome keystrokes must not leak into the page"
         );
         assert_eq!(
-            browser_input_event(&key, rect, frame, true),
+            browser_input_event(&key, rect, frame, true, false),
             Some(key),
             "click-focused page canvas receives keyboard events"
         );
         assert_eq!(
-            browser_input_event(&egui::Event::Text("mesh".to_owned()), rect, frame, true),
+            browser_input_event(
+                &egui::Event::Text("mesh".to_owned()),
+                rect,
+                frame,
+                true,
+                false
+            ),
             Some(egui::Event::Text("mesh".to_owned())),
             "committed text reaches the focused page canvas"
         );
@@ -9020,7 +9027,7 @@ mod tests {
             pressed: true,
             modifiers: egui::Modifiers::default(),
         };
-        match browser_input_event(&ev, rect, frame, true).expect("focused click forwards") {
+        match browser_input_event(&ev, rect, frame, true, false).expect("focused click forwards") {
             egui::Event::PointerButton {
                 pos,
                 button,
@@ -9042,9 +9049,34 @@ mod tests {
                 &egui::Event::PointerMoved(pos2(0.0, 0.0)),
                 rect,
                 frame,
-                true
+                true,
+                false
             ),
             Some(egui::Event::PointerGone)
+        );
+    }
+
+    #[test]
+    fn browser_page_drag_keeps_forwarding_clamped_moves_after_leaving_the_image() {
+        let rect = Rect::from_min_size(pos2(100.0, 40.0), vec2(800.0, 600.0));
+        let frame = [1600usize, 1200usize];
+        let outside = pos2(1000.0, 700.0);
+
+        assert_eq!(
+            browser_input_event(
+                &egui::Event::PointerMoved(outside),
+                rect,
+                frame,
+                true,
+                false
+            ),
+            Some(egui::Event::PointerGone),
+            "a focused hover leaving the image still clears page hover state"
+        );
+        assert_eq!(
+            browser_input_event(&egui::Event::PointerMoved(outside), rect, frame, true, true),
+            Some(egui::Event::PointerMoved(pos2(1600.0, 1200.0))),
+            "a captured page drag keeps moving at the clamped frame edge"
         );
     }
 
