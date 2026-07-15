@@ -21,7 +21,8 @@
 set -uo pipefail
 
 POLICY_DIR=/usr/share/magic-mesh/selinux/mde-web-preview
-MODULE=mde-web-preview
+SOURCE_STEM=mde-web-preview
+MODULE=mde_web_preview
 BIN=/usr/bin/mde-web-preview
 
 # 1) SELinux present + not disabled? (selinuxenabled: 0 = Enforcing OR Permissive.)
@@ -30,14 +31,15 @@ if ! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled 2>/dev/null; 
   exit 0
 fi
 
-if [ ! -f "$POLICY_DIR/$MODULE.te" ]; then
+if [ ! -f "$POLICY_DIR/$SOURCE_STEM.te" ]; then
   echo "mde-web-preview SELinux: policy source missing at $POLICY_DIR — skipping"
   exit 0
 fi
 
 WORK="$(mktemp -d /tmp/mde-web-preview-selinux.XXXXXX)" || exit 0
 trap 'rm -rf "$WORK"' EXIT
-cp -f "$POLICY_DIR/$MODULE.te" "$POLICY_DIR/$MODULE.fc" "$WORK/" 2>/dev/null || {
+cp -f "$POLICY_DIR/$SOURCE_STEM.te" "$WORK/$MODULE.te" 2>/dev/null &&
+  cp -f "$POLICY_DIR/$SOURCE_STEM.fc" "$WORK/$MODULE.fc" 2>/dev/null || {
   echo "mde-web-preview SELinux: cannot stage policy source — skipping"; exit 0; }
 
 built=""

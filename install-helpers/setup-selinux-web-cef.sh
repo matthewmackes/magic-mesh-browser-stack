@@ -23,7 +23,8 @@
 set -uo pipefail
 
 POLICY_DIR=/usr/share/magic-mesh/selinux/mde-web-cef
-MODULE=mde-web-cef
+SOURCE_STEM=mde-web-cef
+MODULE=mde_web_cef
 BIN=/usr/bin/mde-web-cef
 RENDERER=/usr/libexec/mackesd/mde-web-cef-renderer
 
@@ -33,14 +34,15 @@ if ! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled 2>/dev/null; 
   exit 0
 fi
 
-if [ ! -f "$POLICY_DIR/$MODULE.te" ]; then
+if [ ! -f "$POLICY_DIR/$SOURCE_STEM.te" ]; then
   echo "mde-web-cef SELinux: policy source missing at $POLICY_DIR — skipping"
   exit 0
 fi
 
 WORK="$(mktemp -d /tmp/mde-web-cef-selinux.XXXXXX)" || exit 0
 trap 'rm -rf "$WORK"' EXIT
-cp -f "$POLICY_DIR/$MODULE.te" "$POLICY_DIR/$MODULE.fc" "$WORK/" 2>/dev/null || {
+cp -f "$POLICY_DIR/$SOURCE_STEM.te" "$WORK/$MODULE.te" 2>/dev/null &&
+  cp -f "$POLICY_DIR/$SOURCE_STEM.fc" "$WORK/$MODULE.fc" 2>/dev/null || {
   echo "mde-web-cef SELinux: cannot stage policy source — skipping"; exit 0; }
 
 built=""
