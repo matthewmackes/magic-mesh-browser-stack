@@ -11,18 +11,14 @@
 //! ## User-presence posture (security-2)
 //!
 //! The authenticator-data User Present (`UP`) bit is set **only** when the
-//! ceremony carried a real presence signal (`PasskeyRequest::user_present`,
-//! populated from a shim-observed user gesture / transient activation) — never
-//! hardcoded. A ceremony with no verified presence honestly signs `UP=0`, which
-//! a relying party rejects, rather than fabricating "a human was here".
-//!
-//! DEFERRED: this presence signal is *page-asserted* (the injected shim runs in
-//! the page's own JS context, so a hostile same-origin page could in principle
-//! forge it for its own `rp_id`). A trustworthy, unforgeable presence gate — a
-//! shell-rendered consent prompt the page cannot script — is intentionally out
-//! of scope for this hardening pass (it is a sizable new UI). Until it lands,
-//! `UP` reflects the best available honest signal (a checked gesture) instead of
-//! a constant, and the shim refuses to auto-dispatch a gesture-less ceremony.
+//! ceremony carried a real presence signal (`PasskeyRequest::user_present`) —
+//! never hardcoded. In the production Browser path, `mde-shell-egui` holds each
+//! page-origin ceremony behind a shell-rendered Approve/Deny prompt and stamps
+//! `user_present=true` only after approval; a denied ceremony never reaches this
+//! worker. A ceremony with no verified presence honestly signs `UP=0`, which a
+//! relying party rejects, rather than fabricating "a human was here". User
+//! Verified (`UV`) remains unset; this is consent/presence, not PIN/biometric
+//! verification.
 
 // arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
 // code; `mackesd` pulls it in only under its own `async-services` feature.
@@ -130,15 +126,15 @@ pub struct PasskeyRequest {
     pub allow_credentials: Vec<String>,
     /// Optional browser-suggested timeout.
     pub timeout_ms: Option<u64>,
-    /// Whether a user-presence step (a real user gesture / transient
-    /// activation, reported by the injected shim) accompanied this ceremony.
+    /// Whether a user-presence step accompanied this ceremony. In the normal
+    /// Browser path this is stamped by the trusted shell after its Approve/Deny
+    /// prompt; older helper/direct-Bus paths may omit it.
     ///
     /// security-2: the authenticator-data User Present (`UP`) bit is set **only**
     /// when this is true, rather than hardcoded. Defaults to `false` when the
     /// producer omits the signal, so an absent/forged-empty request yields an
     /// honest UP=0 (which a relying party rejects) instead of a fabricated
-    /// "human was here". This is a page-asserted signal, not yet an unforgeable
-    /// shell consent prompt — see the module note on the deferred consent UI.
+    /// "human was here". This is consent/presence, not user verification.
     pub user_present: bool,
 }
 
@@ -787,7 +783,7 @@ fn parse_request(body: &str, id: &str) -> Result<PasskeyRequest, String> {
     if timeout_ms.is_some_and(|ms| !(1_000..=600_000).contains(&ms)) {
         return Err("timeout_ms out of range".to_owned());
     }
-    // security-2: presence signal from the shim. Absent => not present.
+    // security-2: presence signal from the Browser shell. Absent => not present.
     let user_present = v
         .get("user_present")
         .and_then(serde_json::Value::as_bool)

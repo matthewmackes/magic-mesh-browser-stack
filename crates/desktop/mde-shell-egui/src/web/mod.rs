@@ -489,6 +489,69 @@ impl std::fmt::Debug for PendingLoginSave {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPasskeyConsent {
+    tab_id: u64,
+    engine: BrowserEngine,
+    handoff_body: String,
+    client_request_id: String,
+    ceremony: String,
+    origin: String,
+    rp_id: String,
+    user_name: Option<String>,
+}
+
+impl PendingPasskeyConsent {
+    fn from_handoff(
+        tab_id: u64,
+        engine: BrowserEngine,
+        handoff_body: String,
+        client_request_id: String,
+    ) -> Result<Self, String> {
+        let v: serde_json::Value = serde_json::from_str(&handoff_body)
+            .map_err(|err| format!("passkey handoff JSON: {err}"))?;
+        let field = |key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("passkey handoff missing {key}"))
+        };
+        let user_name = v
+            .get("user_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let ceremony = field("ceremony")?;
+        let origin = field("origin")?;
+        let rp_id = field("rp_id")?;
+        Ok(Self {
+            tab_id,
+            engine,
+            handoff_body,
+            client_request_id,
+            ceremony,
+            origin,
+            rp_id,
+            user_name,
+        })
+    }
+
+    fn verb(&self) -> &'static str {
+        if self.ceremony == "create" {
+            "create a passkey"
+        } else {
+            "use a passkey"
+        }
+    }
+
+    fn display_origin(&self) -> String {
+        origin_label(&self.origin)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessOutput {
     success: bool,
     stdout: String,
@@ -1497,8 +1560,11 @@ pub(crate) struct WebState {
     /// Last time the Browser scanned passkey completion events.
     passkey_result_last_poll: Option<Instant>,
     /// Helper page request ids waiting for daemon passkey completion, keyed by
-    /// the bridge-minted `client_request_id`.
-    pending_passkey_requests: BTreeMap<String, usize>,
+    /// the bridge-minted `client_request_id` and routed by stable tab id.
+    pending_passkey_requests: BTreeMap<String, u64>,
+    /// A page-origin WebAuthn ceremony waiting for shell approval before the
+    /// daemon can create/sign anything.
+    pending_passkey_consent: Option<PendingPasskeyConsent>,
     /// Last `event/browser-share/<node>` ULID applied by this shell.
     share_result_cursor: Option<String>,
     /// Last time the Browser scanned accepted share route events.
@@ -1726,6 +1792,7 @@ impl Default for WebState {
             passkey_result_cursor: None,
             passkey_result_last_poll: None,
             pending_passkey_requests: BTreeMap::new(),
+            pending_passkey_consent: None,
             share_result_cursor: None,
             share_result_last_poll: None,
             latest_qr_share: None,
@@ -1793,6 +1860,10 @@ impl WebState {
     /// The active tab, if any.
     fn active_tab(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
+    }
+
+    fn tab_index_by_id(&self, tab_id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == tab_id)
     }
 
     /// WIN7-4 — the open-tab count, the SAME `self.tabs` length
@@ -2543,10 +2614,13 @@ impl WebState {
             let Ok(completion) = parse_passkey_completion(body) else {
                 continue;
             };
-            let Some(tab_index) = self
+            let Some(tab_id) = self
                 .pending_passkey_requests
                 .remove(&completion.client_request_id)
             else {
+                continue;
+            };
+            let Some(tab_index) = self.tab_index_by_id(tab_id) else {
                 continue;
             };
             let Some(tab) = self.tabs.get_mut(tab_index) else {
@@ -2819,6 +2893,15 @@ impl WebState {
         {
             self.pending_login_save = None;
         }
+        if self
+            .pending_passkey_consent
+            .as_ref()
+            .is_some_and(|pending| pending.tab_id == closing_tab_id)
+        {
+            self.pending_passkey_consent = None;
+        }
+        self.pending_passkey_requests
+            .retain(|_, tab_id| *tab_id != closing_tab_id);
         if self.tabs.is_empty() {
             self.active = 0;
             self.address.clear();
@@ -4338,25 +4421,107 @@ impl WebState {
         }
     }
 
-    fn handle_passkey_event(&mut self, tab_index: usize, engine: BrowserEngine, body: &str) {
+    fn handle_passkey_event(&mut self, tab_id: u64, engine: BrowserEngine, body: &str) {
         match browser_passkey_body(engine, body) {
             Ok(handoff_body) => {
-                let client_request_id = passkey_client_request_id(body);
-                publish_to_bus(
-                    self.bus_root.as_deref(),
-                    ACTION_BROWSER_PASSKEY,
-                    &handoff_body,
-                );
-                if let Some(client_request_id) = client_request_id {
-                    self.pending_passkey_requests
-                        .insert(client_request_id, tab_index);
+                let Some(client_request_id) = passkey_client_request_id(body) else {
+                    self.capture_notice =
+                        Some("Passkey: ignored helper event (missing request id)".to_owned());
+                    return;
+                };
+                if self.pending_passkey_consent.is_some() {
+                    self.complete_passkey_denial(
+                        tab_id,
+                        &client_request_id,
+                        "Another passkey ceremony is already waiting for approval",
+                    );
+                    self.capture_notice = Some(
+                        "Passkey: blocked duplicate ceremony while approval is pending".to_owned(),
+                    );
+                    return;
                 }
-                self.capture_notice = Some("Passkey: sent ceremony to daemon".to_owned());
+                match PendingPasskeyConsent::from_handoff(
+                    tab_id,
+                    engine,
+                    handoff_body,
+                    client_request_id,
+                ) {
+                    Ok(pending) => {
+                        let notice = format!("Passkey: approval required for {}", pending.rp_id);
+                        self.pending_passkey_consent = Some(pending);
+                        self.capture_notice = Some(notice);
+                    }
+                    Err(err) => {
+                        self.capture_notice =
+                            Some(format!("Passkey: ignored helper event ({err})"));
+                    }
+                }
             }
             Err(err) => {
                 self.capture_notice = Some(format!("Passkey: ignored helper event ({err})"));
             }
         }
+    }
+
+    fn complete_passkey_denial(
+        &mut self,
+        tab_id: u64,
+        client_request_id: &str,
+        reason: &str,
+    ) -> bool {
+        let Some(tab_index) = self.tab_index_by_id(tab_id) else {
+            return false;
+        };
+        let body = browser_passkey_denied_body(client_request_id, reason);
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.session.complete_passkey(body);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn approve_pending_passkey(&mut self) {
+        let Some(pending) = self.pending_passkey_consent.take() else {
+            return;
+        };
+        if self.tab_index_by_id(pending.tab_id).is_none() {
+            self.capture_notice = Some("Passkey: source tab closed".to_owned());
+            return;
+        }
+        match browser_passkey_shell_approved_body(&pending.handoff_body) {
+            Ok(handoff_body) => {
+                publish_to_bus(
+                    self.bus_root.as_deref(),
+                    ACTION_BROWSER_PASSKEY,
+                    &handoff_body,
+                );
+                self.pending_passkey_requests
+                    .insert(pending.client_request_id.clone(), pending.tab_id);
+                self.capture_notice =
+                    Some(format!("Passkey: approved ceremony for {}", pending.rp_id));
+            }
+            Err(err) => {
+                self.complete_passkey_denial(
+                    pending.tab_id,
+                    &pending.client_request_id,
+                    "Passkey ceremony could not be approved",
+                );
+                self.capture_notice = Some(format!("Passkey: approval failed ({err})"));
+            }
+        }
+    }
+
+    fn deny_pending_passkey(&mut self) {
+        let Some(pending) = self.pending_passkey_consent.take() else {
+            return;
+        };
+        self.complete_passkey_denial(
+            pending.tab_id,
+            &pending.client_request_id,
+            "Passkey ceremony denied by user",
+        );
+        self.capture_notice = Some(format!("Passkey: denied ceremony for {}", pending.rp_id));
     }
 
     fn handle_js_dialog_event(&mut self, tab_index: usize, dialog: &JsDialog) {
@@ -5931,7 +6096,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             page_scrape_events.push((event.id, event.body));
         }
         for event in tab.session.drain_passkey_events() {
-            passkey_events.push((idx, tab.engine, event.body));
+            passkey_events.push((tab.id, tab.engine, event.body));
         }
         // window.open / target=_blank the engine cancelled → open as a real tab
         // on the same engine (the popup-producer chain, EventMsg::PopupRequested).
@@ -5972,8 +6137,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     for (id, body) in page_scrape_events {
         state.handle_page_scrape_event(id, body);
     }
-    for (tab_index, engine, body) in passkey_events {
-        state.handle_passkey_event(tab_index, engine, &body);
+    for (tab_id, engine, body) in passkey_events {
+        state.handle_passkey_event(tab_id, engine, &body);
     }
     for (tab_index, dialog) in js_dialog_events {
         state.handle_js_dialog_event(tab_index, &dialog);
@@ -6149,7 +6314,14 @@ fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         .get(active)
         .is_some_and(|t| t.session.is_crashed() || t.session.cert_error().is_some());
     if !interstitial_below {
-        if let Some(prompt) = state.pending_before_unload_prompt() {
+        if let Some(pending) = state.pending_passkey_consent.clone() {
+            let active_tab_id = state.tabs.get(active).map(|tab| tab.id);
+            match passkey_consent_prompt_bar(ui, &pending, active_tab_id) {
+                Some(true) => state.approve_pending_passkey(),
+                Some(false) => state.deny_pending_passkey(),
+                None => {}
+            }
+        } else if let Some(prompt) = state.pending_before_unload_prompt() {
             if let Some(proceed) = before_unload_prompt_bar(ui, &prompt) {
                 state.answer_active_before_unload(prompt.id, proceed);
             }
@@ -10936,6 +11108,66 @@ fn before_unload_primary_label(prompt: &BeforeUnloadDialog) -> &'static str {
     } else {
         "Leave"
     }
+}
+
+fn passkey_consent_prompt_text(
+    pending: &PendingPasskeyConsent,
+    active_tab_id: Option<u64>,
+) -> String {
+    let origin = pending.display_origin();
+    let background = if active_tab_id == Some(pending.tab_id) {
+        ""
+    } else {
+        "Background tab: "
+    };
+    let account = pending
+        .user_name
+        .as_deref()
+        .map(|name| format!(" for {}", ellipsize(name, 48)))
+        .unwrap_or_default();
+    format!(
+        "{background}{origin} wants to {}{} on {} via {}",
+        pending.verb(),
+        account,
+        pending.rp_id,
+        pending.engine.label()
+    )
+}
+
+fn passkey_consent_prompt_bar(
+    ui: &mut egui::Ui,
+    pending: &PendingPasskeyConsent,
+    active_tab_id: Option<u64>,
+) -> Option<bool> {
+    let mut decision = None;
+    egui::Frame::NONE
+        .fill(chrome_ui::prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(passkey_consent_prompt_text(pending, active_tab_id))
+                        .color(chrome_ui::CHROME_TEXT),
+                );
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Approve").color(chrome_ui::CHROME_TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Deny").color(chrome_ui::CHROME_TEXT),
+                    ))
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        });
+    decision
 }
 
 /// Human label for an engine-neutral permission kind (matches
@@ -20297,13 +20529,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_passkey_helper_event_publishes_daemon_handoff() {
+    fn browser_passkey_helper_event_requires_shell_approval_before_daemon_handoff() {
         let bus = tempfile::tempdir().expect("temp bus");
         let (session, helper, _writer) = live_page_session();
         let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
         state.push_session_with_engine(session, BrowserEngine::Cef);
         run_until_texture(&mut state);
         let _ = drain_control_messages(&helper);
+        let tab_id = state.tabs[0].id;
 
         write_helper_event(
             &helper,
@@ -20324,9 +20557,33 @@ mod tests {
 
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Passkey: sent ceremony to daemon")
+            Some("Passkey: approval required for login.example")
+        );
+        let pending = state
+            .pending_passkey_consent
+            .as_ref()
+            .expect("passkey waits for shell approval");
+        assert_eq!(pending.tab_id, tab_id);
+        assert_eq!(pending.client_request_id, "mde-pk-test-2");
+        assert_eq!(pending.rp_id, "login.example");
+        assert_eq!(
+            passkey_consent_prompt_text(pending, Some(tab_id)),
+            "login.example wants to use a passkey on login.example via CEF"
         );
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        assert!(
+            persist
+                .list_since(ACTION_BROWSER_PASSKEY, None)
+                .expect("list passkey actions before approval")
+                .is_empty(),
+            "the daemon must not see a passkey ceremony before shell approval"
+        );
+
+        state.approve_pending_passkey();
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: approved ceremony for login.example")
+        );
         let msgs = persist
             .list_since(ACTION_BROWSER_PASSKEY, None)
             .expect("list passkey actions");
@@ -20341,9 +20598,15 @@ mod tests {
         assert_eq!(v["rp_id"], "login.example");
         assert_eq!(v["client_request_id"], "mde-pk-test-2");
         assert_eq!(v["allow_credentials"][0], "credential_id_123456");
+        assert_eq!(v["shell_consent"], true);
+        assert_eq!(v["presence_source"], "browser_shell_prompt");
+        assert_eq!(
+            v["user_present"], true,
+            "the Browser shell approval click is the user-presence signal"
+        );
         assert_eq!(
             state.pending_passkey_requests.get("mde-pk-test-2"),
-            Some(&0usize)
+            Some(&tab_id)
         );
     }
 
@@ -20370,6 +20633,13 @@ mod tests {
             },
         );
         run_until_texture(&mut state);
+        let tab_id = state.tabs[0].id;
+        state.approve_pending_passkey();
+        assert_eq!(
+            state.pending_passkey_requests.get("mde-pk-test-3"),
+            Some(&tab_id),
+            "the pending route uses the stable source tab id"
+        );
         let _ = drain_control_messages(&helper);
 
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
@@ -20422,6 +20692,131 @@ mod tests {
             !state.pending_passkey_requests.contains_key("mde-pk-test-3"),
             "completion removes the pending route"
         );
+    }
+
+    #[test]
+    fn browser_passkey_denial_rejects_the_page_without_daemon_handoff() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::PasskeyRequest {
+                body: r#"{
+                    "ceremony":"create",
+                    "origin":"https://login.example/register",
+                    "rp_id":"login.example",
+                    "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456",
+                    "client_request_id":"mde-pk-test-deny",
+                    "user_handle_b64url":"user_handle_123456",
+                    "user_name":"MDE User"
+                }"#
+                .to_owned(),
+            },
+        );
+        run_until_texture(&mut state);
+        state.deny_pending_passkey();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        assert!(
+            persist
+                .list_since(ACTION_BROWSER_PASSKEY, None)
+                .expect("list passkey actions")
+                .is_empty(),
+            "denied passkey ceremonies must not reach the daemon"
+        );
+        assert!(state.pending_passkey_consent.is_none());
+        assert!(state.pending_passkey_requests.is_empty());
+        let controls = drain_control_messages(&helper);
+        let Some(mde_web_preview_client::ControlMsg::CompletePasskey { body }) =
+            controls.iter().find(|msg| {
+                matches!(
+                    msg,
+                    mde_web_preview_client::ControlMsg::CompletePasskey { .. }
+                )
+            })
+        else {
+            panic!("expected CompletePasskey denial control, got {controls:?}");
+        };
+        let returned: serde_json::Value = serde_json::from_str(body).expect("denial JSON");
+        assert_eq!(returned["op"], "browser_passkey_denied");
+        assert_eq!(returned["client_request_id"], "mde-pk-test-deny");
+        assert_eq!(returned["error"], "Passkey ceremony denied by user");
+    }
+
+    #[test]
+    fn browser_passkey_duplicate_pending_request_is_denied_without_replacing_prompt() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        run_until_texture(&mut state);
+        let _ = drain_control_messages(&helper);
+
+        for client_request_id in ["mde-pk-first", "mde-pk-second"] {
+            write_helper_event(
+                &helper,
+                &mde_web_preview_client::EventMsg::PasskeyRequest {
+                    body: format!(
+                        r#"{{
+                            "ceremony":"get",
+                            "origin":"https://login.example/auth",
+                            "rp_id":"login.example",
+                            "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456",
+                            "client_request_id":"{client_request_id}"
+                        }}"#
+                    ),
+                },
+            );
+            run_until_texture(&mut state);
+        }
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: blocked duplicate ceremony while approval is pending")
+        );
+        let pending = state
+            .pending_passkey_consent
+            .as_ref()
+            .expect("first request still waits for approval");
+        assert_eq!(pending.client_request_id, "mde-pk-first");
+        let controls = drain_control_messages(&helper);
+        let denial = controls
+            .iter()
+            .find_map(|msg| match msg {
+                mde_web_preview_client::ControlMsg::CompletePasskey { body } => {
+                    Some(serde_json::from_str::<serde_json::Value>(body).expect("denial JSON"))
+                }
+                _ => None,
+            })
+            .expect("second request denied");
+        assert_eq!(denial["client_request_id"], "mde-pk-second");
+        assert_eq!(
+            denial["error"],
+            "Another passkey ceremony is already waiting for approval"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        assert!(
+            persist
+                .list_since(ACTION_BROWSER_PASSKEY, None)
+                .expect("list passkey actions before approval")
+                .is_empty(),
+            "neither request reaches the daemon before approval"
+        );
+        state.approve_pending_passkey();
+        let msgs = persist
+            .list_since(ACTION_BROWSER_PASSKEY, None)
+            .expect("list passkey actions after approval");
+        assert_eq!(msgs.len(), 1);
+        let approved: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("passkey body"))
+                .expect("approved JSON");
+        assert_eq!(approved["client_request_id"], "mde-pk-first");
     }
 
     #[test]

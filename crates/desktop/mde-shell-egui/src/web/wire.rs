@@ -767,6 +767,31 @@ pub(super) fn browser_passkey_body(
     Ok(body.to_string())
 }
 
+pub(super) fn browser_passkey_shell_approved_body(handoff_body: &str) -> Result<String, String> {
+    let mut body: serde_json::Value = serde_json::from_str(handoff_body)
+        .map_err(|err| format!("invalid passkey handoff JSON: {err}"))?;
+    let Some(obj) = body.as_object_mut() else {
+        return Err("passkey handoff is not an object".to_owned());
+    };
+    obj.insert("user_present".to_owned(), serde_json::json!(true));
+    obj.insert("shell_consent".to_owned(), serde_json::json!(true));
+    obj.insert(
+        "presence_source".to_owned(),
+        serde_json::json!("browser_shell_prompt"),
+    );
+    serde_json::to_string(&body).map_err(|err| format!("passkey handoff encode: {err}"))
+}
+
+pub(super) fn browser_passkey_denied_body(client_request_id: &str, reason: &str) -> String {
+    serde_json::json!({
+        "op": "browser_passkey_denied",
+        "source": "browser",
+        "client_request_id": client_request_id.trim(),
+        "error": reason.trim(),
+    })
+    .to_string()
+}
+
 pub(super) fn passkey_client_request_id(helper_body: &str) -> Option<String> {
     let helper: serde_json::Value = serde_json::from_str(helper_body).ok()?;
     optional_trimmed_str(&helper, "client_request_id")
