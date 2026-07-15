@@ -19,8 +19,8 @@ use mde_egui::egui::{
 };
 use mde_egui::{muted_note, ChipTone, Style};
 use mde_web_preview_client::{
-    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, JsDialog,
-    SessionState,
+    confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, EditCommand,
+    JsDialog, SessionState,
 };
 
 use super::{
@@ -1488,6 +1488,72 @@ pub(super) fn paint_omnibox_inline_completion(
         rect.center().y - ghost.size().y / 2.0,
     );
     ui.painter().galley(text_pos, ghost, CHROME_TEXT_DIM);
+}
+
+/// An action chosen from the in-page right-click context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageContextAction {
+    Back,
+    Forward,
+    Reload,
+    Edit(EditCommand),
+}
+
+/// Chrome-owned context menu for the page canvas. The caller applies the returned
+/// action to the active session so the live page/input bridge stays in `web/mod.rs`.
+pub(super) fn page_context_menu(
+    resp: &egui::Response,
+    can_back: bool,
+    can_forward: bool,
+    url: &str,
+) -> Option<PageContextAction> {
+    let mut action = None;
+    resp.context_menu(|ui| {
+        if ui
+            .add_enabled(can_back, egui::Button::new("Back"))
+            .clicked()
+        {
+            action = Some(PageContextAction::Back);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(can_forward, egui::Button::new("Forward"))
+            .clicked()
+        {
+            action = Some(PageContextAction::Forward);
+            ui.close_menu();
+        }
+        if ui.button("Reload").clicked() {
+            action = Some(PageContextAction::Reload);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Cut").clicked() {
+            action = Some(PageContextAction::Edit(EditCommand::Cut));
+            ui.close_menu();
+        }
+        if ui.button("Copy").clicked() {
+            action = Some(PageContextAction::Edit(EditCommand::Copy));
+            ui.close_menu();
+        }
+        if ui.button("Paste").clicked() {
+            action = Some(PageContextAction::Edit(EditCommand::Paste));
+            ui.close_menu();
+        }
+        if ui.button("Select all").clicked() {
+            action = Some(PageContextAction::Edit(EditCommand::SelectAll));
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(!url.is_empty(), egui::Button::new("Copy page URL"))
+            .clicked()
+        {
+            ui.ctx().copy_text(url.to_owned());
+            ui.close_menu();
+        }
+    });
+    action
 }
 
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
