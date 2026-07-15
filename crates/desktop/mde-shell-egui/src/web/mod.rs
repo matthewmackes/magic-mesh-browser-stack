@@ -12231,15 +12231,19 @@ mod tests {
             .collect();
 
         assert!(
+            texts.iter().any(|text| text == "CEF"),
+            "engine picker should expose CEF as a first-class segment: {texts:?}"
+        );
+        assert!(
             texts.iter().any(|text| text == "Chromium"),
-            "engine picker should expose Chromium as a first-class segment: {texts:?}"
+            "engine picker should make the CEF/Chromium relationship visible: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "Servo"),
             "engine picker should keep Servo visible as the fallback segment: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "+ New tab"),
+            texts.iter().any(|text| text == "New tab"),
             "engine picker should use one clear primary new-tab affordance: {texts:?}"
         );
         assert!(
@@ -12259,20 +12263,24 @@ mod tests {
         state.push_session_with_engine(servo, BrowserEngine::Servo);
 
         assert!(
-            chrome_ui::tab_label(&state.tabs[0]).contains("Cr "),
-            "CEF/Chromium tabs should carry a compact Chromium marker"
+            chrome_ui::engine_marker(state.tabs[0].engine) == "CEF",
+            "CEF/Chromium tabs should carry a compact CEF badge marker"
         );
         assert!(
-            chrome_ui::tab_hover(&state.tabs[0]).contains("Engine: Chromium"),
-            "CEF/Chromium hover card should name the engine"
+            chrome_ui::tab_hover(&state.tabs[0]).contains("Engine: CEF / Chromium"),
+            "CEF/Chromium hover card should name the engine stack"
         );
         assert!(
-            chrome_ui::tab_label(&state.tabs[1]).contains("Sv "),
-            "Servo tabs should carry a compact Servo marker"
+            chrome_ui::engine_marker(state.tabs[1].engine) == "Sv",
+            "Servo tabs should carry a compact Servo badge marker"
         );
         assert!(
             chrome_ui::tab_hover(&state.tabs[1]).contains("Engine: Servo"),
             "Servo hover card should name the engine"
+        );
+        assert!(
+            !chrome_ui::tab_label(&state.tabs[0]).contains("CEF"),
+            "the tab title should not repeat the engine now that the badge owns it"
         );
     }
 

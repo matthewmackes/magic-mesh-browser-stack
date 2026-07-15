@@ -86,10 +86,12 @@ const STATE_HOVER_ALPHA: u8 = 20;
 const STATE_FOCUS_ALPHA: u8 = 26;
 const STATE_PRESSED_ALPHA: u8 = 26;
 const CHROME_TAB_RADIUS: f32 = 8.0;
-const ENGINE_NEW_TAB_W: f32 = 86.0;
-const ENGINE_SEGMENT_W: f32 = 92.0;
-const ENGINE_CONTROL_H: f32 = 24.0;
-const ENGINE_SEGMENT_RADIUS: f32 = 10.0;
+const TAB_ENGINE_BADGE_W: f32 = 28.0;
+const TAB_ENGINE_BADGE_H: f32 = 13.0;
+const ENGINE_NEW_TAB_W: f32 = 104.0;
+const ENGINE_SEGMENT_W: f32 = 112.0;
+const ENGINE_CONTROL_H: f32 = 30.0;
+const ENGINE_SEGMENT_RADIUS: f32 = 12.0;
 const ACTION_BUTTON_RADIUS: f32 = 8.0;
 
 /// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
@@ -196,15 +198,29 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
 
 pub(super) const fn engine_display_name(engine: BrowserEngine) -> &'static str {
     match engine {
-        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Cef => "CEF / Chromium",
         BrowserEngine::Servo => "Servo",
     }
 }
 
 pub(super) const fn engine_marker(engine: BrowserEngine) -> &'static str {
     match engine {
-        BrowserEngine::Cef => "Cr",
+        BrowserEngine::Cef => "CEF",
         BrowserEngine::Servo => "Sv",
+    }
+}
+
+pub(super) const fn engine_primary_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "CEF",
+        BrowserEngine::Servo => "Servo",
+    }
+}
+
+pub(super) const fn engine_supporting_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Rust engine",
     }
 }
 
@@ -233,6 +249,10 @@ pub(super) const fn engine_new_tab_fill(engine: BrowserEngine) -> Color32 {
     engine_accent(engine)
 }
 
+pub(super) const fn engine_new_tab_text() -> &'static str {
+    "New tab"
+}
+
 pub(super) const fn engine_segment_fill(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
     if matches!(
         (engine, selected),
@@ -252,6 +272,20 @@ pub(super) const fn engine_segment_text(engine: BrowserEngine, selected: Browser
         engine_on_container(engine)
     } else {
         CHROME_TEXT
+    }
+}
+
+pub(super) const fn engine_segment_supporting_text(
+    engine: BrowserEngine,
+    selected: BrowserEngine,
+) -> Color32 {
+    if matches!(
+        (engine, selected),
+        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
+    ) {
+        engine_on_container(engine)
+    } else {
+        CHROME_TEXT_DIM
     }
 }
 
@@ -442,30 +476,58 @@ pub(super) fn tab_pill_sized(
     // `click_and_drag` keeps activation, middle-click close, and drag-reorder on
     // the same browser-tab affordance while egui handles the click/drag threshold.
     let response = ui.add(
-        egui::Button::new(
-            egui::RichText::new(label)
-                .size(CHROME_FONT)
-                .color(tab_text(active)),
-        )
-        .fill(tab_fill(active))
-        .stroke(egui::Stroke::new(1.0, tab_stroke(active)))
-        .corner_radius(CHROME_TAB_RADIUS)
-        .min_size(egui::vec2(width, CHROME_TAB_H))
-        .sense(egui::Sense::click_and_drag()),
+        egui::Button::new("")
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(CHROME_TAB_RADIUS)
+            .min_size(egui::vec2(width, CHROME_TAB_H))
+            .sense(egui::Sense::click_and_drag()),
     );
     let accent = engine_accent(engine);
     let r = response.rect;
-    let indicator = if active {
-        egui::Rect::from_min_max(
-            egui::pos2(r.left() + 7.0, r.top()),
-            egui::pos2(r.right() - 7.0, r.top() + 2.0),
-        )
+    let pressed = response.is_pointer_button_down_on();
+    let fill = if active {
+        if pressed {
+            state_layer(CHROME_TOOLBAR, accent, STATE_PRESSED_ALPHA)
+        } else if response.hovered() {
+            state_layer(CHROME_TOOLBAR, accent, STATE_HOVER_ALPHA)
+        } else {
+            CHROME_TOOLBAR
+        }
+    } else if pressed {
+        state_layer(CHROME_SURFACE_CONTAINER, CHROME_TEXT, STATE_PRESSED_ALPHA)
+    } else if response.hovered() {
+        state_layer(CHROME_SURFACE_CONTAINER, accent, STATE_HOVER_ALPHA)
     } else {
-        egui::Rect::from_min_max(
-            egui::pos2(r.left() + 7.0, r.top()),
-            egui::pos2((r.left() + 25.0).min(r.right() - 7.0), r.top() + 2.0),
-        )
+        CHROME_SURFACE_CONTAINER
     };
+
+    ui.painter().rect(
+        r,
+        CHROME_TAB_RADIUS,
+        fill,
+        egui::Stroke::new(
+            if active { 1.25 } else { 1.0 },
+            if active || response.hovered() {
+                state_layer(CHROME_OUTLINE, accent, 96)
+            } else {
+                tab_stroke(active)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    let indicator = egui::Rect::from_min_max(
+        egui::pos2(r.left() + 6.0, r.bottom() - 2.0),
+        egui::pos2(
+            if active {
+                r.right() - 6.0
+            } else {
+                (r.left() + 22.0).min(r.right() - 6.0)
+            },
+            r.bottom(),
+        ),
+    );
     ui.painter().rect_filled(
         indicator,
         1.0,
@@ -475,6 +537,58 @@ pub(super) fn tab_pill_sized(
             accent.gamma_multiply(0.55)
         },
     );
+
+    if r.width() >= TAB_ENGINE_BADGE_W + 18.0 {
+        let badge = egui::Rect::from_center_size(
+            egui::pos2(r.left() + 5.0 + TAB_ENGINE_BADGE_W / 2.0, r.center().y),
+            egui::vec2(TAB_ENGINE_BADGE_W, TAB_ENGINE_BADGE_H),
+        );
+        let badge_fill = if active {
+            engine_container(engine)
+        } else {
+            state_layer(CHROME_TOOLBAR, accent, 32)
+        };
+        ui.painter().rect(
+            badge,
+            TAB_ENGINE_BADGE_H / 2.0,
+            badge_fill,
+            egui::Stroke::new(1.0, accent.gamma_multiply(if active { 0.8 } else { 0.5 })),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            engine_marker(engine),
+            font_id(CHROME_FONT - 1.5),
+            if active {
+                engine_on_container(engine)
+            } else {
+                accent
+            },
+        );
+
+        let text_left = badge.right() + 5.0;
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, r.top()),
+            egui::pos2(r.right() - 7.0, r.bottom()),
+        );
+        let label_chars = (text_rect.width() / 5.8).floor() as usize;
+        if label_chars > 1 && !label.is_empty() {
+            let label = ellipsize(label, label_chars);
+            ui.painter().with_clip_rect(text_rect).text(
+                egui::pos2(text_left, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font_id(CHROME_FONT),
+                tab_text(active),
+            );
+        }
+    } else {
+        ui.painter()
+            .circle_filled(r.center(), (r.width() * 0.18).clamp(2.0, 4.0), accent);
+    }
+
+    mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
     response
 }
 
@@ -637,9 +751,8 @@ pub(super) fn tab_label(tab: &Tab) -> String {
     let user_scripts = if tab.user_scripts { "S " } else { "" };
     let user_agent = tab.user_agent.marker();
     let device_profile = tab.device_profile.marker();
-    let engine = engine_marker(tab.engine);
     format!(
-        "{state} {engine} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
+        "{state} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
         ellipsize(base, 24)
     )
 }
@@ -878,18 +991,54 @@ pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, ve
 }
 
 fn engine_new_tab_button(ui: &mut egui::Ui, engine: BrowserEngine, width: f32) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new("+ New tab")
-                .size(CHROME_FONT)
-                .color(CHROME_TOOLBAR),
-        )
-        .fill(engine_new_tab_fill(engine))
-        .stroke(egui::Stroke::new(1.0, engine_accent(engine)))
-        .corner_radius(ENGINE_SEGMENT_RADIUS)
-        .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
-    )
-    .on_hover_text(format!("New {} tab", engine_display_name(engine)))
+    let response = ui.add(
+        egui::Button::new("")
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(ENGINE_SEGMENT_RADIUS)
+            .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
+    );
+    let r = response.rect;
+    let accent = engine_new_tab_fill(engine);
+    let fill = if response.is_pointer_button_down_on() {
+        state_layer(accent, CHROME_TEXT, STATE_PRESSED_ALPHA)
+    } else if response.hovered() {
+        state_layer(accent, CHROME_TOOLBAR, STATE_HOVER_ALPHA)
+    } else {
+        accent
+    };
+    ui.painter().rect(
+        r,
+        ENGINE_SEGMENT_RADIUS,
+        fill,
+        egui::Stroke::new(1.0, accent),
+        egui::StrokeKind::Inside,
+    );
+
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(r.left() + 15.0, r.center().y),
+        egui::vec2(16.0, 16.0),
+    );
+    ui.painter()
+        .circle_filled(glyph.center(), 8.0, Color32::from_white_alpha(44));
+    ui.painter().text(
+        glyph.center(),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        font_id(CHROME_FONT + 3.0),
+        CHROME_TOOLBAR,
+    );
+    ui.painter()
+        .with_clip_rect(r.shrink2(egui::vec2(4.0, 0.0)))
+        .text(
+            egui::pos2(glyph.right() + 6.0, r.center().y),
+            egui::Align2::LEFT_CENTER,
+            engine_new_tab_text(),
+            font_id(CHROME_FONT + 0.5),
+            CHROME_TOOLBAR,
+        );
+    mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
+    response.on_hover_text(format!("New {} tab", engine_display_name(engine)))
 }
 
 fn engine_segment_button(
@@ -900,25 +1049,82 @@ fn engine_segment_button(
 ) -> egui::Response {
     let is_selected = engine == selected;
     let response = ui.add(
-        egui::Button::new(
-            egui::RichText::new(engine_display_name(engine))
-                .size(CHROME_FONT)
-                .color(engine_segment_text(engine, selected)),
-        )
-        .fill(engine_segment_fill(engine, selected))
-        .stroke(egui::Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            engine_segment_stroke(engine, selected),
-        ))
-        .corner_radius(ENGINE_SEGMENT_RADIUS)
-        .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
+        egui::Button::new("")
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(ENGINE_SEGMENT_RADIUS)
+            .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
     );
     let r = response.rect;
-    let rail = egui::Rect::from_min_max(
-        egui::pos2(r.left() + 4.0, r.top() + 5.0),
-        egui::pos2(r.left() + 7.0, r.bottom() - 5.0),
+    let accent = engine_accent(engine);
+    let base_fill = engine_segment_fill(engine, selected);
+    let fill = if response.is_pointer_button_down_on() {
+        state_layer(base_fill, CHROME_TEXT, STATE_PRESSED_ALPHA)
+    } else if response.hovered() && !is_selected {
+        state_layer(base_fill, accent, STATE_HOVER_ALPHA)
+    } else {
+        base_fill
+    };
+    ui.painter().rect(
+        r,
+        ENGINE_SEGMENT_RADIUS,
+        fill,
+        egui::Stroke::new(
+            if is_selected { 1.5 } else { 1.0 },
+            engine_segment_stroke(engine, selected),
+        ),
+        egui::StrokeKind::Inside,
     );
-    ui.painter().rect_filled(rail, 1.5, engine_accent(engine));
+
+    let marker = egui::Rect::from_center_size(
+        egui::pos2(r.left() + 18.0, r.center().y),
+        egui::vec2(28.0, 18.0),
+    );
+    ui.painter().rect_filled(
+        marker,
+        9.0,
+        if is_selected {
+            accent
+        } else {
+            state_layer(CHROME_TOOLBAR, accent, 40)
+        },
+    );
+    ui.painter().text(
+        marker.center(),
+        egui::Align2::CENTER_CENTER,
+        engine_marker(engine),
+        font_id(CHROME_FONT - 2.0),
+        if is_selected { CHROME_TOOLBAR } else { accent },
+    );
+
+    let text_left = marker.right() + 7.0;
+    let clip = egui::Rect::from_min_max(
+        egui::pos2(text_left, r.top()),
+        egui::pos2(r.right() - 6.0, r.bottom()),
+    );
+    let painter = ui.painter().with_clip_rect(clip);
+    painter.text(
+        egui::pos2(text_left, r.top() + 8.0),
+        egui::Align2::LEFT_CENTER,
+        engine_primary_label(engine),
+        font_id(CHROME_FONT + 0.5),
+        engine_segment_text(engine, selected),
+    );
+    painter.text(
+        egui::pos2(text_left, r.bottom() - 8.0),
+        egui::Align2::LEFT_CENTER,
+        engine_supporting_label(engine),
+        font_id(CHROME_FONT - 2.0),
+        engine_segment_supporting_text(engine, selected),
+    );
+    if is_selected {
+        let underline = egui::Rect::from_min_max(
+            egui::pos2(r.left() + 10.0, r.bottom() - 2.0),
+            egui::pos2(r.right() - 10.0, r.bottom()),
+        );
+        ui.painter().rect_filled(underline, 1.0, accent);
+    }
+    mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
     response.on_hover_text(format!(
         "Use {} for future Browser tabs",
         engine_display_name(engine)
@@ -4077,9 +4283,13 @@ mod tests {
 
     #[test]
     fn engine_selector_uses_browser_local_labels_and_state() {
-        assert_eq!(engine_display_name(BrowserEngine::Cef), "Chromium");
-        assert_eq!(engine_marker(BrowserEngine::Cef), "Cr");
+        assert_eq!(engine_display_name(BrowserEngine::Cef), "CEF / Chromium");
+        assert_eq!(engine_primary_label(BrowserEngine::Cef), "CEF");
+        assert_eq!(engine_supporting_label(BrowserEngine::Cef), "Chromium");
+        assert_eq!(engine_marker(BrowserEngine::Cef), "CEF");
         assert_eq!(engine_display_name(BrowserEngine::Servo), "Servo");
+        assert_eq!(engine_primary_label(BrowserEngine::Servo), "Servo");
+        assert_eq!(engine_supporting_label(BrowserEngine::Servo), "Rust engine");
         assert_eq!(engine_marker(BrowserEngine::Servo), "Sv");
         assert_eq!(
             engine_segment_fill(BrowserEngine::Cef, BrowserEngine::Cef),
@@ -4119,6 +4329,7 @@ mod tests {
         );
         assert_eq!(engine_new_tab_fill(BrowserEngine::Cef), CHROME_PRIMARY);
         assert_eq!(engine_new_tab_fill(BrowserEngine::Servo), CHROME_SUCCESS);
+        assert_eq!(engine_new_tab_text(), "New tab");
     }
 
     #[test]
