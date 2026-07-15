@@ -5996,85 +5996,6 @@ fn helper_env_for(engine: BrowserEngine, power_mode: bool) -> Vec<(String, Strin
     ]
 }
 
-/// The browser-reserved tab accelerators (Chrome's tab-strip keyboard UX),
-/// live only while the Browser surface is painted — this runs from
-/// [`web_panel`].
-///
-/// Every match CONSUMES the key from this frame's input, so a reserved
-/// shortcut never leaks into chrome widgets or the page-canvas forwarding at
-/// the bottom of the frame (`paint_body` clones `i.events` after this ran) —
-/// the same reservation Chrome makes for Ctrl+T/W. Page-canvas keyboard focus
-/// deliberately does NOT pause these: tab management stays reachable while
-/// page typing is forwarded.
-///
-/// Tab-opening/closing accelerators (Ctrl+T / Ctrl+W / Ctrl+Shift+T) pause
-/// while a chrome text field (omnibox / find bar / dashboard search) owned
-/// keyboard focus on the last painted frame — closing the tab out of an
-/// in-progress edit would surprise, and egui's own TextEdit binds Ctrl+W as
-/// delete-previous-word, which the pause preserves. Tab CYCLING
-/// (Ctrl+Tab / Ctrl+digit) stays
-/// live during edits, exactly like desktop browsers — and deliberately so:
-/// egui's own focus traversal walks widget focus on Tab presses, so a cycling
-/// shortcut gated on text focus could dead-end itself once that walk reaches
-/// the omnibox.
-fn handle_tab_keyboard(ctx: &egui::Context, state: &mut WebState) {
-    const CTRL: egui::Modifiers = egui::Modifiers::CTRL;
-    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
-    // F11 toggles immersive/fullscreen mode; Esc leaves it. Handled before the
-    // edit-focus gate so the immersive view is always escapable, even mid-typing.
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
-        state.fullscreen = !state.fullscreen;
-    }
-    if state.fullscreen
-        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-    {
-        state.fullscreen = false;
-    }
-    // ORDER MATTERS: `consume_key` matches modifiers logically (an EXTRA
-    // Shift is ignored — egui's documented behaviour), so the Ctrl+Shift
-    // variants must be consumed before their plain-Ctrl counterparts or
-    // Ctrl+Shift+T would trigger "new tab" instead of "reopen".
-    if !state.chrome_edit_focus {
-        if ctx.input_mut(|i| i.consume_key(CTRL_SHIFT, egui::Key::T)) {
-            state.restore_closed_tab();
-        }
-        if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::T)) {
-            state.request_new_tab(state.engine);
-        }
-        if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::W)) {
-            state.close_tab(state.active);
-        }
-    }
-    if ctx.input_mut(|i| i.consume_key(CTRL_SHIFT, egui::Key::Tab)) {
-        state.select_prev_tab();
-    }
-    if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::Tab)) {
-        state.select_next_tab();
-    }
-    // Ctrl+1..Ctrl+8 activate the Nth tab (out-of-range is ignored by
-    // `select_tab`); Ctrl+9 activates the LAST tab — the Chrome convention.
-    const DIGITS: [egui::Key; 8] = [
-        egui::Key::Num1,
-        egui::Key::Num2,
-        egui::Key::Num3,
-        egui::Key::Num4,
-        egui::Key::Num5,
-        egui::Key::Num6,
-        egui::Key::Num7,
-        egui::Key::Num8,
-    ];
-    for (nth, key) in DIGITS.into_iter().enumerate() {
-        if ctx.input_mut(|i| i.consume_key(CTRL, key)) {
-            state.select_tab(nth);
-        }
-    }
-    if ctx.input_mut(|i| i.consume_key(CTRL, egui::Key::Num9)) {
-        if let Some(last) = state.tabs.len().checked_sub(1) {
-            state.select_tab(last);
-        }
-    }
-}
-
 /// Render the Browser surface into `ui`: poll every tab, upload any fresh frame on
 /// the active tab, draw the navigation chrome, and paint the body (or the honest
 /// crashed / loading / gated states).
@@ -6082,7 +6003,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     // Tab-strip keyboard UX: consume the browser-reserved shortcuts FIRST so
     // neither chrome widgets nor the page-canvas forwarding in `paint_body`
     // ever see them.
-    handle_tab_keyboard(ui.ctx(), state);
+    chrome_ui::handle_tab_keyboard(ui.ctx(), state);
     state.poll_suggestions();
     state.poll_downloads();
     state.poll_incoming_send_tabs();
