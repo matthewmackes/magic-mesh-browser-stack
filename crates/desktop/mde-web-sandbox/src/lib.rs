@@ -64,8 +64,10 @@
 //! cgroup limit strings, the rootfs bind plan) are unit-tested here, and the
 //! privileged `apply` sequence performs the real syscalls at helper startup.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -141,11 +143,21 @@ impl SandboxPolicy {
         format!("{} {}", self.cpu_quota_us, self.cpu_period_us)
     }
 
-    /// The private tmpfs rootfs mountpoint for this policy (keyed on `hostname`
-    /// so two engines never share a rootfs path).
+    /// The stable prefix for this policy's private tmpfs rootfs mountpoints
+    /// (keyed on `hostname` so two engines never share a rootfs namespace).
     #[must_use]
-    pub fn rootfs_path(&self) -> PathBuf {
+    pub fn rootfs_path_prefix(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/.mde-{}-root", self.hostname))
+    }
+
+    /// The actual per-launch rootfs mountpoint. It is intentionally unique per
+    /// helper launch so a killed verifier or crashed browser cannot poison the
+    /// next process by leaving a stale fixed `/tmp/.mde-web-*-root` path behind.
+    #[must_use]
+    pub fn rootfs_path_for_run(&self, host_pid: u32, run_id: u128) -> PathBuf {
+        let mut path: OsString = self.rootfs_path_prefix().into_os_string();
+        path.push(format!("-{host_pid}-{run_id}"));
+        PathBuf::from(path)
     }
 }
 
@@ -367,6 +379,7 @@ pub fn apply_with_binds(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf])
     // exception must name the writer's OWN parent-ns id. Read them here.
     let uid = Uid::current().as_raw();
     let gid = Gid::current().as_raw();
+    let rootfs_path = policy.rootfs_path_for_run(std::process::id(), rootfs_run_id());
 
     // 3. new user + mount + IPC + UTS + cgroup + PID namespaces (NOT network).
     unshare(
@@ -409,7 +422,7 @@ pub fn apply_with_binds(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf])
     }
 
     // 6. read-only rootfs + tmpfs (incl. a fresh procfs), then pivot into it.
-    build_rootfs(policy, extra_readonly_binds).context("rootfs")?;
+    build_rootfs(policy, &rootfs_path, extra_readonly_binds).context("rootfs")?;
 
     // 7. generic hostname (UTS namespace).
     sethostname(policy.hostname).context("sethostname")?;
@@ -555,11 +568,22 @@ fn current_cgroup_path() -> Result<String> {
     Ok(path)
 }
 
+fn rootfs_run_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 /// Build the fresh tmpfs root, bind the read-only runtime (+ any caller-named
 /// extra read-only paths) into it, and `pivot_root` so it becomes `/`.
-fn build_rootfs(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf]) -> Result<()> {
-    let newroot = policy.rootfs_path();
-    let newroot = newroot.as_path();
+fn build_rootfs(
+    policy: SandboxPolicy,
+    rootfs_path: &Path,
+    extra_readonly_binds: &[PathBuf],
+) -> Result<()> {
+    validate_rootfs_mountpoint(policy, rootfs_path)?;
+    let newroot = rootfs_path;
 
     // Make all existing mounts private so our changes don't propagate out.
     mount(
@@ -571,8 +595,11 @@ fn build_rootfs(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf]) -> Resu
     )
     .context("make-rprivate /")?;
 
-    // A fresh tmpfs as the new root.
-    std::fs::create_dir_all(newroot)?;
+    // A fresh tmpfs as the new root. The mountpoint is unique per launch; if it
+    // somehow already exists, fail with a contextual collision instead of reusing
+    // a stale root that may have been left by a killed verifier.
+    std::fs::create_dir(newroot)
+        .with_context(|| format!("create rootfs mountpoint {}", newroot.display()))?;
     mount(
         Some("tmpfs"),
         newroot,
@@ -644,6 +671,34 @@ fn build_rootfs(policy: SandboxPolicy, extra_readonly_binds: &[PathBuf]) -> Resu
     umount2("/oldroot", MntFlags::MNT_DETACH).context("detach oldroot")?;
     // Best-effort tidy of the now-empty mountpoint.
     let _ = std::fs::remove_dir("/oldroot");
+    Ok(())
+}
+
+fn validate_rootfs_mountpoint(policy: SandboxPolicy, path: &Path) -> Result<()> {
+    let prefix = policy.rootfs_path_prefix();
+    let expected_parent = prefix
+        .parent()
+        .context("rootfs prefix must have a parent")?;
+    anyhow::ensure!(
+        path.parent() == Some(expected_parent),
+        "rootfs mountpoint must stay under {}",
+        expected_parent.display()
+    );
+
+    let expected_name = prefix
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("rootfs prefix must be valid utf-8")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("rootfs mountpoint must be valid utf-8")?;
+    anyhow::ensure!(
+        name.starts_with(&format!("{expected_name}-")),
+        "rootfs mountpoint {} does not match policy prefix {}",
+        path.display(),
+        prefix.display()
+    );
     Ok(())
 }
 
@@ -851,13 +906,38 @@ mod tests {
         );
         assert_eq!(p.cgroup_cpu_max(), "200000 100000");
         assert_eq!(p.hostname, "web-cef");
-        // Distinct, non-colliding rootfs path from the Servo helper's.
-        assert_eq!(p.rootfs_path(), PathBuf::from("/tmp/.mde-web-cef-root"));
-        assert_ne!(p.rootfs_path(), SandboxPolicy::tab().rootfs_path());
+        // Distinct, non-colliding rootfs path prefix from the Servo helper's.
         assert_eq!(
-            SandboxPolicy::tab().rootfs_path(),
+            p.rootfs_path_prefix(),
+            PathBuf::from("/tmp/.mde-web-cef-root")
+        );
+        assert_ne!(
+            p.rootfs_path_prefix(),
+            SandboxPolicy::tab().rootfs_path_prefix()
+        );
+        assert_eq!(
+            SandboxPolicy::tab().rootfs_path_prefix(),
             PathBuf::from("/tmp/.mde-web-preview-root")
         );
+        assert_eq!(
+            p.rootfs_path_for_run(123, 456),
+            PathBuf::from("/tmp/.mde-web-cef-root-123-456")
+        );
+        assert_eq!(
+            SandboxPolicy::tab().rootfs_path_for_run(123, 456),
+            PathBuf::from("/tmp/.mde-web-preview-root-123-456")
+        );
+    }
+
+    #[test]
+    fn rootfs_mountpoint_validation_rejects_cross_policy_or_out_of_tmp_paths() {
+        let p = SandboxPolicy::web_cef();
+        validate_rootfs_mountpoint(p, &p.rootfs_path_for_run(77, 88))
+            .expect("policy-owned rootfs path accepted");
+        validate_rootfs_mountpoint(p, Path::new("/tmp/.mde-web-preview-root-77-88"))
+            .expect_err("wrong engine prefix rejected");
+        validate_rootfs_mountpoint(p, Path::new("/var/tmp/.mde-web-cef-root-77-88"))
+            .expect_err("rootfs path outside /tmp rejected");
     }
 
     #[test]

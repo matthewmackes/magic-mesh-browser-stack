@@ -12205,6 +12205,10 @@ mod tests {
             "engine picker should show the selected engine as action context: {texts:?}"
         );
         assert!(
+            texts.iter().any(|text| text == "Default"),
+            "engine picker should mark the future-tab default engine: {texts:?}"
+        );
+        assert!(
             texts.iter().any(|text| text.contains("0 tabs")),
             "engine picker should expose per-engine tab counts before any tab is opened: {texts:?}"
         );
@@ -12224,8 +12228,8 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New CEF tab"),
-            "engine picker should make the CEF primary action explicit: {texts:?}"
+            texts.iter().any(|text| text == "New tab"),
+            "engine picker should keep the primary action clean for CEF: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "CEF / Chromium"),
@@ -12241,8 +12245,8 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New Servo tab"),
-            "engine picker should make the Servo primary action explicit: {texts:?}"
+            texts.iter().any(|text| text == "New tab"),
+            "engine picker should keep the primary action clean for Servo: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "Servo"),
