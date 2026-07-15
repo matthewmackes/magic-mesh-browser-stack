@@ -1329,6 +1329,167 @@ pub(super) fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: boo
     .clicked()
 }
 
+/// Chrome/Edge-style trust signal for the omnibox's leading security chip,
+/// derived purely from a URL's scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SecurityLevel {
+    /// `https://` — a lock glyph, neutral tone.
+    Secure,
+    /// `http://` — a "Not secure" glyph/tone.
+    NotSecure,
+    /// `mesh://` and mesh-hosted services — trusted overlay.
+    Mesh,
+    /// `about:` / blank / new-tab / any other scheme.
+    Neutral,
+}
+
+impl SecurityLevel {
+    pub(super) const fn glyph(self) -> &'static str {
+        match self {
+            Self::Secure => "\u{1F512}",
+            Self::NotSecure => "\u{26A0}",
+            Self::Mesh => "\u{1F6E1}",
+            Self::Neutral => "\u{1F50E}",
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Secure => "Secure connection (HTTPS)",
+            Self::NotSecure => "Not secure \u{2014} plain HTTP",
+            Self::Mesh => "Mesh \u{2014} trusted overlay connection",
+            Self::Neutral => "No connection security to report",
+        }
+    }
+
+    pub(super) const fn tone(self) -> ChipTone {
+        match self {
+            Self::Secure | Self::Neutral => ChipTone::Neutral,
+            Self::NotSecure => ChipTone::Warn,
+            Self::Mesh => ChipTone::Info,
+        }
+    }
+}
+
+/// A short-list of common two-level public suffixes for the omnibox's eTLD+1
+/// heuristic. This is deliberately not a vendored Public Suffix List.
+const OMNIBOX_TWO_LEVEL_SUFFIXES: &[&str] = &["co.uk", "com.au", "co.jp", "org.uk"];
+
+/// Chrome-style display breakdown of a URL for the unfocused omnibox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OmniboxDisplay {
+    pub(super) scheme_shown: Option<String>,
+    pub(super) host: String,
+    pub(super) host_emphasis: Range<usize>,
+    pub(super) rest: String,
+    pub(super) security: SecurityLevel,
+}
+
+fn omnibox_etld1_range(host: &str) -> Range<usize> {
+    if host.is_empty() {
+        return 0..0;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 2 {
+        return 0..host.len();
+    }
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    let take = if OMNIBOX_TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) {
+        3
+    } else {
+        2
+    }
+    .min(labels.len());
+    let start_label = labels.len() - take;
+    let start: usize = labels[..start_label].iter().map(|l| l.len() + 1).sum();
+    start..host.len()
+}
+
+pub(super) fn omnibox_display(url: &str) -> OmniboxDisplay {
+    let trimmed = url.trim();
+    let (scheme_shown, security, after_scheme) =
+        if let Some(rest) = trimmed.strip_prefix("https://") {
+            (None, SecurityLevel::Secure, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("http://") {
+            (Some("http://"), SecurityLevel::NotSecure, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("mesh://") {
+            (Some("mesh://"), SecurityLevel::Mesh, rest)
+        } else {
+            return OmniboxDisplay {
+                scheme_shown: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+                host: String::new(),
+                host_emphasis: 0..0,
+                rest: String::new(),
+                security: SecurityLevel::Neutral,
+            };
+        };
+
+    let split_at = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (host_part, rest) = after_scheme.split_at(split_at);
+    let host = host_part
+        .strip_prefix("www.")
+        .unwrap_or(host_part)
+        .to_owned();
+    let host_emphasis = omnibox_etld1_range(&host);
+
+    OmniboxDisplay {
+        scheme_shown: scheme_shown.map(str::to_owned),
+        host,
+        host_emphasis,
+        rest: rest.to_owned(),
+        security,
+    }
+}
+
+pub(super) fn omnibox_layout_job(url: &str, font_id: egui::FontId) -> egui::text::LayoutJob {
+    let display = omnibox_display(url);
+    let mut job = egui::text::LayoutJob::default();
+    let dim = omnibox_dim_format(font_id.clone());
+    let strong = omnibox_strong_format(font_id);
+    if display.host.is_empty() {
+        if let Some(scheme) = &display.scheme_shown {
+            job.append(scheme, 0.0, dim);
+        }
+        return job;
+    }
+    if let Some(scheme) = &display.scheme_shown {
+        job.append(scheme, 0.0, dim.clone());
+    }
+    let Range { start, end } = display.host_emphasis;
+    if start > 0 {
+        job.append(&display.host[..start], 0.0, dim.clone());
+    }
+    job.append(&display.host[start..end], 0.0, strong);
+    if end < display.host.len() {
+        job.append(&display.host[end..], 0.0, dim.clone());
+    }
+    if !display.rest.is_empty() {
+        job.append(&display.rest, 0.0, dim);
+    }
+    job
+}
+
+pub(super) fn paint_omnibox_inline_completion(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    draft: &str,
+    tail: &str,
+) {
+    if draft.is_empty() || tail.is_empty() {
+        return;
+    }
+    let font_id = font_id(CHROME_FONT);
+    let typed = ui.fonts(|f| f.layout_no_wrap(draft.to_owned(), font_id.clone(), CHROME_TEXT));
+    let ghost = ui.fonts(|f| f.layout_no_wrap(tail.to_owned(), font_id, CHROME_TEXT_DIM));
+    let text_pos = egui::pos2(
+        rect.left() + 4.0 + typed.size().x,
+        rect.center().y - ghost.size().y / 2.0,
+    );
+    ui.painter().galley(text_pos, ghost, CHROME_TEXT_DIM);
+}
+
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
 /// the active session; the address bar loads on submit. On a crashed tab, Reload
 /// becomes a respawn request. The page-actions menu (BOOKMARKS-10) hangs off both
@@ -1557,11 +1718,11 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // editing always shows the full, unmodified draft underneath.
         if has_tab && !crashed && resp.has_focus() {
             if let Some(tail) = state.suggestions.inline_completion_tail() {
-                super::paint_omnibox_inline_completion(ui, resp.rect, &state.address, &tail);
+                paint_omnibox_inline_completion(ui, resp.rect, &state.address, &tail);
             }
         } else if has_tab && !crashed && !state.address.trim().is_empty() {
             let font_id = font_id(CHROME_FONT);
-            let job = super::omnibox_layout_job(&state.address, font_id);
+            let job = omnibox_layout_job(&state.address, font_id);
             if !job.is_empty() {
                 let galley = ui.fonts(|f| f.layout_job(job));
                 let bg = ui.visuals().extreme_bg_color;
@@ -1754,20 +1915,20 @@ pub(super) fn page_actions_button(
     .on_hover_text(tip);
 }
 
-/// SECURITY-INFO — the plain-language headline for a [`super::SecurityLevel`].
-pub(super) const fn security_headline(level: super::SecurityLevel) -> &'static str {
+/// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`].
+pub(super) const fn security_headline(level: SecurityLevel) -> &'static str {
     match level {
-        super::SecurityLevel::Secure => "Connection is secure",
-        super::SecurityLevel::NotSecure => "Your connection to this site is not secure",
-        super::SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
-        super::SecurityLevel::Neutral => "About this page",
+        SecurityLevel::Secure => "Connection is secure",
+        SecurityLevel::NotSecure => "Your connection to this site is not secure",
+        SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
+        SecurityLevel::Neutral => "About this page",
     }
 }
 
 /// SECURITY-INFO — the [`site_info_panel`]'s content, derived from the current
 /// page URL.
 pub(super) struct SiteInfoSummary {
-    pub(super) security: super::SecurityLevel,
+    pub(super) security: SecurityLevel,
     pub(super) headline: &'static str,
     pub(super) host: String,
     pub(super) host_emphasis: Range<usize>,
@@ -1904,8 +2065,8 @@ pub(super) fn site_info_permission_summary(state: &WebState) -> Option<SiteInfoP
 }
 
 pub(super) fn site_info_summary(page_url: &str) -> SiteInfoSummary {
-    let display = super::omnibox_display(page_url);
-    let cert_line = matches!(display.security, super::SecurityLevel::Secure)
+    let display = omnibox_display(page_url);
+    let cert_line = matches!(display.security, SecurityLevel::Secure)
         .then_some("Certificate: valid \u{2014} the connection is encrypted");
     let confusable = confusable_warning(&display.host);
     SiteInfoSummary {
@@ -2163,7 +2324,7 @@ pub(super) fn security_chip(
     recent_resources: &[mde_web_preview_client::ResourceRequestStatus],
     permissions: Option<&SiteInfoPermissionSummary>,
 ) {
-    let security = super::omnibox_display(page_url).security;
+    let security = omnibox_display(page_url).security;
     let popup_id = security_chip_popup_id();
     let resp = ui
         .add(
