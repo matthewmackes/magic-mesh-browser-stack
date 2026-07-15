@@ -7,6 +7,7 @@
 //! tab dashboard.
 
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
+use mde_egui::ChipTone;
 
 /// Chrome's UI face is Roboto; this slice pins the browser chrome onto egui's
 /// proportional family until the actual Roboto font asset is embedded.
@@ -22,6 +23,9 @@ pub(super) const CHROME_ON_PRIMARY_CONTAINER: Color32 = Color32::from_rgb(4, 30,
 pub(super) const CHROME_OUTLINE: Color32 = Color32::from_rgb(218, 220, 224);
 pub(super) const CHROME_TEXT: Color32 = Color32::from_rgb(32, 33, 36);
 pub(super) const CHROME_TEXT_DIM: Color32 = Color32::from_rgb(95, 99, 104);
+pub(super) const CHROME_SUCCESS: Color32 = Color32::from_rgb(20, 108, 46);
+pub(super) const CHROME_WARN: Color32 = Color32::from_rgb(177, 91, 0);
+pub(super) const CHROME_ERROR: Color32 = Color32::from_rgb(179, 38, 30);
 
 const STATE_HOVER_ALPHA: u8 = 20;
 const STATE_FOCUS_ALPHA: u8 = 26;
@@ -80,6 +84,19 @@ pub(super) const fn menu_item_fill(selected: bool) -> Color32 {
         CHROME_PRIMARY_CONTAINER
     } else {
         CHROME_TOOLBAR
+    }
+}
+
+pub(super) const fn prompt_fill() -> Color32 {
+    CHROME_PRIMARY_CONTAINER
+}
+
+pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
+    match tone {
+        ChipTone::Ok => CHROME_SUCCESS,
+        ChipTone::Warn | ChipTone::Danger => CHROME_WARN,
+        ChipTone::Info => CHROME_PRIMARY,
+        ChipTone::Neutral => CHROME_TEXT_DIM,
     }
 }
 
@@ -166,5 +183,6 @@ mod tests {
         assert_eq!(tab_text(false), CHROME_TEXT_DIM);
         assert_eq!(row_fill(true), CHROME_PRIMARY_CONTAINER);
         assert_eq!(selected_text(true), CHROME_ON_PRIMARY_CONTAINER);
+        assert_eq!(tone_color(ChipTone::Warn), CHROME_WARN);
     }
 }

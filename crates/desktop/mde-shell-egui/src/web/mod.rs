@@ -10458,12 +10458,12 @@ fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
         || notice.starts_with("PDF viewer failed:")
         || notice.starts_with("Print failed:")
     {
-        Style::DANGER
+        chrome_ui::CHROME_ERROR
     } else {
-        Style::ACCENT
+        chrome_ui::CHROME_PRIMARY
     };
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -10960,22 +10960,26 @@ fn permission_kind_label(kind: u8) -> &'static str {
 fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
     let mut decision = None;
     egui::Frame::NONE
-        .fill(Style::SURFACE_HI)
+        .fill(chrome_ui::prompt_fill())
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!("{origin} wants to {}", permission_kind_label(kind)))
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 if ui
-                    .add(egui::Button::new(RichText::new("Allow").color(Style::TEXT)))
+                    .add(egui::Button::new(
+                        RichText::new("Allow").color(chrome_ui::CHROME_TEXT),
+                    ))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("Block").color(Style::TEXT)))
+                    .add(egui::Button::new(
+                        RichText::new("Block").color(chrome_ui::CHROME_TEXT),
+                    ))
                     .clicked()
                 {
                     decision = Some(false);
@@ -10990,21 +10994,26 @@ fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bo
 fn before_unload_prompt_bar(ui: &mut egui::Ui, prompt: &BeforeUnloadDialog) -> Option<bool> {
     let mut decision = None;
     egui::Frame::NONE
-        .fill(Style::SURFACE_HI)
+        .fill(chrome_ui::prompt_fill())
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(before_unload_prompt_text(prompt)).color(Style::TEXT));
+                ui.label(
+                    RichText::new(before_unload_prompt_text(prompt)).color(chrome_ui::CHROME_TEXT),
+                );
                 if ui
                     .add(egui::Button::new(
-                        RichText::new(before_unload_primary_label(prompt)).color(Style::TEXT),
+                        RichText::new(before_unload_primary_label(prompt))
+                            .color(chrome_ui::CHROME_TEXT),
                     ))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("Stay").color(Style::TEXT)))
+                    .add(egui::Button::new(
+                        RichText::new("Stay").color(chrome_ui::CHROME_TEXT),
+                    ))
                     .clicked()
                 {
                     decision = Some(false);
@@ -11019,23 +11028,25 @@ fn before_unload_prompt_bar(ui: &mut egui::Ui, prompt: &BeforeUnloadDialog) -> O
 fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &str) -> Option<bool> {
     let mut decision = None;
     egui::Frame::NONE
-        .fill(Style::SURFACE_HI)
+        .fill(chrome_ui::prompt_fill())
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(format!("Save login for {host} ({username})?"))
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 if ui
-                    .add(egui::Button::new(RichText::new("Save").color(Style::TEXT)))
+                    .add(egui::Button::new(
+                        RichText::new("Save").color(chrome_ui::CHROME_TEXT),
+                    ))
                     .clicked()
                 {
                     decision = Some(true);
                 }
                 if ui
                     .add(egui::Button::new(
-                        RichText::new("Not now").color(Style::TEXT),
+                        RichText::new("Not now").color(chrome_ui::CHROME_TEXT),
                     ))
                     .clicked()
                 {
@@ -11092,19 +11103,19 @@ fn cached_offline_body(
     unavailable_reason: Option<&str>,
 ) {
     egui::Frame::NONE
-        .fill(Style::SURFACE)
+        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Offline copy")
                         .size(Style::HEADING)
-                        .color(Style::TEXT),
+                        .color(chrome_ui::CHROME_TEXT),
                 );
                 ui.label(
                     RichText::new(result.cache_id.chars().take(12).collect::<String>())
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -11124,7 +11135,7 @@ fn cached_offline_body(
                 ui.label(
                     RichText::new(format!("Live page unavailable: {reason}"))
                         .size(Style::SMALL)
-                        .color(Style::WARN),
+                        .color(chrome_ui::CHROME_WARN),
                 );
             }
             ui.add_space(Style::SP_XS);
@@ -11137,7 +11148,7 @@ fn cached_offline_body(
                 ui.label(
                     RichText::new(page)
                         .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
+                        .color(chrome_ui::CHROME_TEXT_DIM),
                 );
                 ui.label(
                     RichText::new(format!(
@@ -11146,7 +11157,7 @@ fn cached_offline_body(
                         result.engine.label()
                     ))
                     .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                    .color(chrome_ui::CHROME_TEXT_DIM),
                 );
             });
             ui.add_space(Style::SP_S);
@@ -11156,7 +11167,7 @@ fn cached_offline_body(
                     ui.label(
                         RichText::new(result.text.as_str())
                             .size(Style::SMALL)
-                            .color(Style::TEXT),
+                            .color(chrome_ui::CHROME_TEXT),
                     );
                 });
         });
@@ -11169,7 +11180,7 @@ fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
         ui.label(
             RichText::new("Sandboxed browser")
                 .size(Style::HEADING)
-                .color(Style::TEXT),
+                .color(chrome_ui::CHROME_TEXT),
         );
         ui.add_space(Style::SP_S);
         muted_note(
