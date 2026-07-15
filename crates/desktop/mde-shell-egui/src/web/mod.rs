@@ -6725,8 +6725,8 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         close = Some(idx);
                     }
                 }
-                engine_new_tab_buttons(ui, state, false);
-                tab_search_menu(ui, state);
+                chrome_ui::engine_new_tab_buttons(ui, state, false);
+                chrome_ui::tab_search_menu(ui, state);
             });
         });
 
@@ -7022,8 +7022,8 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             }
                         });
                     }
-                    engine_new_tab_buttons(ui, state, true);
-                    tab_search_menu(ui, state);
+                    chrome_ui::engine_new_tab_buttons(ui, state, true);
+                    chrome_ui::tab_search_menu(ui, state);
                 });
         });
 
@@ -7082,121 +7082,6 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.close_tab(idx);
     } else if let Some(idx) = select {
         state.select_tab(idx);
-    }
-}
-
-/// Case-insensitive match of `query` against each tab's title AND committed URL;
-/// returns the matching tab indices in strip order. An empty/blank query matches
-/// everything (the full list). Pure — the tab-search dropdown and its test share it.
-fn matching_tab_indices(tabs: &[Tab], query: &str) -> Vec<usize> {
-    let q = query.trim().to_ascii_lowercase();
-    tabs.iter()
-        .enumerate()
-        .filter(|(_, tab)| {
-            q.is_empty()
-                || tab.session.title().to_ascii_lowercase().contains(&q)
-                || tab.session.nav().url.to_ascii_lowercase().contains(&q)
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// A one-line label for a tab-search result row: the page title, falling back to
-/// the URL, then "New tab" — no state dot (the dropdown is a chooser, not the strip).
-fn tab_search_row_label(tab: &Tab) -> String {
-    let title = tab.session.title().trim();
-    if !title.is_empty() {
-        return ellipsize(title, 48);
-    }
-    let url = tab.session.nav().url.trim();
-    if url.is_empty() {
-        "New tab".to_owned()
-    } else {
-        ellipsize(url, 48)
-    }
-}
-
-/// The tab-search dropdown (Chrome's "Search tabs" ⌄): a 🔍 menu button opening a
-/// live-filtered, clickable list of every open tab. Selecting a row activates that
-/// tab and clears the query. Pure list logic lives in [`matching_tab_indices`].
-fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
-    let mut select: Option<usize> = None;
-    ui.menu_button(
-        RichText::new("\u{1F50D}") // 🔍
-            .size(CHROME_FONT)
-            .color(chrome_ui::CHROME_TEXT_DIM),
-        |ui| {
-            ui.set_min_width(300.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut state.tab_search_query)
-                    .hint_text("Search tabs")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.separator();
-            let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    if matches.is_empty() {
-                        ui.weak("No matching tabs");
-                    }
-                    for idx in matches {
-                        let active = idx == state.active;
-                        let label = tab_search_row_label(&state.tabs[idx]);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(label)
-                                        .size(CHROME_FONT)
-                                        .color(chrome_ui::selected_text(active)),
-                                )
-                                .fill(chrome_ui::row_fill(active))
-                                .min_size(egui::vec2(288.0, CHROME_TAB_H)),
-                            )
-                            .clicked()
-                        {
-                            select = Some(idx);
-                            ui.close_menu();
-                        }
-                    }
-                });
-        },
-    )
-    .response
-    .on_hover_text("Search tabs");
-    if let Some(idx) = select {
-        state.select_tab(idx);
-        state.tab_search_query.clear();
-    }
-}
-
-fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: bool) {
-    let mut button = |ui: &mut egui::Ui, engine: BrowserEngine| {
-        let label = format!("+{}", engine.label());
-        let mut widget = egui::Button::new(
-            RichText::new(label)
-                .size(CHROME_FONT)
-                .color(chrome_ui::CHROME_TEXT),
-        )
-        .fill(chrome_ui::control_fill(false))
-        .min_size(egui::vec2(CHROME_NEW_TAB_W, CHROME_TAB_H));
-        if vertical {
-            widget = widget.min_size(egui::vec2(ui.available_width(), CHROME_TAB_H));
-        }
-        if ui
-            .add(widget)
-            .on_hover_text(format!("New {} tab", engine.label()))
-            .clicked()
-        {
-            state.request_new_tab(engine);
-        }
-    };
-    if vertical {
-        button(ui, BrowserEngine::Servo);
-        button(ui, BrowserEngine::Cef);
-    } else {
-        button(ui, BrowserEngine::Servo);
-        button(ui, BrowserEngine::Cef);
     }
 }
 
@@ -14372,12 +14257,21 @@ mod tests {
         }
 
         // Empty query → the full list.
-        assert_eq!(matching_tab_indices(&state.tabs, ""), vec![0, 1, 2]);
+        assert_eq!(
+            chrome_ui::matching_tab_indices(&state.tabs, ""),
+            vec![0, 1, 2]
+        );
         // A URL-substring match, case-insensitive.
-        assert_eq!(matching_tab_indices(&state.tabs, "mail"), vec![1]);
-        assert_eq!(matching_tab_indices(&state.tabs, "MAPS"), vec![2]);
+        assert_eq!(
+            chrome_ui::matching_tab_indices(&state.tabs, "mail"),
+            vec![1]
+        );
+        assert_eq!(
+            chrome_ui::matching_tab_indices(&state.tabs, "MAPS"),
+            vec![2]
+        );
         // No match → empty.
-        assert!(matching_tab_indices(&state.tabs, "zzz").is_empty());
+        assert!(chrome_ui::matching_tab_indices(&state.tabs, "zzz").is_empty());
     }
 
     #[test]

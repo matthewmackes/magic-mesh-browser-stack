@@ -11,6 +11,8 @@ use std::sync::Arc;
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
 use mde_egui::ChipTone;
 
+use super::{ellipsize, BrowserEngine, Tab, WebState, CHROME_FONT, CHROME_NEW_TAB_W, CHROME_TAB_H};
+
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
 /// shared font installer. Keeping it named, not proportional, preserves Inter as
 /// the shell-wide prose face while Browser gets its Material/Chrome exception.
@@ -196,6 +198,113 @@ fn apply_visuals(ui: &mut egui::Ui) {
     visuals.selection.bg_fill =
         state_layer(CHROME_PRIMARY_CONTAINER, CHROME_PRIMARY, STATE_FOCUS_ALPHA);
     visuals.selection.stroke.color = CHROME_ON_PRIMARY_CONTAINER;
+}
+
+/// Case-insensitive match of `query` against each tab's title AND committed URL;
+/// returns the matching tab indices in strip order. An empty/blank query matches
+/// everything. Pure so the tab-search dropdown and tests share one rule.
+pub(super) fn matching_tab_indices(tabs: &[Tab], query: &str) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, tab)| {
+            q.is_empty()
+                || tab.session.title().to_ascii_lowercase().contains(&q)
+                || tab.session.nav().url.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A one-line label for a tab-search result row: page title, URL, then "New tab".
+fn tab_search_row_label(tab: &Tab) -> String {
+    let title = tab.session.title().trim();
+    if !title.is_empty() {
+        return ellipsize(title, 48);
+    }
+    let url = tab.session.nav().url.trim();
+    if url.is_empty() {
+        "New tab".to_owned()
+    } else {
+        ellipsize(url, 48)
+    }
+}
+
+/// Chrome's "Search tabs" dropdown: live-filtered, clickable tab chooser.
+pub(super) fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
+    let mut select: Option<usize> = None;
+    ui.menu_button(
+        egui::RichText::new("\u{1F50D}") // 🔍
+            .size(CHROME_FONT)
+            .color(CHROME_TEXT_DIM),
+        |ui| {
+            ui.set_min_width(300.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut state.tab_search_query)
+                    .hint_text("Search tabs")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.separator();
+            let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if matches.is_empty() {
+                        ui.weak("No matching tabs");
+                    }
+                    for idx in matches {
+                        let active = idx == state.active;
+                        let label = tab_search_row_label(&state.tabs[idx]);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .size(CHROME_FONT)
+                                        .color(selected_text(active)),
+                                )
+                                .fill(row_fill(active))
+                                .min_size(egui::vec2(288.0, CHROME_TAB_H)),
+                            )
+                            .clicked()
+                        {
+                            select = Some(idx);
+                            ui.close_menu();
+                        }
+                    }
+                });
+        },
+    )
+    .response
+    .on_hover_text("Search tabs");
+    if let Some(idx) = select {
+        state.select_tab(idx);
+        state.tab_search_query.clear();
+    }
+}
+
+pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: bool) {
+    let mut button = |ui: &mut egui::Ui, engine: BrowserEngine| {
+        let label = format!("+{}", engine.label());
+        let mut widget = egui::Button::new(
+            egui::RichText::new(label)
+                .size(CHROME_FONT)
+                .color(CHROME_TEXT),
+        )
+        .fill(control_fill(false))
+        .min_size(egui::vec2(CHROME_NEW_TAB_W, CHROME_TAB_H));
+        if vertical {
+            widget = widget.min_size(egui::vec2(ui.available_width(), CHROME_TAB_H));
+        }
+        if ui
+            .add(widget)
+            .on_hover_text(format!("New {} tab", engine.label()))
+            .clicked()
+        {
+            state.request_new_tab(engine);
+        }
+    };
+    button(ui, BrowserEngine::Servo);
+    button(ui, BrowserEngine::Cef);
 }
 
 #[cfg(test)]
