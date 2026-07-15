@@ -7,8 +7,8 @@
 //! [`egui::ColorImage`]. This panel uploads that image to a `TextureHandle` on a
 //! paint-ready (never a per-frame re-upload), paints it as the body, wires the
 //! navigation chrome (back / forward / reload / address bar, §4 tokens) to the
-//! control socket, and forwards this frame's egui input scaled by
-//! `pixels_per_point`.
+//! control socket, maps page pointer positions into frame device pixels, and
+//! forwards page-owned keyboard/text/wheel input over the helper control socket.
 //!
 //! ```text
 //!   session.take_frame() ─▶ ColorImage ─▶ TextureHandle ─▶ ui paints the body
@@ -24376,7 +24376,7 @@ mod tests {
 
     #[cfg(feature = "live-helper")]
     #[test]
-    fn cef_live_browser_ui_renders_a_real_site_when_farm_smoke_is_enabled() {
+    fn cef_live_browser_ui_renders_and_operates_a_real_page_when_farm_smoke_is_enabled() {
         let _env = browser_env_lock();
         if std::env::var_os("MDE_CEF_LIVE_UI_SMOKE").is_none() {
             return;
@@ -24429,6 +24429,22 @@ mod tests {
             server.hits() > 0,
             "CEF did not fetch the live smoke page at {url}"
         );
+        assert!(
+            wait_for_live_title_contains(&mut state, "mde-browser-ui-p0-k0-t_", 200),
+            "CEF live Browser UI smoke did not observe the input-probe page title"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        drive_live_page_input_from_shell_ui(&ctx, &mut state);
+        assert!(
+            wait_for_live_title_contains(&mut state, "mde-browser-ui-p1-k1-tm", 200),
+            "CEF live Browser UI smoke did not observe pointer/key/text response through the shell panel"
+        );
+        assert!(
+            wait_for_live_page_text_contains(&mut state, "P:1 K:1 T:m", 200),
+            "CEF live Browser UI smoke did not read the final page input state over the helper wire"
+        );
 
         if let Some(public_url) = std::env::var("MDE_CEF_LIVE_UI_PUBLIC_URL")
             .ok()
@@ -24446,6 +24462,93 @@ mod tests {
                 "CEF did not render the public Browser UI smoke URL: {public_url}"
             );
         }
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn drive_live_page_input_from_shell_ui(ctx: &egui::Context, state: &mut WebState) {
+        let page_point = pos2(480.0, 420.0);
+        let modifiers = egui::Modifiers::default();
+        let mut click_input = body_input();
+        click_input.events = vec![
+            egui::Event::PointerMoved(page_point),
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            },
+            egui::Event::PointerButton {
+                pos: page_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            },
+        ];
+        assert!(
+            run_panel_on_ctx(ctx, state, click_input),
+            "live Browser UI smoke click frame produced no egui output"
+        );
+        assert!(
+            state.tabs[state.active].page_focused,
+            "clicking the live page canvas must latch Browser page focus"
+        );
+
+        let mut text_input = body_input();
+        text_input.events = vec![
+            egui::Event::Key {
+                key: egui::Key::M,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Text("m".to_owned()),
+            egui::Event::Key {
+                key: egui::Key::M,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ];
+        assert!(
+            run_panel_on_ctx(ctx, state, text_input),
+            "live Browser UI smoke text frame produced no egui output"
+        );
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn wait_for_live_title_contains(state: &mut WebState, needle: &str, frames: usize) -> bool {
+        for _ in 0..frames {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                tab.session.poll();
+                if tab.session.title().contains(needle) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn wait_for_live_page_text_contains(state: &mut WebState, needle: &str, frames: usize) -> bool {
+        let request_id = 0xCE_F1;
+        if let Some(tab) = state.tabs.get_mut(state.active) {
+            tab.session.request_page_text(request_id, 2048);
+        }
+        for _ in 0..frames {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                tab.session.poll();
+                for event in tab.session.drain_page_text_events() {
+                    if event.id == request_id && event.text.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[cfg(feature = "live-helper")]
@@ -24506,7 +24609,7 @@ mod tests {
             let server_hits = Arc::clone(&hits);
             let server_done = Arc::clone(&done);
             let handle = std::thread::spawn(move || {
-                let body = b"<!doctype html><html><body><h1>CEF Browser UI live smoke</h1><p>real HTTP page</p></body></html>";
+                let body = LIVE_BROWSER_INPUT_SMOKE_HTML.as_bytes();
                 while !server_done.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
@@ -24540,6 +24643,53 @@ mod tests {
             self.hits.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
+
+    #[cfg(feature = "live-helper")]
+    const LIVE_BROWSER_INPUT_SMOKE_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>mde-browser-ui-p0-k0-t_</title>
+<style>
+html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-serif}
+#probe{position:absolute;left:32px;top:48px;width:360px;height:128px}
+#typed{position:absolute;left:40px;top:64px;width:240px;height:36px;font:18px sans-serif}
+#status{position:absolute;left:40px;top:112px}
+</style>
+<div id="probe">
+  <h1>CEF Browser UI live smoke</h1>
+  <input id="typed" autocomplete="off" value="" aria-label="Browser UI smoke input">
+  <div id="status">P:0 K:0 T:_</div>
+</div>
+<script>
+(function(){
+  var state={p:0,k:0,t:"_"};
+  var typed=document.getElementById("typed");
+  var status=document.getElementById("status");
+  function render(){
+    document.title="mde-browser-ui-p"+state.p+"-k"+state.k+"-t"+state.t;
+    status.textContent="P:"+state.p+" K:"+state.k+" T:"+state.t;
+  }
+  function focusInput(){ try { typed.focus(); } catch(_e) {} }
+  document.addEventListener("pointerdown",function(){ state.p=1; focusInput(); render(); },true);
+  document.addEventListener("mousedown",function(){ state.p=1; focusInput(); render(); },true);
+  document.addEventListener("keydown",function(e){
+    if (e && e.key && e.key.toLowerCase && e.key.toLowerCase()==="m") state.k=1;
+    render();
+  },true);
+  document.addEventListener("keypress",function(e){
+    if (e && e.key && e.key.length===1) state.t=e.key.toLowerCase();
+    render();
+  },true);
+  typed.addEventListener("input",function(){
+    var value=typed.value || "";
+    state.t=(value.slice(-1) || "_").toLowerCase();
+    render();
+  },true);
+  window.addEventListener("load",function(){ focusInput(); render(); },true);
+  focusInput();
+  render();
+})();
+</script>
+"#;
 
     #[cfg(feature = "live-helper")]
     impl Drop for LiveHttpServer {
