@@ -29,7 +29,7 @@ use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
 use mde_editor_egui::spell::{self, SpellMiss};
 use mde_egui::egui::{self, RichText, Sense, TextureHandle, TextureOptions};
-use mde_egui::{muted_note, ChipTone, Style};
+use mde_egui::{ChipTone, Style};
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
     TransferVerb, TransfersClient,
@@ -8039,7 +8039,7 @@ impl SuggestionState {
         let mut v: Vec<String> = self.bookmarks.iter().map(|b| b.url.clone()).collect();
         v.extend(self.history.iter().cloned());
         v.extend(
-            dedup_search_items(&self.items, &self.history)
+            chrome_ui::dedup_search_items(&self.items, &self.history)
                 .into_iter()
                 .cloned(),
         );
@@ -9345,109 +9345,6 @@ const fn download_state_color(state: TransferState) -> egui::Color32 {
         TransferState::Paused => Style::WARN,
         TransferState::Queued | TransferState::Running => Style::TEXT_DIM,
     }
-}
-
-/// Omnibox search `items` with any entry that duplicates a history hit removed
-/// (a history-matched URL is already shown once, above, by
-/// [`suggestions_panel`] — Chrome-style history-then-search ordering with no
-/// repeats). Pure and paint-free so it's directly unit-testable.
-fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a String> {
-    items.iter().filter(|s| !history.contains(s)).collect()
-}
-
-fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
-    let history = &state.suggestions.history;
-    let bookmarks = &state.suggestions.bookmarks;
-    let search_items = dedup_search_items(&state.suggestions.items, history);
-    if bookmarks.is_empty()
-        && history.is_empty()
-        && search_items.is_empty()
-        && state.suggestions.notice.is_none()
-    {
-        return None;
-    }
-    let mut accepted = None;
-    // Flat render index tracking the keyboard highlight ([`SuggestionState::selected`])
-    // across the bookmark → history → search sections, so a highlighted row gets an
-    // accent fill and Up/Down move visibly.
-    let selected = state.suggestions.selected;
-    let mut idx = 0usize;
-    let fill_for = |idx: usize| {
-        if Some(idx) == selected {
-            chrome_ui::row_fill(true)
-        } else {
-            chrome_ui::row_fill(false)
-        }
-    };
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(Style::SP_XL * 4.0);
-        if !bookmarks.is_empty() {
-            muted_note(ui, "Bookmarks");
-            for bm in bookmarks {
-                let clicked = ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(format!("\u{2605} {}", ellipsize(&bm.title, 32)))
-                                .size(CHROME_FONT)
-                                .color(chrome_ui::CHROME_PRIMARY),
-                        )
-                        .fill(fill_for(idx))
-                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                    )
-                    .on_hover_text(format!("Bookmark: {}", bm.url))
-                    .clicked();
-                if clicked {
-                    accepted = Some(bm.url.clone());
-                }
-                idx += 1;
-            }
-        }
-        if !history.is_empty() {
-            muted_note(ui, "History");
-            for url in history {
-                let clicked = ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(ellipsize(url, 36))
-                                .size(CHROME_FONT)
-                                .color(chrome_ui::CHROME_TEXT),
-                        )
-                        .fill(fill_for(idx))
-                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                    )
-                    .on_hover_text(format!("Visited: {url}"))
-                    .clicked();
-                if clicked {
-                    accepted = Some(url.clone());
-                }
-                idx += 1;
-            }
-        }
-        for suggestion in search_items {
-            let clicked = ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(ellipsize(suggestion, 36))
-                            .size(CHROME_FONT)
-                            .color(chrome_ui::CHROME_TEXT),
-                    )
-                    .fill(fill_for(idx))
-                    .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                )
-                .on_hover_text(format!("Search for {suggestion}"))
-                .clicked();
-            if clicked {
-                accepted = Some(suggestion.clone());
-            }
-            idx += 1;
-        }
-        if state.suggestions.items.is_empty() && history.is_empty() {
-            if let Some(notice) = state.suggestions.notice.as_deref() {
-                muted_note(ui, notice);
-            }
-        }
-    });
-    accepted
 }
 
 fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
@@ -21104,7 +21001,7 @@ mod tests {
         ];
         let history = vec!["https://example.com/mesh".to_owned()];
 
-        let deduped: Vec<String> = dedup_search_items(&items, &history)
+        let deduped: Vec<String> = chrome_ui::dedup_search_items(&items, &history)
             .into_iter()
             .cloned()
             .collect();

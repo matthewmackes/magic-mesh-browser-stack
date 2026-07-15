@@ -917,11 +917,114 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         super::menubar::apply(ui.ctx(), state, action);
     }
     if has_tab && !crashed {
-        accepted_suggestion = super::suggestions_panel(ui, state);
+        accepted_suggestion = suggestions_panel(ui, state);
     }
     if let Some(suggestion) = accepted_suggestion {
         state.accept_suggestion(suggestion);
     }
+}
+
+/// Omnibox search `items` with any entry that duplicates a history hit removed
+/// (a history-matched URL is already shown once, above, by
+/// [`suggestions_panel`] — Chrome-style history-then-search ordering with no
+/// repeats). Pure and paint-free so it's directly unit-testable.
+pub(super) fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a String> {
+    items.iter().filter(|s| !history.contains(s)).collect()
+}
+
+pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
+    let history = &state.suggestions.history;
+    let bookmarks = &state.suggestions.bookmarks;
+    let search_items = dedup_search_items(&state.suggestions.items, history);
+    if bookmarks.is_empty()
+        && history.is_empty()
+        && search_items.is_empty()
+        && state.suggestions.notice.is_none()
+    {
+        return None;
+    }
+    let mut accepted = None;
+    // Flat render index tracking the keyboard highlight ([`SuggestionState::selected`])
+    // across the bookmark → history → search sections, so a highlighted row gets an
+    // accent fill and Up/Down move visibly.
+    let selected = state.suggestions.selected;
+    let mut idx = 0usize;
+    let fill_for = |idx: usize| {
+        if Some(idx) == selected {
+            row_fill(true)
+        } else {
+            row_fill(false)
+        }
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(Style::SP_XL * 4.0);
+        if !bookmarks.is_empty() {
+            muted_note(ui, "Bookmarks");
+            for bm in bookmarks {
+                let clicked = ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("\u{2605} {}", ellipsize(&bm.title, 32)))
+                                .size(CHROME_FONT)
+                                .color(CHROME_PRIMARY),
+                        )
+                        .fill(fill_for(idx))
+                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
+                    )
+                    .on_hover_text(format!("Bookmark: {}", bm.url))
+                    .clicked();
+                if clicked {
+                    accepted = Some(bm.url.clone());
+                }
+                idx += 1;
+            }
+        }
+        if !history.is_empty() {
+            muted_note(ui, "History");
+            for url in history {
+                let clicked = ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(ellipsize(url, 36))
+                                .size(CHROME_FONT)
+                                .color(CHROME_TEXT),
+                        )
+                        .fill(fill_for(idx))
+                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
+                    )
+                    .on_hover_text(format!("Visited: {url}"))
+                    .clicked();
+                if clicked {
+                    accepted = Some(url.clone());
+                }
+                idx += 1;
+            }
+        }
+        for suggestion in search_items {
+            let clicked = ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(ellipsize(suggestion, 36))
+                            .size(CHROME_FONT)
+                            .color(CHROME_TEXT),
+                    )
+                    .fill(fill_for(idx))
+                    .min_size(egui::vec2(96.0, CHROME_BUTTON)),
+                )
+                .on_hover_text(format!("Search for {suggestion}"))
+                .clicked();
+            if clicked {
+                accepted = Some(suggestion.clone());
+            }
+            idx += 1;
+        }
+        if state.suggestions.items.is_empty() && history.is_empty() {
+            if let Some(notice) = state.suggestions.notice.as_deref() {
+                muted_note(ui, notice);
+            }
+        }
+    });
+    accepted
 }
 
 /// How many of `total` fixed-width bookmark buttons fit on the single bar row of
