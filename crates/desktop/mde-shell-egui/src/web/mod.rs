@@ -598,16 +598,6 @@ const STATE_BOOKMARKS_COLLECTION: &str = "state/bookmarks/collection";
 /// The bookmark collection is a persisted+synced store, not per-frame chatter, so
 /// the bar mirror re-reads on a relaxed cadence (an explicit user act adds one).
 const BOOKMARKS_COLLECTION_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
-/// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
-const BOOKMARK_BTN_W: f32 = 132.0;
-/// The width reserved for the ">>" overflow menu button when the row can't hold
-/// every bookmark.
-const BOOKMARK_OVERFLOW_W: f32 = 26.0;
-/// The elision budget for a bookmark button's title (fits inside [`BOOKMARK_BTN_W`]
-/// at [`CHROME_FONT`]); the full title rides the hover tooltip.
-const BOOKMARK_TITLE_CHARS: usize = 18;
-
 /// One top-level bookmark projected onto the bar: just the display title and its
 /// navigation target. Folded from the daemon [`mde_bookmarks::Collection`]'s
 /// render-ordered roots ([`bookmark_bar_links_from`]); the browser never re-derives
@@ -709,48 +699,6 @@ fn matching_bookmarks(index: &[BookmarkBarLink], draft: &str, cap: usize) -> Vec
 /// Chrome's host-root equivalence without a full URL parse.
 fn bookmark_membership_key(url: &str) -> &str {
     url.strip_suffix('/').unwrap_or(url)
-}
-
-/// How many of `total` fixed-width bookmark buttons fit on the single bar row of
-/// `available` width. When every button fits, the return is `total` (no overflow
-/// slot). Otherwise one `overflow_w`-wide ">>" slot is reserved and the return is
-/// how many buttons precede it (possibly zero on a very narrow bar). Pure so the
-/// overflow split is unit-tested without a GPU.
-fn bookmark_bar_visible_count(
-    total: usize,
-    available: f32,
-    btn_w: f32,
-    gap: f32,
-    overflow_w: f32,
-) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    // Width if every button sits on the row: n buttons with (n-1) inter-button gaps.
-    let all = total as f32 * btn_w + (total.saturating_sub(1)) as f32 * gap;
-    if all <= available {
-        return total;
-    }
-    // They don't all fit: reserve the overflow button (its own leading gap) and
-    // pack as many leading buttons as the remaining width allows.
-    let budget = available - overflow_w - gap;
-    let mut count = 0usize;
-    let mut used = 0.0f32;
-    while count < total {
-        let next = if count == 0 {
-            btn_w
-        } else {
-            used + gap + btn_w
-        };
-        if next > budget {
-            break;
-        }
-        used = next;
-        count += 1;
-    }
-    // At least one bookmark always lands in the overflow menu here, so cap the
-    // visible run at `total - 1` even if rounding would otherwise show them all.
-    count.min(total.saturating_sub(1))
 }
 
 mod userscripts;
@@ -6280,8 +6228,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                     // The navigation chrome (back / forward / reload / address bar),
                     // wired to the active session's control socket.
                     nav_chrome(ui, state);
-                    bookmarks_bar(ui, state);
-                    find_chrome(ui, state);
+                    chrome_ui::bookmarks_bar(ui, state);
+                    chrome_ui::find_chrome(ui, state);
                 });
                 insecure_prompt(ui, state);
                 capture_notice(ui, state);
@@ -6309,8 +6257,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             // The navigation chrome (back / forward / reload / address bar), wired
             // to the active session's control socket.
             nav_chrome(ui, state);
-            bookmarks_bar(ui, state);
-            find_chrome(ui, state);
+            chrome_ui::bookmarks_bar(ui, state);
+            chrome_ui::find_chrome(ui, state);
         });
         insecure_prompt(ui, state);
         capture_notice(ui, state);
@@ -9689,167 +9637,6 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 /// tracked across frames (and driven by the tests).
 fn omnibox_widget_id() -> egui::Id {
     egui::Id::new("browser-omnibox")
-}
-
-/// BOOKMARKS-BAR — the single-row horizontal bookmarks bar below the nav chrome.
-///
-/// Renders the top-level bookmarks mirrored from `state/bookmarks/collection` as
-/// elided-title buttons: a plain click navigates the active tab, a middle-click
-/// opens a new tab. When the row can't hold them all, the tail collapses into a
-/// ">>" overflow menu ([`bookmark_bar_visible_count`] does the exact fixed-width
-/// split). Hidden unless the View → Show Bookmarks Bar toggle is on; when shown
-/// but empty it carries an honest hint rather than a blank strip (§7). Look reads
-/// only from `Style` (no raw colour), matching the sibling chrome rows.
-fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
-    if !state.bookmarks_bar_visible {
-        return;
-    }
-    // Clone the small link row so the click closures can drive `&mut state` after
-    // the layout closure (the find-bar's collect-then-act pattern).
-    let links = state.bookmark_bar_links.clone();
-    // (url, open_in_new_tab) chosen this frame, applied once after the layout.
-    let mut chosen: Option<(String, bool)> = None;
-    egui::Frame::NONE
-        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
-        .inner_margin(egui::Margin::symmetric(4, 2))
-        .show(ui, |ui| {
-            if links.is_empty() {
-                muted_note(
-                    ui,
-                    "No bookmarks yet \u{2014} add one from Bookmarks \u{2192} Add Bookmark",
-                );
-                return;
-            }
-            ui.horizontal(|ui| {
-                let avail = ui.available_width();
-                let visible = bookmark_bar_visible_count(
-                    links.len(),
-                    avail,
-                    BOOKMARK_BTN_W,
-                    CHROME_GAP,
-                    BOOKMARK_OVERFLOW_W,
-                );
-                for link in &links[..visible] {
-                    let resp = ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(ellipsize(&link.title, BOOKMARK_TITLE_CHARS))
-                                    .size(CHROME_FONT)
-                                    .color(chrome_ui::CHROME_TEXT),
-                            )
-                            .fill(chrome_ui::control_fill(false))
-                            .min_size(egui::vec2(BOOKMARK_BTN_W, CHROME_BUTTON)),
-                        )
-                        .on_hover_text(format!("{}\n{}", link.title, link.url));
-                    if resp.clicked() {
-                        chosen = Some((link.url.clone(), false));
-                    } else if resp.middle_clicked() {
-                        chosen = Some((link.url.clone(), true));
-                    }
-                }
-                if visible < links.len() {
-                    ui.menu_button(
-                        RichText::new("\u{00BB}")
-                            .size(CHROME_FONT)
-                            .color(chrome_ui::CHROME_TEXT),
-                        |ui| {
-                            for link in &links[visible..] {
-                                let resp = ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(ellipsize(&link.title, 40))
-                                                .size(CHROME_FONT)
-                                                .color(chrome_ui::CHROME_TEXT),
-                                        )
-                                        .fill(chrome_ui::control_fill(false)),
-                                    )
-                                    .on_hover_text(link.url.clone());
-                                if resp.clicked() {
-                                    chosen = Some((link.url.clone(), false));
-                                    ui.close_menu();
-                                } else if resp.middle_clicked() {
-                                    chosen = Some((link.url.clone(), true));
-                                    ui.close_menu();
-                                }
-                            }
-                        },
-                    )
-                    .response
-                    .on_hover_text("More bookmarks");
-                }
-            });
-        });
-    if let Some((url, new_tab)) = chosen {
-        state.open_bookmark(url, new_tab);
-    }
-}
-
-fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
-    if !state.find_open {
-        return;
-    }
-    let enabled = state.can_drive_page_tools();
-    // The engine's match tally, shown as "active/count" (or "No results"). Read
-    // before the mutable-borrow closure below.
-    let find_tally = (!state.find_query.trim().is_empty())
-        .then(|| state.active_find_result())
-        .flatten();
-    let mut submit_forward = false;
-    let mut submit_backward = false;
-    egui::Frame::NONE
-        .fill(chrome_ui::CHROME_SURFACE_CONTAINER)
-        .inner_margin(egui::Margin::symmetric(4, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Find")
-                        .size(CHROME_FONT)
-                        .color(chrome_ui::CHROME_TEXT_DIM),
-                );
-                let resp = ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut state.find_query)
-                        .desired_width(220.0)
-                        .hint_text("Find in page")
-                        .text_color(chrome_ui::CHROME_TEXT)
-                        .font(egui::TextStyle::Small)
-                        .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
-                );
-                state.chrome_edit_focus |= resp.has_focus();
-                if let Some((active, count)) = find_tally {
-                    let label = if count == 0 {
-                        "No results".to_owned()
-                    } else {
-                        format!("{active}/{count}")
-                    };
-                    ui.label(
-                        RichText::new(label)
-                            .size(CHROME_FONT)
-                            .color(chrome_ui::CHROME_TEXT_DIM),
-                    );
-                }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter && ui.input(|i| i.modifiers.shift) {
-                    submit_backward = true;
-                } else if enter {
-                    submit_forward = true;
-                }
-                if chrome_ui::nav_button(ui, "\u{2191}", "Previous match", enabled) {
-                    submit_backward = true;
-                }
-                if chrome_ui::nav_button(ui, "\u{2193}", "Next match", enabled) {
-                    submit_forward = true;
-                }
-                if chrome_ui::nav_button(ui, "\u{00D7}", "Close find", true) {
-                    state.close_find_bar();
-                }
-            });
-        });
-    if submit_backward {
-        state.submit_find(true);
-    } else if submit_forward {
-        state.submit_find(false);
-    }
 }
 
 fn short_transfer_name(job: &TransferJob) -> String {
@@ -24614,18 +24401,30 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
     fn bookmark_bar_visible_count_reserves_an_overflow_slot() {
         let (btn, gap, over) = (100.0, 2.0, 26.0);
         // Everything fits → no overflow slot, all shown.
-        assert_eq!(bookmark_bar_visible_count(3, 400.0, btn, gap, over), 3);
+        assert_eq!(
+            chrome_ui::bookmark_bar_visible_count(3, 400.0, btn, gap, over),
+            3
+        );
         // Exactly the full-row width still shows them all.
         let exact = 3.0 * btn + 2.0 * gap;
-        assert_eq!(bookmark_bar_visible_count(3, exact, btn, gap, over), 3);
+        assert_eq!(
+            chrome_ui::bookmark_bar_visible_count(3, exact, btn, gap, over),
+            3
+        );
         // Too narrow for all 4 → reserve the ">>" slot and show fewer (< total).
-        let v = bookmark_bar_visible_count(4, exact, btn, gap, over);
+        let v = chrome_ui::bookmark_bar_visible_count(4, exact, btn, gap, over);
         assert!(v < 4, "an overflow split shows fewer than the total");
         assert!(v >= 1, "a comfortable width still shows some buttons");
         // A sliver of width shows none — the whole set lives in the overflow menu.
-        assert_eq!(bookmark_bar_visible_count(4, 20.0, btn, gap, over), 0);
+        assert_eq!(
+            chrome_ui::bookmark_bar_visible_count(4, 20.0, btn, gap, over),
+            0
+        );
         // Empty collection → nothing.
-        assert_eq!(bookmark_bar_visible_count(0, 400.0, btn, gap, over), 0);
+        assert_eq!(
+            chrome_ui::bookmark_bar_visible_count(0, 400.0, btn, gap, over),
+            0
+        );
     }
 
     #[test]
@@ -24723,13 +24522,13 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
         // row and the rest live behind the ">>" menu. Assert the split via the pure
         // fit fn on the same fixed geometry the renderer uses.
         let total = 40usize;
-        let narrow = 3.0 * BOOKMARK_BTN_W; // room for only a couple buttons
-        let visible = bookmark_bar_visible_count(
+        let narrow = 3.0 * chrome_ui::BOOKMARK_BTN_W; // room for only a couple buttons
+        let visible = chrome_ui::bookmark_bar_visible_count(
             total,
             narrow,
-            BOOKMARK_BTN_W,
+            chrome_ui::BOOKMARK_BTN_W,
             CHROME_GAP,
-            BOOKMARK_OVERFLOW_W,
+            chrome_ui::BOOKMARK_OVERFLOW_W,
         );
         assert!(visible < total, "not all bookmarks fit the narrow row");
         assert!(visible >= 1, "at least one bookmark shows before the menu");

@@ -9,14 +9,14 @@
 use std::sync::Arc;
 
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
-use mde_egui::{ChipTone, Style};
+use mde_egui::{muted_note, ChipTone, Style};
 use mde_web_preview_client::SessionState;
 
 use super::{
     centered, ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
     DisplayTarget, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
-    CHROME_NEW_TAB_W, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_W,
-    PRIVATE_MODE_EXPLAINER,
+    CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
+    CHROME_TAB_W, PRIVATE_MODE_EXPLAINER,
 };
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
@@ -43,6 +43,16 @@ pub(super) const CHROME_ERROR: Color32 = Color32::from_rgb(179, 38, 30);
 const STATE_HOVER_ALPHA: u8 = 20;
 const STATE_FOCUS_ALPHA: u8 = 26;
 const STATE_PRESSED_ALPHA: u8 = 26;
+
+/// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
+/// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
+pub(super) const BOOKMARK_BTN_W: f32 = 132.0;
+/// The width reserved for the ">>" overflow menu button when the row can't hold
+/// every bookmark.
+pub(super) const BOOKMARK_OVERFLOW_W: f32 = 26.0;
+/// The elision budget for a bookmark button's title (fits inside [`BOOKMARK_BTN_W`]
+/// at [`CHROME_FONT`]); the full title rides the hover tooltip.
+const BOOKMARK_TITLE_CHARS: usize = 18;
 
 pub(super) const fn button_text(enabled: bool) -> Color32 {
     if enabled {
@@ -603,6 +613,194 @@ pub(super) fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: boo
     )
     .on_hover_text(tip)
     .clicked()
+}
+
+/// How many of `total` fixed-width bookmark buttons fit on the single bar row of
+/// `available` width. When every button fits, the return is `total` (no overflow
+/// slot). Otherwise one `overflow_w`-wide ">>" slot is reserved and the return is
+/// how many buttons precede it (possibly zero on a very narrow bar).
+pub(super) fn bookmark_bar_visible_count(
+    total: usize,
+    available: f32,
+    btn_w: f32,
+    gap: f32,
+    overflow_w: f32,
+) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    // Width if every button sits on the row: n buttons with (n-1) inter-button gaps.
+    let all = total as f32 * btn_w + (total.saturating_sub(1)) as f32 * gap;
+    if all <= available {
+        return total;
+    }
+    // They don't all fit: reserve the overflow button (its own leading gap) and
+    // pack as many leading buttons as the remaining width allows.
+    let budget = available - overflow_w - gap;
+    let mut count = 0usize;
+    let mut used = 0.0f32;
+    while count < total {
+        let next = if count == 0 {
+            btn_w
+        } else {
+            used + gap + btn_w
+        };
+        if next > budget {
+            break;
+        }
+        used = next;
+        count += 1;
+    }
+    // At least one bookmark always lands in the overflow menu here, so cap the
+    // visible run at `total - 1` even if rounding would otherwise show them all.
+    count.min(total.saturating_sub(1))
+}
+
+/// Single-row bookmarks bar below the nav chrome.
+pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.bookmarks_bar_visible {
+        return;
+    }
+    let links = state.bookmark_bar_links.clone();
+    let mut chosen: Option<(String, bool)> = None;
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            if links.is_empty() {
+                muted_note(
+                    ui,
+                    "No bookmarks yet \u{2014} add one from Bookmarks \u{2192} Add Bookmark",
+                );
+                return;
+            }
+            ui.horizontal(|ui| {
+                let visible = bookmark_bar_visible_count(
+                    links.len(),
+                    ui.available_width(),
+                    BOOKMARK_BTN_W,
+                    CHROME_GAP,
+                    BOOKMARK_OVERFLOW_W,
+                );
+                for link in &links[..visible] {
+                    let resp = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(ellipsize(&link.title, BOOKMARK_TITLE_CHARS))
+                                    .size(CHROME_FONT)
+                                    .color(CHROME_TEXT),
+                            )
+                            .fill(control_fill(false))
+                            .min_size(egui::vec2(BOOKMARK_BTN_W, CHROME_BUTTON)),
+                        )
+                        .on_hover_text(format!("{}\n{}", link.title, link.url));
+                    if resp.clicked() {
+                        chosen = Some((link.url.clone(), false));
+                    } else if resp.middle_clicked() {
+                        chosen = Some((link.url.clone(), true));
+                    }
+                }
+                if visible < links.len() {
+                    ui.menu_button(
+                        egui::RichText::new("\u{00BB}")
+                            .size(CHROME_FONT)
+                            .color(CHROME_TEXT),
+                        |ui| {
+                            for link in &links[visible..] {
+                                let resp = ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(ellipsize(&link.title, 40))
+                                                .size(CHROME_FONT)
+                                                .color(CHROME_TEXT),
+                                        )
+                                        .fill(control_fill(false)),
+                                    )
+                                    .on_hover_text(link.url.clone());
+                                if resp.clicked() {
+                                    chosen = Some((link.url.clone(), false));
+                                    ui.close_menu();
+                                } else if resp.middle_clicked() {
+                                    chosen = Some((link.url.clone(), true));
+                                    ui.close_menu();
+                                }
+                            }
+                        },
+                    )
+                    .response
+                    .on_hover_text("More bookmarks");
+                }
+            });
+        });
+    if let Some((url, new_tab)) = chosen {
+        state.open_bookmark(url, new_tab);
+    }
+}
+
+pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.find_open {
+        return;
+    }
+    let enabled = state.can_drive_page_tools();
+    let find_tally = (!state.find_query.trim().is_empty())
+        .then(|| state.active_find_result())
+        .flatten();
+    let mut submit_forward = false;
+    let mut submit_backward = false;
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Find")
+                        .size(CHROME_FONT)
+                        .color(CHROME_TEXT_DIM),
+                );
+                let resp = ui.add_enabled(
+                    enabled,
+                    egui::TextEdit::singleline(&mut state.find_query)
+                        .desired_width(220.0)
+                        .hint_text("Find in page")
+                        .text_color(CHROME_TEXT)
+                        .font(egui::TextStyle::Small)
+                        .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
+                );
+                state.chrome_edit_focus |= resp.has_focus();
+                if let Some((active, count)) = find_tally {
+                    let label = if count == 0 {
+                        "No results".to_owned()
+                    } else {
+                        format!("{active}/{count}")
+                    };
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(CHROME_FONT)
+                            .color(CHROME_TEXT_DIM),
+                    );
+                }
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter && ui.input(|i| i.modifiers.shift) {
+                    submit_backward = true;
+                } else if enter {
+                    submit_forward = true;
+                }
+                if nav_button(ui, "\u{2191}", "Previous match", enabled) {
+                    submit_backward = true;
+                }
+                if nav_button(ui, "\u{2193}", "Next match", enabled) {
+                    submit_forward = true;
+                }
+                if nav_button(ui, "\u{00D7}", "Close find", true) {
+                    state.close_find_bar();
+                }
+            });
+        });
+    if submit_backward {
+        state.submit_find(true);
+    } else if submit_forward {
+        state.submit_find(false);
+    }
 }
 
 #[cfg(test)]
