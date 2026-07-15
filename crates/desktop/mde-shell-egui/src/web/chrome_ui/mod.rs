@@ -10,8 +10,13 @@ use std::sync::Arc;
 
 use mde_egui::egui::{self, Color32, FontFamily, FontId, TextStyle};
 use mde_egui::ChipTone;
+use mde_web_preview_client::SessionState;
 
-use super::{ellipsize, BrowserEngine, Tab, WebState, CHROME_FONT, CHROME_NEW_TAB_W, CHROME_TAB_H};
+use super::{
+    ellipsize, media_metadata_chip_label, BrowserEngine, ContainerProfile, DeviceProfile,
+    DisplayTarget, Tab, UserAgentOverride, WebState, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W,
+    CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_W,
+};
 
 /// Chrome's UI face is Roboto, registered as a named family by `mde-egui`'s
 /// shared font installer. Keeping it named, not proportional, preserves Inter as
@@ -198,6 +203,218 @@ fn apply_visuals(ui: &mut egui::Ui) {
     visuals.selection.bg_fill =
         state_layer(CHROME_PRIMARY_CONTAINER, CHROME_PRIMARY, STATE_FOCUS_ALPHA);
     visuals.selection.stroke.color = CHROME_ON_PRIMARY_CONTAINER;
+}
+
+/// The width of each pill in the single-row horizontal strip: full width when the
+/// strip is roomy, shrinking toward [`CHROME_TAB_MIN_W`] as tabs multiply. Once at
+/// the floor the strip scrolls horizontally rather than wrapping onto stacked rows.
+pub(super) fn horizontal_tab_pill_width(available: f32, tab_count: usize) -> f32 {
+    let tab_count = tab_count.max(1) as f32;
+    let per_slot_overhead = CHROME_TAB_CLOSE + 2.0 * CHROME_GAP;
+    let per_tab = available / tab_count - per_slot_overhead;
+    per_tab.clamp(CHROME_TAB_MIN_W, CHROME_TAB_W)
+}
+
+pub(super) fn tab_pill_sized(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    width: f32,
+) -> egui::Response {
+    // `click_and_drag` keeps activation, middle-click close, and drag-reorder on
+    // the same browser-tab affordance while egui handles the click/drag threshold.
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(CHROME_FONT)
+                .color(tab_text(active)),
+        )
+        .fill(tab_fill(active))
+        .min_size(egui::vec2(width, CHROME_TAB_H))
+        .sense(egui::Sense::click_and_drag()),
+    )
+}
+
+pub(super) fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new("\u{00D7}")
+                .size(CHROME_FONT)
+                .color(CHROME_TEXT_DIM),
+        )
+        .fill(control_fill(false))
+        .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
+    )
+    .on_hover_text("Close tab")
+}
+
+/// Which speaker glyph (and hover label) a tab shows, if any.
+pub(super) fn audio_glyph_for(audible: bool, muted: bool) -> Option<(&'static str, &'static str)> {
+    if muted {
+        Some(("\u{1F507}", "Unmute tab")) // 🔇
+    } else if audible {
+        Some(("\u{1F50A}", "Mute tab")) // 🔊
+    } else {
+        None
+    }
+}
+
+pub(super) fn tab_audio_glyph(
+    ui: &mut egui::Ui,
+    audible: bool,
+    muted: bool,
+) -> Option<egui::Response> {
+    let (glyph, hover) = audio_glyph_for(audible, muted)?;
+    Some(
+        ui.add(
+            egui::Button::new(
+                egui::RichText::new(glyph)
+                    .size(CHROME_FONT)
+                    .color(CHROME_TEXT_DIM),
+            )
+            .fill(control_fill(false))
+            .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
+        )
+        .on_hover_text(hover),
+    )
+}
+
+pub(super) fn compact_menu_item(label: &str) -> egui::Button<'_> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(CHROME_FONT)
+            .color(CHROME_TEXT),
+    )
+    .min_size(egui::vec2(124.0, CHROME_TAB_H))
+}
+
+pub(super) fn tab_label(tab: &Tab) -> String {
+    let title = tab.session.title().trim();
+    let url = tab.session.nav().url.trim();
+    let base = if !title.is_empty() {
+        title
+    } else if !url.is_empty() {
+        url
+    } else {
+        "New tab"
+    };
+    let state = if tab.idle_suspended {
+        "\u{25D2}"
+    } else {
+        match tab.session.state() {
+            SessionState::Loading => "\u{25CC}",
+            SessionState::Live => "\u{25CF}",
+            SessionState::Crashed { .. } => "!",
+        }
+    };
+    let container = tab.container.marker();
+    let display = tab.display_target.marker();
+    let muted = if tab.muted { "M " } else { "" };
+    let autoplay = if tab.autoplay_blocked { "A " } else { "" };
+    let force_dark = if tab.force_dark { "D " } else { "" };
+    let reader = if tab.reader_mode { "R " } else { "" };
+    let user_scripts = if tab.user_scripts { "S " } else { "" };
+    let user_agent = tab.user_agent.marker();
+    let device_profile = tab.device_profile.marker();
+    format!(
+        "{state} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
+        ellipsize(base, 24)
+    )
+}
+
+pub(super) fn tab_hover(tab: &Tab) -> String {
+    let url = tab.session.nav().url.trim();
+    let state = if tab.idle_suspended {
+        "Idle suspended"
+    } else {
+        match tab.session.state() {
+            SessionState::Loading => "Loading",
+            SessionState::Live => "Live",
+            SessionState::Crashed { .. } => "Crashed",
+        }
+    };
+    let container = match tab.container {
+        ContainerProfile::None => String::new(),
+        profile => format!(" - Container: {}", profile.label()),
+    };
+    let display = match tab.display_target {
+        DisplayTarget::Current => String::new(),
+        target => format!(" - Display target: {}", target.label()),
+    };
+    let audio = if tab.muted { " - Muted" } else { "" };
+    let now_playing = tab
+        .session
+        .media_metadata()
+        .and_then(|metadata| media_metadata_chip_label(&metadata.body))
+        .map_or_else(String::new, |label| format!(" - {label}"));
+    let autoplay = if tab.autoplay_blocked {
+        " - Autoplay blocked"
+    } else {
+        ""
+    };
+    let force_dark = if tab.force_dark { " - Force dark" } else { "" };
+    let reader = if tab.reader_mode { " - Reader" } else { "" };
+    let user_scripts = if tab.user_scripts {
+        " - Curated userscripts"
+    } else {
+        ""
+    };
+    let user_agent = match tab.user_agent {
+        UserAgentOverride::Default => String::new(),
+        user_agent => format!(" - User agent: {}", user_agent.label()),
+    };
+    let device_profile = match tab.device_profile {
+        DeviceProfile::Default => String::new(),
+        profile => format!(" - Device: {}", profile.label()),
+    };
+    if url.is_empty() {
+        format!(
+            "{state}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+        )
+    } else {
+        format!(
+            "{state} - {url}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
+        )
+    }
+}
+
+/// Fit a native page-frame size into a thumbnail no wider than `max_w`, preserving
+/// aspect ratio; zero for a degenerate frame.
+pub(super) fn thumbnail_size(native: egui::Vec2, max_w: f32) -> egui::Vec2 {
+    if native.x <= 0.0 || native.y <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    let w = max_w.min(native.x);
+    egui::vec2(w, w * native.y / native.x)
+}
+
+pub(super) fn tab_hover_card(ui: &mut egui::Ui, tab: &Tab) {
+    ui.label(tab_hover(tab));
+    if let Some(tex) = &tab.texture {
+        let size = thumbnail_size(tex.size_vec2(), 240.0);
+        if size.x > 0.0 {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                tex.id(),
+                size,
+            )));
+        }
+    }
+}
+
+pub(super) fn tab_favicon_image(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
+    const TAB_FAVICON_SIZE: f32 = 16.0;
+    let size = egui::vec2(TAB_FAVICON_SIZE, TAB_FAVICON_SIZE);
+    match texture {
+        Some(handle) => {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                handle.id(),
+                size,
+            )));
+        }
+        None => {
+            ui.allocate_space(size);
+        }
+    }
 }
 
 /// Case-insensitive match of `query` against each tab's title AND committed URL;

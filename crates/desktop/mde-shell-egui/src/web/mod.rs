@@ -6508,7 +6508,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     // Overflow (BROWSER tabstrip): pills shrink toward a floor as they multiply;
     // once at the floor the strip scrolls horizontally in ONE row instead of
     // wrapping onto stacked rows.
-    let pill_width = horizontal_tab_pill_width(ui.available_width(), state.tabs.len());
+    let pill_width = chrome_ui::horizontal_tab_pill_width(ui.available_width(), state.tabs.len());
 
     // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
     // below — see `resolve_tab_favicon_textures`.
@@ -6537,15 +6537,18 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                     let label = if tab.pinned {
                         String::new()
                     } else {
-                        tab_label(tab)
+                        chrome_ui::tab_label(tab)
                     };
                     let pill_w = if tab.pinned {
                         CHROME_TAB_PINNED_W
                     } else {
                         pill_width
                     };
-                    tab_favicon_image(ui, favicon_textures.get(idx).and_then(Option::as_ref));
-                    let tab_response = tab_pill_sized(ui, &label, active, pill_w);
+                    chrome_ui::tab_favicon_image(
+                        ui,
+                        favicon_textures.get(idx).and_then(Option::as_ref),
+                    );
+                    let tab_response = chrome_ui::tab_pill_sized(ui, &label, active, pill_w);
                     pill_rects.push((idx, tab_response.rect));
                     if tab_response.clicked() {
                         select = Some(idx);
@@ -6584,10 +6587,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         );
                     }
                     tab_response
-                        .on_hover_ui(|ui| tab_hover_card(ui, tab))
+                        .on_hover_ui(|ui| chrome_ui::tab_hover_card(ui, tab))
                         .context_menu(|ui| {
                             if ui
-                                .add_enabled(idx > 0, compact_menu_item("Move tab left"))
+                                .add_enabled(idx > 0, chrome_ui::compact_menu_item("Move tab left"))
                                 .clicked()
                             {
                                 move_tab = Some((idx, idx - 1));
@@ -6596,7 +6599,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             if ui
                                 .add_enabled(
                                     idx + 1 < state.tabs.len(),
-                                    compact_menu_item("Move tab right"),
+                                    chrome_ui::compact_menu_item("Move tab right"),
                                 )
                                 .clicked()
                             {
@@ -6604,18 +6607,21 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.close_menu();
                             }
                             let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                            if ui.add(compact_menu_item(pin_label)).clicked() {
+                            if ui.add(chrome_ui::compact_menu_item(pin_label)).clicked() {
                                 pin_tab = Some((idx, !tab.pinned));
                                 ui.close_menu();
                             }
-                            if ui.add(compact_menu_item("Duplicate tab")).clicked() {
+                            if ui
+                                .add(chrome_ui::compact_menu_item("Duplicate tab"))
+                                .clicked()
+                            {
                                 duplicate_tab_idx = Some(idx);
                                 ui.close_menu();
                             }
                             if ui
                                 .add_enabled(
                                     state.tabs.len() > 1,
-                                    compact_menu_item("Close other tabs"),
+                                    chrome_ui::compact_menu_item("Close other tabs"),
                                 )
                                 .clicked()
                             {
@@ -6625,7 +6631,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             if ui
                                 .add_enabled(
                                     idx + 1 < state.tabs.len(),
-                                    compact_menu_item("Close tabs to the right"),
+                                    chrome_ui::compact_menu_item("Close tabs to the right"),
                                 )
                                 .clicked()
                             {
@@ -6633,16 +6639,22 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.close_menu();
                             }
                             if tab.group.is_none() {
-                                if ui.add(compact_menu_item("Add tab to new group")).clicked() {
+                                if ui
+                                    .add(chrome_ui::compact_menu_item("Add tab to new group"))
+                                    .clicked()
+                                {
                                     group_tab = Some(idx);
                                     ui.close_menu();
                                 }
-                            } else if ui.add(compact_menu_item("Remove from group")).clicked() {
+                            } else if ui
+                                .add(chrome_ui::compact_menu_item("Remove from group"))
+                                .clicked()
+                            {
                                 ungroup_tab_idx = Some(idx);
                                 ui.close_menu();
                             }
                             let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                            if ui.add(compact_menu_item(mute_label)).clicked() {
+                            if ui.add(chrome_ui::compact_menu_item(mute_label)).clicked() {
                                 mute_tab = Some((idx, !tab.muted));
                                 ui.close_menu();
                             }
@@ -6651,7 +6663,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Block autoplay"
                             };
-                            if ui.add(compact_menu_item(autoplay_label)).clicked() {
+                            if ui
+                                .add(chrome_ui::compact_menu_item(autoplay_label))
+                                .clicked()
+                            {
                                 autoplay_tab = Some((idx, !tab.autoplay_blocked));
                                 ui.close_menu();
                             }
@@ -6660,7 +6675,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable force dark"
                             };
-                            if ui.add(compact_menu_item(dark_label)).clicked() {
+                            if ui.add(chrome_ui::compact_menu_item(dark_label)).clicked() {
                                 force_dark_tab = Some((idx, !tab.force_dark));
                                 ui.close_menu();
                             }
@@ -6669,7 +6684,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable reader mode"
                             };
-                            if ui.add(compact_menu_item(reader_label)).clicked() {
+                            if ui.add(chrome_ui::compact_menu_item(reader_label)).clicked() {
                                 reader_tab = Some((idx, !tab.reader_mode));
                                 ui.close_menu();
                             }
@@ -6678,7 +6693,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable userscripts"
                             };
-                            if ui.add(compact_menu_item(scripts_label)).clicked() {
+                            if ui
+                                .add(chrome_ui::compact_menu_item(scripts_label))
+                                .clicked()
+                            {
                                 user_scripts_tab = Some((idx, !tab.user_scripts));
                                 ui.close_menu();
                             }
@@ -6687,7 +6705,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 if ui
                                     .add_enabled(
                                         tab.container != container,
-                                        compact_menu_item(container.label()),
+                                        chrome_ui::compact_menu_item(container.label()),
                                     )
                                     .clicked()
                                 {
@@ -6700,7 +6718,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 if ui
                                     .add_enabled(
                                         tab.display_target != display_target,
-                                        compact_menu_item(display_target.label()),
+                                        chrome_ui::compact_menu_item(display_target.label()),
                                     )
                                     .clicked()
                                 {
@@ -6708,20 +6726,22 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     ui.close_menu();
                                 }
                             }
-                            if ui.add(compact_menu_item("Close tab")).clicked() {
+                            if ui.add(chrome_ui::compact_menu_item("Close tab")).clicked() {
                                 close = Some(idx);
                                 ui.close_menu();
                             }
                         });
                     // Speaker glyph for an audible/muted tab, click-to-mute.
-                    if let Some(audio) = tab_audio_glyph(ui, tab.session.audible(), tab.muted) {
+                    if let Some(audio) =
+                        chrome_ui::tab_audio_glyph(ui, tab.session.audible(), tab.muted)
+                    {
                         if audio.clicked() {
                             mute_tab = Some((idx, !tab.muted));
                         }
                     }
                     // Pinned tabs hide the inline × (Chrome's affordance); they
                     // still close via middle-click or the context menu.
-                    if !tab.pinned && inline_close_button(ui).clicked() {
+                    if !tab.pinned && chrome_ui::inline_close_button(ui).clicked() {
                         close = Some(idx);
                     }
                 }
@@ -6834,10 +6854,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         let label = if tab.pinned {
                             String::new()
                         } else {
-                            tab_label(tab)
+                            chrome_ui::tab_label(tab)
                         };
                         ui.horizontal(|ui| {
-                            tab_favicon_image(
+                            chrome_ui::tab_favicon_image(
                                 ui,
                                 favicon_textures.get(idx).and_then(Option::as_ref),
                             );
@@ -6847,7 +6867,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 (ui.available_width() - CHROME_TAB_CLOSE - CHROME_GAP)
                                     .max(CHROME_NEW_TAB_W)
                             };
-                            let resp = tab_pill_sized(ui, &label, active, width);
+                            let resp = chrome_ui::tab_pill_sized(ui, &label, active, width);
                             pill_rects.push((idx, resp.rect));
                             if resp.clicked() {
                                 select = Some(idx);
@@ -6880,144 +6900,170 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     color,
                                 );
                             }
-                            resp.on_hover_text(tab_hover(tab)).context_menu(|ui| {
-                                if ui
-                                    .add_enabled(idx > 0, compact_menu_item("Move tab up"))
-                                    .clicked()
-                                {
-                                    move_tab = Some((idx, idx - 1));
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        idx + 1 < state.tabs.len(),
-                                        compact_menu_item("Move tab down"),
-                                    )
-                                    .clicked()
-                                {
-                                    move_tab = Some((idx, idx + 1));
-                                    ui.close_menu();
-                                }
-                                let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                                if ui.add(compact_menu_item(pin_label)).clicked() {
-                                    pin_tab = Some((idx, !tab.pinned));
-                                    ui.close_menu();
-                                }
-                                if ui.add(compact_menu_item("Duplicate tab")).clicked() {
-                                    duplicate_tab_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        state.tabs.len() > 1,
-                                        compact_menu_item("Close other tabs"),
-                                    )
-                                    .clicked()
-                                {
-                                    close_others_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        idx + 1 < state.tabs.len(),
-                                        compact_menu_item("Close tabs to the right"),
-                                    )
-                                    .clicked()
-                                {
-                                    close_right_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if tab.group.is_none() {
-                                    if ui.add(compact_menu_item("Add tab to new group")).clicked() {
-                                        group_tab = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                } else if ui.add(compact_menu_item("Remove from group")).clicked() {
-                                    ungroup_tab_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                                if ui.add(compact_menu_item(mute_label)).clicked() {
-                                    mute_tab = Some((idx, !tab.muted));
-                                    ui.close_menu();
-                                }
-                                let autoplay_label = if tab.autoplay_blocked {
-                                    "Allow autoplay"
-                                } else {
-                                    "Block autoplay"
-                                };
-                                if ui.add(compact_menu_item(autoplay_label)).clicked() {
-                                    autoplay_tab = Some((idx, !tab.autoplay_blocked));
-                                    ui.close_menu();
-                                }
-                                let dark_label = if tab.force_dark {
-                                    "Disable force dark"
-                                } else {
-                                    "Enable force dark"
-                                };
-                                if ui.add(compact_menu_item(dark_label)).clicked() {
-                                    force_dark_tab = Some((idx, !tab.force_dark));
-                                    ui.close_menu();
-                                }
-                                let reader_label = if tab.reader_mode {
-                                    "Disable reader mode"
-                                } else {
-                                    "Enable reader mode"
-                                };
-                                if ui.add(compact_menu_item(reader_label)).clicked() {
-                                    reader_tab = Some((idx, !tab.reader_mode));
-                                    ui.close_menu();
-                                }
-                                let scripts_label = if tab.user_scripts {
-                                    "Disable userscripts"
-                                } else {
-                                    "Enable userscripts"
-                                };
-                                if ui.add(compact_menu_item(scripts_label)).clicked() {
-                                    user_scripts_tab = Some((idx, !tab.user_scripts));
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                for container in ContainerProfile::ALL {
+                            resp.on_hover_text(chrome_ui::tab_hover(tab))
+                                .context_menu(|ui| {
                                     if ui
                                         .add_enabled(
-                                            tab.container != container,
-                                            compact_menu_item(container.label()),
+                                            idx > 0,
+                                            chrome_ui::compact_menu_item("Move tab up"),
                                         )
                                         .clicked()
                                     {
-                                        container_tab = Some((idx, container));
+                                        move_tab = Some((idx, idx - 1));
                                         ui.close_menu();
                                     }
-                                }
-                                ui.separator();
-                                for display_target in DisplayTarget::ALL {
                                     if ui
                                         .add_enabled(
-                                            tab.display_target != display_target,
-                                            compact_menu_item(display_target.label()),
+                                            idx + 1 < state.tabs.len(),
+                                            chrome_ui::compact_menu_item("Move tab down"),
                                         )
                                         .clicked()
                                     {
-                                        display_tab = Some((idx, display_target));
+                                        move_tab = Some((idx, idx + 1));
                                         ui.close_menu();
                                     }
-                                }
-                                if ui.add(compact_menu_item("Close tab")).clicked() {
-                                    close = Some(idx);
-                                    ui.close_menu();
-                                }
-                            });
+                                    let pin_label =
+                                        if tab.pinned { "Unpin tab" } else { "Pin tab" };
+                                    if ui.add(chrome_ui::compact_menu_item(pin_label)).clicked() {
+                                        pin_tab = Some((idx, !tab.pinned));
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add(chrome_ui::compact_menu_item("Duplicate tab"))
+                                        .clicked()
+                                    {
+                                        duplicate_tab_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            state.tabs.len() > 1,
+                                            chrome_ui::compact_menu_item("Close other tabs"),
+                                        )
+                                        .clicked()
+                                    {
+                                        close_others_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            idx + 1 < state.tabs.len(),
+                                            chrome_ui::compact_menu_item("Close tabs to the right"),
+                                        )
+                                        .clicked()
+                                    {
+                                        close_right_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    if tab.group.is_none() {
+                                        if ui
+                                            .add(chrome_ui::compact_menu_item(
+                                                "Add tab to new group",
+                                            ))
+                                            .clicked()
+                                        {
+                                            group_tab = Some(idx);
+                                            ui.close_menu();
+                                        }
+                                    } else if ui
+                                        .add(chrome_ui::compact_menu_item("Remove from group"))
+                                        .clicked()
+                                    {
+                                        ungroup_tab_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    let mute_label =
+                                        if tab.muted { "Unmute tab" } else { "Mute tab" };
+                                    if ui.add(chrome_ui::compact_menu_item(mute_label)).clicked() {
+                                        mute_tab = Some((idx, !tab.muted));
+                                        ui.close_menu();
+                                    }
+                                    let autoplay_label = if tab.autoplay_blocked {
+                                        "Allow autoplay"
+                                    } else {
+                                        "Block autoplay"
+                                    };
+                                    if ui
+                                        .add(chrome_ui::compact_menu_item(autoplay_label))
+                                        .clicked()
+                                    {
+                                        autoplay_tab = Some((idx, !tab.autoplay_blocked));
+                                        ui.close_menu();
+                                    }
+                                    let dark_label = if tab.force_dark {
+                                        "Disable force dark"
+                                    } else {
+                                        "Enable force dark"
+                                    };
+                                    if ui.add(chrome_ui::compact_menu_item(dark_label)).clicked() {
+                                        force_dark_tab = Some((idx, !tab.force_dark));
+                                        ui.close_menu();
+                                    }
+                                    let reader_label = if tab.reader_mode {
+                                        "Disable reader mode"
+                                    } else {
+                                        "Enable reader mode"
+                                    };
+                                    if ui.add(chrome_ui::compact_menu_item(reader_label)).clicked()
+                                    {
+                                        reader_tab = Some((idx, !tab.reader_mode));
+                                        ui.close_menu();
+                                    }
+                                    let scripts_label = if tab.user_scripts {
+                                        "Disable userscripts"
+                                    } else {
+                                        "Enable userscripts"
+                                    };
+                                    if ui
+                                        .add(chrome_ui::compact_menu_item(scripts_label))
+                                        .clicked()
+                                    {
+                                        user_scripts_tab = Some((idx, !tab.user_scripts));
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    for container in ContainerProfile::ALL {
+                                        if ui
+                                            .add_enabled(
+                                                tab.container != container,
+                                                chrome_ui::compact_menu_item(container.label()),
+                                            )
+                                            .clicked()
+                                        {
+                                            container_tab = Some((idx, container));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    for display_target in DisplayTarget::ALL {
+                                        if ui
+                                            .add_enabled(
+                                                tab.display_target != display_target,
+                                                chrome_ui::compact_menu_item(
+                                                    display_target.label(),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            display_tab = Some((idx, display_target));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    if ui.add(chrome_ui::compact_menu_item("Close tab")).clicked() {
+                                        close = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                });
                             // Speaker glyph for an audible/muted tab, click-to-mute.
                             if let Some(audio) =
-                                tab_audio_glyph(ui, tab.session.audible(), tab.muted)
+                                chrome_ui::tab_audio_glyph(ui, tab.session.audible(), tab.muted)
                             {
                                 if audio.clicked() {
                                     mute_tab = Some((idx, !tab.muted));
                                 }
                             }
                             // Pinned tabs hide the × (close via middle-click / menu).
-                            if !tab.pinned && inline_close_button(ui).clicked() {
+                            if !tab.pinned && chrome_ui::inline_close_button(ui).clicked() {
                                 close = Some(idx);
                             }
                         });
@@ -7120,214 +7166,12 @@ fn tab_drag_target_index(
         .map(|(idx, _)| *idx)
 }
 
-/// The width of each pill in the single-row horizontal strip: full width when the
-/// strip is roomy, shrinking toward [`CHROME_TAB_MIN_W`] as tabs multiply. Once at
-/// the floor the strip scrolls horizontally rather than wrapping onto stacked rows
-/// (the industry-standard tab overflow behaviour).
-fn horizontal_tab_pill_width(available: f32, tab_count: usize) -> f32 {
-    let tab_count = tab_count.max(1) as f32;
-    // Each pill also carries its inline close button plus the item spacing on both
-    // sides; reserve that so the *visible* pill width is honest and the fit
-    // estimate lines up with the real layout.
-    let per_slot_overhead = CHROME_TAB_CLOSE + 2.0 * CHROME_GAP;
-    let per_tab = available / tab_count - per_slot_overhead;
-    per_tab.clamp(CHROME_TAB_MIN_W, CHROME_TAB_W)
-}
-
 /// The egui temp-memory key under which the horizontal/vertical strips stash the
 /// laid-out pill rects, so egui-driven tests can aim pointer drags at real pill
 /// centres (Buttons have no stable id to `read_response`).
 #[cfg(test)]
 fn tab_pill_rects_id() -> egui::Id {
     egui::Id::new("browser-test-tab-pill-rects")
-}
-
-fn tab_pill_sized(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
-    // `click_and_drag` so the same pill activates on a plain click, closes on a
-    // middle-click, AND reorders on a horizontal/vertical drag. egui's built-in
-    // click-vs-drag threshold (`max_click_dist`, 6pt) keeps a click a click.
-    ui.add(
-        egui::Button::new(
-            RichText::new(label)
-                .size(CHROME_FONT)
-                .color(chrome_ui::tab_text(active)),
-        )
-        .fill(chrome_ui::tab_fill(active))
-        .min_size(egui::vec2(width, CHROME_TAB_H))
-        .sense(Sense::click_and_drag()),
-    )
-}
-
-fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            RichText::new("\u{00D7}")
-                .size(CHROME_FONT)
-                .color(chrome_ui::CHROME_TEXT_DIM),
-        )
-        .fill(chrome_ui::control_fill(false))
-        .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
-    )
-    .on_hover_text("Close tab")
-}
-
-/// Which speaker glyph (and its hover label) a tab shows, if any: `🔇` when muted
-/// (mute WINS — the user hears nothing regardless of playback), `🔊` when audibly
-/// playing, `None` when silent and unmuted. Pure, so the choice is unit-tested
-/// without a live `Ui`.
-fn audio_glyph_for(audible: bool, muted: bool) -> Option<(&'static str, &'static str)> {
-    if muted {
-        Some(("\u{1F507}", "Unmute tab")) // 🔇
-    } else if audible {
-        Some(("\u{1F50A}", "Mute tab")) // 🔊
-    } else {
-        None
-    }
-}
-
-/// The speaker affordance a tab shows when it is producing audio or is muted —
-/// Chrome's audible/mute glyph. Clicking it toggles the tab's mute. Renders (and
-/// returns a clickable `Response`) ONLY for an audible or muted tab; a silent,
-/// unmuted tab shows nothing so the strip stays quiet.
-fn tab_audio_glyph(ui: &mut egui::Ui, audible: bool, muted: bool) -> Option<egui::Response> {
-    let (glyph, hover) = audio_glyph_for(audible, muted)?;
-    Some(
-        ui.add(
-            egui::Button::new(
-                RichText::new(glyph)
-                    .size(CHROME_FONT)
-                    .color(chrome_ui::CHROME_TEXT_DIM),
-            )
-            .fill(chrome_ui::control_fill(false))
-            .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
-        )
-        .on_hover_text(hover),
-    )
-}
-
-fn compact_menu_item(label: &str) -> egui::Button<'_> {
-    egui::Button::new(
-        RichText::new(label)
-            .size(CHROME_FONT)
-            .color(chrome_ui::CHROME_TEXT),
-    )
-    .min_size(egui::vec2(124.0, CHROME_TAB_H))
-}
-
-fn tab_label(tab: &Tab) -> String {
-    let title = tab.session.title().trim();
-    let url = tab.session.nav().url.trim();
-    let base = if !title.is_empty() {
-        title
-    } else if !url.is_empty() {
-        url
-    } else {
-        "New tab"
-    };
-    let state = if tab.idle_suspended {
-        "\u{25D2}"
-    } else {
-        match tab.session.state() {
-            SessionState::Loading => "\u{25CC}",
-            SessionState::Live => "\u{25CF}",
-            SessionState::Crashed { .. } => "!",
-        }
-    };
-    let container = tab.container.marker();
-    let display = tab.display_target.marker();
-    let muted = if tab.muted { "M " } else { "" };
-    let autoplay = if tab.autoplay_blocked { "A " } else { "" };
-    let force_dark = if tab.force_dark { "D " } else { "" };
-    let reader = if tab.reader_mode { "R " } else { "" };
-    let user_scripts = if tab.user_scripts { "S " } else { "" };
-    let user_agent = tab.user_agent.marker();
-    let device_profile = tab.device_profile.marker();
-    format!(
-        "{state} {container}{display}{muted}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}{}",
-        ellipsize(base, 24)
-    )
-}
-
-fn tab_hover(tab: &Tab) -> String {
-    let url = tab.session.nav().url.trim();
-    let state = if tab.idle_suspended {
-        "Idle suspended"
-    } else {
-        match tab.session.state() {
-            SessionState::Loading => "Loading",
-            SessionState::Live => "Live",
-            SessionState::Crashed { .. } => "Crashed",
-        }
-    };
-    let container = match tab.container {
-        ContainerProfile::None => String::new(),
-        profile => format!(" - Container: {}", profile.label()),
-    };
-    let display = match tab.display_target {
-        DisplayTarget::Current => String::new(),
-        target => format!(" - Display target: {}", target.label()),
-    };
-    let audio = if tab.muted { " - Muted" } else { "" };
-    let now_playing = tab
-        .session
-        .media_metadata()
-        .and_then(|metadata| media_metadata_chip_label(&metadata.body))
-        .map_or_else(String::new, |label| format!(" - {label}"));
-    let autoplay = if tab.autoplay_blocked {
-        " - Autoplay blocked"
-    } else {
-        ""
-    };
-    let force_dark = if tab.force_dark { " - Force dark" } else { "" };
-    let reader = if tab.reader_mode { " - Reader" } else { "" };
-    let user_scripts = if tab.user_scripts {
-        " - Curated userscripts"
-    } else {
-        ""
-    };
-    let user_agent = match tab.user_agent {
-        UserAgentOverride::Default => String::new(),
-        user_agent => format!(" - User agent: {}", user_agent.label()),
-    };
-    let device_profile = match tab.device_profile {
-        DeviceProfile::Default => String::new(),
-        profile => format!(" - Device: {}", profile.label()),
-    };
-    if url.is_empty() {
-        format!(
-            "{state}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
-        )
-    } else {
-        format!(
-            "{state} - {url}{container}{display}{audio}{now_playing}{autoplay}{force_dark}{reader}{user_scripts}{user_agent}{device_profile}"
-        )
-    }
-}
-
-/// Fit a native page-frame size into a thumbnail no wider than `max_w`, preserving
-/// aspect ratio; zero for a degenerate (empty) frame. Pure so the fit is unit-tested.
-fn thumbnail_size(native: egui::Vec2, max_w: f32) -> egui::Vec2 {
-    if native.x <= 0.0 || native.y <= 0.0 {
-        return egui::Vec2::ZERO;
-    }
-    let w = max_w.min(native.x);
-    egui::vec2(w, w * native.y / native.x)
-}
-
-/// Tab hover card (industry-grade tab hover): the text summary PLUS, when the tab
-/// has a cached page frame, a small thumbnail preview scaled by [`thumbnail_size`].
-/// An inactive tab that has not rendered a frame yet just shows the text.
-fn tab_hover_card(ui: &mut egui::Ui, tab: &Tab) {
-    ui.label(tab_hover(tab));
-    if let Some(tex) = &tab.texture {
-        let size = thumbnail_size(tex.size_vec2(), 240.0);
-        if size.x > 0.0 {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                tex.id(),
-                size,
-            )));
-        }
-    }
 }
 
 /// A cheap fingerprint of a favicon's PNG bytes, so [`tab_favicon_texture`] can
@@ -7381,33 +7225,6 @@ fn resolve_tab_favicon_textures(
     tabs.iter_mut()
         .map(|tab| tab_favicon_texture(ctx, tab))
         .collect()
-}
-
-/// The favicon slot's fixed size — small enough to sit inline with the pill's
-/// [`CHROME_FONT`] label, matching the desktop-browser convention of a page icon
-/// immediately left of its tab title.
-const TAB_FAVICON_SIZE: f32 = 16.0;
-
-/// Draw one tab's favicon slot immediately before its pill.
-///
-/// Paints the decoded texture when one resolved this frame; otherwise reserves
-/// the same [`TAB_FAVICON_SIZE`] square blank — the pill's own state glyph
-/// (`●`/`◌`/`!`, from [`tab_label`]) already carries "no favicon yet", so there is
-/// no separate placeholder icon to draw, and reserving the space either way keeps
-/// every pill's leading edge aligned regardless of whether its favicon has loaded.
-fn tab_favicon_image(ui: &mut egui::Ui, texture: Option<&TextureHandle>) {
-    let size = egui::vec2(TAB_FAVICON_SIZE, TAB_FAVICON_SIZE);
-    match texture {
-        Some(handle) => {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                handle.id(),
-                size,
-            )));
-        }
-        None => {
-            ui.allocate_space(size);
-        }
-    }
 }
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
@@ -13527,11 +13344,11 @@ mod tests {
             "container identity stays per-tab"
         );
         assert!(
-            tab_label(&state.tabs[1]).contains("W "),
+            chrome_ui::tab_label(&state.tabs[1]).contains("W "),
             "the tab pill carries the Work marker"
         );
         assert!(
-            tab_hover(&state.tabs[1]).contains("Container: Work"),
+            chrome_ui::tab_hover(&state.tabs[1]).contains("Container: Work"),
             "the hover text names the container"
         );
 
@@ -13564,11 +13381,11 @@ mod tests {
             "display target intent stays per-tab"
         );
         assert!(
-            tab_label(&state.tabs[1]).contains("D2 "),
+            chrome_ui::tab_label(&state.tabs[1]).contains("D2 "),
             "the tab pill carries the Display 2 marker"
         );
         assert!(
-            tab_hover(&state.tabs[1]).contains("Display target: Secondary Display"),
+            chrome_ui::tab_hover(&state.tabs[1]).contains("Display target: Secondary Display"),
             "the hover text names the display target"
         );
 
@@ -13659,10 +13476,10 @@ mod tests {
             u64::try_from(IDLE_TAB_SUSPEND_AFTER.as_millis()).unwrap()
         );
         assert!(
-            tab_label(&state.tabs[0]).contains('\u{25D2}'),
+            chrome_ui::tab_label(&state.tabs[0]).contains('\u{25D2}'),
             "suspended tabs wear the idle marker"
         );
-        assert!(tab_hover(&state.tabs[0]).contains("Idle suspended"));
+        assert!(chrome_ui::tab_hover(&state.tabs[0]).contains("Idle suspended"));
     }
 
     #[test]
@@ -13880,19 +13697,19 @@ mod tests {
     #[test]
     fn the_audio_glyph_reflects_playback_and_mute() {
         // Silent + unmuted → no glyph (the strip stays quiet).
-        assert_eq!(audio_glyph_for(false, false), None);
+        assert_eq!(chrome_ui::audio_glyph_for(false, false), None);
         // Audibly playing → the speaker, hover offers to mute.
         assert_eq!(
-            audio_glyph_for(true, false),
+            chrome_ui::audio_glyph_for(true, false),
             Some(("\u{1F50A}", "Mute tab"))
         );
         // Muted → the muted-speaker; mute WINS the glyph even while audio plays.
         assert_eq!(
-            audio_glyph_for(false, true),
+            chrome_ui::audio_glyph_for(false, true),
             Some(("\u{1F507}", "Unmute tab"))
         );
         assert_eq!(
-            audio_glyph_for(true, true),
+            chrome_ui::audio_glyph_for(true, true),
             Some(("\u{1F507}", "Unmute tab"))
         );
     }
@@ -15753,14 +15570,23 @@ mod tests {
     #[test]
     fn horizontal_tab_pills_shrink_to_a_floor_then_scroll_instead_of_wrapping() {
         // A roomy strip with few tabs keeps full-width pills.
-        assert_eq!(horizontal_tab_pill_width(1200.0, 2), CHROME_TAB_W);
+        assert_eq!(
+            chrome_ui::horizontal_tab_pill_width(1200.0, 2),
+            CHROME_TAB_W
+        );
         // A crowded strip shrinks pills to the floor (never below), so the strip
         // scrolls in ONE row instead of stacking onto a second row.
-        assert_eq!(horizontal_tab_pill_width(1200.0, 40), CHROME_TAB_MIN_W);
+        assert_eq!(
+            chrome_ui::horizontal_tab_pill_width(1200.0, 40),
+            CHROME_TAB_MIN_W
+        );
         // The floor holds even in an absurdly narrow strip.
-        assert!(horizontal_tab_pill_width(40.0, 40) >= CHROME_TAB_MIN_W);
+        assert!(chrome_ui::horizontal_tab_pill_width(40.0, 40) >= CHROME_TAB_MIN_W);
         // More tabs never widen a pill.
-        assert!(horizontal_tab_pill_width(1200.0, 20) <= horizontal_tab_pill_width(1200.0, 4));
+        assert!(
+            chrome_ui::horizontal_tab_pill_width(1200.0, 20)
+                <= chrome_ui::horizontal_tab_pill_width(1200.0, 4)
+        );
     }
 
     #[test]
@@ -22043,15 +21869,15 @@ mod tests {
     #[test]
     fn thumbnail_size_preserves_aspect_and_caps_width() {
         // Wider than the cap → scaled down, aspect preserved (240 * 800/1280 = 150).
-        let s = thumbnail_size(egui::vec2(1280.0, 800.0), 240.0);
+        let s = chrome_ui::thumbnail_size(egui::vec2(1280.0, 800.0), 240.0);
         assert!((s.x - 240.0).abs() < 0.01);
         assert!((s.y - 150.0).abs() < 0.01);
         // Already narrower than the cap → not upscaled.
-        let s2 = thumbnail_size(egui::vec2(100.0, 50.0), 240.0);
+        let s2 = chrome_ui::thumbnail_size(egui::vec2(100.0, 50.0), 240.0);
         assert!((s2.x - 100.0).abs() < 0.01 && (s2.y - 50.0).abs() < 0.01);
         // A degenerate frame yields no thumbnail.
         assert_eq!(
-            thumbnail_size(egui::vec2(0.0, 800.0), 240.0),
+            chrome_ui::thumbnail_size(egui::vec2(0.0, 800.0), 240.0),
             egui::Vec2::ZERO
         );
     }
