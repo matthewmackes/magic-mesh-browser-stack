@@ -12186,7 +12186,7 @@ mod tests {
             "engine picker should expose CEF as a first-class segment: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "Chromium"),
+            texts.iter().any(|text| text.contains("Chromium")),
             "engine picker should make the CEF/Chromium relationship visible: {texts:?}"
         );
         assert!(
@@ -12196,7 +12196,17 @@ mod tests {
         let selected_action = chrome_ui::engine_new_tab_text(state.engine);
         assert!(
             texts.iter().any(|text| text == selected_action),
-            "engine picker should name the selected engine in the primary new-tab action ({selected_action}): {texts:?}"
+            "engine picker should keep one clean primary new-tab action ({selected_action}): {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == chrome_ui::engine_new_tab_supporting_text(state.engine)),
+            "engine picker should show the selected engine as action context: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("0 tabs")),
+            "engine picker should expose per-engine tab counts before any tab is opened: {texts:?}"
         );
         assert!(
             !texts
@@ -12214,8 +12224,12 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New CEF tab"),
-            "engine picker should retitle the primary action when CEF is selected: {texts:?}"
+            texts.iter().any(|text| text == "New tab"),
+            "engine picker should keep the primary action stable when CEF is selected: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "CEF / Chromium"),
+            "engine picker should show CEF/Chromium as selected action context: {texts:?}"
         );
 
         state.select_engine(BrowserEngine::Servo);
@@ -12227,8 +12241,12 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(
-            texts.iter().any(|text| text == "New Servo tab"),
-            "engine picker should retitle the primary action when Servo is selected: {texts:?}"
+            texts.iter().any(|text| text == "New tab"),
+            "engine picker should keep the primary action stable when Servo is selected: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Servo"),
+            "engine picker should show Servo as selected action context: {texts:?}"
         );
     }
 
