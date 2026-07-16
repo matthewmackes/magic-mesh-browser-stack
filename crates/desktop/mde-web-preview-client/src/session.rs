@@ -2145,6 +2145,8 @@ mod tests {
             MediaTransportAction::Stop,
             MediaTransportAction::Next,
             MediaTransportAction::Previous,
+            MediaTransportAction::VolumeUp,
+            MediaTransportAction::VolumeDown,
         ] {
             session.media_transport(action);
             assert_eq!(

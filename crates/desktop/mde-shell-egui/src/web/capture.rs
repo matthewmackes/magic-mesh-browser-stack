@@ -978,6 +978,7 @@ fn media_manifest_items(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn active_page_media_asset_requests(
     page_url: &str,
     title: &str,

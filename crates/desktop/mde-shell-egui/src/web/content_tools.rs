@@ -135,6 +135,7 @@ pub(super) struct OfflineCacheViewportTexture {
 /// pulls in the parent's `spellcheck_highlight_words` / `spellcheck_notice` helpers
 /// and `WebState`'s private fields. A pure relocation from the `web` god-module.
 impl WebState {
+    #[cfg(test)]
     pub(super) fn apply_spellcheck_correction(
         &mut self,
         tab_index: usize,
@@ -573,6 +574,7 @@ impl WebState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn export_active_page_metadata_scrape_to_dirs(
         &mut self,
         spool_dir: PathBuf,

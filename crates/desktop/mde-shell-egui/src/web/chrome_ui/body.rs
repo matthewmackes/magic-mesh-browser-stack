@@ -10,6 +10,15 @@ use super::super::{
 use super::*;
 
 pub(super) fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
+    let page_motion_key = active_body_page_motion_key(state);
+    page_transition_frame(ui, page_motion_key, |ui| active_body_contents(ui, state));
+}
+
+fn active_body_contents(ui: &mut egui::Ui, state: &mut WebState) {
+    if state.active_internal_page().is_some() {
+        options_page(ui, state);
+        return;
+    }
     // Read the active tab's status first so the crashed/cert-error arms can
     // mutate `state` (respawn flag, back/close) without holding a `&mut Tab`
     // borrow of it.
@@ -138,7 +147,9 @@ pub(super) fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
         Some((false, None, false, false, _, _)) => {
             // Connected, no first frame yet: an honest loading note, never a blank.
             centered(ui, |ui| {
-                browser_body_note(ui, "Loading the page\u{2026}");
+                loading_globe(ui, 54.0, "body");
+                ui.add_space(Style::SP_S);
+                browser_body_note(ui, "Loading the page...");
             });
         }
         None => {

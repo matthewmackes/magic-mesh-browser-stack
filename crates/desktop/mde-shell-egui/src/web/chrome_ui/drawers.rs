@@ -13,8 +13,406 @@ use super::super::{
 };
 use super::*;
 use mde_egui::egui::{RichText, Sense};
-use mde_egui::muted_note;
 use mde_files_egui::transfers::{TransferState, TransferVerb};
+
+const DRAWER_ICON_BUTTON_W: f32 = 28.0;
+const DRAWER_ICON_BUTTON_H: f32 = 24.0;
+const DRAWER_CONTROL_RADIUS: f32 = 6.0;
+pub(super) const QR_MATRIX_LIGHT: egui::Color32 = super::CHROME_TOOLBAR;
+pub(super) const QR_MATRIX_DARK: egui::Color32 = super::CHROME_TEXT;
+pub(super) const PRINT_PAGE_RANGE_HELP: &str = "Page range, e.g. 1-5,8: empty prints all pages";
+
+fn drawer_button_widget(
+    label: impl Into<String>,
+    role: BrowserActionRole,
+) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(label.into())
+            .size(Style::SMALL)
+            .color(action_button_text(role)),
+    )
+    .fill(action_button_fill(role))
+    .stroke(egui::Stroke::new(1.0, action_button_stroke(role)))
+    .corner_radius(DRAWER_CONTROL_RADIUS)
+    .min_size(egui::vec2(28.0, 24.0))
+}
+
+fn drawer_button(
+    ui: &mut egui::Ui,
+    label: impl Into<String>,
+    role: BrowserActionRole,
+    tip: &str,
+) -> egui::Response {
+    let response = ui.add(drawer_button_widget(label, role));
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn drawer_icon_button(
+    ui: &mut egui::Ui,
+    icon: ChromeIcon,
+    role: BrowserActionRole,
+    tip: &str,
+) -> egui::Response {
+    drawer_icon_button_impl(ui, true, icon, role, tip)
+}
+
+fn drawer_icon_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: ChromeIcon,
+    role: BrowserActionRole,
+    tip: &str,
+) -> egui::Response {
+    drawer_icon_button_impl(ui, enabled, icon, role, tip)
+}
+
+fn drawer_icon_button_impl(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: ChromeIcon,
+    role: BrowserActionRole,
+    tip: &str,
+) -> egui::Response {
+    let enabled = ui.is_enabled() && enabled;
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(DRAWER_ICON_BUTTON_W, DRAWER_ICON_BUTTON_H),
+        sense,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        action_button_fill(role),
+        action_button_text(role),
+        enabled,
+    );
+    ui.painter().rect(
+        rect,
+        DRAWER_CONTROL_RADIUS,
+        fill,
+        egui::Stroke::new(1.0, action_button_stroke(role)),
+        egui::StrokeKind::Inside,
+    );
+    let icon_color = if enabled {
+        action_button_text(role)
+    } else {
+        super::CHROME_TEXT_DIM
+    };
+    paint_chrome_icon(ui.painter(), rect, icon, icon_color);
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn drawer_close_button(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    drawer_icon_button(ui, ChromeIcon::Close, BrowserActionRole::Quiet, tip)
+}
+
+fn drawer_status_row(ui: &mut egui::Ui, icon: ChromeIcon, text: &str, color: egui::Color32) {
+    ui.horizontal_wrapped(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
+        paint_chrome_icon(ui.painter(), rect, icon, color);
+        ui.label(RichText::new(text).size(Style::SMALL).color(color));
+    });
+}
+
+fn drawer_tone_icon(tone: ChipTone, fallback: ChromeIcon) -> ChromeIcon {
+    match tone {
+        ChipTone::Ok => ChromeIcon::Check,
+        ChipTone::Warn | ChipTone::Danger => ChromeIcon::Warning,
+        ChipTone::Info | ChipTone::Neutral => fallback,
+    }
+}
+
+fn drawer_text_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    tip: &str,
+) -> egui::Response {
+    let inner = egui::Frame::NONE
+        .fill(super::CHROME_SURFACE)
+        .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text(
+                        RichText::new(hint)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
+                    )
+                    .desired_width(width)
+                    .font(font_id(Style::SMALL))
+                    .text_color(super::CHROME_TEXT)
+                    .background_color(super::CHROME_SURFACE)
+                    .margin(egui::Margin::symmetric(0, 0))
+                    .frame(false),
+            )
+        });
+    mde_egui::focus::paint_focus_ring(ui.painter(), inner.response.rect, inner.inner.has_focus());
+    chrome_hover_text(inner.inner, tip)
+}
+
+fn drawer_multiline_text_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    rows: usize,
+    tip: &str,
+) -> egui::Response {
+    let inner = egui::Frame::NONE
+        .fill(super::CHROME_SURFACE)
+        .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .hint_text(
+                        RichText::new(hint)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
+                    )
+                    .desired_width(width)
+                    .desired_rows(rows)
+                    .font(font_id(Style::SMALL))
+                    .text_color(super::CHROME_TEXT)
+                    .background_color(super::CHROME_SURFACE)
+                    .margin(egui::Margin::symmetric(0, 0))
+                    .frame(false),
+            )
+        });
+    mde_egui::focus::paint_focus_ring(ui.painter(), inner.response.rect, inner.inner.has_focus());
+    chrome_hover_text(inner.inner, tip)
+}
+
+fn drawer_stepper(ui: &mut egui::Ui, value: &mut u16, min: u16, max: u16, tip: &str) {
+    *value = (*value).clamp(min, max);
+    ui.horizontal(|ui| {
+        if drawer_icon_button_enabled(
+            ui,
+            *value > min,
+            ChromeIcon::Minus,
+            BrowserActionRole::Quiet,
+            "Decrease",
+        )
+        .clicked()
+        {
+            *value = (*value).saturating_sub(1).max(min);
+        }
+
+        let text = (*value).to_string();
+        egui::Frame::NONE
+            .fill(super::CHROME_SURFACE)
+            .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(8, 2))
+            .show(ui, |ui| {
+                ui.set_min_width(22.0);
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new(text)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT),
+                    );
+                });
+            })
+            .response
+            .on_hover_ui(|ui| chrome_tooltip(ui, tip));
+
+        if drawer_icon_button_enabled(
+            ui,
+            *value < max,
+            ChromeIcon::Plus,
+            BrowserActionRole::Quiet,
+            "Increase",
+        )
+        .clicked()
+        {
+            *value = (*value).saturating_add(1).min(max);
+        }
+    })
+    .response
+    .on_hover_ui(|ui| chrome_tooltip(ui, tip));
+}
+
+fn drawer_progress_bar(ui: &mut egui::Ui, progress: u8) {
+    let progress = progress.min(100);
+    let fraction = f32::from(progress) / 100.0;
+    let width = (ui.available_width() * 0.55).max(120.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 16.0), Sense::hover());
+    let label = format!("{progress}%");
+    let font = font_id(Style::SMALL);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label, font, super::CHROME_TEXT_DIM));
+    let track_right = (rect.right() - galley.size().x - Style::SP_S).max(rect.left() + 32.0);
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.center().y - 3.0),
+        egui::pos2(track_right, rect.center().y + 3.0),
+    );
+    ui.painter().rect_filled(track, 3.0, super::CHROME_SURFACE);
+    ui.painter().rect_stroke(
+        track,
+        3.0,
+        egui::Stroke::new(1.0, super::CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+    if progress > 0 {
+        let fill_w = (track.width() * fraction).max(2.0);
+        let fill = egui::Rect::from_min_size(track.min, egui::vec2(fill_w, track.height()));
+        ui.painter().rect_filled(fill, 3.0, super::CHROME_PRIMARY);
+    }
+    ui.painter().galley(
+        egui::pos2(
+            track.right() + Style::SP_S,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        super::CHROME_TEXT_DIM,
+    );
+}
+
+fn drawer_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: impl Into<String>,
+    role: BrowserActionRole,
+    tip: &str,
+) -> egui::Response {
+    let response = ui.add_enabled(enabled, drawer_button_widget(label, role));
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn drawer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    let font = font_id(Style::SMALL);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, super::CHROME_TEXT));
+    let target_size = egui::vec2((galley.size().x + 36.0).max(82.0), 24.0);
+    let (rect, response) = ui.allocate_exact_size(target_size, Sense::click());
+    if response.clicked() {
+        *checked = !*checked;
+    }
+
+    let hover_fill = if *checked {
+        super::CHROME_PRIMARY
+    } else {
+        super::CHROME_TOOLBAR
+    };
+    let fill = animated_response_fill(ui, &response, hover_fill, super::CHROME_TEXT, true);
+    let box_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 6.0, rect.center().y - 7.0),
+        egui::vec2(14.0, 14.0),
+    );
+    ui.painter().rect_filled(box_rect, 3.0, fill);
+    ui.painter().rect_stroke(
+        box_rect,
+        3.0,
+        egui::Stroke::new(
+            1.0,
+            if *checked {
+                super::CHROME_PRIMARY
+            } else {
+                super::CHROME_OUTLINE
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if *checked {
+        let check = [
+            egui::pos2(box_rect.left() + 3.0, box_rect.center().y),
+            egui::pos2(box_rect.left() + 6.0, box_rect.bottom() - 3.5),
+            egui::pos2(box_rect.right() - 3.0, box_rect.top() + 3.5),
+        ];
+        ui.painter().line_segment(
+            [check[0], check[1]],
+            egui::Stroke::new(1.7, super::CHROME_TOOLBAR),
+        );
+        ui.painter().line_segment(
+            [check[1], check[2]],
+            egui::Stroke::new(1.7, super::CHROME_TOOLBAR),
+        );
+    }
+    ui.painter().galley(
+        egui::pos2(
+            box_rect.right() + 7.0,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        super::CHROME_TEXT,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response
+}
+
+fn drawer_choice_chip(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> egui::Response {
+    let font = font_id(Style::SMALL);
+    let text_color = super::selected_text(selected);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, text_color));
+    let target_size = egui::vec2((galley.size().x + 18.0).max(44.0), 24.0);
+    let (rect, response) = ui.allocate_exact_size(target_size, Sense::click());
+    let base = if selected {
+        super::CHROME_PRIMARY_CONTAINER
+    } else {
+        super::CHROME_SURFACE
+    };
+    let fill = animated_response_fill(ui, &response, base, super::CHROME_TEXT, true);
+    let stroke = if selected {
+        super::CHROME_PRIMARY
+    } else {
+        super::CHROME_OUTLINE
+    };
+    ui.painter().rect(
+        rect,
+        6.0,
+        fill,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        text_color,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn drawer_separator(ui: &mut egui::Ui) {
+    let width = ui.available_width().max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 9.0), Sense::hover());
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.right().max(rect.left() + 1.0), y),
+        ],
+        egui::Stroke::new(1.0, super::CHROME_OUTLINE),
+    );
+}
+
+fn drawer_inline_separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 24.0), Sense::hover());
+    let x = rect.center().x;
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, rect.top() + 4.0),
+            egui::pos2(x, rect.bottom() - 4.0),
+        ],
+        egui::Stroke::new(1.0, super::CHROME_OUTLINE),
+    );
+}
 
 pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.print_settings_open {
@@ -38,17 +436,16 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close print settings")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close print settings").clicked() {
                         state.print_settings_open = false;
                     }
-                    if ui
-                        .small_button("\u{21BB}")
-                        .on_hover_text("Refresh CUPS destinations")
-                        .clicked()
+                    if drawer_icon_button(
+                        ui,
+                        ChromeIcon::Reload,
+                        BrowserActionRole::Quiet,
+                        "Refresh CUPS destinations",
+                    )
+                    .clicked()
                     {
                         state.refresh_cups_printers();
                     }
@@ -56,93 +453,145 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if let Some(notice) = &state.cups_notice {
-                ui.colored_label(
-                    super::CHROME_ERROR,
-                    RichText::new(format!("! {notice}")).size(Style::SMALL),
-                );
+                drawer_status_row(ui, ChromeIcon::Warning, notice, super::CHROME_ERROR);
             }
 
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Destination").size(Style::SMALL));
-                egui::ComboBox::from_id_salt("browser-cups-destination")
-                    .selected_text(
-                        state
-                            .cups_settings
-                            .destination
-                            .as_deref()
-                            .unwrap_or("System default"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut state.cups_settings.destination,
-                            None,
-                            "System default",
-                        );
-                        for printer in &printers {
-                            let label = if printer.is_default {
-                                format!("{} (default)", printer.name)
-                            } else {
-                                printer.name.clone()
-                            };
-                            ui.selectable_value(
-                                &mut state.cups_settings.destination,
-                                Some(printer.name.clone()),
-                                label,
-                            );
-                        }
-                    });
-
-                ui.separator();
-                ui.label(RichText::new("Copies").size(Style::SMALL));
-                ui.add(
-                    egui::DragValue::new(&mut state.cups_settings.copies)
-                        .range(1..=99)
-                        .speed(1),
+                ui.label(
+                    RichText::new("Destination")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
                 );
-                ui.checkbox(&mut state.cups_settings.duplex, "Duplex");
-                ui.checkbox(&mut state.cups_settings.grayscale, "Grayscale");
-                egui::ComboBox::from_label("Orientation")
-                    .selected_text(state.cups_settings.orientation.label())
-                    .show_ui(ui, |ui| {
-                        for o in [PrintOrientation::Portrait, PrintOrientation::Landscape] {
-                            ui.selectable_value(&mut state.cups_settings.orientation, o, o.label());
-                        }
-                    });
-                egui::ComboBox::from_label("Paper")
-                    .selected_text(state.cups_settings.paper_size.label())
-                    .show_ui(ui, |ui| {
-                        for p in [
-                            PaperSize::Default,
-                            PaperSize::A4,
-                            PaperSize::Letter,
-                            PaperSize::Legal,
-                        ] {
-                            ui.selectable_value(&mut state.cups_settings.paper_size, p, p.label());
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Pages").size(Style::SMALL));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.cups_settings.page_ranges)
-                            .hint_text("all")
-                            .desired_width(80.0),
+                if drawer_choice_chip(
+                    ui,
+                    "System default",
+                    state.cups_settings.destination.is_none(),
+                    "Use the system default CUPS destination",
+                )
+                .clicked()
+                {
+                    state.cups_settings.destination = None;
+                }
+                let selected_destination = state.cups_settings.destination.clone();
+                let selected_destination_name = selected_destination.as_deref();
+                let selected_destination_is_listed = selected_destination
+                    .as_deref()
+                    .map(|selected| printers.iter().any(|printer| printer.name == selected))
+                    .unwrap_or(true);
+                for printer in &printers {
+                    let selected = selected_destination_name == Some(printer.name.as_str());
+                    let label = if printer.is_default {
+                        format!("{} (default)", printer.name)
+                    } else {
+                        printer.name.clone()
+                    };
+                    if drawer_choice_chip(ui, &label, selected, "Select CUPS destination").clicked()
+                    {
+                        state.cups_settings.destination = Some(printer.name.clone());
+                    }
+                }
+                if let Some(destination) =
+                    selected_destination.filter(|_| !selected_destination_is_listed)
+                {
+                    let _ = drawer_choice_chip(
+                        ui,
+                        &destination,
+                        true,
+                        "The selected CUPS destination is not in the latest printer list",
+                    );
+                }
+
+                drawer_inline_separator(ui);
+                ui.label(
+                    RichText::new("Copies")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                drawer_stepper(
+                    ui,
+                    &mut state.cups_settings.copies,
+                    1,
+                    99,
+                    "Number of copies",
+                );
+                chrome_hover_text(
+                    drawer_toggle(ui, &mut state.cups_settings.duplex, "Duplex"),
+                    "Print on both sides when the destination supports it",
+                );
+                chrome_hover_text(
+                    drawer_toggle(ui, &mut state.cups_settings.grayscale, "Grayscale"),
+                    "Request grayscale output from CUPS",
+                );
+                drawer_inline_separator(ui);
+                ui.label(
+                    RichText::new("Orientation")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                for orientation in [PrintOrientation::Portrait, PrintOrientation::Landscape] {
+                    if drawer_choice_chip(
+                        ui,
+                        orientation.label(),
+                        state.cups_settings.orientation == orientation,
+                        "Set print orientation",
                     )
-                    .on_hover_text("Page range, e.g. 1-5,8 — empty prints all pages");
-                });
-                if ui
-                    .add_enabled(
-                        state.can_drive_page_tools(),
-                        egui::Button::new(RichText::new("Print").size(Style::SMALL)),
-                    )
-                    .on_hover_text("Queue this page PDF and submit it to CUPS")
                     .clicked()
+                    {
+                        state.cups_settings.orientation = orientation;
+                    }
+                }
+                drawer_inline_separator(ui);
+                ui.label(
+                    RichText::new("Paper")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                for paper in [
+                    PaperSize::Default,
+                    PaperSize::A4,
+                    PaperSize::Letter,
+                    PaperSize::Legal,
+                ] {
+                    if drawer_choice_chip(
+                        ui,
+                        paper.label(),
+                        state.cups_settings.paper_size == paper,
+                        "Set print paper size",
+                    )
+                    .clicked()
+                    {
+                        state.cups_settings.paper_size = paper;
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Pages")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                drawer_text_field(
+                    ui,
+                    &mut state.cups_settings.page_ranges,
+                    "all",
+                    80.0,
+                    PRINT_PAGE_RANGE_HELP,
+                );
+                if drawer_button_enabled(
+                    ui,
+                    state.can_drive_page_tools(),
+                    "Print",
+                    BrowserActionRole::Primary,
+                    "Queue this page PDF and submit it to CUPS",
+                )
+                .clicked()
                 {
                     state.print_active_page();
                 }
             });
 
             if printers.is_empty() {
-                muted_note(
+                browser_muted_note(
                     ui,
                     "No CUPS destinations discovered; system default is still usable",
                 );
@@ -174,49 +623,55 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close site styles")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close site styles").clicked() {
                         state.site_styles_open = false;
                     }
                 });
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Host").size(Style::SMALL));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.site_style_host_draft)
-                        .hint_text("example.com")
-                        .desired_width(140.0),
+                ui.label(
+                    RichText::new("Host")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
                 );
-                if ui
-                    .add(egui::Button::new(RichText::new("Add").size(Style::SMALL)))
+                drawer_text_field(
+                    ui,
+                    &mut state.site_style_host_draft,
+                    "example.com",
+                    140.0,
+                    "Site host for this CSS rule",
+                );
+                if drawer_button(ui, "Add", BrowserActionRole::Secondary, "Add site style")
                     .clicked()
                 {
                     state.add_user_site_style();
                 }
             });
-            ui.add(
-                egui::TextEdit::multiline(&mut state.site_style_css_draft)
-                    .hint_text("body{max-width:80ch;margin-inline:auto}")
-                    .desired_rows(2)
-                    .desired_width(320.0),
+            drawer_multiline_text_field(
+                ui,
+                &mut state.site_style_css_draft,
+                "body{max-width:80ch;margin-inline:auto}",
+                320.0,
+                2,
+                "CSS injected on matching hosts",
             );
             if !state.user_site_styles.is_empty() {
-                ui.separator();
+                drawer_separator(ui);
                 for (i, style) in state.user_site_styles.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!(
-                                "{} \u{2014} {}",
-                                style.host,
-                                ellipsize(&style.css, 36)
-                            ))
-                            .size(Style::SMALL)
-                            .color(super::CHROME_TEXT_DIM),
+                            RichText::new(format!("{}: {}", style.host, ellipsize(&style.css, 36)))
+                                .size(Style::SMALL)
+                                .color(super::CHROME_TEXT_DIM),
                         );
-                        if ui.small_button("Remove").clicked() {
+                        if drawer_button(
+                            ui,
+                            "Remove",
+                            BrowserActionRole::Quiet,
+                            "Remove this site style",
+                        )
+                        .clicked()
+                        {
                             remove = Some(i);
                         }
                     });
@@ -253,18 +708,17 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close history")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close history").clicked() {
                         close = true;
                     }
                     if !state.history.is_empty()
-                        && ui
-                            .small_button("Clear")
-                            .on_hover_text("Forget this session's history")
-                            .clicked()
+                        && drawer_button(
+                            ui,
+                            "Clear",
+                            BrowserActionRole::Quiet,
+                            "Forget this session's history",
+                        )
+                        .clicked()
                     {
                         clear = true;
                     }
@@ -288,18 +742,12 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         } else {
                             visit.title.clone()
                         };
-                        let elided = if label.chars().count() > 72 {
-                            format!("{}\u{2026}", label.chars().take(71).collect::<String>())
-                        } else {
-                            label
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(elided).size(Style::SMALL))
-                                    .frame(false),
-                            )
-                            .on_hover_text(visit.url.clone())
-                            .clicked()
+                        let elided = ellipsize(&label, 72);
+                        if chrome_hover_text(
+                            super::chrome_menu_row(ui, &elided, ChromeIcon::History, true, ""),
+                            visit.url.clone(),
+                        )
+                        .clicked()
                         {
                             open_url = Some(visit.url.clone());
                         }
@@ -349,25 +797,27 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close downloads")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close downloads").clicked() {
                         state.downloads_open = false;
                     }
-                    if ui
-                        .small_button("\u{21BB}")
-                        .on_hover_text("Refresh downloads")
-                        .clicked()
+                    if drawer_icon_button(
+                        ui,
+                        ChromeIcon::Reload,
+                        BrowserActionRole::Quiet,
+                        "Refresh downloads",
+                    )
+                    .clicked()
                     {
                         state.refresh_downloads();
                     }
                     if !jobs.is_empty()
-                        && ui
-                            .small_button("Clear all")
-                            .on_hover_text("Remove every download from this list")
-                            .clicked()
+                        && drawer_button(
+                            ui,
+                            "Clear all",
+                            BrowserActionRole::Quiet,
+                            "Remove every download from this list",
+                        )
+                        .clicked()
                     {
                         clear_all = true;
                     }
@@ -375,50 +825,44 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if let Some(notice) = &state.download_notice {
-                ui.colored_label(
-                    super::CHROME_ERROR,
-                    RichText::new(format!("! {notice}")).size(Style::SMALL),
-                );
+                drawer_status_row(ui, ChromeIcon::Warning, notice, super::CHROME_ERROR);
             }
 
             if let Some(pending) = &pending_dangerous {
-                ui.separator();
+                drawer_separator(ui);
                 egui::Frame::NONE
                     .fill(super::prompt_fill())
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new("\u{26A0} This type of file can harm your device")
-                                    .size(Style::SMALL)
-                                    .color(super::CHROME_WARN),
-                            );
-                        });
+                        drawer_status_row(
+                            ui,
+                            ChromeIcon::Warning,
+                            "This type of file can harm your device",
+                            super::CHROME_WARN,
+                        );
                         ui.label(
                             RichText::new(&pending.filename)
                                 .size(Style::SMALL)
                                 .color(super::CHROME_TEXT),
                         );
                         ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new(
-                                    RichText::new("Keep")
-                                        .size(Style::SMALL)
-                                        .color(super::CHROME_WARN),
-                                ))
-                                .on_hover_text("Download it anyway")
-                                .clicked()
+                            if drawer_button(
+                                ui,
+                                "Keep",
+                                BrowserActionRole::Warning,
+                                "Download it anyway",
+                            )
+                            .clicked()
                             {
                                 keep_dangerous = true;
                             }
-                            if ui
-                                .add(egui::Button::new(
-                                    RichText::new("Discard")
-                                        .size(Style::SMALL)
-                                        .color(super::CHROME_TEXT_DIM),
-                                ))
-                                .on_hover_text("Drop this download")
-                                .clicked()
+                            if drawer_button(
+                                ui,
+                                "Discard",
+                                BrowserActionRole::Quiet,
+                                "Drop this download",
+                            )
+                            .clicked()
                             {
                                 discard_dangerous = true;
                             }
@@ -432,12 +876,12 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 } else {
                     "Transfers worker ledger is not present on this node"
                 };
-                muted_note(ui, message);
+                browser_muted_note(ui, message);
                 return;
             }
 
             for job in jobs.iter().take(6) {
-                ui.separator();
+                drawer_separator(ui);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -465,62 +909,69 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                 .color(super::CHROME_TEXT_DIM),
                         );
                         if let Some(progress) = job.progress {
-                            ui.add(
-                                egui::ProgressBar::new(f32::from(progress) / 100.0)
-                                    .desired_width((ui.available_width() * 0.55).max(120.0))
-                                    .text(format!("{progress}%")),
-                            );
+                            drawer_progress_bar(ui, progress);
                         }
                         if let Some(err) = &job.error {
-                            ui.colored_label(
-                                super::CHROME_ERROR,
-                                RichText::new(format!("! {err}")).size(Style::SMALL),
-                            );
+                            drawer_status_row(ui, ChromeIcon::Warning, err, super::CHROME_ERROR);
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("Remove")
-                            .on_hover_text("Remove from list")
+                        if drawer_button(ui, "Remove", BrowserActionRole::Quiet, "Remove from list")
                             .clicked()
                         {
                             removed = Some(job.id.clone());
                         }
                         if let Some(url) = state.download_source_urls.get(&job.id) {
-                            if ui
-                                .small_button("Copy link")
-                                .on_hover_text("Copy the download's source URL")
-                                .clicked()
+                            if drawer_button(
+                                ui,
+                                "Copy link",
+                                BrowserActionRole::Secondary,
+                                "Copy the download's source URL",
+                            )
+                            .clicked()
                             {
                                 ui.ctx().copy_text(url.clone());
                                 state.capture_notice = Some("Download link copied".to_owned());
                             }
                         }
                         if job.state == TransferState::Done {
-                            if ui
-                                .small_button("Show")
-                                .on_hover_text("Show the completed download in its folder")
-                                .clicked()
+                            if drawer_button(
+                                ui,
+                                "Show",
+                                BrowserActionRole::Secondary,
+                                "Show the completed download in its folder",
+                            )
+                            .clicked()
                             {
                                 reveal_download = Some(job.id.clone());
                             }
-                            if ui
-                                .small_button("Open")
-                                .on_hover_text("Open the completed download")
-                                .clicked()
+                            if drawer_button(
+                                ui,
+                                "Open",
+                                BrowserActionRole::Secondary,
+                                "Open the completed download",
+                            )
+                            .clicked()
                             {
                                 open_download = Some(job.id.clone());
                             }
                         }
                         if !job.state.is_terminal()
-                            && ui.small_button("Cancel").on_hover_text("Cancel").clicked()
+                            && drawer_button(ui, "Cancel", BrowserActionRole::Quiet, "Cancel")
+                                .clicked()
                         {
                             action = Some(TransferVerb::Cancel(job.id.clone()));
                         }
-                        if job.state.can_resume() && ui.small_button("Resume").clicked() {
+                        if job.state.can_resume()
+                            && drawer_button(ui, "Resume", BrowserActionRole::Secondary, "Resume")
+                                .clicked()
+                        {
                             action = Some(TransferVerb::Resume(job.id.clone()));
                         }
-                        if job.state.can_pause() && ui.small_button("Pause").clicked() {
+                        if job.state.can_pause()
+                            && drawer_button(ui, "Pause", BrowserActionRole::Secondary, "Pause")
+                                .clicked()
+                        {
                             action = Some(TransferVerb::Pause(job.id.clone()));
                         }
                     });
@@ -529,7 +980,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             let hidden = jobs.len().saturating_sub(6);
             if hidden > 0 {
-                muted_note(
+                browser_muted_note(
                     ui,
                     &format!("{hidden} older browser download{} hidden", plural(hidden)),
                 );
@@ -579,17 +1030,16 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close QR share")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close QR share").clicked() {
                         state.latest_qr_share = None;
                     }
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy QR share URL")
-                        .clicked()
+                    if drawer_button(
+                        ui,
+                        "Copy",
+                        BrowserActionRole::Secondary,
+                        "Copy QR share URL",
+                    )
+                    .clicked()
                     {
                         ui.ctx().copy_text(result.url.clone());
                         state.capture_notice = Some("QR share URL copied".to_owned());
@@ -630,7 +1080,7 @@ fn paint_qr_matrix(ui: &mut egui::Ui, modules: &[Vec<bool>]) {
     let side = 168.0_f32.min(ui.available_width().max(96.0));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, egui::Color32::WHITE);
+    painter.rect_filled(rect, 2.0, QR_MATRIX_LIGHT);
     let quiet_zone = 4_usize;
     let total = width + quiet_zone * 2;
     let cell = rect.width() / total as f32;
@@ -646,7 +1096,7 @@ fn paint_qr_matrix(ui: &mut egui::Ui, modules: &[Vec<bool>]) {
             painter.rect_filled(
                 egui::Rect::from_min_size(min, egui::vec2(cell.ceil(), cell.ceil())),
                 0.0,
-                egui::Color32::BLACK,
+                QR_MATRIX_DARK,
             );
         }
     }
@@ -667,25 +1117,21 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new(format!(
-                        "{} \u{2192} {}",
-                        result.source_lang, result.target_lang
-                    ))
-                    .size(Style::SMALL)
-                    .color(super::CHROME_TEXT_DIM),
+                    RichText::new(format!("{} > {}", result.source_lang, result.target_lang))
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close translation")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close translation").clicked() {
                         state.latest_translation = None;
                     }
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy translated text")
-                        .clicked()
+                    if drawer_button(
+                        ui,
+                        "Copy",
+                        BrowserActionRole::Secondary,
+                        "Copy translated text",
+                    )
+                    .clicked()
                     {
                         ui.ctx().copy_text(result.translation.clone());
                         state.capture_notice = Some("Translation copied".to_owned());
@@ -752,18 +1198,17 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     },
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close spelling results")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close spelling results").clicked() {
                         state.latest_spellcheck = None;
                     }
                     if !result.misses.is_empty()
-                        && ui
-                            .small_button("Copy")
-                            .on_hover_text("Copy spelling results")
-                            .clicked()
+                        && drawer_button(
+                            ui,
+                            "Copy",
+                            BrowserActionRole::Secondary,
+                            "Copy spelling results",
+                        )
+                        .clicked()
                     {
                         ui.ctx().copy_text(spellcheck_results_text(&result.misses));
                         state.capture_notice = Some("Spelling results copied".to_owned());
@@ -772,11 +1217,7 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if let Some(error) = result.error.as_deref() {
-                ui.label(
-                    RichText::new(error)
-                        .size(Style::SMALL)
-                        .color(super::CHROME_WARN),
-                );
+                drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
                 return;
             }
 
@@ -812,12 +1253,13 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                         .color(super::CHROME_TEXT_DIM),
                                 );
                                 for suggestion in miss.suggestions.iter().take(4) {
-                                    if ui
-                                        .small_button(suggestion.as_str())
-                                        .on_hover_text(
-                                            "Apply spelling suggestion to this occurrence",
-                                        )
-                                        .clicked()
+                                    if drawer_button(
+                                        ui,
+                                        suggestion.as_str(),
+                                        BrowserActionRole::Secondary,
+                                        "Apply spelling suggestion to this occurrence",
+                                    )
+                                    .clicked()
                                     {
                                         state.apply_spellcheck_correction_at(
                                             result.tab_index,
@@ -826,12 +1268,13 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                                             occurrence,
                                         );
                                     }
-                                    if ui
-                                        .small_button("all")
-                                        .on_hover_text(
-                                            "Apply this suggestion to all visible matches",
-                                        )
-                                        .clicked()
+                                    if drawer_button(
+                                        ui,
+                                        "all",
+                                        BrowserActionRole::Quiet,
+                                        "Apply this suggestion to all visible matches",
+                                    )
+                                    .clicked()
                                     {
                                         state.apply_spellcheck_correction_all(
                                             result.tab_index,
@@ -874,34 +1317,39 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Close offline copy")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Close offline copy").clicked() {
                         state.latest_offline_cache = None;
                     }
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy cached page text")
-                        .clicked()
+                    if drawer_button(
+                        ui,
+                        "Copy",
+                        BrowserActionRole::Secondary,
+                        "Copy cached page text",
+                    )
+                    .clicked()
                     {
                         ui.ctx().copy_text(result.text.clone());
                         state.capture_notice = Some("Offline copy text copied".to_owned());
                     }
                     if result.archive_mhtml.is_some()
-                        && ui
-                            .small_button("MHTML")
-                            .on_hover_text("Save cached offline MHTML archive")
-                            .clicked()
+                        && drawer_button(
+                            ui,
+                            "MHTML",
+                            BrowserActionRole::Secondary,
+                            "Save cached offline MHTML archive",
+                        )
+                        .clicked()
                     {
                         state.save_latest_offline_cache_archive();
                     }
                     if result.pdf_snapshot.is_some()
-                        && ui
-                            .small_button("PDF")
-                            .on_hover_text("Open cached PDF snapshot")
-                            .clicked()
+                        && drawer_button(
+                            ui,
+                            "PDF",
+                            BrowserActionRole::Secondary,
+                            "Open cached PDF snapshot",
+                        )
+                        .clicked()
                     {
                         state.open_latest_offline_cache_pdf();
                     }
@@ -979,7 +1427,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
                             .sense(Sense::hover()),
                     )
-                    .on_hover_text("Cached viewport image");
+                    .on_hover_ui(|ui| chrome_tooltip(ui, "Cached viewport image"));
                 }
             }
             egui::ScrollArea::vertical()
@@ -1006,22 +1454,21 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Browser engine update")
-                        .size(CHROME_FONT)
-                        .color(super::CHROME_TEXT),
+                drawer_status_row(
+                    ui,
+                    ChromeIcon::Engine,
+                    "Browser engine update",
+                    super::CHROME_TEXT,
                 );
-                ui.label(
-                    RichText::new(status.state.as_str())
-                        .size(Style::SMALL)
-                        .color(super::tone_color(status.tone())),
+                let tone = status.tone();
+                drawer_status_row(
+                    ui,
+                    drawer_tone_icon(tone, ChromeIcon::Engine),
+                    status.state.as_str(),
+                    super::tone_color(tone),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Hide browser engine update status")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Hide browser engine update status").clicked() {
                         state.latest_security_update = None;
                     }
                 });
@@ -1056,11 +1503,7 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             .into_iter()
             .flatten()
             {
-                ui.label(
-                    RichText::new(detail)
-                        .size(Style::SMALL)
-                        .color(super::CHROME_WARN),
-                );
+                drawer_status_row(ui, ChromeIcon::Warning, detail, super::CHROME_WARN);
             }
         });
 }
@@ -1082,17 +1525,9 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Browser speech")
-                        .size(CHROME_FONT)
-                        .color(super::CHROME_TEXT),
-                );
+                drawer_status_row(ui, ChromeIcon::Audio, "Browser speech", super::CHROME_TEXT);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("\u{00D7}")
-                        .on_hover_text("Hide browser speech status")
-                        .clicked()
-                    {
+                    if drawer_close_button(ui, "Hide browser speech status").clicked() {
                         state.latest_read_aloud_status = None;
                         state.latest_voice_command_status = None;
                     }
@@ -1101,10 +1536,12 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             if let Some(status) = read_aloud {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(status.chip_label())
-                            .size(Style::SMALL)
-                            .color(super::tone_color(status.tone())),
+                    let tone = status.tone();
+                    drawer_status_row(
+                        ui,
+                        drawer_tone_icon(tone, ChromeIcon::Audio),
+                        &status.chip_label(),
+                        super::tone_color(tone),
                     );
                     if let Some(title) = status.last_title.as_deref() {
                         ui.label(
@@ -1129,20 +1566,18 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     );
                 });
                 if let Some(error) = status.last_error.as_deref() {
-                    ui.label(
-                        RichText::new(error)
-                            .size(Style::SMALL)
-                            .color(super::CHROME_WARN),
-                    );
+                    drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
                 }
             }
 
             if let Some(status) = voice {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(status.chip_label())
-                            .size(Style::SMALL)
-                            .color(super::tone_color(status.tone())),
+                    let tone = status.tone();
+                    drawer_status_row(
+                        ui,
+                        drawer_tone_icon(tone, ChromeIcon::Search),
+                        &status.chip_label(),
+                        super::tone_color(tone),
                     );
                     if let Some(url) = status.last_url.as_deref() {
                         ui.label(
@@ -1168,11 +1603,7 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     );
                 });
                 if let Some(error) = status.last_error.as_deref() {
-                    ui.label(
-                        RichText::new(error)
-                            .size(Style::SMALL)
-                            .color(super::CHROME_WARN),
-                    );
+                    drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
                 }
             }
         });

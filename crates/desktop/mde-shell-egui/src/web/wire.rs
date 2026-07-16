@@ -2081,6 +2081,10 @@ fn media_metadata_u64(value: &serde_json::Value, key: &str) -> u64 {
         .unwrap_or_default()
 }
 
+fn media_metadata_optional_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(serde_json::Value::as_u64)
+}
+
 fn browser_media_metadata_object(body: &str) -> Option<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     Some(serde_json::json!({
@@ -2095,6 +2099,7 @@ fn browser_media_metadata_object(body: &str) -> Option<serde_json::Value> {
             .unwrap_or(true),
         "duration_ms": media_metadata_u64(&value, "duration_ms"),
         "position_ms": media_metadata_u64(&value, "position_ms"),
+        "volume_percent": media_metadata_optional_u64(&value, "volume_percent"),
     }))
 }
 
@@ -2200,6 +2205,11 @@ fn media_transport_action_from_str(
         "stop" => Some(mde_web_preview_client::MediaTransportAction::Stop),
         "next" => Some(mde_web_preview_client::MediaTransportAction::Next),
         "previous" | "prev" => Some(mde_web_preview_client::MediaTransportAction::Previous),
+        "volumeup" | "volume-up" | "volume_up" | "volup" | "raisevolume" | "raise-volume" => {
+            Some(mde_web_preview_client::MediaTransportAction::VolumeUp)
+        }
+        "volumedown" | "volume-down" | "volume_down" | "voldown" | "lowervolume"
+        | "lower-volume" => Some(mde_web_preview_client::MediaTransportAction::VolumeDown),
         _ => None,
     }
 }
@@ -2217,6 +2227,8 @@ pub(super) fn browser_media_control_body(
         mde_web_preview_client::MediaTransportAction::Stop => "stop",
         mde_web_preview_client::MediaTransportAction::Next => "next",
         mde_web_preview_client::MediaTransportAction::Previous => "previous",
+        mde_web_preview_client::MediaTransportAction::VolumeUp => "volume-up",
+        mde_web_preview_client::MediaTransportAction::VolumeDown => "volume-down",
     };
     serde_json::json!({
         "op": "browser_media_control",
@@ -2256,6 +2268,7 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
         .tabs
         .iter()
         .enumerate()
+        .filter(|(_, tab)| tab.internal_page.is_none())
         .map(|(index, tab)| {
             let nav = tab.session.nav();
             serde_json::json!({
@@ -2310,7 +2323,12 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
         "op": "browser_session_sync",
         "source": "browser",
         "host": local_hostname(),
-        "active_index": if state.tabs.is_empty() {
+        "active_index": if state.tabs.is_empty()
+            || state
+                .tabs
+                .get(state.active)
+                .is_some_and(|tab| tab.internal_page.is_some())
+        {
             serde_json::Value::Null
         } else {
             serde_json::json!(state.active.min(state.tabs.len().saturating_sub(1)))

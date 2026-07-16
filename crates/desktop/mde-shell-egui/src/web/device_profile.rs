@@ -39,6 +39,7 @@ impl ContainerProfile {
         }
     }
 
+    #[cfg(test)]
     pub(super) const fn chip(self) -> &'static str {
         match self {
             Self::None => "",
@@ -46,16 +47,6 @@ impl ContainerProfile {
             Self::Work => "Work",
             Self::Banking => "Banking",
             Self::Research => "Research",
-        }
-    }
-
-    pub(super) const fn marker(self) -> &'static str {
-        match self {
-            Self::None => "",
-            Self::Personal => "P ",
-            Self::Work => "W ",
-            Self::Banking => "B ",
-            Self::Research => "R ",
         }
     }
 
@@ -106,21 +97,13 @@ impl DisplayTarget {
         }
     }
 
+    #[cfg(test)]
     pub(super) const fn chip(self) -> &'static str {
         match self {
             Self::Current => "",
             Self::Primary => "Display 1",
             Self::Secondary => "Display 2",
             Self::AllDisplays => "All Displays",
-        }
-    }
-
-    pub(super) const fn marker(self) -> &'static str {
-        match self {
-            Self::Current => "",
-            Self::Primary => "D1 ",
-            Self::Secondary => "D2 ",
-            Self::AllDisplays => "DA ",
         }
     }
 
@@ -199,19 +182,12 @@ impl UserAgentOverride {
         }
     }
 
+    #[cfg(test)]
     pub(super) const fn chip(self) -> &'static str {
         match self {
             Self::Default => "",
             Self::DesktopChrome => "UA Desktop",
             Self::AndroidChrome => "UA Mobile",
-        }
-    }
-
-    pub(super) const fn marker(self) -> &'static str {
-        match self {
-            Self::Default => "",
-            Self::DesktopChrome => "UA ",
-            Self::AndroidChrome => "UAm ",
         }
     }
 
@@ -261,19 +237,12 @@ impl DeviceProfile {
         }
     }
 
+    #[cfg(test)]
     pub(super) const fn chip(self) -> &'static str {
         match self {
             Self::Default => "",
             Self::Phone => "Device Phone",
             Self::Tablet => "Device Tablet",
-        }
-    }
-
-    pub(super) const fn marker(self) -> &'static str {
-        match self {
-            Self::Default => "",
-            Self::Phone => "Ph ",
-            Self::Tablet => "Tb ",
         }
     }
 

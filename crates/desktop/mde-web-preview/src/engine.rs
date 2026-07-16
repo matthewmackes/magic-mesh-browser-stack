@@ -1438,9 +1438,11 @@ fn media_transport_script(action: MediaTransportAction) -> String {
         MediaTransportAction::Stop => "stop",
         MediaTransportAction::Next => "next",
         MediaTransportAction::Previous => "previous",
+        MediaTransportAction::VolumeUp => "volumeUp",
+        MediaTransportAction::VolumeDown => "volumeDown",
     };
     format!(
-        r#"(function(){{try{{var action='{action}';var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){{return !el.ended&&(el.readyState>0||el.currentSrc||el.src||el.currentTime>0);}});if(!list.length)return;var playing=list.find(function(el){{return !el.paused&&!el.ended;}});var current=playing||list.find(function(el){{return el.currentTime>0&&!el.ended;}})||list[0];function play(el){{if(!el)return;try{{el.dataset.mdeAutoplayAllowed='true';}}catch(_e){{}}try{{var p=el.play();if(p&&p.catch)p.catch(function(){{}});}}catch(_e){{}}}}function pause(el){{try{{el.pause();}}catch(_e){{}}}}function seek(el,t){{try{{if(isFinite(t)){{if(el.fastSeek)el.fastSeek(t);else el.currentTime=t;}}}}catch(_e){{}}}}function pauseActive(){{for(var i=0;i<list.length;i++){{if(!list[i].paused&&!list[i].ended)pause(list[i]);}}}}if(action==='pause'){{pauseActive();return;}}if(action==='stop'){{for(var i=0;i<list.length;i++){{pause(list[i]);seek(list[i],0);}}return;}}if(action==='play'){{play(current);return;}}if(action==='playPause'){{if(playing)pauseActive();else play(current);return;}}var dir=action==='next'?1:-1;var wasPlaying=!!playing;var idx=Math.max(0,list.indexOf(current));if(list.length>1){{pause(current);var target=list[(idx+dir+list.length)%list.length];seek(target,0);play(target);return;}}if(action==='next'){{var end=isFinite(current.duration)&&current.duration>0?current.duration:current.currentTime+30;seek(current,end);}}else{{seek(current,0);}}if(wasPlaying)play(current);}}catch(_e){{}}}})();"#
+        r#"(function(){{try{{var action='{action}';var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){{return !el.ended&&(el.readyState>0||el.currentSrc||el.src||el.currentTime>0);}});if(!list.length)return;var playing=list.find(function(el){{return !el.paused&&!el.ended;}});var current=playing||list.find(function(el){{return el.currentTime>0&&!el.ended;}})||list[0];function clamp(v){{v=Number(v);return isFinite(v)?Math.max(0,Math.min(1,v)):1;}}function play(el){{if(!el)return;try{{el.dataset.mdeAutoplayAllowed='true';}}catch(_e){{}}try{{var p=el.play();if(p&&p.catch)p.catch(function(){{}});}}catch(_e){{}}}}function pause(el){{try{{el.pause();}}catch(_e){{}}}}function seek(el,t){{try{{if(isFinite(t)){{if(el.fastSeek)el.fastSeek(t);else el.currentTime=t;}}}}catch(_e){{}}}}function volume(el,delta){{if(!el)return;try{{el.volume=clamp((isFinite(el.volume)?el.volume:1)+delta);if(delta>0)el.muted=false;}}catch(_e){{}}}}function pauseActive(){{for(var i=0;i<list.length;i++){{if(!list[i].paused&&!list[i].ended)pause(list[i]);}}}}if(action==='pause'){{pauseActive();return;}}if(action==='stop'){{for(var i=0;i<list.length;i++){{pause(list[i]);seek(list[i],0);}}return;}}if(action==='volumeUp'||action==='volumeDown'){{volume(current,action==='volumeUp'?0.05:-0.05);return;}}if(action==='play'){{play(current);return;}}if(action==='playPause'){{if(playing)pauseActive();else play(current);return;}}var dir=action==='next'?1:-1;var wasPlaying=!!playing;var idx=Math.max(0,list.indexOf(current));if(list.length>1){{pause(current);var target=list[(idx+dir+list.length)%list.length];seek(target,0);play(target);return;}}if(action==='next'){{var end=isFinite(current.duration)&&current.duration>0?current.duration:current.currentTime+30;seek(current,end);}}else{{seek(current,0);}}if(wasPlaying)play(current);}}catch(_e){{}}}})();"#
     )
 }
 
@@ -1450,6 +1452,7 @@ function trim(v,n){v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?
 function has(v){return trim(v,2048).length>0;}
 function meta(sel){try{var el=document.querySelector(sel);return el?(el.content||el.getAttribute('content')||''):'';}catch(_e){return '';}}
 function ms(v){v=Number(v);return isFinite(v)&&v>0?Math.round(v*1000):0;}
+function pct(v){v=Number(v);return isFinite(v)?Math.round(Math.max(0,Math.min(1,v))*100):null;}
 var list=[];
 try{list=[].slice.call(document.querySelectorAll('audio,video'));}catch(_e){}
 var media=list.find(function(el){return !el.paused&&!el.ended;})||list.find(function(el){return !el.ended&&(el.currentTime>0||el.readyState>0||el.currentSrc||el.src);})||null;
@@ -1472,7 +1475,8 @@ var body=JSON.stringify({
   source_url:trim(source||location.href||'',2048),
   paused:media?!!media.paused:true,
   duration_ms:ms(media&&media.duration),
-  position_ms:ms(media&&media.currentTime)
+  position_ms:ms(media&&media.currentTime),
+  volume_percent:pct(media&&media.volume)
 });
 if(body===window.__mdeMediaMetadataLast)return null;
 window.__mdeMediaMetadataLast=body;
@@ -1786,12 +1790,15 @@ mod tests {
             (MediaTransportAction::Stop, "stop"),
             (MediaTransportAction::Next, "next"),
             (MediaTransportAction::Previous, "previous"),
+            (MediaTransportAction::VolumeUp, "volumeUp"),
+            (MediaTransportAction::VolumeDown, "volumeDown"),
         ] {
             let script = media_transport_script(action);
             assert!(script.contains("querySelectorAll('audio,video')"));
             assert!(script.contains(&format!("action='{token}'")));
             assert!(script.contains("pauseActive"));
             assert!(script.contains("fastSeek"));
+            assert!(script.contains("volume(current"));
             assert!(script.contains("mdeAutoplayAllowed"));
             assert!(
                 !script.contains("</script>"),
@@ -1807,6 +1814,7 @@ mod tests {
         assert!(script.contains("querySelectorAll('audio,video')"));
         assert!(script.contains("duration_ms"));
         assert!(script.contains("position_ms"));
+        assert!(script.contains("volume_percent"));
         assert!(script.contains("__mdeMediaMetadataLast"));
         assert!(script.contains("JSON.stringify"));
         assert!(script.contains("return null"));

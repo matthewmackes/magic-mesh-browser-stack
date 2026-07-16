@@ -211,6 +211,10 @@ pub enum MediaTransportAction {
     Next = 4,
     /// Move to the previous media element, or seek the current one to the start.
     Previous = 5,
+    /// Raise the selected page media element volume by a bounded step.
+    VolumeUp = 6,
+    /// Lower the selected page media element volume by a bounded step.
+    VolumeDown = 7,
 }
 
 impl MediaTransportAction {
@@ -224,6 +228,8 @@ impl MediaTransportAction {
             3 => Some(Self::Stop),
             4 => Some(Self::Next),
             5 => Some(Self::Previous),
+            6 => Some(Self::VolumeUp),
+            7 => Some(Self::VolumeDown),
             _ => None,
         }
     }
@@ -1497,9 +1503,9 @@ pub enum EventMsg {
     /// Bounded page/media-session now-playing metadata observed by the helper.
     ///
     /// The body is a UTF-8 JSON object with conservative public media fields such
-    /// as `title`, `artist`, `album`, `source_url`, `paused`, `duration_ms`, and
-    /// `position_ms`. The shell treats it as page-provided display metadata, not
-    /// trusted control input.
+    /// as `title`, `artist`, `album`, `source_url`, `paused`, `duration_ms`,
+    /// `position_ms`, and `volume_percent`. The shell treats it as page-provided
+    /// display metadata, not trusted control input.
     MediaMetadata {
         /// Bounded JSON body with now-playing metadata.
         body: String,
@@ -2146,6 +2152,8 @@ mod tests {
             MediaTransportAction::Stop,
             MediaTransportAction::Next,
             MediaTransportAction::Previous,
+            MediaTransportAction::VolumeUp,
+            MediaTransportAction::VolumeDown,
         ] {
             round_control(&ControlMsg::MediaTransport { action });
         }

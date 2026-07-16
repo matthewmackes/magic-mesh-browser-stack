@@ -1418,12 +1418,15 @@ fn media_transport_script_covers_page_media_actions() {
         (MediaTransportAction::Stop, "stop"),
         (MediaTransportAction::Next, "next"),
         (MediaTransportAction::Previous, "previous"),
+        (MediaTransportAction::VolumeUp, "volumeUp"),
+        (MediaTransportAction::VolumeDown, "volumeDown"),
     ] {
         let script = media_transport_script(action);
         assert!(script.contains("querySelectorAll('audio,video')"));
         assert!(script.contains(&format!("action='{token}'")));
         assert!(script.contains("pauseActive"));
         assert!(script.contains("fastSeek"));
+        assert!(script.contains("volume(current"));
         assert!(script.contains("mdeAutoplayAllowed"));
         assert!(
             !script.contains("</script>"),
@@ -1439,6 +1442,7 @@ fn media_metadata_beacon_script_is_bounded_and_decodable() {
     assert!(script.contains("querySelectorAll('audio,video')"));
     assert!(script.contains("duration_ms"));
     assert!(script.contains("position_ms"));
+    assert!(script.contains("volume_percent"));
     assert!(script.contains("__mdeMediaMetadataLast"));
     assert!(script.contains(CEF_MEDIA_METADATA_BEACON_PREFIX));
     assert!(script.contains("encodeURIComponent(body)"));

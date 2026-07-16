@@ -76,14 +76,14 @@ impl SiteDataManager {
             .map_or(0, |s| s.cleared_count);
         match active_host {
             Some(host) => format!(
-                "Site data: {} tracked site{} · {open_tabs} open tab{} · {host} cleared {cleared} time{}",
+                "Site data: {} tracked site{}; {open_tabs} open tab{}; {host} cleared {cleared} time{}",
                 self.sites.len(),
                 plural(self.sites.len()),
                 plural_u32(open_tabs),
                 plural_u32(cleared),
             ),
             None => format!(
-                "Site data: {} tracked site{} · {open_tabs} open tab{}",
+                "Site data: {} tracked site{}; {open_tabs} open tab{}",
                 self.sites.len(),
                 plural(self.sites.len()),
                 plural_u32(open_tabs),

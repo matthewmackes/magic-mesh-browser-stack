@@ -70,7 +70,17 @@ if [ -z "$built" ]; then
 fi
 
 # 3) Load it + relabel the (already-installed) binaries so the transition fires.
-if semodule -i "$built" >/dev/null 2>&1; then
+# Browser RPM %post can start the Servo and CEF SELinux setup units at the same
+# time. The SELinux module store is global, so serialize semodule writes here.
+if command -v flock >/dev/null 2>&1 && [ -d /run/lock ]; then
+  if ( flock -w 120 9 && semodule -i "$built" >/dev/null 2>&1 ) 9>/run/lock/mde-browser-selinux.lock; then
+    restorecon -F "$BIN" >/dev/null 2>&1 || :
+    restorecon -F "$RENDERER" >/dev/null 2>&1 || :
+    echo "mde-web-cef SELinux: confined domain mde_web_cef_t loaded + binaries relabelled"
+  else
+    echo "mde-web-cef SELinux: semodule -i failed or timed out on the module-store lock — leaving policy unloaded (OS sandbox still active)"
+  fi
+elif semodule -i "$built" >/dev/null 2>&1; then
   restorecon -F "$BIN" >/dev/null 2>&1 || :
   restorecon -F "$RENDERER" >/dev/null 2>&1 || :
   echo "mde-web-cef SELinux: confined domain mde_web_cef_t loaded + binaries relabelled"

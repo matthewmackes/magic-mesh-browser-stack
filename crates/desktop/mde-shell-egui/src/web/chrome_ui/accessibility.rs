@@ -68,6 +68,17 @@ fn tab_accessibility_tools(tab: &Tab) -> String {
 }
 
 fn tab_accessibility_summary(tab: &Tab) -> String {
+    if let Some(page) = tab.internal_page {
+        return format!(
+            "Browser internal page, {}, {}, internal, container {}, display target {}, {}",
+            page.title(),
+            page.url(),
+            tab.container.label(),
+            tab.display_target.label(),
+            tab_accessibility_tools(tab)
+        );
+    }
+
     let nav = tab.session.nav();
     let title = tab.session.title().trim();
     let title = if title.is_empty() { "Untitled" } else { title };

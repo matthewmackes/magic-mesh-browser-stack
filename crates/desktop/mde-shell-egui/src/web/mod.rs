@@ -36,18 +36,21 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    host_of, BeforeUnloadDialog, CertError, EditCommand, FilterListSource, FilterListStore,
-    JsDialog, LoginCaptureStatus, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist,
-    SessionState, WebSession,
+    host_of, BeforeUnloadDialog, CertError, FilterListSource, FilterListStore, JsDialog,
+    LoginCaptureStatus, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist, SessionState,
+    WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 
 // ── live-helper: spawning the real sandboxed `mde-web-preview` helper ──────────
 //
@@ -125,6 +128,10 @@ const NEW_TAB_URL: &str = "about:blank";
 #[cfg(feature = "live-helper")]
 const START_URL: &str = NEW_TAB_URL;
 
+/// Browser-owned internal options page. This URL is never sent to a helper; it
+/// lives as tab metadata and renders in `active_body` before page pixels.
+const BROWSER_OPTIONS_URL: &str = "mde://browser/options";
+
 /// DD-9's browser media policy is block-all autoplay by default. The helpers own
 /// the engine-specific shim; the shell owns the per-tab policy bit and mirrors it
 /// into every fresh helper session.
@@ -134,7 +141,9 @@ const DEFAULT_AUTOPLAY_BLOCKED: bool = true;
 /// private by design (no persistent profile: the sandbox has no writable `$HOME`),
 /// so history and cookies never outlive the session.
 const PRIVATE_MODE_EXPLAINER: &str =
-    "\u{1F512} Private by default \u{2014} history and cookies clear when you close the browser";
+    "Private by default: history and cookies clear when you close the browser";
+#[cfg(feature = "live-helper")]
+const NO_GPU_SEAT_NOTICE: &str = "The sandboxed browser needs a GPU seat: none is available here.";
 
 /// The fallback helper view geometry (device px) when no live seat size is known
 /// yet (hermetic tests, first frame before the seat is probed). A live spawn
@@ -167,6 +176,7 @@ const CHROME_TAB_CLOSE: f32 = 18.0;
 const CHROME_NEW_TAB_W: f32 = 58.0;
 const CHROME_OMNIBOX_H: f32 = 22.0;
 const CHROME_GAP: f32 = 2.0;
+const DEFAULT_VERTICAL_TABS: bool = true;
 const DEFAULT_DENIED_PERMISSIONS: &str = "location, camera, microphone, notifications, clipboard";
 const PAGE_ZOOM_MIN: u16 = 50;
 const PAGE_ZOOM_MAX: u16 = 200;
@@ -188,6 +198,31 @@ struct TabGroup {
     color: egui::Color32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserInternalPage {
+    Options,
+}
+
+impl BrowserInternalPage {
+    const fn url(self) -> &'static str {
+        match self {
+            Self::Options => BROWSER_OPTIONS_URL,
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Options => "Browser Options",
+        }
+    }
+
+    fn from_url(url: &str) -> Option<Self> {
+        url.trim()
+            .eq_ignore_ascii_case(BROWSER_OPTIONS_URL)
+            .then_some(Self::Options)
+    }
+}
+
 /// A distinct Browser-local group color, cycled by group index over the chrome
 /// Material palette so successive groups are visually separable.
 fn tab_group_color(index: usize) -> egui::Color32 {
@@ -202,6 +237,11 @@ struct Tab {
     session: WebSession,
     /// Engine that owns this helper session.
     engine: BrowserEngine,
+    /// Browser-owned internal page rendered by the shell instead of page pixels.
+    internal_page: Option<BrowserInternalPage>,
+    /// The peer end of an inert local session socket used only to satisfy the
+    /// tab's existing `WebSession` storage while an internal page is active.
+    internal_peer: Option<UnixStream>,
     /// Named container identity for the tab. Helpers are already one session per
     /// tab; this records the user-facing isolation bucket in the chrome.
     container: ContainerProfile,
@@ -283,6 +323,9 @@ struct FaviconCache {
 /// helper as a `session.resize` — long enough that a drag-resize sends ONE settled
 /// resize instead of one per frame, short enough to feel immediate.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Active live Browser pages must keep the DRM loop waking even without pointer
+/// input; otherwise video/canvas pages only advance when another event arrives.
+const LIVE_PAGE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Debounces browser-panel viewport-size changes (browser-1, item 2).
 ///
@@ -375,6 +418,7 @@ enum ManagedPolicyBlockTrigger {
     HttpContinue,
     HttpsUpgrade,
     HelperDocument,
+    #[cfg(feature = "live-helper")]
     LiveSpawn,
     Download,
 }
@@ -387,6 +431,7 @@ impl ManagedPolicyBlockTrigger {
             Self::HttpContinue => "http_continue",
             Self::HttpsUpgrade => "https_upgrade",
             Self::HelperDocument => "helper_document",
+            #[cfg(feature = "live-helper")]
             Self::LiveSpawn => "live_spawn",
             Self::Download => "download",
         }
@@ -592,6 +637,11 @@ const fn plural_u32(count: u32) -> &'static str {
 
 const DOWNLOADS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SEND_TAB_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Startup tab intents spawn live helpers immediately today. Keep session
+/// restore and send-tab replay bounded so stale or poisoned state cannot freeze
+/// the seat.
+#[cfg(any(test, feature = "live-helper"))]
+const MAX_EAGER_BROWSER_STARTUP_OPEN_TABS: usize = 8;
 const VOICE_COMMAND_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MEDIA_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHARE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -684,30 +734,23 @@ fn bookmarked_url_set(bookmarks: &[BookmarkBarLink]) -> std::collections::HashSe
         .collect()
 }
 
-/// Bookmarks whose title or URL contains the (case-insensitive) draft, most-relevant
-/// first (title-prefix > url-prefix > substring), capped. Powers omnibox bookmark
+/// Bookmarks whose title or URL/fuzzy title matches the draft, most-relevant
+/// first through the shared omnibox ranker, capped. Powers omnibox bookmark
 /// autocomplete — the highest-signal suggestion class, so it renders above history.
 fn matching_bookmarks(index: &[BookmarkBarLink], draft: &str, cap: usize) -> Vec<BookmarkBarLink> {
-    let q = draft.trim().to_lowercase();
-    if q.is_empty() {
-        return Vec::new();
-    }
-    let rank = |b: &BookmarkBarLink| -> u8 {
-        let (t, u) = (b.title.to_lowercase(), b.url.to_lowercase());
-        if t.starts_with(&q) {
-            0
-        } else if u.starts_with(&q) || u.contains(&format!("://{q}")) {
-            1
-        } else {
-            2
-        }
-    };
-    let mut hits: Vec<&BookmarkBarLink> = index
-        .iter()
-        .filter(|b| b.title.to_lowercase().contains(&q) || b.url.to_lowercase().contains(&q))
-        .collect();
-    hits.sort_by_key(|b| rank(b));
-    hits.into_iter().take(cap).cloned().collect()
+    let items = index.iter().cloned().enumerate().map(|(idx, bookmark)| {
+        SearchItem::new(
+            SearchDomain::BrowserBookmark,
+            bookmark.title.clone(),
+            bookmark.url.clone(),
+            bookmark,
+        )
+        .with_source_rank(idx)
+    });
+    ranked_hits(draft, items, cap)
+        .into_iter()
+        .map(|hit| hit.item.payload)
+        .collect()
 }
 
 /// Normalize a URL for bookmarked-state membership so a trailing-slash-only
@@ -1106,7 +1149,15 @@ fn reveal_target_for(open: &Path) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TabOpenIntent {
     NewForeground(BrowserEngine),
-    NewForegroundUrl { engine: BrowserEngine, url: String },
+    NewForegroundUrl {
+        engine: BrowserEngine,
+        url: String,
+    },
+    ReplaceActiveUrl {
+        index: usize,
+        engine: BrowserEngine,
+        url: String,
+    },
 }
 
 /// One entry on the session-only reopen stack (Ctrl+Shift+T / History →
@@ -1504,8 +1555,13 @@ pub(crate) struct WebState {
     media_control_cursor: Option<String>,
     /// Last time the Browser scanned platform media-control actions.
     media_control_last_poll: Option<Instant>,
+    /// Shell-owned Browser mini-player/PiP overlay. This is a view over the
+    /// selected Browser media tab's retained frame + existing transport controls,
+    /// not a claim that the engine has detached a native video element.
+    media_pip_open: bool,
     /// One-shot startup restore latch. The Browser reads the daemon-owned latest
     /// session-sync snapshot once, before the live-helper blank-tab fallback.
+    #[cfg(any(test, feature = "live-helper"))]
     startup_restore_attempted: bool,
     /// Candidate roots for daemon-persisted startup restore snapshots. Production
     /// probes the local durable root first, then the Syncthing-backed workgroup
@@ -1714,7 +1770,7 @@ impl Default for WebState {
             open_requested: VecDeque::new(),
             open_bookmarks_requested: false,
             closed_tabs: Vec::new(),
-            vertical_tabs: false,
+            vertical_tabs: DEFAULT_VERTICAL_TABS,
             fullscreen: false,
             insecure_prompt: None,
             insecure_prompt_target: InsecureNavigationTarget::ActiveTab,
@@ -1758,6 +1814,8 @@ impl Default for WebState {
             last_media_status_signature: None,
             media_control_cursor: None,
             media_control_last_poll: None,
+            media_pip_open: false,
+            #[cfg(any(test, feature = "live-helper"))]
             startup_restore_attempted: false,
             session_restore_roots: default_session_restore_roots(),
             incoming_send_tab_last_poll: None,
@@ -1842,6 +1900,45 @@ impl WebState {
         self.tabs.get_mut(self.active)
     }
 
+    fn active_internal_page(&self) -> Option<BrowserInternalPage> {
+        self.tabs.get(self.active).and_then(|tab| tab.internal_page)
+    }
+
+    fn open_or_focus_internal_page(&mut self, page: BrowserInternalPage) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.internal_page == Some(page))
+        {
+            self.select_tab(index);
+            return;
+        }
+        if let Err(err) = self.push_internal_page(page) {
+            self.capture_notice = Some(format!("Could not open {}: {err}", page.title()));
+        }
+    }
+
+    fn open_options_tab(&mut self) {
+        self.open_or_focus_internal_page(BrowserInternalPage::Options);
+    }
+
+    fn clear_active_internal_page_for_load(&mut self, url: &str) -> Option<usize> {
+        let index = self.active;
+        let tab = self.tabs.get_mut(index)?;
+        tab.internal_page?;
+        tab.internal_page = None;
+        tab.internal_peer = None;
+        tab.texture = None;
+        tab.last_frame = None;
+        tab.favicon_cache = None;
+        tab.resizer = ViewportResizer::default();
+        tab.last_activity = Instant::now();
+        tab.idle_suspended = false;
+        self.address = url.to_owned();
+        self.last_engine_url = None;
+        Some(index)
+    }
+
     fn tab_index_by_id(&self, tab_id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == tab_id)
     }
@@ -1851,6 +1948,81 @@ impl WebState {
     /// (no second read, §7). Backs the Start Menu Browser tile's live fact.
     pub(crate) fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// Browser candidates for the shell-owned front door: persisted bookmarks,
+    /// session-only history, and an explicit web-search action for the typed query.
+    /// The history half stays in memory only, matching Browser privacy locks.
+    pub(crate) fn search_omnibox_items(&self, query: &str) -> Vec<SearchItem<String>> {
+        let query = query.trim();
+        let mut items = Vec::new();
+        items.extend(
+            matching_bookmarks(&self.bookmark_index, query, 5)
+                .into_iter()
+                .enumerate()
+                .map(|(idx, bookmark)| {
+                    SearchItem::new(
+                        SearchDomain::BrowserBookmark,
+                        bookmark.title,
+                        bookmark.url.clone(),
+                        bookmark.url,
+                    )
+                    .with_source_rank(idx)
+                }),
+        );
+        let history_offset = items.len();
+        items.extend(
+            self.history
+                .matching(query)
+                .take(5)
+                .enumerate()
+                .map(|(idx, visit)| {
+                    let title = if visit.title.trim().is_empty() {
+                        visit.url.clone()
+                    } else {
+                        visit.title.clone()
+                    };
+                    SearchItem::new(
+                        SearchDomain::BrowserHistory,
+                        title,
+                        visit.url.clone(),
+                        visit.url.clone(),
+                    )
+                    .with_source_rank(history_offset + idx)
+                }),
+        );
+        if !query.is_empty() {
+            let search_target =
+                keyword_search_target(query, &self.search_engines).unwrap_or_else(|| {
+                    format!("{DEFAULT_SEARCH_URL}?q={}", percent_encode_query(query))
+                });
+            items.push(
+                SearchItem::new(
+                    SearchDomain::WebSuggestion,
+                    format!("Search web for {query}"),
+                    search_target,
+                    query.to_owned(),
+                )
+                .with_source_rank(items.len()),
+            );
+        }
+        items
+    }
+
+    /// Activate a shell-front-door Browser target through Browser's normal address
+    /// submission/new-tab path.
+    pub(crate) fn open_search_omnibox_target(&mut self, target: &str) {
+        let Some(url) =
+            keyword_search_target(target, &self.search_engines).or_else(|| omnibox_target(target))
+        else {
+            return;
+        };
+        if self.tabs.is_empty() {
+            self.request_new_tab_with_url(self.engine, url);
+            return;
+        }
+        self.address = url.clone();
+        self.load_target(url);
     }
 
     #[cfg(test)]
@@ -1970,9 +2142,44 @@ impl WebState {
         let Some(tab) = self.tabs.get_mut(index) else {
             return false;
         };
+        if tab.internal_page.is_some() {
+            return false;
+        }
         tab.session.media_transport(request.action);
         tab.last_activity = Instant::now();
         true
+    }
+
+    /// Drive the Browser media target selected by the now-playing fold: an explicit
+    /// tab id when provided by Bus/MPRIS, otherwise the active media tab, audible
+    /// background tab, or active live tab fallback. Hardware media keys use this so
+    /// foreground browsing does not steal Play/Pause from background media.
+    pub(crate) fn selected_media_transport(
+        &mut self,
+        action: mde_web_preview_client::MediaTransportAction,
+    ) -> bool {
+        self.apply_browser_media_control(BrowserMediaControlRequest {
+            action,
+            tab_id: None,
+        })
+    }
+
+    fn media_pip_available(&self) -> bool {
+        browser_media_status_tab_index(self).is_some_and(|index| {
+            self.tabs.get(index).is_some_and(|tab| {
+                tab.internal_page.is_none()
+                    && !tab.session.is_crashed()
+                    && tab.session.media_metadata().is_some()
+            })
+        })
+    }
+
+    pub(crate) fn toggle_media_pip(&mut self) {
+        if self.media_pip_open {
+            self.media_pip_open = false;
+        } else if self.media_pip_available() {
+            self.media_pip_open = true;
+        }
     }
 
     /// Rebuild + publish the session snapshot at a UI-safe cadence. Genuine
@@ -2057,6 +2264,9 @@ impl WebState {
     fn poll_tabs_for_panel(&mut self) -> BrowserTabPollEvents {
         let mut events = BrowserTabPollEvents::default();
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.internal_page.is_some() {
+                continue;
+            }
             if tab.idle_suspended && idx != self.active {
                 continue;
             }
@@ -2178,21 +2388,73 @@ impl WebState {
         self.poll_session_snapshot();
     }
 
+    /// Upload one tab's pending frame only when one is present, so an idle page
+    /// never triggers a texture re-upload. If a retained CPU frame exists but no
+    /// GPU texture has been created for that tab yet, build it once so shell-owned
+    /// consumers such as Browser PiP can paint background media without selecting
+    /// the tab.
+    fn upload_tab_frame(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if tab.internal_page.is_some() {
+            return;
+        }
+        if let Some(img) = tab.session.take_frame() {
+            // Share one Arc<ColorImage> between the retained CPU frame and the
+            // GPU upload instead of deep-copying full-resolution pixels on
+            // every decoded frame.
+            let img = std::sync::Arc::new(img);
+            tab.last_frame = Some(img.clone());
+            match tab.texture.as_mut() {
+                Some(handle) => handle.set(img, BROWSER_TEX),
+                None => {
+                    tab.texture =
+                        Some(ctx.load_texture(format!("web-preview-{}", tab.id), img, BROWSER_TEX));
+                }
+            }
+        } else if tab.texture.is_none() {
+            if let Some(img) = tab.last_frame.clone() {
+                tab.texture =
+                    Some(ctx.load_texture(format!("web-preview-{}", tab.id), img, BROWSER_TEX));
+            }
+        }
+    }
+
     /// Upload the active tab's pending frame only when one is present, so an idle
     /// page never triggers a texture re-upload.
     fn upload_active_frame(&mut self, ctx: &egui::Context) {
-        if let Some(tab) = self.active_tab() {
-            if let Some(img) = tab.session.take_frame() {
-                // Share one Arc<ColorImage> between the retained CPU frame and the
-                // GPU upload instead of deep-copying full-resolution pixels on
-                // every decoded frame.
-                let img = std::sync::Arc::new(img);
-                tab.last_frame = Some(img.clone());
-                match tab.texture.as_mut() {
-                    Some(handle) => handle.set(img, BROWSER_TEX),
-                    None => tab.texture = Some(ctx.load_texture("web-preview", img, BROWSER_TEX)),
-                }
-            }
+        if self.active_internal_page().is_some() {
+            return;
+        }
+        self.upload_tab_frame(ctx, self.active);
+    }
+
+    fn upload_media_pip_frame(&mut self, ctx: &egui::Context) {
+        if !self.media_pip_open {
+            return;
+        }
+        if let Some(index) = browser_media_status_tab_index(self) {
+            self.upload_tab_frame(ctx, index);
+        }
+    }
+
+    fn active_live_page_needs_repaint(&self) -> bool {
+        self.tabs.get(self.active).is_some_and(|tab| {
+            tab.internal_page.is_none()
+                && !tab.idle_suspended
+                && !tab.session.is_crashed()
+                && (tab.texture.is_some()
+                    || tab.last_frame.is_some()
+                    || tab.session.nav().loading
+                    || tab.session.media_metadata().is_some()
+                    || tab.session.audible())
+        })
+    }
+
+    fn request_active_live_page_repaint(&self, ctx: &egui::Context) {
+        if self.active_live_page_needs_repaint() {
+            ctx.request_repaint_after(LIVE_PAGE_REPAINT_INTERVAL);
         }
     }
 
@@ -2210,7 +2472,11 @@ impl WebState {
     fn suspend_idle_tabs(&mut self, now: Instant) {
         let mut suspended = Vec::new();
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
-            if idx == self.active || tab.idle_suspended || tab.session.is_crashed() {
+            if idx == self.active
+                || tab.internal_page.is_some()
+                || tab.idle_suspended
+                || tab.session.is_crashed()
+            {
                 continue;
             }
             if tab.session.audible() && !tab.muted {
@@ -2243,6 +2509,50 @@ impl WebState {
                 .count(),
             self.download_jobs.len(),
         )
+    }
+
+    /// A compact Browser-download projection for the shell's shared file-operation
+    /// status cell. The daemon transfer ledger remains the source of truth; this
+    /// folds the Browser-filtered view the downloads drawer already shows.
+    pub(crate) fn operation_progress_summary(
+        &self,
+    ) -> Option<mde_files_egui::model::OperationProgressSummary> {
+        let mut active = 0;
+        let mut known_progress = 0;
+        let mut progress_total = 0.0;
+        let mut first_label: Option<String> = None;
+
+        for job in self
+            .download_jobs
+            .iter()
+            .filter(|job| job.state.is_active())
+        {
+            active += 1;
+            if first_label.is_none() {
+                first_label = Some(short_transfer_name(job));
+            }
+            if let Some(progress) = job.progress {
+                known_progress += 1;
+                progress_total += (f32::from(progress) / 100.0).clamp(0.0, 1.0);
+            }
+        }
+
+        if active == 0 {
+            return None;
+        }
+
+        let label = if active == 1 {
+            first_label.unwrap_or_else(|| "Browser download".to_owned())
+        } else {
+            format!("{active} browser downloads")
+        };
+
+        Some(mde_files_egui::model::OperationProgressSummary {
+            active,
+            known_progress,
+            fraction: (known_progress > 0).then_some(progress_total / known_progress as f32),
+            label,
+        })
     }
 
     fn dispatch_download_verb(&mut self, verb: TransferVerb) {
@@ -2316,6 +2626,8 @@ impl WebState {
             id,
             session,
             engine,
+            internal_page: None,
+            internal_peer: None,
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
             group: None,
@@ -2341,6 +2653,45 @@ impl WebState {
         self.publish_session_snapshot();
     }
 
+    fn push_internal_page(&mut self, page: BrowserInternalPage) -> Result<(), String> {
+        let (shell, peer) = UnixStream::pair().map_err(|err| err.to_string())?;
+        let session = WebSession::from_stream(shell, None).map_err(|err| err.to_string())?;
+        let id = self.next_tab_id;
+        self.next_tab_id = self.next_tab_id.saturating_add(1);
+        self.tabs.push(Tab {
+            id,
+            session,
+            engine: self.engine,
+            internal_page: Some(page),
+            internal_peer: Some(peer),
+            container: ContainerProfile::None,
+            display_target: DisplayTarget::Current,
+            group: None,
+            pinned: false,
+            muted: false,
+            autoplay_blocked: DEFAULT_AUTOPLAY_BLOCKED,
+            force_dark: false,
+            reader_mode: false,
+            user_scripts: false,
+            user_agent: UserAgentOverride::Default,
+            device_profile: DeviceProfile::Default,
+            last_activity: Instant::now(),
+            idle_suspended: false,
+            page_focused: false,
+            texture: None,
+            last_frame: None,
+            last_audited_resource_seq: 0,
+            last_audited_cert_error: None,
+            resizer: ViewportResizer::default(),
+            favicon_cache: None,
+        });
+        self.active = self.tabs.len() - 1;
+        self.address = page.url().to_owned();
+        self.last_engine_url = None;
+        self.publish_session_snapshot();
+        Ok(())
+    }
+
     /// Request a foreground tab. The surface owns the visible affordance; the shell
     /// live-helper path owns the process spawn, so tests and portable builds can
     /// assert the intent without fabricating a helper.
@@ -2350,6 +2701,10 @@ impl WebState {
     }
 
     fn request_new_tab_with_url(&mut self, engine: BrowserEngine, url: String) {
+        if let Some(page) = BrowserInternalPage::from_url(&url) {
+            self.open_or_focus_internal_page(page);
+            return;
+        }
         let prompt_plain_http = is_plain_http(&url) && !browser_internal_plain_http_new_tab(&url);
         if prompt_plain_http {
             if host_of(&url).is_some_and(|h| self.hsts_hosts.contains(&h)) {
@@ -2393,6 +2748,9 @@ impl WebState {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        if tab.internal_page.is_some() {
+            return;
+        }
         let url = tab.session.nav().url.trim().to_owned();
         if url.is_empty() {
             return;
@@ -2490,6 +2848,7 @@ impl WebState {
     /// restoring shell-owned settings and enqueueing tab opens through the existing
     /// live-helper path. The active tab is queued last because each live open
     /// foregrounds the newly attached helper.
+    #[cfg(any(test, feature = "live-helper"))]
     fn restore_session_sync_snapshot(&mut self, body: &str) -> Result<usize, String> {
         let v: serde_json::Value =
             serde_json::from_str(body).map_err(|err| format!("session snapshot JSON: {err}"))?;
@@ -2509,6 +2868,8 @@ impl WebState {
             .and_then(serde_json::Value::as_bool)
         {
             self.vertical_tabs = vertical;
+        } else {
+            self.vertical_tabs = DEFAULT_VERTICAL_TABS;
         }
         if let Some(zoom) = settings
             .get("page_zoom_percent")
@@ -2570,6 +2931,28 @@ impl WebState {
         if let Some(active_index) = active_index {
             restore_tabs.sort_by_key(|(index, _, _)| (*index == active_index, *index));
         }
+        let total_count = restore_tabs.len();
+        if total_count > MAX_EAGER_BROWSER_STARTUP_OPEN_TABS {
+            let active = active_index
+                .and_then(|active_index| {
+                    restore_tabs
+                        .iter()
+                        .position(|(index, _, _)| *index == active_index)
+                })
+                .map(|pos| restore_tabs.remove(pos));
+            let keep_without_active =
+                MAX_EAGER_BROWSER_STARTUP_OPEN_TABS.saturating_sub(usize::from(active.is_some()));
+            restore_tabs.truncate(keep_without_active);
+            if let Some(active) = active {
+                restore_tabs.push(active);
+            }
+            self.capture_notice = Some(format!(
+                "Session restore opened {} tabs and skipped {} older tab{} to keep Browser responsive",
+                restore_tabs.len(),
+                total_count.saturating_sub(restore_tabs.len()),
+                plural(total_count.saturating_sub(restore_tabs.len()))
+            ));
+        }
         self.open_requested.clear();
         let count = restore_tabs.len();
         for (_, engine, url) in restore_tabs {
@@ -2578,9 +2961,27 @@ impl WebState {
         Ok(count)
     }
 
+    #[cfg(any(test, feature = "live-helper"))]
+    fn cap_eager_startup_open_requests(&mut self) {
+        let total_count = self.open_requested.len();
+        if total_count <= MAX_EAGER_BROWSER_STARTUP_OPEN_TABS {
+            return;
+        }
+        self.open_requested
+            .truncate(MAX_EAGER_BROWSER_STARTUP_OPEN_TABS);
+        let skipped = total_count.saturating_sub(self.open_requested.len());
+        self.capture_notice = Some(format!(
+            "Browser startup queued {} tabs and skipped {} queued tab{} to keep Browser responsive",
+            self.open_requested.len(),
+            skipped,
+            plural(skipped)
+        ));
+    }
+
     /// One-shot startup restore from the daemon-owned latest snapshot files. The
     /// helper-spawn path drains the resulting open queue, so restore and ordinary
     /// new-tab creation stay on the same code path.
+    #[cfg(any(test, feature = "live-helper"))]
     fn restore_startup_session_once(&mut self) -> Option<usize> {
         if self.startup_restore_attempted {
             return None;
@@ -3208,6 +3609,10 @@ impl WebState {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        if let Some(page) = tab.internal_page {
+            self.open_or_focus_internal_page(page);
+            return;
+        }
         let engine = tab.engine;
         let url = tab.session.nav().url.trim().to_owned();
         if url.is_empty() {
@@ -3308,6 +3713,10 @@ impl WebState {
     }
 
     fn load_target(&mut self, url: String) {
+        if let Some(page) = BrowserInternalPage::from_url(&url) {
+            self.open_or_focus_internal_page(page);
+            return;
+        }
         if is_plain_http(&url) {
             // Session HSTS: a host the user already upgraded auto-upgrades silently
             // (the one-shot recursion re-enters with an https URL, so is_plain_http
@@ -3348,6 +3757,18 @@ impl WebState {
             self.clear_insecure_prompt();
             self.managed_policy_block = None;
             self.publish_external_protocol(protocol, &url);
+            return;
+        }
+        if let Some(index) = self.clear_active_internal_page_for_load(&url) {
+            self.clear_insecure_prompt();
+            self.managed_policy_block = None;
+            self.open_requested
+                .push_back(TabOpenIntent::ReplaceActiveUrl {
+                    index,
+                    engine: self.engine,
+                    url,
+                });
+            self.publish_session_snapshot();
             return;
         }
         self.clear_insecure_prompt();
@@ -3634,9 +4055,9 @@ impl WebState {
     }
 
     fn active_tab_has_frame(&self) -> bool {
-        self.tabs
-            .get(self.active)
-            .is_some_and(|tab| tab.last_frame.is_some() && !tab.session.is_crashed())
+        self.tabs.get(self.active).is_some_and(|tab| {
+            tab.internal_page.is_none() && tab.last_frame.is_some() && !tab.session.is_crashed()
+        })
     }
 
     fn capture_active_viewport(&mut self) {
@@ -4343,7 +4764,7 @@ impl WebState {
     fn can_drive_page_tools(&self) -> bool {
         self.tabs
             .get(self.active)
-            .is_some_and(|tab| !tab.session.is_crashed())
+            .is_some_and(|tab| tab.internal_page.is_none() && !tab.session.is_crashed())
     }
 
     fn set_page_zoom(&mut self, percent: u16) {
@@ -4403,6 +4824,7 @@ impl WebState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn active_tab_media_transport(
         &mut self,
         action: mde_web_preview_client::MediaTransportAction,
@@ -4848,6 +5270,11 @@ impl WebState {
 
     fn sync_address_from_active(&mut self) {
         if let Some(tab) = self.tabs.get(self.active) {
+            if let Some(page) = tab.internal_page {
+                self.address = page.url().to_owned();
+                self.last_engine_url = None;
+                return;
+            }
             let url = tab.session.nav().url.trim();
             if !url.is_empty() {
                 self.address = url.to_owned();
@@ -4864,6 +5291,13 @@ impl WebState {
     /// in-progress operator edit, and a blurred-but-unsubmitted draft survives
     /// until the engine really moves.
     fn sync_address_on_engine_nav(&mut self) {
+        if let Some(page) = self.active_internal_page() {
+            if !self.omnibox_focused {
+                self.address = page.url().to_owned();
+            }
+            self.last_engine_url = None;
+            return;
+        }
         let Some(url) = self
             .tabs
             .get(self.active)
@@ -4963,6 +5397,50 @@ impl WebState {
             // A fresh helper re-negotiates its viewport from scratch.
             tab.resizer = ViewportResizer::default();
         }
+        self.publish_session_snapshot();
+    }
+
+    #[cfg(feature = "live-helper")]
+    fn replace_tab_with_session(
+        &mut self,
+        index: usize,
+        session: WebSession,
+        engine: BrowserEngine,
+    ) {
+        if index >= self.tabs.len() {
+            self.push_session_with_engine(session, engine);
+            return;
+        }
+        let mut session = session;
+        let url = session.nav().url.clone();
+        session.set_filter(self.compiled_request_filter_for_url(&url));
+        session.set_autoplay_blocked(DEFAULT_AUTOPLAY_BLOCKED);
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.session = session;
+            tab.engine = engine;
+            tab.internal_page = None;
+            tab.internal_peer = None;
+            tab.container = ContainerProfile::None;
+            tab.display_target = DisplayTarget::Current;
+            tab.muted = false;
+            tab.autoplay_blocked = DEFAULT_AUTOPLAY_BLOCKED;
+            tab.force_dark = false;
+            tab.reader_mode = false;
+            tab.user_scripts = false;
+            tab.user_agent = UserAgentOverride::Default;
+            tab.device_profile = DeviceProfile::Default;
+            tab.texture = None;
+            tab.last_frame = None;
+            tab.last_audited_resource_seq = 0;
+            tab.last_audited_cert_error = None;
+            tab.last_activity = Instant::now();
+            tab.idle_suspended = false;
+            tab.page_focused = false;
+            tab.resizer = ViewportResizer::default();
+            tab.favicon_cache = None;
+        }
+        self.active = index.min(self.tabs.len().saturating_sub(1));
+        self.sync_address_from_active();
         self.publish_session_snapshot();
     }
 
@@ -5133,6 +5611,7 @@ impl WebState {
     }
 
     /// The saved logins for `host` (lowercased), in save order.
+    #[cfg(test)]
     fn logins_for_host(&self, host: &str) -> Vec<&StoredLogin> {
         let host = host.trim().to_ascii_lowercase();
         self.session_logins
@@ -5281,6 +5760,7 @@ impl WebState {
     /// Fold an auto-captured login (engine-supplied `origin` + page JSON carrying
     /// username/password) into a host-bound "Save password?" offer. Skipped if the
     /// exact credential is already stored, so a re-login never re-prompts.
+    #[cfg(test)]
     fn handle_login_capture(&mut self, origin: &str, body: &str) {
         let tab_id = self.tabs.get(self.active).map_or(0, |tab| tab.id);
         self.handle_login_capture_from_tab(tab_id, origin, body);
@@ -5347,6 +5827,9 @@ impl WebState {
         let managed_policy = self.managed_url_policy.clone();
         let safe_browsing = SafeBrowsingBlocklist::from_hosts(&self.safe_browsing_hosts);
         for tab in &mut self.tabs {
+            if tab.internal_page.is_some() {
+                continue;
+            }
             let mut filter = RequestFilter::from_store(&store)
                 .with_managed_policy(managed_policy.clone())
                 .with_safe_browsing(safe_browsing.clone());
@@ -5356,7 +5839,11 @@ impl WebState {
     }
 
     fn active_first_party(&self) -> Option<String> {
-        let url = self.tabs.get(self.active)?.session.nav().url.trim();
+        let tab = self.tabs.get(self.active)?;
+        if tab.internal_page.is_some() {
+            return None;
+        }
+        let url = tab.session.nav().url.trim();
         host_of(url)
     }
 
@@ -5381,6 +5868,7 @@ impl WebState {
         let hosts = self
             .tabs
             .iter()
+            .filter(|tab| tab.internal_page.is_none())
             .filter_map(|tab| host_of(tab.session.nav().url.trim()))
             .collect::<Vec<_>>();
         self.site_data
@@ -5394,6 +5882,9 @@ impl WebState {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        if tab.internal_page.is_some() {
+            return;
+        }
         let url = tab.session.nav().url.trim().to_owned();
         let title = tab.session.title().to_owned();
         if url.is_empty() || url == NEW_TAB_URL {
@@ -5978,6 +6469,7 @@ impl WebState {
         }
         self.restore_startup_session_once();
         self.drain_incoming_send_tabs();
+        self.cap_eager_startup_open_requests();
         if !self.open_requested.is_empty() {
             self.spawn_attempted = true;
             self.drain_live_tab_requests(seat_present);
@@ -6014,6 +6506,17 @@ impl WebState {
                         helper_bin_path(engine),
                         WebSession::spawn,
                     );
+                }
+                TabOpenIntent::ReplaceActiveUrl { index, engine, url } => {
+                    if let Some(session) = self.make_session(
+                        seat_present,
+                        engine,
+                        url,
+                        helper_bin_path(engine),
+                        WebSession::spawn,
+                    ) {
+                        self.replace_tab_with_session(index, session, engine);
+                    }
                 }
             }
         }
@@ -6077,8 +6580,7 @@ impl WebState {
         spawn: impl FnOnce(&SpawnSpec) -> std::io::Result<WebSession>,
     ) -> Option<WebSession> {
         if !seat_present {
-            self.gate_notice =
-                Some("The sandboxed browser needs a GPU seat — none is available here.".to_owned());
+            self.gate_notice = Some(NO_GPU_SEAT_NOTICE.to_owned());
             return None;
         }
         if !helper_bin.exists() {
@@ -6181,6 +6683,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.apply_tab_poll_events(tab_events);
     state.finish_browser_panel_poll();
     state.upload_active_frame(ui.ctx());
+    state.upload_media_pip_frame(ui.ctx());
+    state.request_active_live_page_repaint(ui.ctx());
     chrome_ui::install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
 
     // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
@@ -6193,6 +6697,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         .is_some_and(|tab| tab.session.fullscreen());
     if state.fullscreen || page_fullscreen {
         chrome_ui::active_body(ui, state);
+        chrome_ui::media_pip_overlay(ui, state);
         return;
     }
 
@@ -6221,6 +6726,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 chrome_ui::drawer_stack(ui, state);
                 ui.add_space(CHROME_GAP);
                 chrome_ui::active_body(ui, state);
+                chrome_ui::media_pip_overlay(ui, state);
             });
         });
     } else {
@@ -6241,18 +6747,22 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         chrome_ui::drawer_stack(ui, state);
         ui.add_space(CHROME_GAP);
         chrome_ui::active_body(ui, state);
+        chrome_ui::media_pip_overlay(ui, state);
     }
 }
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if i + 1 >= max_chars {
-            out.push('\u{2026}');
-            return out;
-        }
-        out.push(ch);
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_owned();
     }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut out = s.chars().take(max_chars - 3).collect::<String>();
+    out.push_str("...");
     out
 }
 
@@ -6492,10 +7002,12 @@ const ACTION_BROWSER_SESSION_SYNC: &str = "action/browser/session-sync";
 /// Daemon-owned Browser session-sync snapshot subdirectory. Must match
 /// `mackesd::workers::browser_session_sync::SESSION_SYNC_SUBDIR` without creating
 /// a desktop-shell dependency on the daemon crate.
+#[cfg(any(test, feature = "live-helper"))]
 const SESSION_SYNC_SUBDIR: &str = "browser-session-sync";
 
 /// Daemon-owned latest snapshot filename. The file body is the Browser snapshot
 /// JSON itself, so startup restore can feed it straight into the parser.
+#[cfg(any(test, feature = "live-helper"))]
 const SESSION_SYNC_LATEST_FILE: &str = "latest.json";
 
 /// Daemon-owned send-tab outbox subdirectory. Must match
@@ -6644,6 +7156,7 @@ struct BrowserReadAloudStatus {
 }
 
 impl BrowserReadAloudStatus {
+    #[cfg(test)]
     fn is_visible(&self) -> bool {
         self.state != "idle" || self.accepted > 0 || self.rejected > 0
     }
@@ -6682,6 +7195,7 @@ struct BrowserVoiceCommandStatus {
 }
 
 impl BrowserVoiceCommandStatus {
+    #[cfg(test)]
     fn is_visible(&self) -> bool {
         self.state != "idle" || self.accepted > 0 || self.rejected > 0
     }
@@ -6736,19 +7250,23 @@ struct BrowserPasskeyCompletion {
 }
 
 impl BrowserPasskeyStatus {
+    #[cfg(test)]
     fn ceremony_is_visible(&self) -> bool {
         self.state != "idle" || self.accepted > 0 || self.rejected > 0
     }
 
+    #[cfg(test)]
     fn hardware_is_visible(&self) -> bool {
         self.hardware_state != "unknown"
     }
 
+    #[cfg(test)]
     fn ctaphid_is_visible(&self) -> bool {
         self.hardware_ctaphid_state == "init_request_ready"
             && self.hardware_ctaphid_init_frame_count > 0
     }
 
+    #[cfg(test)]
     fn tone(&self) -> ChipTone {
         match self.state.as_str() {
             "pending" => ChipTone::Info,
@@ -6758,6 +7276,7 @@ impl BrowserPasskeyStatus {
         }
     }
 
+    #[cfg(test)]
     fn chip_label(&self) -> String {
         match self.state.as_str() {
             "pending" => "Passkey pending".to_owned(),
@@ -6768,6 +7287,7 @@ impl BrowserPasskeyStatus {
         }
     }
 
+    #[cfg(test)]
     fn hardware_tone(&self) -> ChipTone {
         match self.hardware_state.as_str() {
             "ready" => ChipTone::Ok,
@@ -6777,6 +7297,7 @@ impl BrowserPasskeyStatus {
         }
     }
 
+    #[cfg(test)]
     fn hardware_chip_label(&self) -> String {
         match self.hardware_state.as_str() {
             "ready" => "Security key ready".to_owned(),
@@ -6786,6 +7307,7 @@ impl BrowserPasskeyStatus {
         }
     }
 
+    #[cfg(test)]
     fn ctaphid_tone(&self) -> ChipTone {
         match self.hardware_ctaphid_state.as_str() {
             "init_request_ready" => ChipTone::Info,
@@ -6793,6 +7315,7 @@ impl BrowserPasskeyStatus {
         }
     }
 
+    #[cfg(test)]
     fn ctaphid_chip_label(&self) -> String {
         match self.hardware_ctaphid_state.as_str() {
             "init_request_ready" => "CTAP INIT framed".to_owned(),
@@ -6885,6 +7408,7 @@ impl BrowserSecurityUpdateStatus {
         }
     }
 
+    #[cfg(test)]
     fn chip_label(&self) -> String {
         match self.state.as_str() {
             "current" => "CEF current".to_owned(),
@@ -7099,17 +7623,58 @@ impl SuggestionState {
         self.bookmarks = matches;
     }
 
+    /// Browser's local contribution to the shared unified-omnibox model, in the
+    /// same render/commit order the dropdown exposes: bookmarks, history, then
+    /// deduped web suggestions. The payload is the exact value accepted on Enter.
+    fn ordered_search_items(&self) -> Vec<SearchItem<String>> {
+        let mut items: Vec<SearchItem<String>> = Vec::new();
+        items.extend(self.bookmarks.iter().enumerate().map(|(idx, bookmark)| {
+            SearchItem::new(
+                SearchDomain::BrowserBookmark,
+                bookmark.title.clone(),
+                bookmark.url.clone(),
+                bookmark.url.clone(),
+            )
+            .with_source_rank(idx)
+        }));
+        let history_offset = items.len();
+        items.extend(self.history.iter().enumerate().map(|(idx, url)| {
+            SearchItem::new(
+                SearchDomain::BrowserHistory,
+                url.clone(),
+                url.clone(),
+                url.clone(),
+            )
+            .with_source_rank(history_offset + idx)
+        }));
+        let search_offset = items.len();
+        items.extend(
+            chrome_ui::dedup_search_items(&self.items, &self.history)
+                .into_iter()
+                .enumerate()
+                .map(|(idx, suggestion)| {
+                    SearchItem::new(
+                        SearchDomain::WebSuggestion,
+                        suggestion.clone(),
+                        format!(
+                            "{DEFAULT_SEARCH_URL}?q={}",
+                            percent_encode_query(suggestion)
+                        ),
+                        suggestion.clone(),
+                    )
+                    .with_source_rank(search_offset + idx)
+                }),
+        );
+        items
+    }
+
     /// The flat suggestion list in RENDER order (bookmarks, history, deduped search)
     /// as the strings that get committed on Enter — the index space for [`Self::selected`].
     fn ordered_commit_values(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.bookmarks.iter().map(|b| b.url.clone()).collect();
-        v.extend(self.history.iter().cloned());
-        v.extend(
-            chrome_ui::dedup_search_items(&self.items, &self.history)
-                .into_iter()
-                .cloned(),
-        );
-        v
+        self.ordered_search_items()
+            .into_iter()
+            .map(|item| item.payload)
+            .collect()
     }
 
     /// Move the keyboard highlight by `delta` (±1), wrapping over the current list.
@@ -7267,6 +7832,7 @@ fn local_session_sync_root() -> PathBuf {
     )
 }
 
+#[cfg(any(test, feature = "live-helper"))]
 fn session_sync_latest_path(root: &Path, host: &str) -> PathBuf {
     root.join(SESSION_SYNC_SUBDIR)
         .join(sanitize_session_host(host))
@@ -7438,6 +8004,7 @@ fn cleanup_empty_send_tab_source_dirs(root: &Path, host: &str) {
     }
 }
 
+#[cfg(any(test, feature = "live-helper"))]
 fn speed_dial_from_settings(settings: &serde_json::Value) -> Option<Vec<SpeedDialEntry>> {
     let entries = settings.get("speed_dial")?.as_array()?;
     let restored = entries
@@ -7471,6 +8038,14 @@ fn speed_dial_from_settings(settings: &serde_json::Value) -> Option<Vec<SpeedDia
 
 mod wire;
 use wire::*;
+
+mod mpris;
+pub(crate) use mpris::BrowserMprisHandle;
+
+/// Start the Browser's freedesktop MPRIS bridge for this shell session.
+pub(crate) fn spawn_browser_mpris() -> BrowserMprisHandle {
+    mpris::spawn(mde_bus::client_data_dir(), local_hostname())
+}
 
 /// Mint the transfer job a completed browser download or scraper output uses once
 /// the helper has materialized the file locally. The browser does not crawl or move
@@ -7694,7 +8269,7 @@ mod tests {
     use super::chrome_ui::{browser_input_event, frame_target_device_px, map_pointer_to_frame};
     use super::*;
     use mde_egui::egui::{pos2, vec2, Rect};
-    use mde_web_preview_client::{scm, testkit, wire};
+    use mde_web_preview_client::{scm, testkit, wire, EditCommand};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
@@ -7802,6 +8377,10 @@ mod tests {
         rect.is_positive().then_some(rect)
     }
 
+    #[cfg_attr(
+        not(feature = "live-helper"),
+        allow(dead_code, reason = "used by the live-helper Browser UI smoke")
+    )]
     fn live_page_panel_point_for_frame(
         ctx: &egui::Context,
         state: &mut WebState,
@@ -7997,6 +8576,75 @@ mod tests {
             "test session defaults to Servo"
         );
         assert!(page_value.contains("Click the page canvas to focus keyboard input"));
+    }
+
+    #[test]
+    fn browser_options_tab_accesskit_names_the_internal_page() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        state.open_options_tab();
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let nodes = accesskit_nodes(&out);
+        let browser = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser status"))
+            .expect("browser status accesskit node");
+        let value = browser.value().expect("browser status value");
+        assert!(value.contains("Browser internal page"));
+        assert!(value.contains("Browser Options"));
+        assert!(value.contains(BROWSER_OPTIONS_URL));
+        assert!(
+            !value.contains("Untitled") && !value.contains("about:blank"),
+            "Options AccessKit summary must not leak the inert helper session: {value}"
+        );
+    }
+
+    #[test]
+    fn loading_tab_renders_netscape_style_globe_status() {
+        let (mut session, helper) = raw_session_pair();
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: true,
+                url: "https://loading.example/".to_owned(),
+            },
+        );
+        session.poll();
+        let mut state = WebState::default();
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text == "Loading the page..."),
+            "loading body should still expose the concise status copy: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains('\u{2026}')),
+            "loading body must not paint the unicode ellipsis glyph: {texts:?}"
+        );
+        assert!(
+            accesskit_nodes(&out)
+                .iter()
+                .any(|(_, node)| node.label() == Some("Browser loading globe")),
+            "loading body/toolbar should expose the Browser loading globe status"
+        );
+        assert!(
+            chrome_ui::loading_globe_painted_shape_count() > 0,
+            "Netscape-style loading globe must paint real shapes"
+        );
     }
 
     fn write_helper_event(stream: &UnixStream, msg: &mde_web_preview_client::EventMsg) {
@@ -8959,7 +9607,9 @@ mod tests {
             "the live page frame must upload before body input can be painted"
         );
 
-        let page_point = pos2(480.0, 420.0);
+        let page_point = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("the Browser page texture should be locatable before clicking")
+            .center();
         let mut click_input = body_input();
         click_input.events = vec![
             egui::Event::PointerMoved(page_point),
@@ -9038,7 +9688,9 @@ mod tests {
         assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
 
         // Focus the page body.
-        let page_point = pos2(480.0, 420.0);
+        let page_point = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("the Browser page texture should be locatable before clicking")
+            .center();
         let mut click = body_input();
         click.events = vec![
             egui::Event::PointerMoved(page_point),
@@ -9118,6 +9770,8 @@ mod tests {
             mde_web_preview_client::MediaTransportAction::Stop,
             mde_web_preview_client::MediaTransportAction::Next,
             mde_web_preview_client::MediaTransportAction::Previous,
+            mde_web_preview_client::MediaTransportAction::VolumeUp,
+            mde_web_preview_client::MediaTransportAction::VolumeDown,
         ] {
             state.active_tab_media_transport(action);
         }
@@ -9244,6 +9898,8 @@ mod tests {
             mde_web_preview_client::MediaTransportAction::Stop,
             mde_web_preview_client::MediaTransportAction::Next,
             mde_web_preview_client::MediaTransportAction::Previous,
+            mde_web_preview_client::MediaTransportAction::VolumeUp,
+            mde_web_preview_client::MediaTransportAction::VolumeDown,
         ] {
             assert!(
                 controls.iter().any(|msg| matches!(
@@ -9818,8 +10474,12 @@ mod tests {
             "container identity stays per-tab"
         );
         assert!(
-            chrome_ui::tab_label(&state.tabs[1]).contains("W "),
-            "the tab pill carries the Work marker"
+            !chrome_ui::tab_label(&state.tabs[1]).contains("W "),
+            "the tab title should stay clean; status belongs to the chip row"
+        );
+        assert!(
+            chrome_ui::tab_status_chip_labels(&state.tabs[1]).contains(&"Work"),
+            "the tab pill carries the Work container chip"
         );
         assert!(
             chrome_ui::tab_hover(&state.tabs[1]).contains("Container: Work"),
@@ -9855,8 +10515,12 @@ mod tests {
             "display target intent stays per-tab"
         );
         assert!(
-            chrome_ui::tab_label(&state.tabs[1]).contains("D2 "),
-            "the tab pill carries the Display 2 marker"
+            !chrome_ui::tab_label(&state.tabs[1]).contains("D2 "),
+            "the tab title should stay clean; status belongs to the chip row"
+        );
+        assert!(
+            chrome_ui::tab_status_chip_labels(&state.tabs[1]).contains(&"Secondary Display"),
+            "the tab pill carries the secondary-display chip"
         );
         assert!(
             chrome_ui::tab_hover(&state.tabs[1]).contains("Display target: Secondary Display"),
@@ -9950,8 +10614,12 @@ mod tests {
             u64::try_from(IDLE_TAB_SUSPEND_AFTER.as_millis()).unwrap()
         );
         assert!(
-            chrome_ui::tab_label(&state.tabs[0]).contains('\u{25D2}'),
-            "suspended tabs wear the idle marker"
+            !chrome_ui::tab_label(&state.tabs[0]).contains('\u{25D2}'),
+            "the tab title should stay clean; status belongs to the chip row"
+        );
+        assert!(
+            chrome_ui::tab_status_chip_labels(&state.tabs[0]).contains(&"Idle suspended"),
+            "suspended tabs wear the idle status chip"
         );
         assert!(chrome_ui::tab_hover(&state.tabs[0]).contains("Idle suspended"));
     }
@@ -10043,9 +10711,119 @@ mod tests {
             "Browser should no longer paint the shared MENUBAR-ALL title strip: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text.contains('\u{22EE}')),
-            "Browser-local toolbar menu button should remain visible: {texts:?}"
+            !texts.iter().any(|text| text.contains('\u{22EE}')),
+            "Browser toolbar should not render the old dropdown ellipsis: {texts:?}"
         );
+        assert!(
+            !texts.iter().any(|text| text == "Browser Options"),
+            "Options render only after the internal tab is opened: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_options_tab_opens_focuses_and_clears_for_real_navigation() {
+        let mut state = WebState::default();
+
+        state.open_options_tab();
+
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(
+            state.active_internal_page(),
+            Some(BrowserInternalPage::Options)
+        );
+        assert_eq!(state.address, BROWSER_OPTIONS_URL);
+        assert_eq!(chrome_ui::tab_label(&state.tabs[0]), "Browser Options");
+
+        state.open_options_tab();
+        assert_eq!(
+            state.tabs.len(),
+            1,
+            "opening Options again focuses the existing internal tab"
+        );
+
+        state.load_target("https://example.test/".to_owned());
+        assert_eq!(state.active_internal_page(), None);
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::ReplaceActiveUrl {
+                index: 0,
+                engine: BrowserEngine::Servo,
+                url: "https://example.test/".to_owned(),
+            }),
+            "real omnibox navigation replaces the internal page with a live helper"
+        );
+    }
+
+    #[test]
+    fn browser_options_page_renders_command_categories_and_disabled_rows_in_chrome_text() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        state.power_mode = true;
+        state.open_options_tab();
+        let menu_titles: Vec<String> = menubar::chrome_menus(&state)
+            .iter()
+            .map(|menu| menu.title.clone())
+            .collect();
+        assert_eq!(
+            menu_titles,
+            [
+                "Page".to_owned(),
+                "Engine".to_owned(),
+                "Edit".to_owned(),
+                "View".to_owned(),
+                "Power".to_owned(),
+                "History".to_owned(),
+                "Privacy".to_owned(),
+                "Bookmarks".to_owned()
+            ],
+            "Options page is backed by every top-level Browser command category"
+        );
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let texts = painted_text(&out.shapes);
+        let labels: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
+        for label in [
+            "Navigation",
+            "Runtime",
+            "Input",
+            "Rendering",
+            "Instrumentation",
+        ] {
+            assert!(
+                labels.contains(&label),
+                "Options page category rail must expose the visible {label} category: {labels:?}"
+            );
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Back" && *color == chrome_ui::CHROME_TEXT_DIM),
+            "disabled command rows stay visible with Browser dim text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Use CEF / Chromium for New Tabs"
+                    && *color == chrome_ui::CHROME_TEXT),
+            "engine controls render through the Options command model: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_options_actions_dispatch_through_menubar_apply() {
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+        assert!(state.vertical_tabs);
+
+        menubar::apply(&ctx, &mut state, menubar::MenuAction::ToggleVerticalTabs);
+        assert!(!state.vertical_tabs);
+        menubar::apply(
+            &ctx,
+            &mut state,
+            menubar::MenuAction::SelectEngine(BrowserEngine::Cef),
+        );
+        assert_eq!(state.engine, BrowserEngine::Cef);
     }
 
     #[test]
@@ -10059,6 +10837,32 @@ mod tests {
         );
         assert!(state.tabs[0].texture.is_some());
         assert!(run_panel(&mut state), "the browser image produced no draw");
+    }
+
+    #[test]
+    fn frame_upload_uses_arc_capture_retention_without_cpu_clone() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(
+            run_until_texture(&mut state),
+            "no frame uploaded to a texture"
+        );
+        let tab = &state.tabs[state.active];
+        assert!(tab.texture.is_some(), "paint-ready frame did not upload");
+        let frame = tab
+            .last_frame
+            .as_ref()
+            .expect("paint-ready upload must retain the capture frame");
+        assert!(
+            !frame.pixels.is_empty(),
+            "retained capture frame must keep the decoded pixels"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(frame),
+            1,
+            "Browser should retain exactly one CPU-side frame Arc for capture"
+        );
     }
 
     #[test]
@@ -10169,27 +10973,33 @@ mod tests {
     }
 
     #[test]
-    fn the_audio_glyph_reflects_playback_and_mute() {
-        // Silent + unmuted → no glyph (the strip stays quiet).
-        assert_eq!(chrome_ui::audio_glyph_for(false, false), None);
-        // Audibly playing → the speaker, hover offers to mute.
+    fn the_audio_icon_reflects_playback_and_mute() {
+        // Silent + unmuted -> no icon (the strip stays quiet).
+        assert_eq!(chrome_ui::audio_icon_for(false, false), None);
+        // Audibly playing -> the speaker, hover offers to mute.
         assert_eq!(
-            chrome_ui::audio_glyph_for(true, false),
-            Some(("\u{1F50A}", "Mute tab"))
+            chrome_ui::audio_icon_for(true, false),
+            Some((chrome_ui::ChromeIcon::VolumeUp, "Mute tab"))
         );
-        // Muted → the muted-speaker; mute WINS the glyph even while audio plays.
+        // Muted -> the muted-speaker; mute wins the icon even while audio plays.
         assert_eq!(
-            chrome_ui::audio_glyph_for(false, true),
-            Some(("\u{1F507}", "Unmute tab"))
+            chrome_ui::audio_icon_for(false, true),
+            Some((chrome_ui::ChromeIcon::VolumeOff, "Unmute tab"))
         );
         assert_eq!(
-            chrome_ui::audio_glyph_for(true, true),
-            Some(("\u{1F507}", "Unmute tab"))
+            chrome_ui::audio_icon_for(true, true),
+            Some((chrome_ui::ChromeIcon::VolumeOff, "Unmute tab"))
         );
     }
 
     #[test]
     fn media_metadata_chip_label_uses_title_artist_and_source_fallbacks() {
+        assert_eq!(ellipsize("abcdef", 6), "abcdef");
+        assert_eq!(ellipsize("abcdef", 5), "ab...");
+        assert_eq!(ellipsize("abcdef", 3), "...");
+        assert_eq!(ellipsize("abcdef", 0), "");
+        assert!(ellipsize("abcdef", 5).is_ascii());
+        assert!(ellipsize("abcdef", 5).chars().count() <= 5);
         assert_eq!(
             media_metadata_chip_label(r#"{"title":" Track ","artist":" Artist "}"#).as_deref(),
             Some("Now: Track - Artist")
@@ -10199,10 +11009,220 @@ mod tests {
                 r#"{"title":"","source_url":"https://media.example/song.mp3"}"#
             )
             .as_deref(),
-            Some("Now: https://media.example/song…")
+            Some("Now: https://media.example/so...")
         );
         assert_eq!(media_metadata_chip_label(r#"{"title":"   "}"#), None);
         assert_eq!(media_metadata_chip_label("not-json"), None);
+    }
+
+    #[test]
+    fn browser_media_toolbar_model_requires_real_media_metadata() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            chrome_ui::browser_media_toolbar_model(&state),
+            None,
+            "ordinary pages without media metadata must not grow toolbar chrome"
+        );
+    }
+
+    #[test]
+    fn browser_media_toolbar_model_reflects_paused_active_media() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Paused Track","paused":true}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        let model = chrome_ui::browser_media_toolbar_model(&state).expect("toolbar media model");
+        assert_eq!(model.label, "Now: Paused Track");
+        assert!(model.paused);
+        assert!(!model.background);
+        let (icon, _tip, action) = chrome_ui::media_toolbar_play_action(model.paused);
+        assert_eq!(icon, chrome_ui::ChromeIcon::Play);
+        assert_eq!(action, mde_web_preview_client::MediaTransportAction::Play);
+    }
+
+    #[test]
+    fn browser_media_toolbar_model_selects_background_media_and_existing_transport_path() {
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+
+        let model = chrome_ui::browser_media_toolbar_model(&state).expect("toolbar media model");
+        assert_eq!(model.label, "Now: Background");
+        assert!(!model.paused);
+        assert!(model.background);
+        let (icon, _tip, action) = chrome_ui::media_toolbar_play_action(model.paused);
+        assert_eq!(icon, chrome_ui::ChromeIcon::Pause);
+        assert_eq!(action, mde_web_preview_client::MediaTransportAction::Pause);
+
+        assert!(state.selected_media_transport(action));
+        let media_controls = drain_control_messages(&media_helper);
+        assert!(
+            media_controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport {
+                    action: mde_web_preview_client::MediaTransportAction::Pause
+                }
+            )),
+            "toolbar media control should reuse the selected background media path: {media_controls:?}"
+        );
+        let quiet_controls = drain_control_messages(&quiet_helper);
+        assert!(
+            quiet_controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport { .. }
+            )),
+            "quiet foreground tab must not receive toolbar media transport: {quiet_controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_media_pip_model_requires_media_metadata_and_retained_frame() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        state.media_pip_open = true;
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            chrome_ui::browser_media_pip_model(&state),
+            None,
+            "PiP must not render for ordinary pages without media metadata"
+        );
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"PiP Track","paused":true}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        assert_eq!(
+            chrome_ui::browser_media_pip_model(&state),
+            None,
+            "metadata alone is not enough; the overlay needs a retained frame"
+        );
+
+        assert!(run_until_texture(&mut state));
+        let model = chrome_ui::browser_media_pip_model(&state).expect("PiP model");
+        assert_eq!(model.label, "Now: PiP Track");
+        assert!(model.paused);
+        assert_eq!(
+            model.frame_size,
+            [testkit::FAKE_W as usize, testkit::FAKE_H as usize]
+        );
+    }
+
+    #[test]
+    fn browser_media_pip_menu_toggles_state_through_menubar_apply() {
+        let ctx = egui::Context::default();
+        let mut empty = WebState::default();
+        menubar::apply(
+            &ctx,
+            &mut empty,
+            menubar::MenuAction::TogglePictureInPicture,
+        );
+        assert!(
+            !empty.media_pip_open,
+            "no selected Browser media keeps PiP apply as a safe no-op"
+        );
+
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Menu Track","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        menubar::apply(
+            &ctx,
+            &mut state,
+            menubar::MenuAction::TogglePictureInPicture,
+        );
+        assert!(state.media_pip_open);
+        menubar::apply(
+            &ctx,
+            &mut state,
+            menubar::MenuAction::TogglePictureInPicture,
+        );
+        assert!(!state.media_pip_open);
+    }
+
+    #[test]
+    fn browser_media_pip_renders_background_media_frame_without_switching_tabs() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, _quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+        state.media_pip_open = true;
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        assert_eq!(
+            state.active, 1,
+            "rendering PiP must not focus the media tab"
+        );
+        assert!(
+            state.tabs[0].texture.is_some(),
+            "PiP uploads the retained background media frame for painting"
+        );
+        let media_texture = state.tabs[0].texture.as_ref().expect("media texture").id();
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|(text, _)| text == "Picture-in-Picture"),
+            "PiP title should be painted in Browser chrome text: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(text, _)| text == "Now: Background"),
+            "PiP should name the selected background media: {texts:?}"
+        );
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            page_texture_rect(&prims, media_texture).is_some(),
+            "PiP should paint the background media tab texture"
+        );
     }
 
     #[test]
@@ -10230,6 +11250,7 @@ mod tests {
                     "paused": false,
                     "duration_ms": 120000,
                     "position_ms": 42000,
+                    "volume_percent": 42,
                 })
                 .to_string(),
             },
@@ -10273,6 +11294,7 @@ mod tests {
         assert_eq!(latest["metadata"]["paused"], false);
         assert_eq!(latest["metadata"]["duration_ms"], 120000);
         assert_eq!(latest["metadata"]["position_ms"], 42000);
+        assert_eq!(latest["metadata"]["volume_percent"], 42);
     }
 
     #[test]
@@ -10413,6 +11435,109 @@ mod tests {
                 mde_web_preview_client::ControlMsg::MediaTransport { .. }
             )),
             "the quiet foreground tab should not receive the media action: {quiet_controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_media_control_bus_volume_action_uses_selected_media_tab() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false,"volume_percent":42}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        persist
+            .write(
+                &browser_media_control_topic(&local_hostname()),
+                Priority::Default,
+                None,
+                Some(&browser_media_control_body(
+                    mde_web_preview_client::MediaTransportAction::VolumeUp,
+                    None,
+                    "test",
+                    123,
+                )),
+            )
+            .expect("write media volume control");
+
+        state.poll_media_control_actions();
+
+        let media_controls = drain_control_messages(&media_helper);
+        assert!(
+            media_controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport {
+                    action: mde_web_preview_client::MediaTransportAction::VolumeUp
+                }
+            )),
+            "the background media tab should receive the volume action: {media_controls:?}"
+        );
+        let quiet_controls = drain_control_messages(&quiet_helper);
+        assert!(
+            quiet_controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport { .. }
+            )),
+            "the quiet foreground tab should not receive the volume action: {quiet_controls:?}"
+        );
+    }
+
+    #[test]
+    fn browser_hardware_media_key_drives_selected_background_media_tab() {
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let (quiet_session, quiet_helper, _quiet_writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::AudioState { audible: true },
+        );
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        state.push_session_with_engine(quiet_session, BrowserEngine::Cef);
+        state.tabs[1].session.poll();
+        assert_eq!(state.active, 1, "quiet foreground tab is active");
+
+        assert!(
+            state.selected_media_transport(mde_web_preview_client::MediaTransportAction::PlayPause)
+        );
+
+        let media_controls = drain_control_messages(&media_helper);
+        assert!(
+            media_controls.iter().any(|msg| matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport {
+                    action: mde_web_preview_client::MediaTransportAction::PlayPause
+                }
+            )),
+            "hardware media key should follow the selected background media tab: {media_controls:?}"
+        );
+        let quiet_controls = drain_control_messages(&quiet_helper);
+        assert!(
+            quiet_controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::MediaTransport { .. }
+            )),
+            "quiet foreground tab must not steal the hardware media key: {quiet_controls:?}"
         );
     }
 
@@ -11913,6 +13038,7 @@ mod tests {
         let (b, _hb) = testkit::connect().expect("connect b");
         let (c, _hc) = testkit::connect().expect("connect c");
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         state.push_session(a);
         state.push_session(b);
         state.push_session(c);
@@ -11953,6 +13079,7 @@ mod tests {
         let (b, _hb) = testkit::connect().expect("connect b");
         let (c, _hc) = testkit::connect().expect("connect c");
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         state.push_session(a);
         state.push_session(b);
         state.push_session(c);
@@ -11984,6 +13111,7 @@ mod tests {
         let (a, _ha) = testkit::connect().expect("connect a");
         let (b, _hb) = testkit::connect().expect("connect b");
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         state.push_session(a);
         state.push_session(b);
         state.tabs[0].force_dark = true; // marker proving the order is unchanged
@@ -12089,6 +13217,7 @@ mod tests {
     #[test]
     fn many_tabs_stay_on_one_scrolling_row_and_the_active_tab_stays_reachable() {
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         let mut _helpers = Vec::new();
         for _ in 0..20 {
             let (s, h) = testkit::connect().expect("connect");
@@ -12120,6 +13249,54 @@ mod tests {
         assert!(
             run_panel(&mut state),
             "the active far tab renders in the single scrolling row"
+        );
+    }
+
+    #[test]
+    fn horizontal_tabs_page_body_stays_within_the_visible_workspace() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.set_vertical_tabs(false);
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let rect = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("horizontal Browser body should paint the page texture");
+
+        assert!(
+            rect.left() >= -0.5 && rect.right() <= 960.5,
+            "horizontal Browser body must not paint off the visible right edge: {rect:?}"
+        );
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= 640.5,
+            "horizontal Browser body must remain inside the visible panel: {rect:?}"
+        );
+        assert!(
+            rect.height() > 360.0,
+            "horizontal Browser body should use the remaining workspace, not only the top slice: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn live_browser_page_requests_idle_repaint_heartbeat() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        assert!(
+            repaint_delay <= LIVE_PAGE_REPAINT_INTERVAL,
+            "active live Browser pages must keep polling frames without mouse input (delay {repaint_delay:?})"
         );
     }
 
@@ -12163,7 +13340,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_strip_engine_picker_replaces_raw_engine_new_tab_buttons() {
+    fn tab_strip_uses_compact_new_tab_without_engine_selector() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut state = WebState::default();
@@ -12176,68 +13353,23 @@ mod tests {
             .collect();
 
         assert!(
-            texts.iter().any(|text| text == "CEF"),
-            "engine picker should expose CEF as a first-class segment: {texts:?}"
+            !texts.iter().any(|text| text == "CEF" || text == "Servo"),
+            "tab strip should not render the old engine selector segments: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text.contains("Chromium")),
-            "engine picker should make the CEF/Chromium relationship visible: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "Servo"),
-            "engine picker should keep Servo visible as the fallback segment: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "+"),
-            "engine picker should use a compact icon-sized new-tab action: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "Default"),
-            "engine picker should mark the future-tab default engine: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text.contains("0 tabs")),
-            "engine picker should expose per-engine tab counts before any tab is opened: {texts:?}"
+            !texts.iter().any(|text| text.contains("Chromium")),
+            "CEF/Chromium detail now belongs in Options, not the tab strip: {texts:?}"
         );
         assert!(
             !texts
                 .iter()
-                .any(|text| text.contains("+CEF") || text.contains("+Servo")),
-            "the old raw +engine buttons should be gone: {texts:?}"
+                .any(|text| text == "Default" || text.contains("tabs") || text == "New tab"),
+            "future-engine state and new-tab command belong outside the tab strip: {texts:?}"
         );
 
-        state.select_engine(BrowserEngine::Cef);
-        let out = ctx.run(body_input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
-        });
-        let texts: Vec<String> = painted_text(&out.shapes)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
         assert!(
-            texts.iter().any(|text| text == "+"),
-            "engine picker should keep the compact new-tab action for CEF: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "Default"),
-            "engine picker should mark CEF as the selected future-tab runtime: {texts:?}"
-        );
-
-        state.select_engine(BrowserEngine::Servo);
-        let out = ctx.run(body_input(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| chrome_ui::tab_strip(ui, &mut state));
-        });
-        let texts: Vec<String> = painted_text(&out.shapes)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        assert!(
-            texts.iter().any(|text| text == "+"),
-            "engine picker should keep the compact new-tab action for Servo: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "Default"),
-            "engine picker should mark Servo as the selected future-tab runtime: {texts:?}"
+            chrome_ui::chrome_icon_painted_shape_count(chrome_ui::ChromeIcon::NewTab) > 0,
+            "new-tab toolbar control is a painted icon button"
         );
     }
 
@@ -12357,6 +13489,7 @@ mod tests {
         let png = encode_color_image_png(&img).expect("encode favicon");
 
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         state.push_session(session_with_favicon(&png));
         assert!(
             run_panel(&mut state),
@@ -12474,7 +13607,9 @@ mod tests {
 
         // Focus the page canvas first — the browser-reserved shortcut must
         // still win over page keyboard forwarding.
-        let page_point = pos2(480.0, 420.0);
+        let page_point = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("the Browser page texture should be locatable before clicking")
+            .center();
         let mut click = body_input();
         click.events = vec![
             egui::Event::PointerMoved(page_point),
@@ -12617,6 +13752,7 @@ mod tests {
         let (first, _h1) = testkit::connect().expect("connect 1");
         let (second, _h2) = testkit::connect().expect("connect 2");
         let mut state = WebState::default();
+        state.set_vertical_tabs(false);
         state.push_session(first);
         state.push_session(second);
         // Mark the FIRST tab so the assertion can tell which one closed.
@@ -12798,6 +13934,41 @@ mod tests {
         assert!(run_until_texture(&mut state));
         assert_eq!(state.tabs[0].session.nav().url, "about:blank");
         assert!(run_panel(&mut state), "new-tab dashboard draws");
+    }
+
+    #[test]
+    fn new_tab_dashboard_actions_use_browser_material_buttons() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::new_tab_dashboard(ui, &mut state);
+            });
+        });
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Search" && *color == chrome_ui::CHROME_TOOLBAR),
+            "dashboard submit must use Browser primary-on text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Music" && *color == chrome_ui::CHROME_TEXT),
+            "speed-dial shortcuts must use Browser secondary text: {texts:?}"
+        );
+        for label in ["Search", "Music"] {
+            assert!(
+                !texts.iter().any(|(text, color)| {
+                    text == label
+                        && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)
+                }),
+                "dashboard action `{label}` must not inherit shared shell text colors: {texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -13688,6 +14859,54 @@ mod tests {
             }),
             "cert interstitial metadata must use Browser Material dim text: {texts:?}"
         );
+        let assert_primary_action = |texts: &[(String, egui::Color32)], label: &str| {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, color)| text == label && *color == chrome_ui::CHROME_TOOLBAR),
+                "interstitial action `{label}` must use Browser primary-on text: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|(text, color)| {
+                    text == label
+                        && matches!(
+                            *color,
+                            chrome_ui::CHROME_TEXT
+                                | Style::TEXT
+                                | Style::TEXT_DIM
+                                | Style::TEXT_STRONG
+                        )
+                }),
+                "interstitial action `{label}` must not inherit raw/shared text colors: {texts:?}"
+            );
+        };
+        assert_primary_action(&texts, "Back to safety");
+
+        let mut respawn_requested = false;
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::crashed_body(ui, "renderer exited".to_owned(), &mut respawn_requested);
+            });
+        });
+        assert_primary_action(&painted_text(&out.shapes), "Reload");
+
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::safe_browsing_interstitial_body(ui, "https://blocked.example/");
+            });
+        });
+        assert_primary_action(&painted_text(&out.shapes), "Back to safety");
+
+        let block = ManagedPolicyBlock {
+            url: "https://policy.example/".to_owned(),
+            rule: "blocked-host".to_owned(),
+        };
+        let out = ctx.run(body_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                chrome_ui::managed_policy_interstitial_body(ui, &block);
+            });
+        });
+        assert_primary_action(&painted_text(&out.shapes), "Back to safety");
     }
 
     #[test]
@@ -13778,6 +14997,8 @@ mod tests {
             id: 1,
             session,
             engine: BrowserEngine::Servo,
+            internal_page: None,
+            internal_peer: None,
             container: ContainerProfile::None,
             display_target: DisplayTarget::Current,
             group: None,
@@ -14152,6 +15373,11 @@ mod tests {
         let summary = state.site_data_summary();
         assert!(summary.contains("2 tracked sites"), "summary = {summary}");
         assert!(summary.contains("2 open tabs"), "summary = {summary}");
+        assert!(summary.is_ascii(), "summary = {summary}");
+        assert!(
+            !summary.contains('·'),
+            "site-data summary must use ASCII separators: {summary}"
+        );
     }
 
     #[test]
@@ -14181,6 +15407,11 @@ mod tests {
         assert!(
             summary.contains("news.example.com cleared 1 time"),
             "summary = {summary}"
+        );
+        assert!(summary.is_ascii(), "summary = {summary}");
+        assert!(
+            !summary.contains('·'),
+            "site-data summary must use ASCII separators: {summary}"
         );
     }
 
@@ -14580,9 +15811,15 @@ mod tests {
         for label in ["Add bookmark", "Copy URL", "Send in Chat", "Share to QR"] {
             assert!(
                 texts.iter().any(|(text, color)| {
-                    text.contains(label) && *color == chrome_ui::CHROME_TEXT
+                    text.as_str() == label && *color == chrome_ui::CHROME_TEXT
                 }),
                 "page action `{label}` must use Browser Material text: {texts:?}"
+            );
+        }
+        for legacy in ['\u{2606}', '\u{29C9}', '\u{1F4AC}', '\u{21AA}', '\u{21E5}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "page actions must not paint legacy glyph prefixes as text: {texts:?}"
             );
         }
         assert!(
@@ -15574,6 +16811,135 @@ mod tests {
     }
 
     #[test]
+    fn browser_default_uses_vertical_tabs() {
+        assert!(
+            WebState::default().vertical_tabs,
+            "Browser defaults to the compact vertical tab rail"
+        );
+    }
+
+    #[test]
+    fn browser_session_restore_missing_vertical_tabs_uses_default() {
+        let body = serde_json::json!({
+            "op": "browser_session_sync",
+            "settings": {"future_engine": "cef"},
+            "tabs": [],
+            "downloads": [],
+        })
+        .to_string();
+        let mut state = WebState::default();
+        state.set_vertical_tabs(false);
+
+        state
+            .restore_session_sync_snapshot(&body)
+            .expect("restore snapshot");
+
+        assert!(
+            state.vertical_tabs,
+            "old snapshots without vertical_tabs adopt the new default"
+        );
+    }
+
+    #[test]
+    fn browser_session_restore_preserves_explicit_horizontal_tabs() {
+        let body = serde_json::json!({
+            "op": "browser_session_sync",
+            "settings": {"vertical_tabs": false},
+            "tabs": [],
+            "downloads": [],
+        })
+        .to_string();
+        let mut state = WebState::default();
+
+        state
+            .restore_session_sync_snapshot(&body)
+            .expect("restore snapshot");
+
+        assert!(
+            !state.vertical_tabs,
+            "an explicit user-synced horizontal preference still wins"
+        );
+    }
+
+    #[test]
+    fn browser_session_restore_caps_eager_tabs_and_keeps_the_active_tab() {
+        let active_index = (MAX_EAGER_BROWSER_STARTUP_OPEN_TABS + 3) as u64;
+        let tabs: Vec<_> = (0..(MAX_EAGER_BROWSER_STARTUP_OPEN_TABS + 6))
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "engine": "cef",
+                    "url": format!("https://restore.example/{index}")
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "op": "browser_session_sync",
+            "active_index": active_index,
+            "settings": {"future_engine": "cef"},
+            "tabs": tabs,
+            "downloads": [],
+        })
+        .to_string();
+        let mut state = WebState::default();
+
+        let restored = state
+            .restore_session_sync_snapshot(&body)
+            .expect("restore snapshot");
+
+        assert_eq!(restored, MAX_EAGER_BROWSER_STARTUP_OPEN_TABS);
+        let mut restored_urls = Vec::new();
+        while let Some(TabOpenIntent::NewForegroundUrl { url, .. }) = state.take_open_request() {
+            restored_urls.push(url);
+        }
+        assert_eq!(restored_urls.len(), MAX_EAGER_BROWSER_STARTUP_OPEN_TABS);
+        assert_eq!(
+            restored_urls.last().map(String::as_str),
+            Some("https://restore.example/11"),
+            "the saved active tab stays last so it becomes foreground"
+        );
+        assert!(
+            state
+                .capture_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("skipped 6 older tabs")),
+            "oversized restore should explain the cap: {:?}",
+            state.capture_notice
+        );
+    }
+
+    #[test]
+    fn browser_startup_open_queue_caps_poisoned_send_tab_replay() {
+        let mut state = WebState::default();
+        for index in 0..(MAX_EAGER_BROWSER_STARTUP_OPEN_TABS + 5) {
+            state.request_new_tab_with_url(
+                BrowserEngine::Cef,
+                format!("https://send.example/{index}"),
+            );
+        }
+
+        state.cap_eager_startup_open_requests();
+
+        let mut restored_urls = Vec::new();
+        while let Some(TabOpenIntent::NewForegroundUrl { url, .. }) = state.take_open_request() {
+            restored_urls.push(url);
+        }
+        assert_eq!(restored_urls.len(), MAX_EAGER_BROWSER_STARTUP_OPEN_TABS);
+        assert_eq!(
+            restored_urls.last().map(String::as_str),
+            Some("https://send.example/7")
+        );
+        assert!(
+            state
+                .capture_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("skipped 5 queued tabs")),
+            "oversized startup queue should explain the cap: {:?}",
+            state.capture_notice
+        );
+    }
+
+    #[test]
     fn browser_session_restore_rejects_the_wrong_snapshot_shape() {
         let mut state = WebState::default();
         assert!(state.restore_session_sync_snapshot("{}").is_err());
@@ -16221,8 +17587,19 @@ mod tests {
         );
         assert_eq!(
             chrome_ui::security_headline(chrome_ui::SecurityLevel::Mesh),
-            "Mesh service \u{2014} trusted overlay"
+            "Mesh service: trusted overlay"
         );
+        for level in [
+            chrome_ui::SecurityLevel::Secure,
+            chrome_ui::SecurityLevel::NotSecure,
+            chrome_ui::SecurityLevel::Mesh,
+            chrome_ui::SecurityLevel::Neutral,
+        ] {
+            assert!(chrome_ui::security_headline(level).is_ascii());
+            assert!(chrome_ui::SecurityLevel::label(level).is_ascii());
+            assert!(!chrome_ui::security_headline(level).contains('\u{2014}'));
+            assert!(!chrome_ui::SecurityLevel::label(level).contains('\u{2014}'));
+        }
         assert_eq!(
             chrome_ui::security_headline(chrome_ui::SecurityLevel::Neutral),
             "About this page"
@@ -16243,14 +17620,20 @@ mod tests {
     #[test]
     fn site_info_summary_surfaces_idn_homograph_warning() {
         // A punycode/IDN host (xn-- prefix) trips the spoofing warning...
-        assert!(
-            chrome_ui::site_info_summary("https://xn--pple-43d.com/")
-                .confusable
-                .is_some(),
-            "punycode host warns"
+        let punycode = chrome_ui::site_info_summary("https://xn--pple-43d.com/")
+            .confusable
+            .expect("punycode host warns");
+        assert_eq!(
+            punycode,
+            "Punycode/IDN host (xn--): verify this is the site you expect"
         );
+        assert!(punycode.is_ascii());
+        assert!(!punycode.contains('\u{2014}'));
         // ...a look-alike Cyrillic 'а' (U+0430) mixed with Latin trips it too...
-        assert!(chrome_ui::confusable_warning("\u{0430}pple.com").is_some());
+        let confusable =
+            chrome_ui::confusable_warning("\u{0430}pple.com").expect("confusable host warns");
+        assert!(confusable.is_ascii());
+        assert!(!confusable.contains('\u{2014}'));
         // ...and a plain ASCII host does not.
         assert!(chrome_ui::site_info_summary("https://example.com/")
             .confusable
@@ -16260,9 +17643,12 @@ mod tests {
 
     #[test]
     fn site_info_summary_shows_a_cert_line_only_for_https() {
-        assert!(chrome_ui::site_info_summary("https://example.com/")
+        let cert_line = chrome_ui::site_info_summary("https://example.com/")
             .cert_line
-            .is_some());
+            .expect("HTTPS page reports a certificate line");
+        assert_eq!(cert_line, "Certificate: valid; the connection is encrypted");
+        assert!(cert_line.is_ascii());
+        assert!(!cert_line.contains('\u{2014}'));
         assert!(chrome_ui::site_info_summary("http://example.com/")
             .cert_line
             .is_none());
@@ -18147,6 +19533,34 @@ mod tests {
     }
 
     #[test]
+    fn browser_offline_cache_copy_uses_material_action_button() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        state.address = "https://example.test/".to_owned();
+        seed_gate_notice_for_test(&mut state);
+        state.apply_offline_cache_result(offline_cache_result(
+            "https://example.test/",
+            "Cached fallback body.",
+        ));
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text == "Copy" && *color == chrome_ui::CHROME_TEXT),
+            "offline-cache Copy action must use Browser Material text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "Copy" && *color == Style::TEXT),
+            "offline-cache Copy action must not use shared shell button text: {texts:?}"
+        );
+    }
+
+    #[test]
     fn browser_offline_cache_matches_canonical_url_aliases() {
         let mut state = WebState::default();
         state.apply_offline_cache_result(offline_cache_result(
@@ -18525,7 +19939,7 @@ mod tests {
             .expect("list browser session sync");
         assert_eq!(msgs.len(), 1, "unchanged snapshots are de-duped");
 
-        state.set_vertical_tabs(true);
+        state.set_vertical_tabs(false);
         state.publish_session_snapshot();
         let msgs = persist
             .list_since(ACTION_BROWSER_SESSION_SYNC, None)
@@ -18533,7 +19947,7 @@ mod tests {
         assert_eq!(msgs.len(), 2, "a changed setting emits a new snapshot");
         let latest: serde_json::Value =
             serde_json::from_str(msgs[1].body.as_deref().expect("sync body")).expect("valid JSON");
-        assert_eq!(latest["settings"]["vertical_tabs"], true);
+        assert_eq!(latest["settings"]["vertical_tabs"], false);
     }
 
     #[test]
@@ -18771,6 +20185,41 @@ mod tests {
     }
 
     #[test]
+    fn browser_shell_omnibox_items_include_bookmarks_history_and_web_action() {
+        let mut state = WebState::default();
+        state.bookmark_index = vec![BookmarkBarLink {
+            title: "Mesh Docs".into(),
+            url: "https://docs.mesh/".into(),
+        }];
+        state
+            .history
+            .record("https://history.mesh/", "Mesh History", 10);
+
+        let items = state.search_omnibox_items("mesh");
+        let domains: Vec<SearchDomain> = items.iter().map(|item| item.domain).collect();
+
+        assert!(domains.contains(&SearchDomain::BrowserBookmark));
+        assert!(domains.contains(&SearchDomain::BrowserHistory));
+        assert!(domains.contains(&SearchDomain::WebSuggestion));
+        assert!(items
+            .iter()
+            .any(|item| { item.domain == SearchDomain::WebSuggestion && item.payload == "mesh" }));
+    }
+
+    #[test]
+    fn browser_shell_omnibox_target_opens_a_foreground_tab_when_empty() {
+        let mut state = WebState::default();
+
+        state.open_search_omnibox_target("mesh browser");
+
+        assert!(matches!(
+            state.open_requested.back(),
+            Some(TabOpenIntent::NewForegroundUrl { url, .. })
+                if url == "https://search.mesh/search?q=mesh+browser"
+        ));
+    }
+
+    #[test]
     fn tab_group_color_cycles_over_the_palette() {
         // Distinct colors for successive groups, wrapping at the palette length (5).
         assert_eq!(tab_group_color(0), chrome_ui::tab_group_color(0));
@@ -18826,6 +20275,46 @@ mod tests {
         s.move_selection(1); // -> search
         s.move_selection(1); // wraps back to the first
         assert_eq!(s.selected_value().as_deref(), Some("https://bm.example/"));
+    }
+
+    #[test]
+    fn browser_suggestions_emit_shared_search_items_in_commit_order() {
+        let mut s = SuggestionState::default();
+        s.set_bookmark_matches(vec![BookmarkBarLink {
+            title: "Mesh Bookmark".into(),
+            url: "https://bookmark.example/mesh".into(),
+        }]);
+        s.set_history_matches(vec!["https://history.example/mesh".into()]);
+        s.items = vec!["https://history.example/mesh".into(), "mesh browser".into()];
+
+        let items = s.ordered_search_items();
+        let domains: Vec<SearchDomain> = items.iter().map(|item| item.domain).collect();
+        let payloads: Vec<&str> = items.iter().map(|item| item.payload.as_str()).collect();
+        let targets: Vec<&str> = items.iter().map(|item| item.target.as_str()).collect();
+
+        assert_eq!(
+            domains,
+            [
+                SearchDomain::BrowserBookmark,
+                SearchDomain::BrowserHistory,
+                SearchDomain::WebSuggestion,
+            ],
+            "Browser adapter must expose bookmarks, history, then deduped web suggestions"
+        );
+        assert_eq!(
+            payloads,
+            [
+                "https://bookmark.example/mesh",
+                "https://history.example/mesh",
+                "mesh browser",
+            ],
+            "payloads remain the exact values committed by Enter/click"
+        );
+        assert_eq!(
+            targets[2],
+            "https://search.mesh/search?q=mesh+browser",
+            "web suggestion rows carry their real search target while keeping the typed commit payload"
+        );
     }
 
     #[test]
@@ -20780,6 +22269,41 @@ mod tests {
     }
 
     #[test]
+    fn browser_download_progress_summary_folds_active_ledger_jobs_for_shell_chrome() {
+        let running = transfer_fixture(
+            "browser-running",
+            TransferMethod::BrowserDownload,
+            TransferState::Running,
+            30,
+        );
+        let queued = transfer_fixture(
+            "browser-queued",
+            TransferMethod::BrowserDownload,
+            TransferState::Queued,
+            40,
+        );
+        let done = transfer_fixture(
+            "browser-done",
+            TransferMethod::BrowserDownload,
+            TransferState::Done,
+            50,
+        );
+        let http = transfer_fixture("http", TransferMethod::Http, TransferState::Running, 60);
+        let state =
+            WebState::default().with_transfers(Box::new(RecordingTransfers::with_jobs(vec![
+                done, http, queued, running,
+            ])));
+
+        let summary = state
+            .operation_progress_summary()
+            .expect("active Browser downloads produce shell progress");
+        assert_eq!(summary.active, 2);
+        assert_eq!(summary.known_progress, 1);
+        assert_eq!(summary.fraction, Some(0.42));
+        assert_eq!(summary.label, "2 browser downloads");
+    }
+
+    #[test]
     fn browser_download_completion_publishes_notify_feed_event_once() {
         let bus = tempfile::tempdir().expect("temp bus");
         let running = transfer_fixture(
@@ -20908,6 +22432,12 @@ mod tests {
         assert!(
             state.gate_notice.is_some(),
             "the no-seat gate is named honestly"
+        );
+        assert_eq!(state.gate_notice.as_deref(), Some(NO_GPU_SEAT_NOTICE));
+        assert!(NO_GPU_SEAT_NOTICE.is_ascii());
+        assert!(
+            !NO_GPU_SEAT_NOTICE.contains('\u{2014}'),
+            "no-seat gate copy must avoid typographic dash glyphs"
         );
         // The panel draws the honest gated EmptyState, never a fake page.
         assert!(run_panel(&mut state));
@@ -21685,6 +23215,12 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "Rust docs", "title-prefix ranks first");
         assert_eq!(hits[1].title, "News", "url-substring match ranked lower");
+        let fuzzy = matching_bookmarks(&index, "rstd", 5);
+        assert_eq!(
+            fuzzy.first().map(|b| b.title.as_str()),
+            Some("Rust docs"),
+            "bookmark autocomplete uses the shared fuzzy title tier"
+        );
         // Cap is honored, and a no-match draft yields nothing.
         assert_eq!(matching_bookmarks(&index, "http", 1).len(), 1);
         assert!(matching_bookmarks(&index, "zzz", 5).is_empty());

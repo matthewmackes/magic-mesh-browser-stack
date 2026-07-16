@@ -12,25 +12,26 @@ use std::{
     ops::Range,
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use mde_egui::egui::{
     self, Color32, FontFamily, FontId, RichText, TextStyle, TextureHandle, TextureOptions,
 };
 use mde_egui::menubar::Entry;
-use mde_egui::{muted_note, ChipTone, Style};
+use mde_egui::{AnimatedScalar, ChipTone, Motion, MotionMode, MotionPreset, Style};
 use mde_web_preview_client::{
     confusable_reason, host_of, BeforeUnloadDialog, CertError, ConfusableReason, CursorKind,
-    EditCommand, JsDialog, SessionState,
+    EditCommand, JsDialog, MediaTransportAction, SessionState,
 };
 
 mod accessibility;
 mod body;
 mod drawers;
 use super::{
-    browser_capture_dir, ellipsize, media_metadata_chip_label, BrowserEngine,
-    BrowserOfflineCacheResult, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
+    browser_capture_dir, ellipsize, is_new_tab_url, media_metadata_chip_label, BrowserEngine,
+    BrowserOfflineCacheResult, BrowserReadAloudStatus, BrowserSecurityUpdateStatus,
+    BrowserVoiceCommandStatus, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
     ManagedPolicyBlock, PendingPasskeyConsent, PixelRegion, Tab, UserAgentOverride, WebState,
     CHROME_BUTTON, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE,
     CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM,
@@ -176,11 +177,19 @@ const STATE_PRESSED_ALPHA: u8 = 26;
 const CHROME_TAB_RADIUS: f32 = 8.0;
 const TAB_FAVICON_SIZE: f32 = 16.0;
 const TAB_ENGINE_BADGE_H: f32 = 16.0;
-const ENGINE_NEW_TAB_W: f32 = 42.0;
-const ENGINE_SEGMENT_W: f32 = 138.0;
-const ENGINE_CONTROL_H: f32 = 40.0;
-const ENGINE_SEGMENT_RADIUS: f32 = 18.0;
+const TAB_STATUS_CHIP: f32 = 14.0;
+const TAB_STATUS_CHIP_GAP: f32 = 2.0;
 const ACTION_BUTTON_RADIUS: f32 = 8.0;
+const ICON_BUTTON_RADIUS: f32 = 8.0;
+const ENGINE_TOOLBAR_CHIP_W: f32 = 42.0;
+const ENGINE_TOOLBAR_BADGE: f32 = 14.0;
+const CHROME_SEPARATOR_H: f32 = 9.0;
+const OPTION_ROW_H: f32 = 30.0;
+const OPTION_ICON_SIZE: f32 = 18.0;
+const MEDIA_CLUSTER_LABEL_W: f32 = 132.0;
+const MEDIA_PIP_W: f32 = 272.0;
+const MEDIA_PIP_VIDEO_H: f32 = 150.0;
+const MEDIA_PIP_MARGIN: f32 = 14.0;
 const TAB_GROUP_PALETTE: [Color32; 5] = [
     CHROME_GROUP_BLUE,
     CHROME_GROUP_GREEN,
@@ -192,12 +201,13 @@ const TAB_GROUP_PALETTE: [Color32; 5] = [
 /// The fixed slot width of one bookmark button on the single-row bar. Fixed so the
 /// overflow split ([`bookmark_bar_visible_count`]) is exact — no font measuring.
 pub(super) const BOOKMARK_BTN_W: f32 = 132.0;
-/// The width reserved for the ">>" overflow menu button when the row can't hold
+/// The width reserved for the overflow menu button when the row can't hold
 /// every bookmark.
 pub(super) const BOOKMARK_OVERFLOW_W: f32 = 26.0;
 /// The elision budget for a bookmark button's title (fits inside [`BOOKMARK_BTN_W`]
 /// at [`CHROME_FONT`]); the full title rides the hover tooltip.
 const BOOKMARK_TITLE_CHARS: usize = 18;
+const TAB_DRAG_SETTLE_TRAVEL: f32 = 7.0;
 
 pub(super) const fn button_text(enabled: bool) -> Color32 {
     if enabled {
@@ -223,26 +233,11 @@ pub(super) const fn selected_text(selected: bool) -> Color32 {
     }
 }
 
-pub(super) const fn page_action_text(enabled: bool) -> Color32 {
-    button_text(enabled)
-}
-
-pub(super) const fn page_action_star(
-    has_page: bool,
-    is_bookmarked: bool,
-) -> (&'static str, Color32) {
+pub(super) const fn page_action_icon_color(has_page: bool, is_bookmarked: bool) -> Color32 {
     match (has_page, is_bookmarked) {
-        (false, _) => ("\u{2606}", CHROME_TEXT_DIM),
-        (true, true) => ("\u{2605}", CHROME_PRIMARY),
-        (true, false) => ("\u{2606}", CHROME_TEXT),
-    }
-}
-
-pub(super) const fn tab_fill(active: bool) -> Color32 {
-    if active {
-        CHROME_TOOLBAR
-    } else {
-        CHROME_SURFACE_CONTAINER
+        (false, _) => CHROME_TEXT_DIM,
+        (true, true) => CHROME_PRIMARY,
+        (true, false) => CHROME_TEXT,
     }
 }
 
@@ -255,14 +250,6 @@ pub(super) const fn tab_stroke(active: bool) -> Color32 {
 }
 
 pub(super) const fn row_fill(selected: bool) -> Color32 {
-    if selected {
-        CHROME_PRIMARY_CONTAINER
-    } else {
-        CHROME_TOOLBAR
-    }
-}
-
-pub(super) const fn control_fill(selected: bool) -> Color32 {
     if selected {
         CHROME_PRIMARY_CONTAINER
     } else {
@@ -312,20 +299,6 @@ pub(super) const fn engine_glyph(engine: BrowserEngine) -> &'static str {
     }
 }
 
-pub(super) const fn engine_primary_label(engine: BrowserEngine) -> &'static str {
-    match engine {
-        BrowserEngine::Cef => "CEF",
-        BrowserEngine::Servo => "Servo",
-    }
-}
-
-pub(super) const fn engine_supporting_label(engine: BrowserEngine) -> &'static str {
-    match engine {
-        BrowserEngine::Cef => "Chromium",
-        BrowserEngine::Servo => "Rust web",
-    }
-}
-
 pub(super) const fn engine_accent(engine: BrowserEngine) -> Color32 {
     match engine {
         BrowserEngine::Cef => CHROME_PRIMARY,
@@ -344,94 +317,6 @@ pub(super) const fn engine_on_container(engine: BrowserEngine) -> Color32 {
     match engine {
         BrowserEngine::Cef => CHROME_ON_PRIMARY_CONTAINER,
         BrowserEngine::Servo => CHROME_ON_SUCCESS_CONTAINER,
-    }
-}
-
-pub(super) const fn engine_new_tab_fill(engine: BrowserEngine) -> Color32 {
-    engine_accent(engine)
-}
-
-pub(super) const fn engine_new_tab_text(engine: BrowserEngine) -> &'static str {
-    match engine {
-        BrowserEngine::Cef | BrowserEngine::Servo => "New tab",
-    }
-}
-
-pub(super) const fn engine_new_tab_supporting_text(engine: BrowserEngine) -> &'static str {
-    engine_display_name(engine)
-}
-
-pub(super) fn engine_tab_count_label(count: usize) -> String {
-    if count == 1 {
-        "1 tab".to_owned()
-    } else {
-        format!("{count} tabs")
-    }
-}
-
-pub(super) fn engine_segment_chip_label(
-    engine: BrowserEngine,
-    selected: BrowserEngine,
-    tab_count: usize,
-) -> String {
-    if engine == selected {
-        "Default".to_owned()
-    } else {
-        engine_tab_count_label(tab_count)
-    }
-}
-
-pub(super) const fn engine_selector_horizontal_content_width() -> f32 {
-    ENGINE_NEW_TAB_W + (ENGINE_SEGMENT_W * 2.0) + 6.0
-}
-
-pub(super) const fn engine_segment_fill(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
-    if matches!(
-        (engine, selected),
-        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
-    ) {
-        engine_container(engine)
-    } else {
-        CHROME_TOOLBAR
-    }
-}
-
-pub(super) const fn engine_segment_text(engine: BrowserEngine, selected: BrowserEngine) -> Color32 {
-    if matches!(
-        (engine, selected),
-        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
-    ) {
-        engine_on_container(engine)
-    } else {
-        CHROME_TEXT
-    }
-}
-
-pub(super) const fn engine_segment_supporting_text(
-    engine: BrowserEngine,
-    selected: BrowserEngine,
-) -> Color32 {
-    if matches!(
-        (engine, selected),
-        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
-    ) {
-        engine_on_container(engine)
-    } else {
-        CHROME_TEXT_DIM
-    }
-}
-
-pub(super) const fn engine_segment_stroke(
-    engine: BrowserEngine,
-    selected: BrowserEngine,
-) -> Color32 {
-    if matches!(
-        (engine, selected),
-        (BrowserEngine::Cef, BrowserEngine::Cef) | (BrowserEngine::Servo, BrowserEngine::Servo)
-    ) {
-        engine_accent(engine)
-    } else {
-        CHROME_OUTLINE
     }
 }
 
@@ -487,6 +372,150 @@ pub(super) const fn page_backdrop_fill() -> Color32 {
     CHROME_SURFACE_CONTAINER
 }
 
+pub(super) fn browser_muted_note(ui: &mut egui::Ui, msg: &str) {
+    ui.label(RichText::new(msg).size(Style::SMALL).color(CHROME_TEXT_DIM));
+}
+
+fn browser_status_note(ui: &mut egui::Ui, icon: ChromeIcon, msg: &str, color: Color32) {
+    ui.horizontal_wrapped(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+        paint_chrome_icon(ui.painter(), rect, icon, color);
+        ui.label(RichText::new(msg).size(Style::SMALL).color(color));
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChromeIcon {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+    Options,
+    Downloads,
+    Capture,
+    Bookmark,
+    Security,
+    Warning,
+    Search,
+    Close,
+    ZoomIn,
+    ZoomOut,
+    Print,
+    Privacy,
+    History,
+    Tabs,
+    Engine,
+    NewTab,
+    Up,
+    Down,
+    Check,
+    Page,
+    Edit,
+    View,
+    Power,
+    Share,
+    Find,
+    Audio,
+    Play,
+    Pause,
+    MediaStop,
+    Previous,
+    Next,
+    Minus,
+    Plus,
+    VolumeDown,
+    VolumeOff,
+    VolumeUp,
+    PictureInPicture,
+    DarkMode,
+    Lock,
+}
+
+#[cfg(test)]
+pub(super) const REQUIRED_BROWSER_ICONS: &[ChromeIcon] = &[
+    ChromeIcon::Back,
+    ChromeIcon::Forward,
+    ChromeIcon::Reload,
+    ChromeIcon::Stop,
+    ChromeIcon::Options,
+    ChromeIcon::Downloads,
+    ChromeIcon::Capture,
+    ChromeIcon::Bookmark,
+    ChromeIcon::Security,
+    ChromeIcon::Warning,
+    ChromeIcon::Search,
+    ChromeIcon::Close,
+    ChromeIcon::ZoomIn,
+    ChromeIcon::ZoomOut,
+    ChromeIcon::Print,
+    ChromeIcon::Privacy,
+    ChromeIcon::History,
+    ChromeIcon::Tabs,
+    ChromeIcon::Engine,
+    ChromeIcon::Play,
+    ChromeIcon::Pause,
+    ChromeIcon::MediaStop,
+    ChromeIcon::Previous,
+    ChromeIcon::Next,
+    ChromeIcon::Minus,
+    ChromeIcon::Plus,
+    ChromeIcon::VolumeDown,
+    ChromeIcon::VolumeOff,
+    ChromeIcon::VolumeUp,
+    ChromeIcon::PictureInPicture,
+];
+
+#[cfg(test)]
+pub(super) const LOADING_GLOBE_SHAPE_COUNT: usize = 8;
+
+#[cfg(test)]
+pub(super) const fn chrome_icon_painted_shape_count(icon: ChromeIcon) -> usize {
+    match icon {
+        ChromeIcon::Back
+        | ChromeIcon::Forward
+        | ChromeIcon::Check
+        | ChromeIcon::Close
+        | ChromeIcon::NewTab
+        | ChromeIcon::Up
+        | ChromeIcon::Down
+        | ChromeIcon::ZoomIn
+        | ChromeIcon::ZoomOut
+        | ChromeIcon::Plus
+        | ChromeIcon::Pause
+        | ChromeIcon::Previous
+        | ChromeIcon::Next => 2,
+        ChromeIcon::Stop
+        | ChromeIcon::Options
+        | ChromeIcon::Search
+        | ChromeIcon::Warning
+        | ChromeIcon::Security
+        | ChromeIcon::Bookmark
+        | ChromeIcon::Page
+        | ChromeIcon::Edit
+        | ChromeIcon::View
+        | ChromeIcon::Power
+        | ChromeIcon::Share
+        | ChromeIcon::Find
+        | ChromeIcon::Audio
+        | ChromeIcon::Play
+        | ChromeIcon::VolumeOff
+        | ChromeIcon::VolumeDown
+        | ChromeIcon::VolumeUp
+        | ChromeIcon::PictureInPicture
+        | ChromeIcon::DarkMode => 3,
+        ChromeIcon::Minus => 1,
+        ChromeIcon::Lock | ChromeIcon::MediaStop => 4,
+        ChromeIcon::Reload
+        | ChromeIcon::Downloads
+        | ChromeIcon::Capture
+        | ChromeIcon::Print
+        | ChromeIcon::Privacy
+        | ChromeIcon::History
+        | ChromeIcon::Tabs
+        | ChromeIcon::Engine => 4,
+    }
+}
+
 fn action_button(label: impl Into<String>, role: BrowserActionRole) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(label.into())
@@ -497,6 +526,216 @@ fn action_button(label: impl Into<String>, role: BrowserActionRole) -> egui::But
     .stroke(egui::Stroke::new(1.0, action_button_stroke(role)))
     .corner_radius(ACTION_BUTTON_RADIUS)
     .min_size(egui::vec2(72.0, CHROME_BUTTON))
+}
+
+pub(super) fn chrome_tooltip(ui: &mut egui::Ui, text: &str) {
+    ui.set_max_width(260.0);
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .size(Style::SMALL)
+                .color(CHROME_TEXT_DIM),
+        )
+        .wrap(),
+    );
+}
+
+pub(super) fn chrome_hover_text(
+    response: egui::Response,
+    text: impl Into<String>,
+) -> egui::Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| chrome_tooltip(ui, text.as_str()))
+}
+
+fn action_icon_button(
+    ui: &mut egui::Ui,
+    icon: ChromeIcon,
+    role: BrowserActionRole,
+    tip: &str,
+    min_size: egui::Vec2,
+) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let (rect, response) = allocate_browser_icon_button(ui, enabled, min_size, tip);
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        action_button_fill(role),
+        action_button_text(role),
+        enabled,
+    );
+    ui.painter().rect(
+        rect,
+        ACTION_BUTTON_RADIUS,
+        fill,
+        egui::Stroke::new(1.0, action_button_stroke(role)),
+        egui::StrokeKind::Inside,
+    );
+    let icon_color = if enabled {
+        action_button_text(role)
+    } else {
+        CHROME_TEXT_DIM
+    };
+    paint_chrome_icon(ui.painter(), rect, icon, icon_color);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn allocate_browser_icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    size: egui::Vec2,
+    tip: &str,
+) -> (egui::Rect, egui::Response) {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    (rect, response)
+}
+
+fn allocate_browser_icon_button_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.allocate_rect(rect, sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    response
+}
+
+fn paint_transparent_icon_button_state(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: egui::Rect,
+    radius: f32,
+    layer: Color32,
+    enabled: bool,
+) {
+    let fill = animated_response_fill(ui, response, CHROME_TOOLBAR, layer, enabled);
+    if fill != CHROME_TOOLBAR {
+        ui.painter().rect_filled(rect, radius, fill);
+    }
+}
+
+fn chrome_text_field(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    text: &mut String,
+    hint: &str,
+    desired_width: f32,
+    min_width: f32,
+    password: bool,
+    tip: &str,
+    id: Option<egui::Id>,
+) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(text)
+        .desired_width(desired_width)
+        .hint_text(
+            RichText::new(hint)
+                .size(Style::SMALL)
+                .color(CHROME_TEXT_DIM),
+        )
+        .text_color(CHROME_TEXT)
+        .font(font_id(Style::SMALL))
+        .background_color(CHROME_SURFACE)
+        .margin(egui::Margin::symmetric(0, 0))
+        .frame(false)
+        .min_size(egui::vec2(min_width, CHROME_OMNIBOX_H - 6.0));
+    if password {
+        edit = edit.password(true);
+    }
+    if let Some(id) = id {
+        edit = edit.id(id);
+    }
+
+    let inner = egui::Frame::NONE
+        .fill(CHROME_SURFACE)
+        .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+        .corner_radius(ICON_BUTTON_RADIUS)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| ui.add_enabled(enabled, edit));
+    mde_egui::focus::paint_focus_ring(ui.painter(), inner.response.rect, inner.inner.has_focus());
+    chrome_hover_text(inner.inner, tip)
+}
+
+fn ad_filter_domain_row(ui: &mut egui::Ui, domain: &str, count: u64) {
+    ui.horizontal(|ui| {
+        egui::Frame::NONE
+            .fill(CHROME_PRIMARY_CONTAINER)
+            .inner_margin(egui::Margin::symmetric(6, 1))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(count.to_string())
+                        .size(Style::SMALL)
+                        .strong()
+                        .color(CHROME_PRIMARY),
+                );
+            });
+        ui.label(
+            RichText::new(domain)
+                .size(Style::SMALL)
+                .color(CHROME_TEXT_DIM),
+        );
+    });
+}
+
+fn ad_filter_chip(ui: &mut egui::Ui, blocked: u64, top_blocked: &[(String, u64)]) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+            egui::Sense::hover(),
+        );
+        paint_chrome_icon(ui.painter(), rect, ChromeIcon::Privacy, CHROME_TEXT_DIM);
+        ui.label(
+            RichText::new(blocked.to_string())
+                .size(CHROME_FONT)
+                .color(CHROME_TEXT_DIM),
+        );
+    })
+    .response
+    .on_hover_ui(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "Ad-filter blocked {blocked} request{} on this page",
+                if blocked == 1 { "" } else { "s" }
+            ))
+            .size(Style::SMALL)
+            .color(CHROME_TEXT),
+        );
+        if !top_blocked.is_empty() {
+            chrome_separator(ui);
+            for (domain, count) in top_blocked {
+                ad_filter_domain_row(ui, domain, *count);
+            }
+        }
+    });
+}
+
+fn chrome_separator(ui: &mut egui::Ui) {
+    chrome_separator_with_inset(ui, 0.0);
+}
+
+fn chrome_separator_with_inset(ui: &mut egui::Ui, left_inset: f32) {
+    let width = ui.available_width().max(1.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, CHROME_SEPARATOR_H), egui::Sense::hover());
+    let left = (rect.left() + left_inset).min(rect.right() - 1.0);
+    let right = rect.right().max(left + 1.0);
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(left, y), egui::pos2(right, y)],
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+    );
 }
 
 fn selection_wash() -> Color32 {
@@ -538,6 +777,1085 @@ fn state_layer(base: Color32, layer: Color32, alpha: u8) -> Color32 {
     )
 }
 
+fn control_state_target_alpha(enabled: bool, response: &egui::Response) -> u8 {
+    if !enabled {
+        return 0;
+    }
+    if response.is_pointer_button_down_on() {
+        STATE_PRESSED_ALPHA
+    } else if response.has_focus() {
+        STATE_FOCUS_ALPHA
+    } else if response.hovered() {
+        STATE_HOVER_ALPHA
+    } else {
+        0
+    }
+}
+
+fn animate_control_state_alpha_with_mode(
+    ctx: &egui::Context,
+    id: impl Hash,
+    target_alpha: u8,
+    mode: MotionMode,
+) -> f32 {
+    Motion::animate_typed_with_mode(
+        ctx,
+        ("browser-chrome-control-state", id),
+        f32::from(target_alpha),
+        MotionPreset::Control,
+        mode,
+    )
+    .value()
+    .clamp(0.0, 255.0)
+}
+
+fn animate_control_state_alpha(ctx: &egui::Context, id: impl Hash, target_alpha: u8) -> u8 {
+    animate_control_state_alpha_with_mode(ctx, id, target_alpha, Motion::mode()).round() as u8
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrowserPopoverMotion {
+    opacity: f32,
+    scale: f32,
+    anchor_offset: f32,
+    active: bool,
+}
+
+fn popover_motion_with_mode(
+    ctx: &egui::Context,
+    id: impl Hash,
+    visible: bool,
+    mode: MotionMode,
+) -> BrowserPopoverMotion {
+    let progress = Motion::animate_typed_with_mode(
+        ctx,
+        ("browser-chrome-popover", id),
+        if visible { 1.0 } else { 0.0 },
+        MotionPreset::Popover,
+        mode,
+    );
+    let opacity = progress.value().clamp(0.0, 1.0);
+    let transform_progress = if matches!(mode, MotionMode::Normal) {
+        opacity
+    } else {
+        1.0
+    };
+
+    BrowserPopoverMotion {
+        opacity,
+        scale: 0.98 + 0.02 * transform_progress,
+        anchor_offset: 4.0 * (1.0 - transform_progress),
+        active: !progress.is_settled(),
+    }
+}
+
+fn popover_motion(ctx: &egui::Context, id: impl Hash, visible: bool) -> BrowserPopoverMotion {
+    popover_motion_with_mode(ctx, id, visible, Motion::mode())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrowserDialogMotion {
+    opacity: f32,
+    scale: f32,
+    y_offset: f32,
+    active: bool,
+}
+
+fn dialog_prompt_motion_with_mode(
+    ctx: &egui::Context,
+    id: impl Hash,
+    mode: MotionMode,
+) -> BrowserDialogMotion {
+    let id = egui::Id::new(("browser-chrome-dialog-prompt", id));
+    let spec = Motion::spec(MotionPreset::Dialog);
+    let dt = ctx.input(|i| i.stable_dt);
+    let mut progress = ctx
+        .data_mut(|data| data.get_temp::<AnimatedScalar>(id))
+        .unwrap_or_else(|| AnimatedScalar::settled(0.0));
+    progress.advance(1.0, spec, mode, dt);
+    ctx.data_mut(|data| data.insert_temp(id, progress));
+    if !progress.is_settled() {
+        ctx.request_repaint();
+    }
+
+    let opacity = progress.value().clamp(0.0, 1.0);
+    let transform_progress = if matches!(mode, MotionMode::Normal) {
+        opacity
+    } else {
+        1.0
+    };
+
+    BrowserDialogMotion {
+        opacity,
+        scale: 0.97 + 0.03 * transform_progress,
+        y_offset: 3.0 * (1.0 - transform_progress),
+        active: !progress.is_settled(),
+    }
+}
+
+fn dialog_prompt_motion(ctx: &egui::Context, id: impl Hash) -> BrowserDialogMotion {
+    dialog_prompt_motion_with_mode(ctx, id, Motion::mode())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrowserPanelMotion {
+    opacity: f32,
+    y_offset: f32,
+    active: bool,
+}
+
+fn panel_motion_with_mode(
+    ctx: &egui::Context,
+    id: impl Hash,
+    visible: bool,
+    mode: MotionMode,
+) -> BrowserPanelMotion {
+    let id = egui::Id::new(("browser-chrome-panel", id));
+    let spec = Motion::spec(MotionPreset::Panel);
+    let dt = ctx.input(|i| i.stable_dt);
+    let mut progress = ctx
+        .data_mut(|data| data.get_temp::<AnimatedScalar>(id))
+        .unwrap_or_else(|| AnimatedScalar::settled(0.0));
+    progress.advance(if visible { 1.0 } else { 0.0 }, spec, mode, dt);
+    ctx.data_mut(|data| data.insert_temp(id, progress));
+    if !progress.is_settled() {
+        ctx.request_repaint();
+    }
+
+    let opacity = progress.value().clamp(0.0, 1.0);
+    let travel = match mode {
+        MotionMode::Normal => 7.0,
+        MotionMode::Reduced => 2.0,
+        MotionMode::Disabled => 0.0,
+    };
+    BrowserPanelMotion {
+        opacity,
+        y_offset: travel * (1.0 - opacity),
+        active: !progress.is_settled(),
+    }
+}
+
+fn panel_motion(ctx: &egui::Context, id: impl Hash, visible: bool) -> BrowserPanelMotion {
+    panel_motion_with_mode(ctx, id, visible, Motion::mode())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrowserPageMotion {
+    opacity: f32,
+    active: bool,
+}
+
+fn page_motion_with_mode(
+    ctx: &egui::Context,
+    id: impl Hash,
+    page_key: u64,
+    mode: MotionMode,
+) -> BrowserPageMotion {
+    let key_id = egui::Id::new(("browser-chrome-page-key", &id));
+    let progress_id = egui::Id::new(("browser-chrome-page", id));
+    let spec = Motion::spec(MotionPreset::Page);
+    let dt = ctx.input(|input| input.stable_dt);
+    let mut progress = ctx.data_mut(|data| {
+        let last_key = data.get_temp::<u64>(key_id);
+        let changed = last_key.is_some_and(|last| last != page_key);
+        data.insert_temp(key_id, page_key);
+        if changed {
+            data.insert_temp(progress_id, AnimatedScalar::settled(0.0));
+        }
+        data.get_temp::<AnimatedScalar>(progress_id)
+            .unwrap_or_else(|| AnimatedScalar::settled(1.0))
+    });
+    progress.advance(1.0, spec, mode, dt);
+    ctx.data_mut(|data| data.insert_temp(progress_id, progress));
+    if !progress.is_settled() {
+        ctx.request_repaint();
+    }
+
+    BrowserPageMotion {
+        opacity: progress.value().clamp(0.0, 1.0),
+        active: !progress.is_settled(),
+    }
+}
+
+fn page_motion(ctx: &egui::Context, id: impl Hash, page_key: u64) -> BrowserPageMotion {
+    page_motion_with_mode(ctx, id, page_key, Motion::mode())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrowserDragSettleMotion {
+    offset: egui::Vec2,
+    accent_alpha: u8,
+    active: bool,
+}
+
+impl BrowserDragSettleMotion {
+    const fn settled() -> Self {
+        Self {
+            offset: egui::Vec2::ZERO,
+            accent_alpha: 0,
+            active: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabDragSettleEvent {
+    tab_id: u64,
+    direction: f32,
+}
+
+fn tab_drag_settle_event_id(axis: TabAxis) -> egui::Id {
+    egui::Id::new(("browser-tab-drag-settle-event", axis))
+}
+
+fn tab_drag_settle_progress_id(axis: TabAxis, tab_id: u64) -> egui::Id {
+    egui::Id::new(("browser-tab-drag-settle-progress", axis, tab_id))
+}
+
+fn tab_drag_settle_direction(from: usize, to: usize) -> f32 {
+    match to.cmp(&from) {
+        std::cmp::Ordering::Greater => 1.0,
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+    }
+}
+
+fn note_tab_drag_settle(ctx: &egui::Context, tab_id: u64, axis: TabAxis, direction: f32) {
+    if direction.abs() <= f32::EPSILON {
+        return;
+    }
+    let event = TabDragSettleEvent {
+        tab_id,
+        direction: direction.signum(),
+    };
+    let progress_id = tab_drag_settle_progress_id(axis, tab_id);
+    ctx.data_mut(|data| {
+        data.insert_temp(tab_drag_settle_event_id(axis), event);
+        data.insert_temp(progress_id, AnimatedScalar::settled(0.0));
+    });
+    ctx.request_repaint();
+}
+
+fn tab_drag_settle_motion_with_mode(
+    ctx: &egui::Context,
+    tab_id: u64,
+    axis: TabAxis,
+    mode: MotionMode,
+) -> BrowserDragSettleMotion {
+    let event =
+        ctx.data(|data| data.get_temp::<TabDragSettleEvent>(tab_drag_settle_event_id(axis)));
+    let Some(event) = event.filter(|event| event.tab_id == tab_id) else {
+        return BrowserDragSettleMotion::settled();
+    };
+
+    let progress_id = tab_drag_settle_progress_id(axis, tab_id);
+    let spec = Motion::spec(MotionPreset::DragSettle);
+    let dt = ctx.input(|input| input.stable_dt);
+    let mut progress = ctx
+        .data_mut(|data| data.get_temp::<AnimatedScalar>(progress_id))
+        .unwrap_or_else(|| AnimatedScalar::settled(0.0));
+    progress.advance(1.0, spec, mode, dt);
+    ctx.data_mut(|data| data.insert_temp(progress_id, progress));
+    if !progress.is_settled() {
+        ctx.request_repaint();
+    }
+
+    let settle = progress.value().clamp(0.0, 1.0);
+    let travel = if matches!(mode, MotionMode::Normal) {
+        TAB_DRAG_SETTLE_TRAVEL
+    } else {
+        0.0
+    };
+    let distance = event.direction * travel * (1.0 - settle);
+    let offset = match axis {
+        TabAxis::Horizontal => egui::vec2(distance, 0.0),
+        TabAxis::Vertical => egui::vec2(0.0, distance),
+    };
+
+    BrowserDragSettleMotion {
+        offset,
+        accent_alpha: (112.0 * (1.0 - settle)).round().clamp(0.0, 112.0) as u8,
+        active: !progress.is_settled(),
+    }
+}
+
+fn tab_drag_settle_motion(
+    ctx: &egui::Context,
+    tab_id: u64,
+    axis: TabAxis,
+) -> BrowserDragSettleMotion {
+    tab_drag_settle_motion_with_mode(ctx, tab_id, axis, Motion::mode())
+}
+
+fn active_body_page_motion_key(state: &WebState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "browser-active-body".hash(&mut hasher);
+    state.active.hash(&mut hasher);
+    if let Some(block) = &state.managed_policy_block {
+        "managed-policy".hash(&mut hasher);
+        block.url.hash(&mut hasher);
+        block.rule.hash(&mut hasher);
+        return hasher.finish();
+    }
+    let Some(tab) = state.tabs.get(state.active) else {
+        "empty".hash(&mut hasher);
+        return hasher.finish();
+    };
+    tab.id.hash(&mut hasher);
+    if let Some(page) = tab.internal_page {
+        "internal".hash(&mut hasher);
+        page.url().hash(&mut hasher);
+        return hasher.finish();
+    }
+    let nav_url = tab.session.nav().url.trim();
+    if let Some(url) = tab.session.safe_browsing_block() {
+        "safe-browsing".hash(&mut hasher);
+        url.hash(&mut hasher);
+        return hasher.finish();
+    }
+    if tab.session.is_crashed() {
+        "crashed".hash(&mut hasher);
+        nav_url.hash(&mut hasher);
+        return hasher.finish();
+    }
+    if tab.session.cert_error().is_some() {
+        "certificate-error".hash(&mut hasher);
+        nav_url.hash(&mut hasher);
+        return hasher.finish();
+    }
+    if is_new_tab_url(nav_url) {
+        "new-tab".hash(&mut hasher);
+    } else if tab.texture.is_some() {
+        "page".hash(&mut hasher);
+    } else {
+        "loading".hash(&mut hasher);
+    }
+    nav_url.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn page_transition_frame(ui: &mut egui::Ui, key: u64, contents: impl FnOnce(&mut egui::Ui)) {
+    let motion = page_motion(ui.ctx(), "active-body", key);
+    if motion.active {
+        ui.ctx().request_repaint();
+    }
+    if motion.opacity >= 0.999 {
+        contents(ui);
+        return;
+    }
+    ui.scope(|ui| {
+        ui.multiply_opacity(motion.opacity.max(0.18));
+        contents(ui);
+    });
+}
+
+fn animated_state_layer(
+    ctx: &egui::Context,
+    id: impl Hash,
+    base: Color32,
+    layer: Color32,
+    target_alpha: u8,
+) -> Color32 {
+    let alpha = animate_control_state_alpha(ctx, id, target_alpha);
+    if alpha == 0 {
+        base
+    } else {
+        state_layer(base, layer, alpha)
+    }
+}
+
+fn animated_response_fill(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    base: Color32,
+    layer: Color32,
+    enabled: bool,
+) -> Color32 {
+    animated_state_layer(
+        ui.ctx(),
+        response.id,
+        base,
+        layer,
+        control_state_target_alpha(enabled, response),
+    )
+}
+
+fn icon_stroke(color: Color32) -> egui::Stroke {
+    egui::Stroke::new(1.7, color)
+}
+
+fn loading_globe_accesskit_id(placement: &'static str) -> egui::Id {
+    egui::Id::new(("browser-loading-globe", placement))
+}
+
+fn browser_chrome_reduce_motion(ui: &egui::Ui) -> bool {
+    ui.style().animation_time <= 0.0 || Motion::reduce_motion()
+}
+
+fn loading_globe_phase(time: f64, reduce_motion: bool) -> (f32, bool) {
+    if reduce_motion {
+        return (0.0, false);
+    }
+    (
+        (time as f32 * std::f32::consts::TAU * 0.8).rem_euclid(std::f32::consts::TAU),
+        true,
+    )
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
+}
+
+fn ellipse_points(center: egui::Pos2, rx: f32, ry: f32, phase: f32) -> Vec<egui::Pos2> {
+    (0..=32)
+        .map(|step| {
+            let t = phase + std::f32::consts::TAU * step as f32 / 32.0;
+            egui::pos2(center.x + rx * t.cos(), center.y + ry * t.sin())
+        })
+        .collect()
+}
+
+fn paint_loading_globe(painter: &egui::Painter, rect: egui::Rect, phase: f32, scale: f32) {
+    let r = rect.shrink(2.0 * scale.max(0.5));
+    let c = r.center();
+    let radius = r.width().min(r.height()) * 0.44;
+    let outline = egui::Stroke::new(1.5 * scale, CHROME_PRIMARY);
+    let dim = egui::Stroke::new(1.0 * scale, CHROME_TEXT_DIM.gamma_multiply(0.62));
+    let bright = egui::Stroke::new(1.8 * scale, CHROME_SUCCESS);
+    let orbit = egui::Stroke::new(1.35 * scale, CHROME_WARN);
+
+    painter.circle_filled(c, radius, CHROME_PRIMARY_CONTAINER.gamma_multiply(0.72));
+    painter.circle_stroke(c, radius, outline);
+    painter.add(egui::Shape::line(
+        ellipse_points(c, radius * 0.82, radius * 0.26, 0.0),
+        dim,
+    ));
+    painter.add(egui::Shape::line(
+        ellipse_points(c, radius * 0.82, radius * 0.26, std::f32::consts::PI),
+        dim,
+    ));
+    painter.line_segment(
+        [
+            egui::pos2(c.x - radius * 0.86, c.y),
+            egui::pos2(c.x + radius * 0.86, c.y),
+        ],
+        dim,
+    );
+    let meridian_phase = phase.sin().abs();
+    painter.add(egui::Shape::line(
+        ellipse_points(c, radius * (0.18 + 0.46 * meridian_phase), radius, 0.0),
+        dim,
+    ));
+    painter.add(egui::Shape::line(
+        ellipse_points(
+            c,
+            radius * (0.18 + 0.46 * (phase + std::f32::consts::FRAC_PI_2).sin().abs()),
+            radius,
+            0.0,
+        ),
+        bright,
+    ));
+    painter.add(egui::Shape::line(
+        ellipse_points(c, radius * 1.12, radius * 0.30, phase),
+        orbit,
+    ));
+}
+
+fn paint_chrome_icon(painter: &egui::Painter, rect: egui::Rect, icon: ChromeIcon, color: Color32) {
+    let r = rect.shrink(4.0);
+    let c = r.center();
+    let stroke = icon_stroke(color);
+    match icon {
+        ChromeIcon::Back => {
+            painter.line_segment([r.left_center(), r.right_center()], stroke);
+            painter.line_segment([r.left_center(), egui::pos2(c.x, r.top())], stroke);
+            painter.line_segment([r.left_center(), egui::pos2(c.x, r.bottom())], stroke);
+        }
+        ChromeIcon::Forward => {
+            painter.line_segment([r.left_center(), r.right_center()], stroke);
+            painter.line_segment([r.right_center(), egui::pos2(c.x, r.top())], stroke);
+            painter.line_segment([r.right_center(), egui::pos2(c.x, r.bottom())], stroke);
+        }
+        ChromeIcon::Reload => {
+            painter.circle_stroke(c, r.width().min(r.height()) * 0.36, stroke);
+            painter.line_segment([egui::pos2(c.x + 3.0, r.top()), r.right_top()], stroke);
+            painter.line_segment([r.right_top(), egui::pos2(r.right(), c.y - 5.0)], stroke);
+        }
+        ChromeIcon::Stop | ChromeIcon::Close => {
+            painter.line_segment([r.left_top(), r.right_bottom()], stroke);
+            painter.line_segment([r.right_top(), r.left_bottom()], stroke);
+        }
+        ChromeIcon::Options => {
+            for y in [c.y - 5.0, c.y, c.y + 5.0] {
+                painter.circle_filled(egui::pos2(c.x, y), 1.7, color);
+            }
+        }
+        ChromeIcon::Downloads => {
+            painter.line_segment(
+                [egui::pos2(c.x, r.top()), egui::pos2(c.x, c.y + 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y + 3.0), egui::pos2(c.x - 4.5, c.y - 1.5)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y + 3.0), egui::pos2(c.x + 4.5, c.y - 1.5)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 2.0, r.bottom()),
+                    egui::pos2(r.right() - 2.0, r.bottom()),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::Capture => {
+            painter.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+            painter.circle_stroke(c, 4.0, stroke);
+        }
+        ChromeIcon::Bookmark => {
+            let points = vec![
+                egui::pos2(c.x, r.top()),
+                egui::pos2(c.x + 3.0, c.y - 1.0),
+                egui::pos2(r.right(), c.y - 1.0),
+                egui::pos2(c.x + 4.0, c.y + 2.5),
+                egui::pos2(c.x + 5.5, r.bottom()),
+                egui::pos2(c.x, c.y + 4.5),
+                egui::pos2(c.x - 5.5, r.bottom()),
+                egui::pos2(c.x - 4.0, c.y + 2.5),
+                egui::pos2(r.left(), c.y - 1.0),
+                egui::pos2(c.x - 3.0, c.y - 1.0),
+                egui::pos2(c.x, r.top()),
+            ];
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        ChromeIcon::Security | ChromeIcon::Privacy => {
+            let top = egui::pos2(c.x, r.top());
+            let shield = vec![
+                top,
+                egui::pos2(r.right(), r.top() + 3.0),
+                egui::pos2(r.right() - 1.0, c.y + 4.0),
+                egui::pos2(c.x, r.bottom()),
+                egui::pos2(r.left() + 1.0, c.y + 4.0),
+                egui::pos2(r.left(), r.top() + 3.0),
+                top,
+            ];
+            painter.add(egui::Shape::line(shield, stroke));
+            if icon == ChromeIcon::Privacy {
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x, r.top() + 4.0),
+                        egui::pos2(c.x, r.bottom() - 4.0),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        ChromeIcon::Warning => {
+            let triangle = vec![
+                egui::pos2(c.x, r.top()),
+                egui::pos2(r.right(), r.bottom()),
+                egui::pos2(r.left(), r.bottom()),
+                egui::pos2(c.x, r.top()),
+            ];
+            painter.add(egui::Shape::line(triangle, stroke));
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 3.0), egui::pos2(c.x, c.y + 2.0)],
+                stroke,
+            );
+            painter.circle_filled(egui::pos2(c.x, r.bottom() - 2.5), 1.2, color);
+        }
+        ChromeIcon::Lock => {
+            let body = egui::Rect::from_min_max(
+                egui::pos2(r.left() + 2.0, c.y),
+                egui::pos2(r.right() - 2.0, r.bottom()),
+            );
+            painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.circle_stroke(egui::pos2(c.x, c.y - 1.0), 5.0, stroke);
+            painter.line_segment(
+                [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x - 5.0, c.y + 1.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 5.0, c.y), egui::pos2(c.x + 5.0, c.y + 1.0)],
+                stroke,
+            );
+        }
+        ChromeIcon::Search | ChromeIcon::Find => {
+            painter.circle_stroke(egui::pos2(c.x - 2.0, c.y - 2.0), 5.0, stroke);
+            painter.line_segment([egui::pos2(c.x + 2.0, c.y + 2.0), r.right_bottom()], stroke);
+        }
+        ChromeIcon::ZoomIn | ChromeIcon::ZoomOut => {
+            painter.circle_stroke(egui::pos2(c.x - 2.0, c.y - 2.0), 5.0, stroke);
+            painter.line_segment([egui::pos2(c.x + 2.0, c.y + 2.0), r.right_bottom()], stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 5.0, c.y - 2.0),
+                    egui::pos2(c.x + 1.0, c.y - 2.0),
+                ],
+                stroke,
+            );
+            if icon == ChromeIcon::ZoomIn {
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x - 2.0, c.y - 5.0),
+                        egui::pos2(c.x - 2.0, c.y + 1.0),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        ChromeIcon::Print => {
+            painter.rect_stroke(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left() + 2.0, r.top()),
+                    egui::vec2(r.width() - 4.0, 5.0),
+                ),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left(), c.y - 3.0),
+                    egui::vec2(r.width(), 8.0),
+                ),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left() + 3.0, c.y + 3.0),
+                    egui::vec2(r.width() - 6.0, 7.0),
+                ),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ChromeIcon::History => {
+            painter.circle_stroke(c, 7.0, stroke);
+            painter.line_segment([c, egui::pos2(c.x, c.y - 5.0)], stroke);
+            painter.line_segment([c, egui::pos2(c.x - 4.0, c.y)], stroke);
+        }
+        ChromeIcon::Tabs => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(r.left() + 2.0, r.top() + 4.0),
+                    r.right_bottom(),
+                ),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    r.left_top(),
+                    egui::pos2(r.right() - 3.0, r.bottom() - 4.0),
+                ),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ChromeIcon::Engine => {
+            painter.circle_stroke(c, 7.0, stroke);
+            painter.circle_filled(c, 2.0, color);
+            painter.line_segment([r.left_center(), r.right_center()], stroke);
+            painter.line_segment(
+                [egui::pos2(c.x, r.top()), egui::pos2(c.x, r.bottom())],
+                stroke,
+            );
+        }
+        ChromeIcon::NewTab => {
+            painter.line_segment(
+                [egui::pos2(c.x, r.top()), egui::pos2(c.x, r.bottom())],
+                stroke,
+            );
+            painter.line_segment([r.left_center(), r.right_center()], stroke);
+        }
+        ChromeIcon::Minus | ChromeIcon::Plus => {
+            painter.line_segment([r.left_center(), r.right_center()], stroke);
+            if icon == ChromeIcon::Plus {
+                painter.line_segment(
+                    [egui::pos2(c.x, r.top()), egui::pos2(c.x, r.bottom())],
+                    stroke,
+                );
+            }
+        }
+        ChromeIcon::Up => {
+            painter.line_segment(
+                [egui::pos2(r.left(), c.y + 3.0), egui::pos2(c.x, c.y - 4.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 4.0), egui::pos2(r.right(), c.y + 3.0)],
+                stroke,
+            );
+        }
+        ChromeIcon::Down => {
+            painter.line_segment(
+                [egui::pos2(r.left(), c.y - 3.0), egui::pos2(c.x, c.y + 4.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y + 4.0), egui::pos2(r.right(), c.y - 3.0)],
+                stroke,
+            );
+        }
+        ChromeIcon::Check => {
+            painter.line_segment([r.left_center(), egui::pos2(c.x - 1.0, r.bottom())], stroke);
+            painter.line_segment([egui::pos2(c.x - 1.0, r.bottom()), r.right_top()], stroke);
+        }
+        ChromeIcon::Page => {
+            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 3.0, c.y - 2.0),
+                    egui::pos2(r.right() - 3.0, c.y - 2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 3.0, c.y + 3.0),
+                    egui::pos2(r.right() - 5.0, c.y + 3.0),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::Edit => {
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 3.0, r.bottom() - 2.0),
+                    egui::pos2(r.right() - 2.0, r.top() + 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 2.0, r.bottom()),
+                    egui::pos2(r.left() + 7.0, r.bottom() - 1.0),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::View => {
+            painter.circle_stroke(c, 6.0, stroke);
+            painter.line_segment([r.left_center(), egui::pos2(c.x - 6.0, c.y)], stroke);
+            painter.line_segment([egui::pos2(c.x + 6.0, c.y), r.right_center()], stroke);
+        }
+        ChromeIcon::Power => {
+            painter.circle_stroke(c, 7.0, stroke);
+            painter.line_segment([egui::pos2(c.x, r.top()), c], stroke);
+        }
+        ChromeIcon::Share => {
+            painter.circle_stroke(egui::pos2(r.left() + 3.0, c.y), 2.5, stroke);
+            painter.circle_stroke(egui::pos2(r.right() - 3.0, r.top() + 3.0), 2.5, stroke);
+            painter.circle_stroke(egui::pos2(r.right() - 3.0, r.bottom() - 3.0), 2.5, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 5.0, c.y - 1.0),
+                    egui::pos2(r.right() - 5.0, r.top() + 4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 5.0, c.y + 1.0),
+                    egui::pos2(r.right() - 5.0, r.bottom() - 4.0),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::Audio => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(r.left(), c.y - 4.0),
+                    egui::pos2(c.x - 1.0, c.y + 4.0),
+                ),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 1.0, c.y - 4.0),
+                    egui::pos2(c.x + 4.0, r.top() + 2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 1.0, c.y + 4.0),
+                    egui::pos2(c.x + 4.0, r.bottom() - 2.0),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::VolumeDown | ChromeIcon::VolumeOff | ChromeIcon::VolumeUp => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(r.left(), c.y - 4.0),
+                    egui::pos2(c.x - 3.0, c.y + 4.0),
+                ),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 3.0, c.y - 4.0),
+                    egui::pos2(c.x + 1.0, r.top() + 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 3.0, c.y + 4.0),
+                    egui::pos2(c.x + 1.0, r.bottom() - 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 5.0, c.y), egui::pos2(r.right() - 1.0, c.y)],
+                stroke,
+            );
+            if icon == ChromeIcon::VolumeOff {
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x + 4.0, r.bottom() - 1.0),
+                        egui::pos2(r.right() - 1.0, r.top() + 1.0),
+                    ],
+                    stroke,
+                );
+            } else if icon == ChromeIcon::VolumeUp {
+                painter.line_segment(
+                    [
+                        egui::pos2(r.right() - 3.0, c.y - 4.0),
+                        egui::pos2(r.right() - 3.0, c.y + 4.0),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        ChromeIcon::Play => {
+            let points = vec![
+                egui::pos2(r.left() + 3.0, r.top() + 2.0),
+                egui::pos2(r.left() + 3.0, r.bottom() - 2.0),
+                egui::pos2(r.right() - 2.0, c.y),
+                egui::pos2(r.left() + 3.0, r.top() + 2.0),
+            ];
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        ChromeIcon::Pause => {
+            let left = egui::Rect::from_min_max(
+                egui::pos2(c.x - 5.0, r.top() + 2.0),
+                egui::pos2(c.x - 2.0, r.bottom() - 2.0),
+            );
+            let right = egui::Rect::from_min_max(
+                egui::pos2(c.x + 2.0, r.top() + 2.0),
+                egui::pos2(c.x + 5.0, r.bottom() - 2.0),
+            );
+            painter.rect_filled(left, 1.0, color);
+            painter.rect_filled(right, 1.0, color);
+        }
+        ChromeIcon::MediaStop => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)),
+                1.5,
+                color,
+            );
+        }
+        ChromeIcon::Previous => {
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 2.0, r.top() + 1.0),
+                    egui::pos2(r.left() + 2.0, r.bottom() - 1.0),
+                ],
+                stroke,
+            );
+            let points = vec![
+                egui::pos2(r.right() - 2.0, r.top() + 1.5),
+                egui::pos2(r.left() + 4.0, c.y),
+                egui::pos2(r.right() - 2.0, r.bottom() - 1.5),
+                egui::pos2(r.right() - 2.0, r.top() + 1.5),
+            ];
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        ChromeIcon::Next => {
+            painter.line_segment(
+                [
+                    egui::pos2(r.right() - 2.0, r.top() + 1.0),
+                    egui::pos2(r.right() - 2.0, r.bottom() - 1.0),
+                ],
+                stroke,
+            );
+            let points = vec![
+                egui::pos2(r.left() + 2.0, r.top() + 1.5),
+                egui::pos2(r.right() - 4.0, c.y),
+                egui::pos2(r.left() + 2.0, r.bottom() - 1.5),
+                egui::pos2(r.left() + 2.0, r.top() + 1.5),
+            ];
+            painter.add(egui::Shape::line(points, stroke));
+        }
+        ChromeIcon::PictureInPicture => {
+            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 3.0, r.top() + 4.0),
+                    egui::pos2(r.right() - 3.0, r.top() + 4.0),
+                ],
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(c.x + 1.0, c.y + 1.0),
+                    egui::pos2(r.right() - 2.0, r.bottom() - 2.0),
+                ),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ChromeIcon::DarkMode => {
+            painter.circle_stroke(c, 7.0, stroke);
+            painter.circle_filled(egui::pos2(c.x + 3.0, c.y - 2.0), 7.0, CHROME_TOOLBAR);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) const fn loading_globe_painted_shape_count() -> usize {
+    LOADING_GLOBE_SHAPE_COUNT
+}
+
+pub(super) fn loading_globe(
+    ui: &mut egui::Ui,
+    size: f32,
+    placement: &'static str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let time = ui.input(|input| input.time);
+    let (phase, animate) = loading_globe_phase(time, browser_chrome_reduce_motion(ui));
+    if animate {
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
+    }
+    paint_loading_globe(ui.painter(), rect, phase, size / 44.0);
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(loading_globe_accesskit_id(placement), |node| {
+            node.set_role(egui::accesskit::Role::Image);
+            node.set_label("Browser loading globe");
+            node.set_value("Loading page");
+            node.set_bounds(accesskit_rect(rect));
+        });
+    chrome_hover_text(response, "Loading")
+}
+
+pub(super) fn chrome_icon_button(
+    ui: &mut egui::Ui,
+    icon: ChromeIcon,
+    tip: &str,
+    enabled: bool,
+    selected: bool,
+) -> egui::Response {
+    let enabled = ui.is_enabled() && enabled;
+    let base_fill = if selected {
+        CHROME_PRIMARY_CONTAINER
+    } else {
+        CHROME_TOOLBAR
+    };
+    let (rect, response) =
+        allocate_browser_icon_button(ui, enabled, egui::vec2(CHROME_BUTTON, CHROME_BUTTON), tip);
+    let state_fill = animated_response_fill(
+        ui,
+        &response,
+        base_fill,
+        if selected {
+            CHROME_PRIMARY
+        } else {
+            CHROME_TEXT
+        },
+        enabled,
+    );
+    if selected || state_fill != base_fill {
+        ui.painter()
+            .rect_filled(rect, ICON_BUTTON_RADIUS, state_fill);
+    }
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            ICON_BUTTON_RADIUS,
+            egui::Stroke::new(1.0, CHROME_PRIMARY),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let color = if !enabled {
+        CHROME_TEXT_DIM
+    } else if selected {
+        CHROME_ON_PRIMARY_CONTAINER
+    } else {
+        CHROME_TEXT
+    };
+    paint_chrome_icon(ui.painter(), rect, icon, color);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn toolbar_icon_menu_anchor(
+    ui: &mut egui::Ui,
+    popup_id: egui::Id,
+    icon: ChromeIcon,
+    icon_color: Color32,
+    tip: &str,
+) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let selected = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let (rect, response) =
+        allocate_browser_icon_button(ui, enabled, egui::vec2(CHROME_BUTTON, CHROME_BUTTON), tip);
+    let base_fill = if selected {
+        CHROME_PRIMARY_CONTAINER
+    } else {
+        CHROME_TOOLBAR
+    };
+    let resolved_icon_color = if !enabled {
+        CHROME_TEXT_DIM
+    } else if selected {
+        CHROME_ON_PRIMARY_CONTAINER
+    } else {
+        icon_color
+    };
+    let fill = animated_response_fill(ui, &response, base_fill, resolved_icon_color, enabled);
+    if selected || fill != base_fill {
+        ui.painter().rect_filled(rect, ICON_BUTTON_RADIUS, fill);
+    }
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            ICON_BUTTON_RADIUS,
+            egui::Stroke::new(1.0, CHROME_PRIMARY),
+            egui::StrokeKind::Inside,
+        );
+    }
+    paint_chrome_icon(ui.painter(), rect, icon, resolved_icon_color);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn menu_anchor_keyboard_toggle(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
+}
+
 /// Run a Browser chrome/body subtree under a light Chrome-style egui scope.
 ///
 /// `Ui::scope` clones style state, so the rest of the shell keeps its existing
@@ -553,16 +1871,58 @@ pub(super) fn scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
 /// Render the secondary Browser drawer stack in the same order for horizontal
 /// and vertical chrome layouts.
 pub(super) fn drawer_stack(ui: &mut egui::Ui, state: &mut WebState) {
-    qr_share_drawer(ui, state);
-    spellcheck_drawer(ui, state);
-    speech_status_drawer(ui, state);
-    security_update_drawer(ui, state);
-    translation_drawer(ui, state);
-    offline_cache_drawer(ui, state);
-    print_settings_drawer(ui, state);
-    site_styles_drawer(ui, state);
-    downloads_drawer(ui, state);
-    history_drawer(ui, state);
+    let visible = drawer_stack_visible(state);
+    let motion = panel_motion(ui.ctx(), "drawer-stack", visible);
+    if !visible {
+        return;
+    }
+
+    ui.scope(|ui| {
+        if motion.active {
+            ui.ctx().request_repaint();
+        }
+        ui.multiply_opacity(motion.opacity.max(0.2));
+        if motion.y_offset > 0.0 {
+            ui.add_space(motion.y_offset);
+        }
+
+        qr_share_drawer(ui, state);
+        spellcheck_drawer(ui, state);
+        speech_status_drawer(ui, state);
+        security_update_drawer(ui, state);
+        translation_drawer(ui, state);
+        offline_cache_drawer(ui, state);
+        print_settings_drawer(ui, state);
+        site_styles_drawer(ui, state);
+        downloads_drawer(ui, state);
+        history_drawer(ui, state);
+    });
+}
+
+fn drawer_stack_visible(state: &WebState) -> bool {
+    state.latest_qr_share.is_some()
+        || state
+            .latest_spellcheck
+            .as_ref()
+            .is_some_and(|result| result.is_visible())
+        || state
+            .latest_read_aloud_status
+            .as_ref()
+            .is_some_and(BrowserReadAloudStatus::is_actionable)
+        || state
+            .latest_voice_command_status
+            .as_ref()
+            .is_some_and(BrowserVoiceCommandStatus::is_actionable)
+        || state
+            .latest_security_update
+            .as_ref()
+            .is_some_and(|status| status.is_actionable())
+        || state.latest_translation.is_some()
+        || state.latest_offline_cache.is_some()
+        || state.print_settings_open
+        || state.site_styles_open
+        || state.downloads_open
+        || state.history_open
 }
 
 fn apply_visuals(ui: &mut egui::Ui) {
@@ -613,37 +1973,35 @@ pub(super) fn tab_pill_sized(
     width: f32,
     engine: BrowserEngine,
     favicon: Option<&TextureHandle>,
+    status_chips: &[TabStatusChip],
 ) -> egui::Response {
     // `click_and_drag` keeps activation, middle-click close, and drag-reorder on
     // the same browser-tab affordance while egui handles the click/drag threshold.
-    let response = ui.add(
-        egui::Button::new("")
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(CHROME_TAB_RADIUS)
-            .min_size(egui::vec2(width, CHROME_TAB_H))
-            .sense(egui::Sense::click_and_drag()),
+    let enabled = ui.is_enabled();
+    let (_, response) = ui.allocate_exact_size(
+        egui::vec2(width, CHROME_TAB_H),
+        egui::Sense::click_and_drag(),
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let accent = engine_accent(engine);
     let r = response.rect;
     let pressed = response.is_pointer_button_down_on();
     let active_fill = CHROME_TOOLBAR;
     let inactive_fill = state_layer(CHROME_SURFACE_CONTAINER, accent, 5);
-    let fill = if active {
-        if pressed {
-            state_layer(active_fill, accent, STATE_PRESSED_ALPHA)
-        } else if response.hovered() {
-            state_layer(active_fill, accent, STATE_HOVER_ALPHA)
-        } else {
-            active_fill
-        }
+    let state_layer_color = if active {
+        accent
     } else if pressed {
-        state_layer(CHROME_SURFACE_CONTAINER, CHROME_TEXT, STATE_PRESSED_ALPHA)
-    } else if response.hovered() {
-        state_layer(CHROME_SURFACE_CONTAINER, accent, STATE_HOVER_ALPHA)
+        CHROME_TEXT
     } else {
-        inactive_fill
+        accent
     };
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        if active { active_fill } else { inactive_fill },
+        state_layer_color,
+        true,
+    );
 
     if active {
         ui.painter().rect_filled(
@@ -739,17 +2097,24 @@ pub(super) fn tab_pill_sized(
             ui.painter().text(
                 badge.center(),
                 egui::Align2::CENTER_CENTER,
-                engine_marker(engine),
+                engine_glyph(engine),
                 font_id(CHROME_FONT - 3.0),
                 if active { CHROME_TOOLBAR } else { accent },
             );
         }
 
         let text_left = icon_rect.right() + 6.0;
-        let text_right = if show_badge {
+        let right_rail = if show_badge {
             badge.left() - 6.0
         } else {
             r.right() - 8.0
+        };
+        let chip_count = visible_tab_status_chip_count(r.width(), status_chips.len());
+        let chip_slot_w = tab_status_chip_slot_width(chip_count);
+        let text_right = if chip_count == 0 {
+            right_rail
+        } else {
+            (right_rail - chip_slot_w - 5.0).max(text_left)
         };
         let text_rect = egui::Rect::from_min_max(
             egui::pos2(text_left, r.top()),
@@ -766,6 +2131,16 @@ pub(super) fn tab_pill_sized(
                 tab_text(active),
             );
         }
+        if chip_count > 0 {
+            let chip_left = right_rail - chip_slot_w;
+            paint_tab_status_chips(
+                ui,
+                egui::pos2(chip_left, r.center().y),
+                &status_chips[..chip_count],
+                active,
+                accent,
+            );
+        }
     } else {
         ui.painter().circle_filled(
             egui::pos2(r.right() - 5.0, r.bottom() - 5.0),
@@ -778,10 +2153,224 @@ pub(super) fn tab_pill_sized(
     response
 }
 
+fn paint_tab_drag_settle(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    engine: BrowserEngine,
+    axis: TabAxis,
+    motion: BrowserDragSettleMotion,
+) {
+    if !motion.active || motion.accent_alpha == 0 {
+        return;
+    }
+    let accent = engine_accent(engine);
+    let color =
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), motion.accent_alpha);
+    let shifted = rect.translate(motion.offset);
+    ui.painter().rect_stroke(
+        shifted.shrink(1.0),
+        CHROME_TAB_RADIUS,
+        egui::Stroke::new(1.5, color),
+        egui::StrokeKind::Inside,
+    );
+    let snap_edge = match axis {
+        TabAxis::Horizontal => egui::Rect::from_min_max(
+            egui::pos2(shifted.left() + 7.0, shifted.bottom() - 3.0),
+            egui::pos2(shifted.right() - 7.0, shifted.bottom()),
+        ),
+        TabAxis::Vertical => egui::Rect::from_min_max(
+            egui::pos2(shifted.left(), shifted.top() + 6.0),
+            egui::pos2(shifted.left() + 3.0, shifted.bottom() - 6.0),
+        ),
+    };
+    ui.painter().rect_filled(snap_edge, 1.5, color);
+}
+
 fn tab_engine_badge_width(engine: BrowserEngine) -> f32 {
     match engine {
-        BrowserEngine::Cef => 34.0,
-        BrowserEngine::Servo => 48.0,
+        BrowserEngine::Cef | BrowserEngine::Servo => 22.0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TabStatusChipTone {
+    Dim,
+    Accent,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TabStatusChip {
+    pub(super) icon: ChromeIcon,
+    pub(super) label: &'static str,
+    pub(super) tone: TabStatusChipTone,
+}
+
+pub(super) fn tab_status_chips(tab: &Tab) -> Vec<TabStatusChip> {
+    if tab.internal_page.is_some() {
+        return Vec::new();
+    }
+
+    let mut chips = Vec::new();
+    if tab.idle_suspended {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Pause,
+            label: "Idle suspended",
+            tone: TabStatusChipTone::Dim,
+        });
+    } else {
+        match tab.session.state() {
+            SessionState::Loading => chips.push(TabStatusChip {
+                icon: ChromeIcon::Reload,
+                label: "Loading",
+                tone: TabStatusChipTone::Accent,
+            }),
+            SessionState::Live => {}
+            SessionState::Crashed { .. } => chips.push(TabStatusChip {
+                icon: ChromeIcon::Warning,
+                label: "Crashed",
+                tone: TabStatusChipTone::Error,
+            }),
+        }
+    }
+    if tab.container != ContainerProfile::None {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Privacy,
+            label: tab.container.label(),
+            tone: TabStatusChipTone::Accent,
+        });
+    }
+    if tab.display_target != DisplayTarget::Current {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::View,
+            label: tab.display_target.label(),
+            tone: TabStatusChipTone::Accent,
+        });
+    }
+    if tab.muted {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::VolumeOff,
+            label: "Muted",
+            tone: TabStatusChipTone::Dim,
+        });
+    }
+    if !tab.autoplay_blocked {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Play,
+            label: "Autoplay allowed",
+            tone: TabStatusChipTone::Warn,
+        });
+    }
+    if tab.force_dark {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::DarkMode,
+            label: "Force dark",
+            tone: TabStatusChipTone::Accent,
+        });
+    }
+    if tab.reader_mode {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::View,
+            label: "Reader mode",
+            tone: TabStatusChipTone::Accent,
+        });
+    }
+    if tab.user_scripts {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Edit,
+            label: "Curated userscripts",
+            tone: TabStatusChipTone::Accent,
+        });
+    }
+    if tab.user_agent != UserAgentOverride::Default {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Engine,
+            label: tab.user_agent.label(),
+            tone: TabStatusChipTone::Dim,
+        });
+    }
+    if tab.device_profile != DeviceProfile::Default {
+        chips.push(TabStatusChip {
+            icon: ChromeIcon::Page,
+            label: tab.device_profile.label(),
+            tone: TabStatusChipTone::Dim,
+        });
+    }
+    chips
+}
+
+#[cfg(test)]
+pub(super) fn tab_status_chip_labels(tab: &Tab) -> Vec<&'static str> {
+    tab_status_chips(tab)
+        .into_iter()
+        .map(|chip| chip.label)
+        .collect()
+}
+
+fn visible_tab_status_chip_count(width: f32, chip_count: usize) -> usize {
+    if chip_count == 0 || width < 116.0 {
+        0
+    } else if width < 148.0 {
+        chip_count.min(1)
+    } else if width < 184.0 {
+        chip_count.min(2)
+    } else {
+        chip_count.min(4)
+    }
+}
+
+fn tab_status_chip_slot_width(chip_count: usize) -> f32 {
+    if chip_count == 0 {
+        0.0
+    } else {
+        chip_count as f32 * TAB_STATUS_CHIP
+            + (chip_count.saturating_sub(1) as f32 * TAB_STATUS_CHIP_GAP)
+    }
+}
+
+fn tab_status_chip_color(chip: TabStatusChip, accent: Color32) -> Color32 {
+    match chip.tone {
+        TabStatusChipTone::Dim => CHROME_TEXT_DIM,
+        TabStatusChipTone::Accent => accent,
+        TabStatusChipTone::Warn => CHROME_WARN,
+        TabStatusChipTone::Error => CHROME_ERROR,
+    }
+}
+
+fn paint_tab_status_chips(
+    ui: &mut egui::Ui,
+    left_center: egui::Pos2,
+    chips: &[TabStatusChip],
+    active: bool,
+    accent: Color32,
+) {
+    for (idx, chip) in chips.iter().enumerate() {
+        let x = left_center.x + idx as f32 * (TAB_STATUS_CHIP + TAB_STATUS_CHIP_GAP);
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(x + TAB_STATUS_CHIP / 2.0, left_center.y),
+            egui::vec2(TAB_STATUS_CHIP, TAB_STATUS_CHIP),
+        );
+        let color = tab_status_chip_color(*chip, accent);
+        ui.painter().circle_filled(
+            rect.center(),
+            TAB_STATUS_CHIP / 2.0,
+            state_layer(
+                if active {
+                    CHROME_TOOLBAR
+                } else {
+                    CHROME_SURFACE
+                },
+                color,
+                20,
+            ),
+        );
+        ui.painter().circle_stroke(
+            rect.center(),
+            TAB_STATUS_CHIP / 2.0,
+            egui::Stroke::new(1.0, color.gamma_multiply(0.5)),
+        );
+        paint_chrome_icon(ui.painter(), rect.expand(2.0), chip.icon, color);
     }
 }
 
@@ -829,86 +2418,649 @@ fn paint_tab_identity_icon(
 }
 
 pub(super) fn inline_close_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new("\u{00D7}")
-                .size(CHROME_FONT)
-                .color(CHROME_TEXT_DIM),
-        )
-        .fill(Color32::TRANSPARENT)
-        .corner_radius(CHROME_TAB_CLOSE / 2.0)
-        .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
-    )
-    .on_hover_text("Close tab")
+    let enabled = ui.is_enabled();
+    let (rect, response) = allocate_browser_icon_button(
+        ui,
+        enabled,
+        egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H),
+        "Close tab",
+    );
+    paint_transparent_icon_button_state(
+        ui,
+        &response,
+        rect,
+        CHROME_TAB_CLOSE / 2.0,
+        CHROME_TEXT_DIM,
+        enabled,
+    );
+    paint_chrome_icon(ui.painter(), rect, ChromeIcon::Close, CHROME_TEXT_DIM);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, "Close tab")
 }
 
-/// Which speaker glyph (and hover label) a tab shows, if any.
-pub(super) fn audio_glyph_for(audible: bool, muted: bool) -> Option<(&'static str, &'static str)> {
+/// Which audio icon (and hover label) a tab shows, if any.
+pub(super) const fn audio_icon_for(
+    audible: bool,
+    muted: bool,
+) -> Option<(ChromeIcon, &'static str)> {
     if muted {
-        Some(("\u{1F507}", "Unmute tab")) // 🔇
+        Some((ChromeIcon::VolumeOff, "Unmute tab"))
     } else if audible {
-        Some(("\u{1F50A}", "Mute tab")) // 🔊
+        Some((ChromeIcon::VolumeUp, "Mute tab"))
     } else {
         None
     }
 }
 
-pub(super) fn tab_audio_glyph(
+pub(super) fn tab_audio_button(
     ui: &mut egui::Ui,
     audible: bool,
     muted: bool,
 ) -> Option<egui::Response> {
-    let (glyph, hover) = audio_glyph_for(audible, muted)?;
-    Some(
-        ui.add(
-            egui::Button::new(
-                egui::RichText::new(glyph)
-                    .size(CHROME_FONT)
-                    .color(CHROME_TEXT_DIM),
-            )
-            .fill(Color32::TRANSPARENT)
-            .corner_radius(CHROME_TAB_CLOSE / 2.0)
-            .min_size(egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H)),
+    let (icon, hover) = audio_icon_for(audible, muted)?;
+    let enabled = ui.is_enabled();
+    let (rect, response) = allocate_browser_icon_button(
+        ui,
+        enabled,
+        egui::vec2(CHROME_TAB_CLOSE, CHROME_TAB_H),
+        hover,
+    );
+    paint_transparent_icon_button_state(
+        ui,
+        &response,
+        rect,
+        CHROME_TAB_CLOSE / 2.0,
+        CHROME_TEXT_DIM,
+        enabled,
+    );
+    paint_chrome_icon(ui.painter(), rect, icon, CHROME_TEXT_DIM);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    Some(chrome_hover_text(response, hover))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BrowserMediaToolbarModel {
+    pub(super) label: String,
+    pub(super) paused: bool,
+    pub(super) background: bool,
+    pub(super) audible: bool,
+    pub(super) muted: bool,
+}
+
+pub(super) fn browser_media_toolbar_model(state: &WebState) -> Option<BrowserMediaToolbarModel> {
+    let tab_index = super::wire::browser_media_status_tab_index(state)?;
+    let tab = state.tabs.get(tab_index)?;
+    let metadata = tab.session.media_metadata()?;
+    let label = media_metadata_chip_label(&metadata.body)?;
+    let value: serde_json::Value = serde_json::from_str(&metadata.body).ok()?;
+    let paused = value
+        .get("paused")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| !tab.session.audible());
+    Some(BrowserMediaToolbarModel {
+        label,
+        paused,
+        background: tab_index != state.active,
+        audible: tab.session.audible(),
+        muted: tab.muted,
+    })
+}
+
+pub(super) const fn media_toolbar_play_action(
+    paused: bool,
+) -> (ChromeIcon, &'static str, MediaTransportAction) {
+    if paused {
+        (
+            ChromeIcon::Play,
+            "Play browser media",
+            MediaTransportAction::Play,
         )
-        .on_hover_text(hover),
-    )
+    } else {
+        (
+            ChromeIcon::Pause,
+            "Pause browser media",
+            MediaTransportAction::Pause,
+        )
+    }
 }
 
-pub(super) fn compact_menu_item(label: &str) -> egui::Button<'_> {
-    egui::Button::new(
-        egui::RichText::new(label)
-            .size(CHROME_FONT)
-            .color(CHROME_TEXT),
-    )
-    .min_size(egui::vec2(124.0, CHROME_TAB_H))
+fn media_toolbar_icon_button(
+    ui: &mut egui::Ui,
+    icon: ChromeIcon,
+    tip: &str,
+    action: MediaTransportAction,
+) -> Option<MediaTransportAction> {
+    chrome_icon_button(ui, icon, tip, true, false)
+        .clicked()
+        .then_some(action)
 }
 
-/// Render the Browser-local toolbar command menu and return any picked action.
-fn chrome_menu_button(state: &WebState, ui: &mut egui::Ui) -> Option<super::menubar::MenuAction> {
-    let menus = super::menubar::chrome_menus(state);
+fn pip_icon_button_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    icon: ChromeIcon,
+    tip: &str,
+) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let response = allocate_browser_icon_button_at(ui, rect, enabled, tip);
+    paint_transparent_icon_button_state(
+        ui,
+        &response,
+        rect,
+        ICON_BUTTON_RADIUS,
+        CHROME_TEXT,
+        enabled,
+    );
+    paint_chrome_icon(ui.painter(), rect, icon, CHROME_TEXT);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn browser_media_toolbar(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(model) = browser_media_toolbar_model(state) else {
+        return;
+    };
+    let (play_icon, play_tip, play_action) = media_toolbar_play_action(model.paused);
     let mut picked = None;
-    ui.menu_button(
-        RichText::new("\u{22EE}")
-            .size(CHROME_FONT + 2.0)
-            .color(CHROME_TEXT),
-        |ui| {
-            ui.set_min_width(220.0);
-            for menu in &menus {
-                ui.menu_button(
-                    RichText::new(menu.title.as_str())
-                        .size(CHROME_FONT)
-                        .color(CHROME_TEXT),
-                    |ui| render_chrome_menu_entries(ui, &menu.entries, &mut picked),
+    ui.add_space(CHROME_GAP);
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+        .corner_radius(ICON_BUTTON_RADIUS)
+        .inner_margin(egui::Margin::symmetric(3, 1))
+        .show(ui, |ui| {
+            ui.set_height(CHROME_BUTTON);
+            ui.horizontal(|ui| {
+                let tone = if model.background {
+                    CHROME_PRIMARY
+                } else if model.muted {
+                    CHROME_TEXT_DIM
+                } else {
+                    CHROME_TEXT
+                };
+                let label_text = format!("    {}", model.label);
+                let label = chrome_hover_text(
+                    ui.add_sized(
+                        egui::vec2(MEDIA_CLUSTER_LABEL_W, CHROME_BUTTON),
+                        egui::Label::new(RichText::new(label_text).size(CHROME_FONT).color(tone)),
+                    ),
+                    if model.background {
+                        "Background Browser media"
+                    } else if model.audible {
+                        "Active Browser media"
+                    } else {
+                        "Browser media"
+                    },
                 );
-            }
-        },
-    )
-    .response
-    .on_hover_text("Customize and control Browser");
-    picked
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::pos2(label.rect.left() + 11.0, label.rect.center().y),
+                    egui::vec2(14.0, 14.0),
+                );
+                paint_chrome_icon(ui.painter(), icon_rect, ChromeIcon::Audio, tone);
+                if let Some(action) = media_toolbar_icon_button(
+                    ui,
+                    ChromeIcon::Previous,
+                    "Previous browser media",
+                    MediaTransportAction::Previous,
+                ) {
+                    picked = Some(action);
+                }
+                if let Some(action) =
+                    media_toolbar_icon_button(ui, play_icon, play_tip, play_action)
+                {
+                    picked = Some(action);
+                }
+                if let Some(action) = media_toolbar_icon_button(
+                    ui,
+                    ChromeIcon::MediaStop,
+                    "Stop browser media",
+                    MediaTransportAction::Stop,
+                ) {
+                    picked = Some(action);
+                }
+                if let Some(action) = media_toolbar_icon_button(
+                    ui,
+                    ChromeIcon::VolumeDown,
+                    "Lower browser media volume",
+                    MediaTransportAction::VolumeDown,
+                ) {
+                    picked = Some(action);
+                }
+                if let Some(action) = media_toolbar_icon_button(
+                    ui,
+                    ChromeIcon::VolumeUp,
+                    "Raise browser media volume",
+                    MediaTransportAction::VolumeUp,
+                ) {
+                    picked = Some(action);
+                }
+                if let Some(action) = media_toolbar_icon_button(
+                    ui,
+                    ChromeIcon::Next,
+                    "Next browser media",
+                    MediaTransportAction::Next,
+                ) {
+                    picked = Some(action);
+                }
+            });
+        });
+    if let Some(action) = picked {
+        state.selected_media_transport(action);
+    }
 }
 
-fn render_chrome_menu_entries(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BrowserMediaPipModel {
+    pub(super) tab_index: usize,
+    pub(super) label: String,
+    pub(super) paused: bool,
+    pub(super) background: bool,
+    pub(super) audible: bool,
+    pub(super) muted: bool,
+    pub(super) frame_size: [usize; 2],
+}
+
+pub(super) fn browser_media_pip_model(state: &WebState) -> Option<BrowserMediaPipModel> {
+    if !state.media_pip_open {
+        return None;
+    }
+    let tab_index = super::wire::browser_media_status_tab_index(state)?;
+    let tab = state.tabs.get(tab_index)?;
+    if tab.internal_page.is_some() || tab.session.is_crashed() {
+        return None;
+    }
+    let frame_size = tab.last_frame.as_ref()?.size;
+    let metadata = tab.session.media_metadata()?;
+    let label = media_metadata_chip_label(&metadata.body)?;
+    let value: serde_json::Value = serde_json::from_str(&metadata.body).ok()?;
+    let paused = value
+        .get("paused")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| !tab.session.audible());
+    Some(BrowserMediaPipModel {
+        tab_index,
+        label,
+        paused,
+        background: tab_index != state.active,
+        audible: tab.session.audible(),
+        muted: tab.muted,
+        frame_size,
+    })
+}
+
+pub(super) fn media_pip_overlay(ui: &mut egui::Ui, state: &mut WebState) {
+    let Some(model) = browser_media_pip_model(state) else {
+        return;
+    };
+    let Some((texture_id, texture_size)) = state.tabs.get(model.tab_index).and_then(|tab| {
+        tab.texture
+            .as_ref()
+            .map(|texture| (texture.id(), texture.size_vec2()))
+    }) else {
+        return;
+    };
+    let (play_icon, play_tip, play_action) = media_toolbar_play_action(model.paused);
+    let mut picked = None;
+    let mut close = false;
+    let mut focus_media_tab = false;
+    let outer = ui.clip_rect();
+    let pip_size = egui::vec2(
+        MEDIA_PIP_W + 12.0,
+        MEDIA_PIP_VIDEO_H + CHROME_BUTTON.mul_add(3.0, CHROME_GAP + 12.0),
+    );
+    let min = egui::pos2(
+        (outer.right() - MEDIA_PIP_MARGIN - pip_size.x).max(outer.left() + MEDIA_PIP_MARGIN),
+        (outer.bottom() - MEDIA_PIP_MARGIN - pip_size.y).max(outer.top() + MEDIA_PIP_MARGIN),
+    );
+    let pip_rect = egui::Rect::from_min_size(min, pip_size);
+    ui.painter()
+        .rect_filled(pip_rect, ICON_BUTTON_RADIUS, CHROME_TOOLBAR);
+    ui.painter().rect_stroke(
+        pip_rect,
+        ICON_BUTTON_RADIUS,
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+
+    let content = pip_rect.shrink(6.0);
+    let icon_color = if model.background {
+        CHROME_PRIMARY
+    } else if model.muted {
+        CHROME_TEXT_DIM
+    } else {
+        CHROME_TEXT
+    };
+    let icon_rect = egui::Rect::from_min_size(content.left_top(), egui::vec2(20.0, 20.0));
+    paint_chrome_icon(
+        ui.painter(),
+        icon_rect,
+        ChromeIcon::PictureInPicture,
+        icon_color,
+    );
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(content.right() - CHROME_BUTTON, content.top()),
+        egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+    );
+    if pip_icon_button_at(ui, close_rect, ChromeIcon::Close, "Close PiP").clicked() {
+        close = true;
+    }
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right() + CHROME_GAP, content.top()),
+        egui::pos2(
+            close_rect.left() - CHROME_GAP,
+            content.top() + CHROME_BUTTON,
+        ),
+    );
+    ui.put(
+        title_rect,
+        egui::Label::new(
+            RichText::new("Picture-in-Picture")
+                .size(CHROME_FONT)
+                .color(CHROME_TEXT),
+        ),
+    );
+    let label_rect = egui::Rect::from_min_size(
+        egui::pos2(content.left(), title_rect.bottom()),
+        egui::vec2(content.width(), CHROME_BUTTON),
+    );
+    ui.put(
+        label_rect,
+        egui::Label::new(RichText::new(model.label.as_str()).size(CHROME_FONT).color(
+            if model.audible && !model.muted {
+                CHROME_TEXT
+            } else {
+                CHROME_TEXT_DIM
+            },
+        )),
+    );
+    let video_rect = egui::Rect::from_min_size(
+        egui::pos2(content.left(), label_rect.bottom()),
+        egui::vec2(content.width(), MEDIA_PIP_VIDEO_H),
+    );
+    let video_resp = ui.interact(
+        video_rect,
+        egui::Id::new(("browser-media-pip-video", model.tab_index)),
+        egui::Sense::click(),
+    );
+    ui.painter()
+        .rect_filled(video_rect, ICON_BUTTON_RADIUS, page_backdrop_fill());
+    let image_rect = fit_rect_preserving_aspect(video_rect.shrink(2.0), texture_size);
+    egui::Image::new(egui::load::SizedTexture::new(texture_id, image_rect.size()))
+        .paint_at(ui, image_rect);
+    ui.painter().rect_stroke(
+        video_rect,
+        ICON_BUTTON_RADIUS,
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+    if video_resp.clicked() {
+        focus_media_tab = true;
+    }
+    let _ = chrome_hover_text(
+        video_resp,
+        if model.background {
+            "Show media tab"
+        } else {
+            "Browser media"
+        },
+    );
+
+    let controls_top = video_rect.bottom() + CHROME_GAP;
+    let mut button_left = content.left();
+    let mut button = |ui: &mut egui::Ui,
+                      icon: ChromeIcon,
+                      tip: &str,
+                      action: MediaTransportAction,
+                      picked: &mut Option<MediaTransportAction>| {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(button_left, controls_top),
+            egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+        );
+        button_left += CHROME_BUTTON + CHROME_GAP;
+        if pip_icon_button_at(ui, rect, icon, tip).clicked() {
+            *picked = Some(action);
+        }
+    };
+    button(
+        ui,
+        ChromeIcon::Previous,
+        "Previous browser media",
+        MediaTransportAction::Previous,
+        &mut picked,
+    );
+    button(ui, play_icon, play_tip, play_action, &mut picked);
+    button(
+        ui,
+        ChromeIcon::MediaStop,
+        "Stop browser media",
+        MediaTransportAction::Stop,
+        &mut picked,
+    );
+    button(
+        ui,
+        ChromeIcon::VolumeDown,
+        "Lower browser media volume",
+        MediaTransportAction::VolumeDown,
+        &mut picked,
+    );
+    button(
+        ui,
+        ChromeIcon::VolumeUp,
+        "Raise browser media volume",
+        MediaTransportAction::VolumeUp,
+        &mut picked,
+    );
+    button(
+        ui,
+        ChromeIcon::Next,
+        "Next browser media",
+        MediaTransportAction::Next,
+        &mut picked,
+    );
+
+    if close {
+        state.media_pip_open = false;
+    } else if focus_media_tab {
+        state.select_tab(model.tab_index);
+    }
+    if let Some(action) = picked {
+        state.selected_media_transport(action);
+    }
+}
+
+fn tab_context_menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: ChromeIcon,
+    enabled: bool,
+) -> egui::Response {
+    chrome_menu_row(ui, label, icon, enabled, "Unavailable for this tab")
+}
+
+fn menu_icon(title: &str) -> ChromeIcon {
+    match title {
+        "Page" => ChromeIcon::Page,
+        "Engine" => ChromeIcon::Engine,
+        "Edit" => ChromeIcon::Edit,
+        "View" => ChromeIcon::View,
+        "History" => ChromeIcon::History,
+        "Privacy" => ChromeIcon::Privacy,
+        "Bookmarks" => ChromeIcon::Bookmark,
+        "Power" => ChromeIcon::Power,
+        _ => ChromeIcon::Options,
+    }
+}
+
+fn technical_menu_label(title: &str) -> &'static str {
+    match title {
+        "Page" => "Navigation",
+        "Engine" => "Runtime",
+        "Edit" => "Input",
+        "View" => "Rendering",
+        "History" => "Session",
+        "Privacy" => "Storage",
+        "Bookmarks" => "Bookmarks",
+        "Power" => "Instrumentation",
+        _ => "Controls",
+    }
+}
+
+fn action_icon(action: super::menubar::MenuAction) -> ChromeIcon {
+    use super::menubar::MenuAction;
+    match action {
+        MenuAction::Back => ChromeIcon::Back,
+        MenuAction::Forward => ChromeIcon::Forward,
+        MenuAction::Reload => ChromeIcon::Reload,
+        MenuAction::OpenAddress => ChromeIcon::Page,
+        MenuAction::SelectEngine(_) => ChromeIcon::Engine,
+        MenuAction::ToggleVerticalTabs => ChromeIcon::Tabs,
+        MenuAction::ToggleDownloads => ChromeIcon::Downloads,
+        MenuAction::ToggleHistory | MenuAction::ReopenClosedTab => ChromeIcon::History,
+        MenuAction::ToggleBookmarksBar
+        | MenuAction::AddBookmark
+        | MenuAction::OpenBookmarksManager => ChromeIcon::Bookmark,
+        MenuAction::TogglePowerMode => ChromeIcon::Power,
+        MenuAction::ZoomIn => ChromeIcon::ZoomIn,
+        MenuAction::ZoomOut => ChromeIcon::ZoomOut,
+        MenuAction::ResetZoom => ChromeIcon::Search,
+        MenuAction::OpenFind => ChromeIcon::Find,
+        MenuAction::ToggleAudioMute | MenuAction::ToggleMediaPlayback => ChromeIcon::Audio,
+        MenuAction::TogglePictureInPicture => ChromeIcon::PictureInPicture,
+        MenuAction::ToggleAutoplayBlock
+        | MenuAction::ToggleForceDark
+        | MenuAction::ToggleReaderMode
+        | MenuAction::ToggleUserScripts
+        | MenuAction::OpenSiteStyles => ChromeIcon::DarkMode,
+        MenuAction::CaptureViewport
+        | MenuAction::CaptureFullPage
+        | MenuAction::CaptureMhtml
+        | MenuAction::CaptureAnnotatedViewport
+        | MenuAction::CaptureCalloutViewport
+        | MenuAction::CaptureFreehandViewport
+        | MenuAction::CaptureRegion => ChromeIcon::Capture,
+        MenuAction::PrintPage
+        | MenuAction::TogglePrintSettings
+        | MenuAction::SavePdf
+        | MenuAction::OpenLastPdf => ChromeIcon::Print,
+        MenuAction::ToggleSiteBlocking
+        | MenuAction::ForgetSitePermissions
+        | MenuAction::ClearCurrentTabData
+        | MenuAction::ClearAllBrowsingData => ChromeIcon::Privacy,
+        MenuAction::CopyUrl
+        | MenuAction::SendInChat
+        | MenuAction::ShareToPeer
+        | MenuAction::ShareToPhone
+        | MenuAction::ShareToEmail
+        | MenuAction::ShareToQr
+        | MenuAction::SendTabToNode
+        | MenuAction::SendTabToPhone => ChromeIcon::Share,
+        MenuAction::OpenViewSource
+        | MenuAction::OpenChromiumDevtools
+        | MenuAction::ExportActivePageScrape
+        | MenuAction::ExportMediaManifest
+        | MenuAction::DownloadObservedMedia
+        | MenuAction::DownloadObservedImages
+        | MenuAction::CycleUserAgent
+        | MenuAction::CycleDeviceProfile
+        | MenuAction::PromptCameraPermission
+        | MenuAction::PromptMicrophonePermission
+        | MenuAction::PromptLocationPermission
+        | MenuAction::PromptNotificationsPermission
+        | MenuAction::PromptClipboardPermission
+        | MenuAction::CheckSpelling
+        | MenuAction::ReadAloud
+        | MenuAction::TranslatePage
+        | MenuAction::SaveOfflineCopy
+        | MenuAction::VoiceCommand
+        | MenuAction::Dictate
+        | MenuAction::CycleContainer
+        | MenuAction::CycleDisplayTarget => ChromeIcon::Options,
+    }
+}
+
+fn option_row(
+    ui: &mut egui::Ui,
+    item: &mde_egui::menubar::Item<super::menubar::MenuAction>,
+) -> Option<super::menubar::MenuAction> {
+    let width = ui.available_width().clamp(320.0, 760.0);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, OPTION_ROW_H),
+        if item.enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let selected = item.checked == Some(true);
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        menu_item_fill(selected),
+        CHROME_TEXT,
+        item.enabled,
+    );
+    ui.painter().rect(
+        rect,
+        8.0,
+        fill,
+        egui::Stroke::new(
+            1.0,
+            if selected {
+                CHROME_PRIMARY
+            } else {
+                CHROME_OUTLINE
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let text_color = button_text(item.enabled);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 17.0, rect.center().y),
+        egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+    );
+    paint_chrome_icon(ui.painter(), icon_rect, action_icon(item.id), text_color);
+    if selected {
+        let check_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 15.0, rect.center().y),
+            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+        );
+        paint_chrome_icon(ui.painter(), check_rect, ChromeIcon::Check, CHROME_PRIMARY);
+    } else if !item.enabled {
+        let lock_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 15.0, rect.center().y),
+            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+        );
+        paint_chrome_icon(ui.painter(), lock_rect, ChromeIcon::Lock, CHROME_TEXT_DIM);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        item.label.as_str(),
+        font_id(CHROME_FONT + 1.0),
+        text_color,
+    );
+    if let Some(shortcut) = &item.shortcut {
+        ui.painter().text(
+            egui::pos2(
+                rect.right() - if selected { 34.0 } else { 12.0 },
+                rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            shortcut.as_str(),
+            font_id(CHROME_FONT),
+            CHROME_TEXT_DIM,
+        );
+    }
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    let response = if item.enabled {
+        response
+    } else {
+        chrome_hover_text(response, "Unavailable in the current browser context")
+    };
+    (response.clicked() && item.enabled).then_some(item.id)
+}
+
+fn render_options_entries(
     ui: &mut egui::Ui,
     entries: &[Entry<super::menubar::MenuAction>],
     picked: &mut Option<super::menubar::MenuAction>,
@@ -916,39 +3068,21 @@ fn render_chrome_menu_entries(
     for entry in entries {
         match entry {
             Entry::Item(item) => {
-                let mut label = String::new();
-                if item.checked == Some(true) {
-                    label.push_str("\u{2713} ");
+                if let Some(action) = option_row(ui, item) {
+                    *picked = Some(action);
                 }
-                label.push_str(&item.label);
-                if let Some(shortcut) = &item.shortcut {
-                    label.push_str("    ");
-                    label.push_str(shortcut);
-                }
-                let response = ui.add_enabled(
-                    item.enabled,
-                    egui::Button::new(
-                        RichText::new(label)
-                            .size(CHROME_FONT)
-                            .color(button_text(item.enabled)),
-                    )
-                    .fill(menu_item_fill(item.checked == Some(true))),
-                );
-                if response.clicked() && item.enabled {
-                    *picked = Some(item.id);
-                    ui.close_menu();
-                }
+                ui.add_space(3.0);
             }
             Entry::Submenu { label, entries, .. } => {
-                ui.menu_button(
+                ui.label(
                     RichText::new(label.as_str())
-                        .size(CHROME_FONT)
+                        .size(CHROME_FONT + 1.0)
                         .color(CHROME_TEXT),
-                    |ui| render_chrome_menu_entries(ui, entries, picked),
                 );
+                render_options_entries(ui, entries, picked);
             }
             Entry::Separator => {
-                ui.separator();
+                chrome_separator(ui);
             }
             Entry::Caption(caption) => {
                 ui.label(
@@ -956,12 +3090,120 @@ fn render_chrome_menu_entries(
                         .size(CHROME_FONT)
                         .color(CHROME_TEXT_DIM),
                 );
+                ui.add_space(2.0);
             }
         }
     }
 }
 
+pub(super) fn options_page(ui: &mut egui::Ui, state: &mut WebState) {
+    let menus = super::menubar::chrome_menus(state);
+    let mut picked = None;
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_height(ui.available_height());
+                egui::Frame::NONE
+                    .fill(CHROME_SURFACE_CONTAINER)
+                    .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(154.0);
+                        ui.label(
+                            RichText::new("Runtime")
+                                .size(CHROME_FONT + 3.0)
+                                .color(CHROME_TEXT),
+                        );
+                        ui.label(
+                            RichText::new(super::BROWSER_OPTIONS_URL)
+                                .size(CHROME_FONT)
+                                .color(CHROME_TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
+                        for menu in &menus {
+                            ui.horizontal(|ui| {
+                                let rect = egui::Rect::from_center_size(
+                                    ui.next_widget_position() + egui::vec2(8.0, 8.0),
+                                    egui::vec2(OPTION_ICON_SIZE - 2.0, OPTION_ICON_SIZE - 2.0),
+                                );
+                                ui.allocate_space(egui::vec2(20.0, 18.0));
+                                paint_chrome_icon(
+                                    ui.painter(),
+                                    rect,
+                                    menu_icon(&menu.title),
+                                    CHROME_TEXT_DIM,
+                                );
+                                ui.label(
+                                    RichText::new(technical_menu_label(&menu.title))
+                                        .size(CHROME_FONT)
+                                        .color(CHROME_TEXT),
+                                );
+                            });
+                            ui.add_space(3.0);
+                        }
+                    });
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("browser-options-page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(420.0);
+                        ui.label(
+                            RichText::new("Browser Options")
+                                .size(CHROME_FONT + 8.0)
+                                .color(CHROME_TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Command and runtime controls")
+                                .size(CHROME_FONT)
+                                .color(CHROME_TEXT_DIM),
+                        );
+                        ui.add_space(10.0);
+                        for menu in &menus {
+                            egui::Frame::NONE
+                                .fill(CHROME_SURFACE_CONTAINER)
+                                .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::symmetric(8, 7))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let rect = egui::Rect::from_center_size(
+                                            ui.next_widget_position() + egui::vec2(9.0, 9.0),
+                                            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+                                        );
+                                        ui.allocate_space(egui::vec2(22.0, 20.0));
+                                        paint_chrome_icon(
+                                            ui.painter(),
+                                            rect,
+                                            menu_icon(&menu.title),
+                                            CHROME_PRIMARY,
+                                        );
+                                        ui.label(
+                                            RichText::new(technical_menu_label(&menu.title))
+                                                .size(CHROME_FONT + 4.0)
+                                                .color(CHROME_TEXT),
+                                        );
+                                    });
+                                    ui.add_space(5.0);
+                                    render_options_entries(ui, &menu.entries, &mut picked);
+                                });
+                            ui.add_space(10.0);
+                        }
+                    });
+            });
+        });
+    if let Some(action) = picked {
+        super::menubar::apply(ui.ctx(), state, action);
+    }
+}
+
 pub(super) fn tab_label(tab: &Tab) -> String {
+    if let Some(page) = tab.internal_page {
+        return page.title().to_owned();
+    }
     let title = tab.session.title().trim();
     let url = tab.session.nav().url.trim();
     let base = if !title.is_empty() {
@@ -971,44 +3213,13 @@ pub(super) fn tab_label(tab: &Tab) -> String {
     } else {
         "New tab"
     };
-    let mut markers = String::new();
-    if tab.idle_suspended {
-        markers.push_str("\u{25D2} ");
-    } else {
-        match tab.session.state() {
-            SessionState::Loading => markers.push_str("\u{25CC} "),
-            SessionState::Live => {}
-            SessionState::Crashed { .. } => markers.push_str("! "),
-        }
-    }
-    markers.push_str(tab.container.marker());
-    markers.push_str(tab.display_target.marker());
-    if tab.muted {
-        markers.push_str("M ");
-    }
-    if tab.autoplay_blocked {
-        markers.push_str("A ");
-    }
-    if tab.force_dark {
-        markers.push_str("D ");
-    }
-    if tab.reader_mode {
-        markers.push_str("R ");
-    }
-    if tab.user_scripts {
-        markers.push_str("S ");
-    }
-    markers.push_str(tab.user_agent.marker());
-    markers.push_str(tab.device_profile.marker());
-
-    if markers.is_empty() {
-        ellipsize(base, 28)
-    } else {
-        format!("{markers}{}", ellipsize(base, 24))
-    }
+    ellipsize(base, 28)
 }
 
 pub(super) fn tab_hover(tab: &Tab) -> String {
+    if let Some(page) = tab.internal_page {
+        return format!("{} - {}", page.title(), page.url());
+    }
     let url = tab.session.nav().url.trim();
     let state = if tab.idle_suspended {
         "Idle suspended"
@@ -1076,7 +3287,19 @@ pub(super) fn thumbnail_size(native: egui::Vec2, max_w: f32) -> egui::Vec2 {
 }
 
 pub(super) fn tab_hover_card(ui: &mut egui::Ui, tab: &Tab) {
-    ui.label(tab_hover(tab));
+    ui.set_max_width(260.0);
+    ui.horizontal_wrapped(|ui| {
+        let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+        paint_chrome_icon(ui.painter(), icon_rect, ChromeIcon::Tabs, CHROME_TEXT_DIM);
+        ui.add(
+            egui::Label::new(
+                RichText::new(tab_hover(tab))
+                    .size(Style::SMALL)
+                    .color(CHROME_TEXT_DIM),
+            )
+            .wrap(),
+        );
+    });
     if let Some(tex) = &tab.texture {
         let size = thumbnail_size(tex.size_vec2(), 240.0);
         if size.x > 0.0 {
@@ -1096,7 +3319,12 @@ pub(super) fn matching_tab_indices(tabs: &[Tab], query: &str) -> Vec<usize> {
     tabs.iter()
         .enumerate()
         .filter(|(_, tab)| {
+            let internal_match = tab.internal_page.is_some_and(|page| {
+                page.title().to_ascii_lowercase().contains(&q)
+                    || page.url().to_ascii_lowercase().contains(&q)
+            });
             q.is_empty()
+                || internal_match
                 || tab.session.title().to_ascii_lowercase().contains(&q)
                 || tab.session.nav().url.to_ascii_lowercase().contains(&q)
         })
@@ -1106,6 +3334,9 @@ pub(super) fn matching_tab_indices(tabs: &[Tab], query: &str) -> Vec<usize> {
 
 /// A one-line label for a tab-search result row: page title, URL, then "New tab".
 fn tab_search_row_label(tab: &Tab) -> String {
+    if let Some(page) = tab.internal_page {
+        return page.title().to_owned();
+    }
     let title = tab.session.title().trim();
     if !title.is_empty() {
         return ellipsize(title, 48);
@@ -1118,418 +3349,161 @@ fn tab_search_row_label(tab: &Tab) -> String {
     }
 }
 
+fn tab_search_separator(ui: &mut egui::Ui) {
+    ui.add_space(5.0);
+    let width = ui.available_width().max(1.0);
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, 1.0));
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, (1.0, CHROME_OUTLINE));
+    ui.allocate_space(egui::vec2(width, 1.0));
+    ui.add_space(5.0);
+}
+
+fn tab_search_result_row(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let width = ui.available_width().max(288.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, CHROME_TAB_H), egui::Sense::click());
+    let fill = animated_response_fill(ui, &response, row_fill(active), CHROME_TEXT, true);
+    ui.painter().rect(
+        rect,
+        7.0,
+        fill,
+        egui::Stroke::new(1.0, tab_stroke(active)),
+        egui::StrokeKind::Inside,
+    );
+    let text_color = selected_text(active);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::vec2(OPTION_ICON_SIZE - 1.0, OPTION_ICON_SIZE - 1.0),
+    );
+    paint_chrome_icon(ui.painter(), icon_rect, ChromeIcon::Tabs, text_color);
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font_id(CHROME_FONT),
+        text_color,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response
+}
+
+fn tab_search_results(ui: &mut egui::Ui, state: &WebState) -> Option<usize> {
+    let mut select = None;
+    tab_search_separator(ui);
+    let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
+    egui::ScrollArea::vertical()
+        .max_height(260.0)
+        .show(ui, |ui| {
+            if matches.is_empty() {
+                browser_muted_note(ui, "No matching tabs");
+            }
+            for idx in matches {
+                let active = idx == state.active;
+                let label = tab_search_row_label(&state.tabs[idx]);
+                if tab_search_result_row(ui, &label, active).clicked() {
+                    select = Some(idx);
+                }
+            }
+        });
+    select
+}
+
+fn tab_search_menu_contents(ui: &mut egui::Ui, state: &mut WebState) -> Option<usize> {
+    ui.set_min_width(300.0);
+    let resp = chrome_text_field(
+        ui,
+        true,
+        &mut state.tab_search_query,
+        "Search tabs",
+        f32::INFINITY,
+        220.0,
+        false,
+        "Search tabs",
+        None,
+    );
+    state.chrome_edit_focus |= resp.has_focus();
+    tab_search_results(ui, state)
+}
+
+fn tab_search_anchor_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Search tabs")
+    });
+    let base_fill = if selected {
+        CHROME_PRIMARY_CONTAINER
+    } else {
+        CHROME_TOOLBAR
+    };
+    let icon_color = if selected {
+        CHROME_ON_PRIMARY_CONTAINER
+    } else {
+        CHROME_TEXT
+    };
+    let fill = animated_response_fill(ui, &response, base_fill, icon_color, true);
+    ui.painter().rect(
+        rect,
+        ICON_BUTTON_RADIUS,
+        fill,
+        egui::Stroke::new(
+            1.0,
+            if selected {
+                CHROME_PRIMARY
+            } else {
+                CHROME_OUTLINE
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    paint_chrome_icon(ui.painter(), rect, ChromeIcon::Search, icon_color);
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, "Search tabs")
+}
+
 /// Chrome's "Search tabs" dropdown: live-filtered, clickable tab chooser.
 pub(super) fn tab_search_menu(ui: &mut egui::Ui, state: &mut WebState) {
     let mut select: Option<usize> = None;
-    ui.menu_button(
-        egui::RichText::new("\u{1F50D}") // 🔍
-            .size(CHROME_FONT)
-            .color(CHROME_TEXT_DIM),
+    let popup_id = tab_search_menu_popup_id();
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let response = tab_search_anchor_button(ui, popup_open);
+    let keyboard_toggle = response.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+    if response.clicked() || keyboard_toggle {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            ui.set_min_width(300.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut state.tab_search_query)
-                    .hint_text("Search tabs")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.separator();
-            let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    if matches.is_empty() {
-                        ui.weak("No matching tabs");
-                    }
-                    for idx in matches {
-                        let active = idx == state.active;
-                        let label = tab_search_row_label(&state.tabs[idx]);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(label)
-                                        .size(CHROME_FONT)
-                                        .color(selected_text(active)),
-                                )
-                                .fill(row_fill(active))
-                                .min_size(egui::vec2(288.0, CHROME_TAB_H)),
-                            )
-                            .clicked()
-                        {
-                            select = Some(idx);
-                            ui.close_menu();
-                        }
-                    }
-                });
+            if motion.active {
+                ui.ctx().request_repaint();
+            }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.anchor_offset > 0.0 {
+                ui.add_space(motion.anchor_offset);
+            }
+            if let Some(idx) = tab_search_menu_contents(ui, state) {
+                select = Some(idx);
+                ui.memory_mut(|mem| mem.close_popup());
+            }
         },
-    )
-    .response
-    .on_hover_text("Search tabs");
+    );
     if let Some(idx) = select {
         state.select_tab(idx);
         state.tab_search_query.clear();
     }
 }
 
-pub(super) fn engine_new_tab_buttons(ui: &mut egui::Ui, state: &mut WebState, vertical: bool) {
-    let selected = state.engine;
-    let cef_tabs = state
-        .tabs
-        .iter()
-        .filter(|tab| tab.engine == BrowserEngine::Cef)
-        .count();
-    let servo_tabs = state
-        .tabs
-        .iter()
-        .filter(|tab| tab.engine == BrowserEngine::Servo)
-        .count();
-    let mut open_selected = false;
-    let mut selected_engine = None;
-
-    let mut controls = |ui: &mut egui::Ui, full_width: bool| {
-        ui.spacing_mut().item_spacing = egui::vec2(if full_width { 4.0 } else { 3.0 }, 4.0);
-        let plus_w = if full_width {
-            ui.available_width()
-        } else {
-            ENGINE_NEW_TAB_W
-        };
-        if engine_new_tab_button(ui, selected, plus_w).clicked() {
-            open_selected = true;
-        }
-        if full_width {
-            ui.add_space(CHROME_GAP);
-        }
-        for engine in [BrowserEngine::Cef, BrowserEngine::Servo] {
-            let width = if full_width {
-                ui.available_width()
-            } else {
-                ENGINE_SEGMENT_W
-            };
-            let count = match engine {
-                BrowserEngine::Cef => cef_tabs,
-                BrowserEngine::Servo => servo_tabs,
-            };
-            if engine_segment_button(ui, engine, selected, width, count).clicked() {
-                selected_engine = Some(engine);
-            }
-        }
-    };
-
-    let dock = if vertical {
-        egui::Frame::NONE
-            .fill(state_layer(CHROME_TOOLBAR, engine_accent(selected), 8))
-            .stroke(egui::Stroke::new(
-                1.0,
-                state_layer(CHROME_OUTLINE, engine_accent(selected), 58),
-            ))
-            .corner_radius(ENGINE_SEGMENT_RADIUS)
-            .inner_margin(egui::Margin::symmetric(3, 3))
-            .show(ui, |ui| {
-                ui.vertical(|ui| controls(ui, true));
-            })
-    } else {
-        egui::Frame::NONE
-            .fill(state_layer(CHROME_TOOLBAR, engine_accent(selected), 8))
-            .stroke(egui::Stroke::new(
-                1.0,
-                state_layer(CHROME_OUTLINE, engine_accent(selected), 58),
-            ))
-            .corner_radius(ENGINE_SEGMENT_RADIUS)
-            .inner_margin(egui::Margin::symmetric(3, 3))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| controls(ui, false));
-            })
-    };
-    let dock_rect = dock.response.rect;
-    let rail = if vertical {
-        egui::Rect::from_min_max(
-            egui::pos2(dock_rect.left() + 1.0, dock_rect.top() + 12.0),
-            egui::pos2(dock_rect.left() + 3.0, dock_rect.bottom() - 12.0),
-        )
-    } else {
-        egui::Rect::from_min_max(
-            egui::pos2(
-                dock_rect.left() + ENGINE_NEW_TAB_W + 12.0,
-                dock_rect.bottom() - 3.0,
-            ),
-            egui::pos2(dock_rect.right() - 12.0, dock_rect.bottom() - 1.0),
-        )
-    };
-    ui.painter()
-        .rect_filled(rail, 1.0, engine_accent(selected).gamma_multiply(0.72));
-
-    if let Some(engine) = selected_engine {
-        state.select_engine(engine);
-    }
-    if open_selected {
-        state.request_new_tab(selected);
-    }
-}
-
-fn engine_new_tab_button(ui: &mut egui::Ui, engine: BrowserEngine, width: f32) -> egui::Response {
-    let response = ui.add(
-        egui::Button::new("")
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(ENGINE_SEGMENT_RADIUS)
-            .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
-    );
-    let r = response.rect;
-    let accent = engine_new_tab_fill(engine);
-    let compact = r.width() < 88.0;
-    let fill = if response.is_pointer_button_down_on() {
-        state_layer(accent, CHROME_TEXT, STATE_PRESSED_ALPHA)
-    } else if response.hovered() {
-        state_layer(accent, CHROME_TOOLBAR, STATE_HOVER_ALPHA)
-    } else {
-        accent
-    };
-    let shadow = egui::Rect::from_min_max(
-        egui::pos2(r.left() + 7.0, r.bottom() - 1.5),
-        egui::pos2(r.right() - 7.0, r.bottom()),
-    );
-    ui.painter()
-        .rect_filled(shadow, 1.0, Color32::from_black_alpha(24));
-    ui.painter().rect(
-        r,
-        ENGINE_SEGMENT_RADIUS,
-        fill,
-        egui::Stroke::new(1.0, accent.gamma_multiply(0.8)),
-        egui::StrokeKind::Inside,
-    );
-
-    let glyph = egui::Rect::from_center_size(
-        if compact {
-            r.center()
-        } else {
-            egui::pos2(r.left() + 20.0, r.center().y)
-        },
-        egui::vec2(22.0, 22.0),
-    );
-    ui.painter().circle_filled(
-        glyph.center(),
-        11.0,
-        Color32::from_white_alpha(if response.is_pointer_button_down_on() {
-            170
-        } else {
-            145
-        }),
-    );
-    ui.painter().circle_stroke(
-        glyph.center(),
-        11.0,
-        egui::Stroke::new(1.0, Color32::from_white_alpha(176)),
-    );
-    ui.painter().text(
-        glyph.center(),
-        egui::Align2::CENTER_CENTER,
-        "+",
-        font_id(CHROME_FONT + 3.0),
-        accent,
-    );
-    if compact {
-        mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
-        return response.on_hover_text(format!(
-            "Open a new tab with {}",
-            engine_display_name(engine)
-        ));
-    }
-    let text_left = glyph.right() + 8.0;
-    let badge_reserve = if r.width() >= 132.0 {
-        tab_engine_badge_width(engine) + 18.0
-    } else {
-        8.0
-    };
-    let clip = egui::Rect::from_min_max(
-        egui::pos2(text_left, r.top()),
-        egui::pos2(r.right() - badge_reserve, r.bottom()),
-    );
-    let painter = ui.painter().with_clip_rect(clip);
-    painter.text(
-        egui::pos2(text_left, r.center().y),
-        egui::Align2::LEFT_CENTER,
-        engine_new_tab_text(engine),
-        font_id(CHROME_FONT + 1.0),
-        CHROME_TOOLBAR,
-    );
-    if r.width() >= 132.0 {
-        let badge_w = tab_engine_badge_width(engine);
-        let badge = egui::Rect::from_center_size(
-            egui::pos2(r.right() - 9.0 - badge_w / 2.0, r.center().y),
-            egui::vec2(badge_w, TAB_ENGINE_BADGE_H),
-        );
-        ui.painter().rect(
-            badge,
-            TAB_ENGINE_BADGE_H / 2.0,
-            Color32::from_white_alpha(46),
-            egui::Stroke::new(1.0, Color32::from_white_alpha(116)),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().text(
-            badge.center(),
-            egui::Align2::CENTER_CENTER,
-            engine_marker(engine),
-            font_id(CHROME_FONT - 3.0),
-            CHROME_TOOLBAR,
-        );
-    }
-    mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
-    response.on_hover_text(format!(
-        "Open a new tab with {}",
-        engine_display_name(engine)
-    ))
-}
-
-fn engine_segment_button(
-    ui: &mut egui::Ui,
-    engine: BrowserEngine,
-    selected: BrowserEngine,
-    width: f32,
-    tab_count: usize,
-) -> egui::Response {
-    let is_selected = engine == selected;
-    let response = ui.add(
-        egui::Button::new("")
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(ENGINE_SEGMENT_RADIUS)
-            .min_size(egui::vec2(width, ENGINE_CONTROL_H)),
-    );
-    let r = response.rect;
-    let accent = engine_accent(engine);
-    let base_fill = engine_segment_fill(engine, selected);
-    let fill = if response.is_pointer_button_down_on() {
-        state_layer(base_fill, CHROME_TEXT, STATE_PRESSED_ALPHA)
-    } else if response.hovered() && !is_selected {
-        state_layer(base_fill, accent, STATE_HOVER_ALPHA.saturating_add(8))
-    } else if response.hovered() {
-        state_layer(base_fill, accent, STATE_HOVER_ALPHA)
-    } else {
-        base_fill
-    };
-    if is_selected {
-        ui.painter().rect_filled(
-            r.expand2(egui::vec2(0.5, 1.0)),
-            ENGINE_SEGMENT_RADIUS + 1.0,
-            state_layer(CHROME_SURFACE_CONTAINER_HIGH, accent, 20),
-        );
-    }
-    ui.painter().rect(
-        r,
-        ENGINE_SEGMENT_RADIUS,
-        fill,
-        egui::Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            engine_segment_stroke(engine, selected),
-        ),
-        egui::StrokeKind::Inside,
-    );
-    if is_selected {
-        let selected_rail = egui::Rect::from_min_max(
-            egui::pos2(r.left() + 10.0, r.bottom() - 3.0),
-            egui::pos2(r.right() - 10.0, r.bottom() - 1.0),
-        );
-        ui.painter().rect_filled(selected_rail, 1.0, accent);
-    }
-
-    let marker = egui::Rect::from_center_size(
-        egui::pos2(r.left() + 20.0, r.center().y),
-        egui::vec2(21.0, 21.0),
-    );
-    ui.painter().rect_filled(
-        marker,
-        10.5,
-        if is_selected {
-            accent
-        } else {
-            state_layer(CHROME_TOOLBAR, accent, 36)
-        },
-    );
-    ui.painter().circle_stroke(
-        marker.center(),
-        10.5,
-        egui::Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            accent.gamma_multiply(if is_selected { 0.85 } else { 0.5 }),
-        ),
-    );
-    ui.painter().text(
-        marker.center(),
-        egui::Align2::CENTER_CENTER,
-        engine_glyph(engine),
-        font_id(CHROME_FONT - 1.0),
-        if is_selected { CHROME_TOOLBAR } else { accent },
-    );
-
-    let text_left = marker.right() + 7.0;
-    let chip = engine_segment_chip_label(engine, selected, tab_count);
-    let chip_w = (chip.len() as f32 * 5.5 + 14.0).clamp(42.0, 62.0);
-    let chip_rect = egui::Rect::from_center_size(
-        egui::pos2(r.right() - 8.0 - chip_w / 2.0, r.top() + 13.0),
-        egui::vec2(chip_w, 17.0),
-    );
-    let show_chip = r.width() >= 132.0;
-    if show_chip {
-        ui.painter().rect(
-            chip_rect,
-            8.5,
-            if is_selected {
-                Color32::from_white_alpha(132)
-            } else {
-                state_layer(CHROME_TOOLBAR, accent, 28)
-            },
-            egui::Stroke::new(
-                1.0,
-                if is_selected {
-                    Color32::from_white_alpha(150)
-                } else {
-                    accent.gamma_multiply(0.45)
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().text(
-            chip_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            &chip,
-            font_id(CHROME_FONT - 3.0),
-            engine_segment_supporting_text(engine, selected),
-        );
-    }
-    let clip = egui::Rect::from_min_max(
-        egui::pos2(text_left, r.top()),
-        egui::pos2(
-            if show_chip {
-                chip_rect.left() - 6.0
-            } else {
-                r.right() - 6.0
-            },
-            r.bottom(),
-        ),
-    );
-    let painter = ui.painter().with_clip_rect(clip);
-    painter.text(
-        egui::pos2(text_left, r.top() + 13.0),
-        egui::Align2::LEFT_CENTER,
-        engine_primary_label(engine),
-        font_id(CHROME_FONT + 0.5),
-        engine_segment_text(engine, selected),
-    );
-    painter.text(
-        egui::pos2(text_left, r.bottom() - 11.0),
-        egui::Align2::LEFT_CENTER,
-        if is_selected {
-            engine_tab_count_label(tab_count)
-        } else {
-            engine_supporting_label(engine).to_owned()
-        },
-        font_id(CHROME_FONT - 2.0),
-        engine_segment_supporting_text(engine, selected),
-    );
-    mde_egui::focus::paint_focus_ring(ui.painter(), r, response.has_focus());
-    response.on_hover_text(format!(
-        "Use {} for future Browser tabs",
-        engine_display_name(engine)
-    ))
+pub(super) fn tab_search_menu_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_tab_search_menu_popup")
 }
 
 pub(super) fn tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
@@ -1578,6 +3552,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let mut drag_from: Option<usize> = None;
     let mut drop_pointer: Option<egui::Pos2> = None;
+    let mut drag_settle: Option<(u64, f32)> = None;
 
     egui::ScrollArea::horizontal()
         .id_salt("browser-horizontal-tabs")
@@ -1592,6 +3567,7 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                     } else {
                         tab_label(tab)
                     };
+                    let status_chips = tab_status_chips(tab);
                     let pill_w = if tab.pinned {
                         CHROME_TAB_PINNED_W
                     } else {
@@ -1604,7 +3580,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         pill_w,
                         tab.engine,
                         favicon_textures.get(idx).and_then(Option::as_ref),
+                        &status_chips,
                     );
+                    let settle_motion =
+                        tab_drag_settle_motion(ui.ctx(), tab.id, TabAxis::Horizontal);
                     pill_rects.push((idx, tab_response.rect));
                     if tab_response.clicked() {
                         select = Some(idx);
@@ -1642,66 +3621,95 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             color,
                         );
                     }
+                    paint_tab_drag_settle(
+                        ui,
+                        tab_response.rect,
+                        tab.engine,
+                        TabAxis::Horizontal,
+                        settle_motion,
+                    );
                     tab_response
                         .on_hover_ui(|ui| tab_hover_card(ui, tab))
                         .context_menu(|ui| {
-                            if ui
-                                .add_enabled(idx > 0, compact_menu_item("Move tab left"))
+                            if tab_context_menu_row(ui, "Move tab left", ChromeIcon::Back, idx > 0)
                                 .clicked()
                             {
                                 move_tab = Some((idx, idx - 1));
                                 ui.close_menu();
                             }
-                            if ui
-                                .add_enabled(
-                                    idx + 1 < state.tabs.len(),
-                                    compact_menu_item("Move tab right"),
-                                )
-                                .clicked()
+                            if tab_context_menu_row(
+                                ui,
+                                "Move tab right",
+                                ChromeIcon::Forward,
+                                idx + 1 < state.tabs.len(),
+                            )
+                            .clicked()
                             {
                                 move_tab = Some((idx, idx + 1));
                                 ui.close_menu();
                             }
                             let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                            if ui.add(compact_menu_item(pin_label)).clicked() {
+                            if tab_context_menu_row(ui, pin_label, ChromeIcon::Bookmark, true)
+                                .clicked()
+                            {
                                 pin_tab = Some((idx, !tab.pinned));
                                 ui.close_menu();
                             }
-                            if ui.add(compact_menu_item("Duplicate tab")).clicked() {
+                            if tab_context_menu_row(ui, "Duplicate tab", ChromeIcon::Page, true)
+                                .clicked()
+                            {
                                 duplicate_tab_idx = Some(idx);
                                 ui.close_menu();
                             }
-                            if ui
-                                .add_enabled(
-                                    state.tabs.len() > 1,
-                                    compact_menu_item("Close other tabs"),
-                                )
-                                .clicked()
+                            if tab_context_menu_row(
+                                ui,
+                                "Close other tabs",
+                                ChromeIcon::Close,
+                                state.tabs.len() > 1,
+                            )
+                            .clicked()
                             {
                                 close_others_idx = Some(idx);
                                 ui.close_menu();
                             }
-                            if ui
-                                .add_enabled(
-                                    idx + 1 < state.tabs.len(),
-                                    compact_menu_item("Close tabs to the right"),
-                                )
-                                .clicked()
+                            if tab_context_menu_row(
+                                ui,
+                                "Close tabs to the right",
+                                ChromeIcon::Forward,
+                                idx + 1 < state.tabs.len(),
+                            )
+                            .clicked()
                             {
                                 close_right_idx = Some(idx);
                                 ui.close_menu();
                             }
                             if tab.group.is_none() {
-                                if ui.add(compact_menu_item("Add tab to new group")).clicked() {
+                                if tab_context_menu_row(
+                                    ui,
+                                    "Add tab to new group",
+                                    ChromeIcon::Tabs,
+                                    true,
+                                )
+                                .clicked()
+                                {
                                     group_tab = Some(idx);
                                     ui.close_menu();
                                 }
-                            } else if ui.add(compact_menu_item("Remove from group")).clicked() {
+                            } else if tab_context_menu_row(
+                                ui,
+                                "Remove from group",
+                                ChromeIcon::Tabs,
+                                true,
+                            )
+                            .clicked()
+                            {
                                 ungroup_tab_idx = Some(idx);
                                 ui.close_menu();
                             }
                             let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                            if ui.add(compact_menu_item(mute_label)).clicked() {
+                            if tab_context_menu_row(ui, mute_label, ChromeIcon::Audio, true)
+                                .clicked()
+                            {
                                 mute_tab = Some((idx, !tab.muted));
                                 ui.close_menu();
                             }
@@ -1710,7 +3718,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Block autoplay"
                             };
-                            if ui.add(compact_menu_item(autoplay_label)).clicked() {
+                            if tab_context_menu_row(ui, autoplay_label, ChromeIcon::Play, true)
+                                .clicked()
+                            {
                                 autoplay_tab = Some((idx, !tab.autoplay_blocked));
                                 ui.close_menu();
                             }
@@ -1719,7 +3729,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable force dark"
                             };
-                            if ui.add(compact_menu_item(dark_label)).clicked() {
+                            if tab_context_menu_row(ui, dark_label, ChromeIcon::DarkMode, true)
+                                .clicked()
+                            {
                                 force_dark_tab = Some((idx, !tab.force_dark));
                                 ui.close_menu();
                             }
@@ -1728,7 +3740,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable reader mode"
                             };
-                            if ui.add(compact_menu_item(reader_label)).clicked() {
+                            if tab_context_menu_row(ui, reader_label, ChromeIcon::View, true)
+                                .clicked()
+                            {
                                 reader_tab = Some((idx, !tab.reader_mode));
                                 ui.close_menu();
                             }
@@ -1737,43 +3751,49 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             } else {
                                 "Enable userscripts"
                             };
-                            if ui.add(compact_menu_item(scripts_label)).clicked() {
+                            if tab_context_menu_row(ui, scripts_label, ChromeIcon::Edit, true)
+                                .clicked()
+                            {
                                 user_scripts_tab = Some((idx, !tab.user_scripts));
                                 ui.close_menu();
                             }
-                            ui.separator();
+                            chrome_separator(ui);
                             for container in ContainerProfile::ALL {
-                                if ui
-                                    .add_enabled(
-                                        tab.container != container,
-                                        compact_menu_item(container.label()),
-                                    )
-                                    .clicked()
+                                if tab_context_menu_row(
+                                    ui,
+                                    container.label(),
+                                    ChromeIcon::Privacy,
+                                    tab.container != container,
+                                )
+                                .clicked()
                                 {
                                     container_tab = Some((idx, container));
                                     ui.close_menu();
                                 }
                             }
-                            ui.separator();
+                            chrome_separator(ui);
                             for display_target in DisplayTarget::ALL {
-                                if ui
-                                    .add_enabled(
-                                        tab.display_target != display_target,
-                                        compact_menu_item(display_target.label()),
-                                    )
-                                    .clicked()
+                                if tab_context_menu_row(
+                                    ui,
+                                    display_target.label(),
+                                    ChromeIcon::View,
+                                    tab.display_target != display_target,
+                                )
+                                .clicked()
                                 {
                                     display_tab = Some((idx, display_target));
                                     ui.close_menu();
                                 }
                             }
-                            if ui.add(compact_menu_item("Close tab")).clicked() {
+                            if tab_context_menu_row(ui, "Close tab", ChromeIcon::Close, true)
+                                .clicked()
+                            {
                                 close = Some(idx);
                                 ui.close_menu();
                             }
                         });
-                    // Speaker glyph for an audible/muted tab, click-to-mute.
-                    if let Some(audio) = tab_audio_glyph(ui, tab.session.audible(), tab.muted) {
+                    // Speaker affordance for an audible/muted tab, click-to-mute.
+                    if let Some(audio) = tab_audio_button(ui, tab.session.audible(), tab.muted) {
                         if audio.clicked() {
                             mute_tab = Some((idx, !tab.muted));
                         }
@@ -1784,7 +3804,6 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         close = Some(idx);
                     }
                 }
-                engine_new_tab_buttons(ui, state, false);
                 tab_search_menu(ui, state);
             });
         });
@@ -1797,6 +3816,10 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Horizontal) {
             if to != from {
                 move_tab = Some((from, to));
+                drag_settle = state
+                    .tabs
+                    .get(from)
+                    .map(|tab| (tab.id, tab_drag_settle_direction(from, to)));
             }
         }
     }
@@ -1843,6 +3866,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.ungroup_tab(idx);
     } else if let Some((from, to)) = move_tab {
         state.move_tab(from, to);
+        if let Some((tab_id, direction)) = drag_settle {
+            note_tab_drag_settle(ui.ctx(), tab_id, TabAxis::Horizontal, direction);
+        }
     } else if let Some(idx) = close {
         state.close_tab(idx);
     } else if let Some(idx) = select {
@@ -1873,6 +3899,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     let mut pill_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let mut drag_from: Option<usize> = None;
     let mut drop_pointer: Option<egui::Pos2> = None;
+    let mut drag_settle: Option<(u64, f32)> = None;
 
     // Resolve/cache each tab's favicon texture BEFORE the (immutable) pill loop
     // below — see `resolve_tab_favicon_textures`.
@@ -1882,10 +3909,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         .fill(CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
-            ui.set_width(184.0);
+            ui.set_width(152.0);
             egui::ScrollArea::vertical()
                 .id_salt("browser-vertical-tabs")
-                .max_height(ui.available_height())
+                .max_height(ui.available_height().max(CHROME_TAB_H * 3.0))
                 .show(ui, |ui| {
                     for (idx, tab) in state.tabs.iter().enumerate() {
                         let active = idx == state.active;
@@ -1895,6 +3922,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                         } else {
                             tab_label(tab)
                         };
+                        let status_chips = tab_status_chips(tab);
                         ui.horizontal(|ui| {
                             let width = if tab.pinned {
                                 CHROME_TAB_PINNED_W
@@ -1909,7 +3937,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 width,
                                 tab.engine,
                                 favicon_textures.get(idx).and_then(Option::as_ref),
+                                &status_chips,
                             );
+                            let settle_motion =
+                                tab_drag_settle_motion(ui.ctx(), tab.id, TabAxis::Vertical);
                             pill_rects.push((idx, resp.rect));
                             if resp.clicked() {
                                 select = Some(idx);
@@ -1942,137 +3973,221 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                     color,
                                 );
                             }
-                            resp.on_hover_text(tab_hover(tab)).context_menu(|ui| {
-                                if ui
-                                    .add_enabled(idx > 0, compact_menu_item("Move tab up"))
-                                    .clicked()
-                                {
-                                    move_tab = Some((idx, idx - 1));
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        idx + 1 < state.tabs.len(),
-                                        compact_menu_item("Move tab down"),
+                            paint_tab_drag_settle(
+                                ui,
+                                resp.rect,
+                                tab.engine,
+                                TabAxis::Vertical,
+                                settle_motion,
+                            );
+                            resp.on_hover_ui(|ui| tab_hover_card(ui, tab))
+                                .context_menu(|ui| {
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Move tab up",
+                                        ChromeIcon::Up,
+                                        idx > 0,
                                     )
                                     .clicked()
-                                {
-                                    move_tab = Some((idx, idx + 1));
-                                    ui.close_menu();
-                                }
-                                let pin_label = if tab.pinned { "Unpin tab" } else { "Pin tab" };
-                                if ui.add(compact_menu_item(pin_label)).clicked() {
-                                    pin_tab = Some((idx, !tab.pinned));
-                                    ui.close_menu();
-                                }
-                                if ui.add(compact_menu_item("Duplicate tab")).clicked() {
-                                    duplicate_tab_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
+                                    {
+                                        move_tab = Some((idx, idx - 1));
+                                        ui.close_menu();
+                                    }
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Move tab down",
+                                        ChromeIcon::Down,
+                                        idx + 1 < state.tabs.len(),
+                                    )
+                                    .clicked()
+                                    {
+                                        move_tab = Some((idx, idx + 1));
+                                        ui.close_menu();
+                                    }
+                                    let pin_label =
+                                        if tab.pinned { "Unpin tab" } else { "Pin tab" };
+                                    if tab_context_menu_row(
+                                        ui,
+                                        pin_label,
+                                        ChromeIcon::Bookmark,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        pin_tab = Some((idx, !tab.pinned));
+                                        ui.close_menu();
+                                    }
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Duplicate tab",
+                                        ChromeIcon::Page,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        duplicate_tab_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Close other tabs",
+                                        ChromeIcon::Close,
                                         state.tabs.len() > 1,
-                                        compact_menu_item("Close other tabs"),
                                     )
                                     .clicked()
-                                {
-                                    close_others_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .add_enabled(
+                                    {
+                                        close_others_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Close tabs to the right",
+                                        ChromeIcon::Forward,
                                         idx + 1 < state.tabs.len(),
-                                        compact_menu_item("Close tabs to the right"),
                                     )
                                     .clicked()
-                                {
-                                    close_right_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                if tab.group.is_none() {
-                                    if ui.add(compact_menu_item("Add tab to new group")).clicked() {
-                                        group_tab = Some(idx);
+                                    {
+                                        close_right_idx = Some(idx);
                                         ui.close_menu();
                                     }
-                                } else if ui.add(compact_menu_item("Remove from group")).clicked() {
-                                    ungroup_tab_idx = Some(idx);
-                                    ui.close_menu();
-                                }
-                                let mute_label = if tab.muted { "Unmute tab" } else { "Mute tab" };
-                                if ui.add(compact_menu_item(mute_label)).clicked() {
-                                    mute_tab = Some((idx, !tab.muted));
-                                    ui.close_menu();
-                                }
-                                let autoplay_label = if tab.autoplay_blocked {
-                                    "Allow autoplay"
-                                } else {
-                                    "Block autoplay"
-                                };
-                                if ui.add(compact_menu_item(autoplay_label)).clicked() {
-                                    autoplay_tab = Some((idx, !tab.autoplay_blocked));
-                                    ui.close_menu();
-                                }
-                                let dark_label = if tab.force_dark {
-                                    "Disable force dark"
-                                } else {
-                                    "Enable force dark"
-                                };
-                                if ui.add(compact_menu_item(dark_label)).clicked() {
-                                    force_dark_tab = Some((idx, !tab.force_dark));
-                                    ui.close_menu();
-                                }
-                                let reader_label = if tab.reader_mode {
-                                    "Disable reader mode"
-                                } else {
-                                    "Enable reader mode"
-                                };
-                                if ui.add(compact_menu_item(reader_label)).clicked() {
-                                    reader_tab = Some((idx, !tab.reader_mode));
-                                    ui.close_menu();
-                                }
-                                let scripts_label = if tab.user_scripts {
-                                    "Disable userscripts"
-                                } else {
-                                    "Enable userscripts"
-                                };
-                                if ui.add(compact_menu_item(scripts_label)).clicked() {
-                                    user_scripts_tab = Some((idx, !tab.user_scripts));
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                for container in ContainerProfile::ALL {
-                                    if ui
-                                        .add_enabled(
+                                    if tab.group.is_none() {
+                                        if tab_context_menu_row(
+                                            ui,
+                                            "Add tab to new group",
+                                            ChromeIcon::Tabs,
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            group_tab = Some(idx);
+                                            ui.close_menu();
+                                        }
+                                    } else if tab_context_menu_row(
+                                        ui,
+                                        "Remove from group",
+                                        ChromeIcon::Tabs,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        ungroup_tab_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    let mute_label =
+                                        if tab.muted { "Unmute tab" } else { "Mute tab" };
+                                    if tab_context_menu_row(ui, mute_label, ChromeIcon::Audio, true)
+                                        .clicked()
+                                    {
+                                        mute_tab = Some((idx, !tab.muted));
+                                        ui.close_menu();
+                                    }
+                                    let autoplay_label = if tab.autoplay_blocked {
+                                        "Allow autoplay"
+                                    } else {
+                                        "Block autoplay"
+                                    };
+                                    if tab_context_menu_row(
+                                        ui,
+                                        autoplay_label,
+                                        ChromeIcon::Play,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        autoplay_tab = Some((idx, !tab.autoplay_blocked));
+                                        ui.close_menu();
+                                    }
+                                    let dark_label = if tab.force_dark {
+                                        "Disable force dark"
+                                    } else {
+                                        "Enable force dark"
+                                    };
+                                    if tab_context_menu_row(
+                                        ui,
+                                        dark_label,
+                                        ChromeIcon::DarkMode,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        force_dark_tab = Some((idx, !tab.force_dark));
+                                        ui.close_menu();
+                                    }
+                                    let reader_label = if tab.reader_mode {
+                                        "Disable reader mode"
+                                    } else {
+                                        "Enable reader mode"
+                                    };
+                                    if tab_context_menu_row(
+                                        ui,
+                                        reader_label,
+                                        ChromeIcon::View,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        reader_tab = Some((idx, !tab.reader_mode));
+                                        ui.close_menu();
+                                    }
+                                    let scripts_label = if tab.user_scripts {
+                                        "Disable userscripts"
+                                    } else {
+                                        "Enable userscripts"
+                                    };
+                                    if tab_context_menu_row(
+                                        ui,
+                                        scripts_label,
+                                        ChromeIcon::Edit,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        user_scripts_tab = Some((idx, !tab.user_scripts));
+                                        ui.close_menu();
+                                    }
+                                    chrome_separator(ui);
+                                    for container in ContainerProfile::ALL {
+                                        if tab_context_menu_row(
+                                            ui,
+                                            container.label(),
+                                            ChromeIcon::Privacy,
                                             tab.container != container,
-                                            compact_menu_item(container.label()),
                                         )
                                         .clicked()
-                                    {
-                                        container_tab = Some((idx, container));
-                                        ui.close_menu();
+                                        {
+                                            container_tab = Some((idx, container));
+                                            ui.close_menu();
+                                        }
                                     }
-                                }
-                                ui.separator();
-                                for display_target in DisplayTarget::ALL {
-                                    if ui
-                                        .add_enabled(
+                                    chrome_separator(ui);
+                                    for display_target in DisplayTarget::ALL {
+                                        if tab_context_menu_row(
+                                            ui,
+                                            display_target.label(),
+                                            ChromeIcon::View,
                                             tab.display_target != display_target,
-                                            compact_menu_item(display_target.label()),
                                         )
                                         .clicked()
+                                        {
+                                            display_tab = Some((idx, display_target));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    if tab_context_menu_row(
+                                        ui,
+                                        "Close tab",
+                                        ChromeIcon::Close,
+                                        true,
+                                    )
+                                    .clicked()
                                     {
-                                        display_tab = Some((idx, display_target));
+                                        close = Some(idx);
                                         ui.close_menu();
                                     }
-                                }
-                                if ui.add(compact_menu_item("Close tab")).clicked() {
-                                    close = Some(idx);
-                                    ui.close_menu();
-                                }
-                            });
-                            // Speaker glyph for an audible/muted tab, click-to-mute.
+                                });
+                            // Speaker affordance for an audible/muted tab, click-to-mute.
                             if let Some(audio) =
-                                tab_audio_glyph(ui, tab.session.audible(), tab.muted)
+                                tab_audio_button(ui, tab.session.audible(), tab.muted)
                             {
                                 if audio.clicked() {
                                     mute_tab = Some((idx, !tab.muted));
@@ -2084,7 +4199,6 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             }
                         });
                     }
-                    engine_new_tab_buttons(ui, state, true);
                     tab_search_menu(ui, state);
                 });
         });
@@ -2094,6 +4208,10 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         if let Some(to) = tab_drag_target_index(&pill_rects, pointer, TabAxis::Vertical) {
             if to != from {
                 move_tab = Some((from, to));
+                drag_settle = state
+                    .tabs
+                    .get(from)
+                    .map(|tab| (tab.id, tab_drag_settle_direction(from, to)));
             }
         }
     }
@@ -2140,6 +4258,9 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         state.ungroup_tab(idx);
     } else if let Some((from, to)) = move_tab {
         state.move_tab(from, to);
+        if let Some((tab_id, direction)) = drag_settle {
+            note_tab_drag_settle(ui.ctx(), tab_id, TabAxis::Vertical, direction);
+        }
     } else if let Some(idx) = close {
         state.close_tab(idx);
     } else if let Some(idx) = select {
@@ -2149,7 +4270,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
 
 /// Which way a tab strip runs, so the shared drag-reorder hit-test knows whether
 /// to compare drop points along X (horizontal strip) or Y (vertical strip).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum TabAxis {
     Horizontal,
     Vertical,
@@ -2255,25 +4376,29 @@ pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
         // Private-by-default explainer — the browser has no persistent profile
         // (sandbox has no writable $HOME); make that posture legible on the front
         // door instead of only in the Privacy menu.
-        ui.label(
-            egui::RichText::new(PRIVATE_MODE_EXPLAINER)
-                .small()
-                .color(CHROME_TEXT_DIM),
+        browser_status_note(
+            ui,
+            ChromeIcon::Lock,
+            PRIVATE_MODE_EXPLAINER,
+            CHROME_TEXT_DIM,
         );
         ui.add_space(Style::SP_M);
         ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut state.dashboard_query)
-                    .desired_width(420.0)
-                    .hint_text("Search the mesh")
-                    .text_color(CHROME_TEXT),
+            let resp = chrome_text_field(
+                ui,
+                true,
+                &mut state.dashboard_query,
+                "Search the mesh",
+                420.0,
+                260.0,
+                false,
+                "Search the mesh",
+                None,
             );
             state.chrome_edit_focus |= resp.has_focus();
             submit_search = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("Search").color(CHROME_TEXT),
-                ))
+                .add(action_button("Search", BrowserActionRole::Primary))
                 .clicked()
             {
                 submit_search = true;
@@ -2282,17 +4407,14 @@ pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
         ui.add_space(Style::SP_M);
         ui.horizontal_wrapped(|ui| {
             for service in &state.speed_dial {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(service.label.as_str())
-                                .size(Style::BODY)
-                                .color(CHROME_TEXT),
-                        )
-                        .min_size(egui::vec2(112.0, Style::SP_XL)),
-                    )
-                    .on_hover_text(service.hint.as_str())
-                    .clicked()
+                if chrome_hover_text(
+                    ui.add(
+                        action_button(service.label.clone(), BrowserActionRole::Secondary)
+                            .min_size(egui::vec2(112.0, Style::SP_XL)),
+                    ),
+                    service.hint.as_str(),
+                )
+                .clicked()
                 {
                     open_service = Some(service.url.clone());
                 }
@@ -2308,28 +4430,17 @@ pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
 }
 
 /// A compact Browser chrome button in the local Material palette.
-pub(super) fn nav_button(ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool) -> bool {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(
-            egui::RichText::new(glyph)
-                .size(CHROME_FONT)
-                .color(button_text(enabled)),
-        )
-        .fill(control_fill(false))
-        .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-    )
-    .on_hover_text(tip)
-    .clicked()
+pub(super) fn nav_button(ui: &mut egui::Ui, icon: ChromeIcon, tip: &str, enabled: bool) -> bool {
+    chrome_icon_button(ui, icon, tip, enabled, false).clicked()
 }
 
 /// Chrome/Edge-style trust signal for the omnibox's leading security chip,
 /// derived purely from a URL's scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SecurityLevel {
-    /// `https://` — a lock glyph, neutral tone.
+    /// `https://` — a lock icon, neutral tone.
     Secure,
-    /// `http://` — a "Not secure" glyph/tone.
+    /// `http://` — a "Not secure" icon/tone.
     NotSecure,
     /// `mesh://` and mesh-hosted services — trusted overlay.
     Mesh,
@@ -2338,20 +4449,20 @@ pub(super) enum SecurityLevel {
 }
 
 impl SecurityLevel {
-    pub(super) const fn glyph(self) -> &'static str {
+    pub(super) const fn icon(self) -> ChromeIcon {
         match self {
-            Self::Secure => "\u{1F512}",
-            Self::NotSecure => "\u{26A0}",
-            Self::Mesh => "\u{1F6E1}",
-            Self::Neutral => "\u{1F50E}",
+            Self::Secure => ChromeIcon::Lock,
+            Self::NotSecure => ChromeIcon::Warning,
+            Self::Mesh => ChromeIcon::Security,
+            Self::Neutral => ChromeIcon::Page,
         }
     }
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Secure => "Secure connection (HTTPS)",
-            Self::NotSecure => "Not secure \u{2014} plain HTTP",
-            Self::Mesh => "Mesh \u{2014} trusted overlay connection",
+            Self::NotSecure => "Not secure: plain HTTP",
+            Self::Mesh => "Mesh: trusted overlay connection",
             Self::Neutral => "No connection security to report",
         }
     }
@@ -2493,6 +4604,83 @@ pub(super) enum PageContextAction {
     Edit(EditCommand),
 }
 
+fn page_context_edit_icon(command: EditCommand) -> ChromeIcon {
+    match command {
+        EditCommand::Undo
+        | EditCommand::Redo
+        | EditCommand::Cut
+        | EditCommand::Copy
+        | EditCommand::Paste
+        | EditCommand::Delete
+        | EditCommand::SelectAll => ChromeIcon::Edit,
+    }
+}
+
+fn chrome_menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: ChromeIcon,
+    enabled: bool,
+    disabled_tip: &'static str,
+) -> egui::Response {
+    let width = ui.available_width().max(188.0);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, OPTION_ROW_H),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let fill = animated_response_fill(ui, &response, menu_item_fill(false), CHROME_TEXT, enabled);
+    ui.painter().rect(
+        rect,
+        7.0,
+        fill,
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+    let text_color = button_text(enabled);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::vec2(OPTION_ICON_SIZE - 1.0, OPTION_ICON_SIZE - 1.0),
+    );
+    paint_chrome_icon(ui.painter(), icon_rect, icon, text_color);
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font_id(CHROME_FONT),
+        text_color,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    if enabled {
+        response
+    } else {
+        chrome_hover_text(response, disabled_tip)
+    }
+}
+
+fn page_context_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: ChromeIcon,
+    enabled: bool,
+) -> egui::Response {
+    chrome_menu_row(
+        ui,
+        label,
+        icon,
+        enabled,
+        "Unavailable in the current page context",
+    )
+}
+
+fn page_context_separator(ui: &mut egui::Ui) {
+    chrome_separator_with_inset(ui, 34.0);
+}
+
 /// Chrome-owned context menu for the page canvas. The caller applies the returned
 /// action to the active session so the live page/input bridge stays in `web/mod.rs`.
 pub(super) fn page_context_menu(
@@ -2503,51 +4691,119 @@ pub(super) fn page_context_menu(
 ) -> Option<PageContextAction> {
     let mut action = None;
     resp.context_menu(|ui| {
-        if ui
-            .add_enabled(can_back, egui::Button::new("Back"))
-            .clicked()
-        {
+        ui.set_min_width(210.0);
+        ui.visuals_mut().override_text_color = Some(CHROME_TEXT);
+        ui.spacing_mut().item_spacing.y = 3.0;
+
+        if page_context_row(ui, "Back", ChromeIcon::Back, can_back).clicked() && can_back {
             action = Some(PageContextAction::Back);
             ui.close_menu();
         }
-        if ui
-            .add_enabled(can_forward, egui::Button::new("Forward"))
-            .clicked()
+        if page_context_row(ui, "Forward", ChromeIcon::Forward, can_forward).clicked()
+            && can_forward
         {
             action = Some(PageContextAction::Forward);
             ui.close_menu();
         }
-        if ui.button("Reload").clicked() {
+        if page_context_row(ui, "Reload", ChromeIcon::Reload, true).clicked() {
             action = Some(PageContextAction::Reload);
             ui.close_menu();
         }
-        ui.separator();
-        if ui.button("Cut").clicked() {
+        page_context_separator(ui);
+        if page_context_row(ui, "Cut", page_context_edit_icon(EditCommand::Cut), true).clicked() {
             action = Some(PageContextAction::Edit(EditCommand::Cut));
             ui.close_menu();
         }
-        if ui.button("Copy").clicked() {
+        if page_context_row(ui, "Copy", page_context_edit_icon(EditCommand::Copy), true).clicked() {
             action = Some(PageContextAction::Edit(EditCommand::Copy));
             ui.close_menu();
         }
-        if ui.button("Paste").clicked() {
+        if page_context_row(
+            ui,
+            "Paste",
+            page_context_edit_icon(EditCommand::Paste),
+            true,
+        )
+        .clicked()
+        {
             action = Some(PageContextAction::Edit(EditCommand::Paste));
             ui.close_menu();
         }
-        if ui.button("Select all").clicked() {
+        if page_context_row(
+            ui,
+            "Select all",
+            page_context_edit_icon(EditCommand::SelectAll),
+            true,
+        )
+        .clicked()
+        {
             action = Some(PageContextAction::Edit(EditCommand::SelectAll));
             ui.close_menu();
         }
-        ui.separator();
-        if ui
-            .add_enabled(!url.is_empty(), egui::Button::new("Copy page URL"))
-            .clicked()
+        page_context_separator(ui);
+        if page_context_row(ui, "Copy page URL", ChromeIcon::Share, !url.is_empty()).clicked()
+            && !url.is_empty()
         {
             ui.ctx().copy_text(url.to_owned());
             ui.close_menu();
         }
     });
     action
+}
+
+fn engine_toolbar_chip(ui: &mut egui::Ui, state: &WebState) -> egui::Response {
+    let engine = state.engine;
+    let tip = format!(
+        "New tabs use {}. Open Browser Options to change engines.",
+        engine_display_name(engine)
+    );
+    let (rect, response) = allocate_browser_icon_button(
+        ui,
+        true,
+        egui::vec2(ENGINE_TOOLBAR_CHIP_W, CHROME_BUTTON),
+        &tip,
+    );
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        engine_container(engine),
+        engine_accent(engine),
+        true,
+    );
+    ui.painter().rect(
+        rect,
+        ICON_BUTTON_RADIUS,
+        fill,
+        egui::Stroke::new(1.0, engine_accent(engine)),
+        egui::StrokeKind::Inside,
+    );
+
+    let icon_rect =
+        egui::Rect::from_center_size(rect.center() - egui::vec2(4.0, 0.0), egui::vec2(20.0, 20.0));
+    paint_chrome_icon(
+        ui.painter(),
+        icon_rect,
+        ChromeIcon::Engine,
+        engine_on_container(engine),
+    );
+    let badge_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 9.0, rect.bottom() - 8.0),
+        egui::vec2(ENGINE_TOOLBAR_BADGE, ENGINE_TOOLBAR_BADGE),
+    );
+    ui.painter().circle_filled(
+        badge_rect.center(),
+        ENGINE_TOOLBAR_BADGE * 0.5,
+        engine_accent(engine),
+    );
+    let badge = engine_glyph(engine).to_owned();
+    let badge_galley = ui.fonts(|fonts| fonts.layout_no_wrap(badge, font_id(10.0), CHROME_TOOLBAR));
+    ui.painter().galley(
+        badge_rect.center() - badge_galley.size() * 0.5,
+        badge_galley,
+        CHROME_TOOLBAR,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), response.rect, response.has_focus());
+    chrome_hover_text(response, tip)
 }
 
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
@@ -2591,17 +4847,21 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let has_page = has_tab && !crashed && !page_url.trim().is_empty();
 
     let mut accepted_suggestion: Option<String> = None;
-    let mut toolbar_action: Option<super::menubar::MenuAction> = None;
     ui.horizontal(|ui| {
         // Back / forward — enabled only when the live session offers the history.
-        if nav_button(ui, "\u{2039}", "Back", has_tab && !crashed && nav.can_back) {
+        if nav_button(
+            ui,
+            ChromeIcon::Back,
+            "Back",
+            has_tab && !crashed && nav.can_back,
+        ) {
             if let Some(tab) = state.active_tab() {
                 tab.session.go_back();
             }
         }
         if nav_button(
             ui,
-            "\u{203A}",
+            ChromeIcon::Forward,
             "Forward",
             has_tab && !crashed && nav.can_forward,
         ) {
@@ -2614,14 +4874,14 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         // investigated 2026-07-10 — see `can_show_stop_control`), so its compact
         // chrome keeps the honest Reload control while loading.
         let can_stop = super::can_show_stop_control(has_tab, crashed, nav.loading, active_engine);
-        let (nav_label, nav_tip) = if can_stop {
-            ("\u{00D7}", "Stop loading")
+        let (nav_icon, nav_tip) = if can_stop {
+            (ChromeIcon::Stop, "Stop loading")
         } else if crashed {
-            ("\u{21BB}", "Reload (restart page)")
+            (ChromeIcon::Reload, "Reload (restart page)")
         } else {
-            ("\u{21BB}", "Reload")
+            (ChromeIcon::Reload, "Reload")
         };
-        if nav_button(ui, nav_label, nav_tip, has_tab) {
+        if nav_button(ui, nav_icon, nav_tip, has_tab) {
             if crashed {
                 state.respawn_requested = true;
             } else if can_stop {
@@ -2631,6 +4891,21 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             } else if let Some(tab) = state.active_tab() {
                 tab.session.reload();
             }
+        }
+
+        if chrome_icon_button(
+            ui,
+            ChromeIcon::NewTab,
+            &format!("Open a new tab with {}", engine_display_name(state.engine)),
+            true,
+            false,
+        )
+        .clicked()
+        {
+            state.request_new_tab(state.engine);
+        }
+        if engine_toolbar_chip(ui, state).clicked() {
+            state.open_options_tab();
         }
 
         // BOOKMARKS-10 — the page-actions menu (bookmark this page / copy its URL /
@@ -2659,7 +4934,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
         if nav_button(
             ui,
-            "\u{25A3}",
+            ChromeIcon::Capture,
             if state.capture_region_mode {
                 "Select capture region"
             } else {
@@ -2675,33 +4950,31 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         }
 
         let (active_downloads, total_downloads) = state.download_counts();
-        let downloads_label = if active_downloads > 0 {
-            format!("\u{2193} {active_downloads}")
-        } else {
-            "\u{2193}".to_owned()
-        };
         let downloads_tip = if total_downloads == 0 {
             "Downloads"
         } else {
             "Downloads from the shared Transfers ledger"
         };
-        if ui
-            .button(
-                egui::RichText::new(downloads_label)
-                    .size(CHROME_FONT)
-                    .color(if state.downloads_open {
-                        CHROME_PRIMARY
-                    } else {
-                        CHROME_TEXT
-                    }),
-            )
-            .on_hover_text(downloads_tip)
-            .clicked()
+        if chrome_icon_button(
+            ui,
+            ChromeIcon::Downloads,
+            downloads_tip,
+            true,
+            state.downloads_open,
+        )
+        .clicked()
         {
             state.downloads_open = !state.downloads_open;
             if state.downloads_open {
                 state.refresh_downloads();
             }
+        }
+        if active_downloads > 0 {
+            ui.label(
+                RichText::new(active_downloads.to_string())
+                    .size(CHROME_FONT)
+                    .color(CHROME_PRIMARY),
+            );
         }
 
         // BOOKMARKS-7 — a compact "N blocked" shield when the ad-filter has dropped
@@ -2716,30 +4989,16 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 .get(state.active)
                 .map(|t| t.session.block_tally().top_domains(6))
                 .unwrap_or_default();
-            ui.label(
-                egui::RichText::new(format!("\u{2298} {blocked}"))
-                    .size(CHROME_FONT)
-                    .color(CHROME_TEXT_DIM),
-            )
-            .on_hover_ui(|ui| {
-                ui.label(format!(
-                    "Ad-filter blocked {blocked} request{} on this page",
-                    if blocked == 1 { "" } else { "s" }
-                ));
-                if !top_blocked.is_empty() {
-                    ui.separator();
-                    for (domain, count) in &top_blocked {
-                        ui.label(
-                            egui::RichText::new(format!("{count}\u{00D7}  {domain}"))
-                                .small()
-                                .color(CHROME_TEXT_DIM),
-                        );
-                    }
-                }
-            });
+            ad_filter_chip(ui, u64::from(blocked), &top_blocked);
         }
 
         ui.add_space(CHROME_GAP);
+
+        if has_tab && !crashed && nav.loading {
+            loading_globe(ui, CHROME_BUTTON, "toolbar");
+            ui.add_space(CHROME_GAP);
+        }
+        browser_media_toolbar(ui, state);
 
         // OMNIBOX-STYLE — the leading security chip reflects the CURRENT
         // (committed) page URL's scheme, never the in-progress edit draft.
@@ -2752,22 +5011,21 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         ui.add_space(CHROME_GAP);
 
         // The address bar fills the rest of the row.
-        let field = egui::TextEdit::singleline(&mut state.address)
-            .id(super::omnibox_widget_id())
-            .desired_width((ui.available_width() - (CHROME_BUTTON * 2.0 + Style::SP_XL)).max(160.0))
-            .hint_text("Enter an address")
-            .text_color(CHROME_TEXT)
-            .font(egui::TextStyle::Small)
-            .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H));
-        let resp = ui.add_enabled(has_tab && !crashed, field);
+        let resp = chrome_text_field(
+            ui,
+            has_tab && !crashed,
+            &mut state.address,
+            "Enter an address",
+            (ui.available_width() - (CHROME_BUTTON * 2.0 + Style::SP_XL)).max(160.0),
+            160.0,
+            false,
+            "Enter an address",
+            Some(super::omnibox_widget_id()),
+        );
         // Latch omnibox focus for next frame's engine-sync + accelerator
         // guards (the same tracked-focus idiom as `Tab::page_focused`).
         state.omnibox_focused = resp.has_focus();
         state.chrome_edit_focus |= resp.has_focus();
-        // The branded 2px accent focus ring (mde_egui::focus, the dock/Console/Start
-        // idiom) on the primary keyboard target, so keyboard-only users get a clear,
-        // consistent focus indicator instead of egui's faint default outline (a11y).
-        mde_egui::focus::paint_focus_ring(ui.painter(), resp.rect, resp.has_focus());
         if resp.changed() && has_tab && !crashed {
             state.update_suggestions_for_address();
         }
@@ -2785,9 +5043,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             let job = omnibox_layout_job(&state.address, font_id);
             if !job.is_empty() {
                 let galley = ui.fonts(|f| f.layout_job(job));
-                let bg = ui.visuals().extreme_bg_color;
-                let corner_radius = ui.visuals().widgets.inactive.corner_radius;
-                ui.painter().rect_filled(resp.rect, corner_radius, bg);
+                ui.painter().rect_filled(resp.rect, 4.0, CHROME_SURFACE);
                 let text_pos = egui::pos2(
                     resp.rect.left() + 4.0,
                     resp.rect.center().y - galley.size().y / 2.0,
@@ -2821,18 +5077,14 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             && has_tab
             && !crashed;
 
-        let go = ui
-            .add_enabled(
-                has_tab && !crashed && !state.address.trim().is_empty(),
-                egui::Button::new(
-                    egui::RichText::new("\u{2192}")
-                        .size(CHROME_FONT)
-                        .color(CHROME_TEXT),
-                )
-                .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-            )
-            .on_hover_text("Go")
-            .clicked();
+        let go = chrome_icon_button(
+            ui,
+            ChromeIcon::Forward,
+            "Go",
+            has_tab && !crashed && !state.address.trim().is_empty(),
+            false,
+        )
+        .clicked();
 
         if submit {
             // Enter commits the keyboard-highlighted suggestion if one is selected,
@@ -2846,11 +5098,18 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             state.submit_address();
         }
 
-        toolbar_action = chrome_menu_button(state, ui);
+        if chrome_icon_button(
+            ui,
+            ChromeIcon::Options,
+            "Browser options",
+            true,
+            state.active_internal_page() == Some(super::BrowserInternalPage::Options),
+        )
+        .clicked()
+        {
+            state.open_options_tab();
+        }
     });
-    if let Some(action) = toolbar_action {
-        super::menubar::apply(ui.ctx(), state, action);
-    }
     if has_tab && !crashed {
         accepted_suggestion = suggestions_panel(ui, state);
     }
@@ -2870,13 +5129,14 @@ pub(super) fn page_actions_menu(
     title: &str,
 ) {
     let has_page = !url.trim().is_empty();
-    let text = page_action_text(has_page);
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(egui::RichText::new("\u{2606}  Add bookmark").color(text)),
-        )
-        .clicked()
+    if chrome_menu_row(
+        ui,
+        "Add bookmark",
+        ChromeIcon::Bookmark,
+        has_page,
+        "No loaded page to bookmark",
+    )
+    .clicked()
     {
         super::publish(
             super::ACTION_BOOKMARKS_ADD,
@@ -2884,22 +5144,26 @@ pub(super) fn page_actions_menu(
         );
         ui.close_menu();
     }
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(egui::RichText::new("\u{29C9}  Copy URL").color(text)),
-        )
-        .clicked()
+    if chrome_menu_row(
+        ui,
+        "Copy URL",
+        ChromeIcon::Page,
+        has_page,
+        "No loaded page URL to copy",
+    )
+    .clicked()
     {
         ui.ctx().copy_text(url.to_string());
         ui.close_menu();
     }
-    if ui
-        .add_enabled(
-            has_page,
-            egui::Button::new(egui::RichText::new("\u{1F4AC}  Send in Chat").color(text)),
-        )
-        .clicked()
+    if chrome_menu_row(
+        ui,
+        "Send in Chat",
+        ChromeIcon::Share,
+        has_page,
+        "No loaded page to send",
+    )
+    .clicked()
     {
         super::publish(
             super::ACTION_CHAT_SEND,
@@ -2913,15 +5177,14 @@ pub(super) fn page_actions_menu(
         super::BrowserShareTarget::Email,
         super::BrowserShareTarget::Qr,
     ] {
-        if ui
-            .add_enabled(
-                has_page,
-                egui::Button::new(
-                    egui::RichText::new(format!("{}  Share to {}", "\u{21AA}", target.label()))
-                        .color(text),
-                ),
-            )
-            .clicked()
+        if chrome_menu_row(
+            ui,
+            &format!("Share to {}", target.label()),
+            ChromeIcon::Share,
+            has_page,
+            "No loaded page to share",
+        )
+        .clicked()
         {
             super::publish_browser_share(bus_root, target, url, title);
             ui.close_menu();
@@ -2931,15 +5194,14 @@ pub(super) fn page_actions_menu(
         super::BrowserSendTabTarget::Node,
         super::BrowserSendTabTarget::Phone,
     ] {
-        if ui
-            .add_enabled(
-                has_page,
-                egui::Button::new(
-                    egui::RichText::new(format!("{}  Send tab to {}", "\u{21E5}", target.label()))
-                        .color(text),
-                ),
-            )
-            .clicked()
+        if chrome_menu_row(
+            ui,
+            &format!("Send tab to {}", target.label()),
+            ChromeIcon::Tabs,
+            has_page,
+            "No loaded tab to send",
+        )
+        .clicked()
         {
             if let Some(engine) = engine {
                 super::publish_browser_send_tab(bus_root, target, engine, url, title);
@@ -2959,20 +5221,35 @@ pub(super) fn page_actions_button(
     url: &str,
     title: &str,
 ) {
-    let (glyph, color) = page_action_star(has_page, is_bookmarked);
+    let color = page_action_icon_color(has_page, is_bookmarked);
     let tip = if is_bookmarked {
-        "Bookmarked \u{2014} page actions: edit bookmark, copy URL, share"
+        "Bookmarked: page actions, edit bookmark, copy URL, share"
     } else {
-        "Page actions \u{2014} bookmark, copy URL, share"
+        "Page actions: bookmark, copy URL, share"
     };
-    ui.menu_button(
-        egui::RichText::new(glyph).size(CHROME_FONT).color(color),
+    let popup_id = egui::Id::new("mde_web_page_actions_menu_popup");
+    let response = toolbar_icon_menu_anchor(ui, popup_id, ChromeIcon::Bookmark, color, tip);
+    if response.clicked() || menu_anchor_keyboard_toggle(ui, &response) {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
+            if motion.active {
+                ui.ctx().request_repaint();
+            }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.anchor_offset > 0.0 {
+                ui.add_space(motion.anchor_offset);
+            }
             page_actions_menu(ui, bus_root, engine, url, title);
         },
-    )
-    .response
-    .on_hover_text(tip);
+    );
 }
 
 /// SECURITY-INFO — the plain-language headline for a [`SecurityLevel`].
@@ -2980,7 +5257,7 @@ pub(super) const fn security_headline(level: SecurityLevel) -> &'static str {
     match level {
         SecurityLevel::Secure => "Connection is secure",
         SecurityLevel::NotSecure => "Your connection to this site is not secure",
-        SecurityLevel::Mesh => "Mesh service \u{2014} trusted overlay",
+        SecurityLevel::Mesh => "Mesh service: trusted overlay",
         SecurityLevel::Neutral => "About this page",
     }
 }
@@ -3022,13 +5299,13 @@ pub(super) fn confusable_warning(host: &str) -> Option<String> {
     confusable_reason(host).map(|reason| {
         match reason {
             ConfusableReason::Punycode => {
-                "Punycode/IDN host (xn--) \u{2014} verify this is the site you expect"
+                "Punycode/IDN host (xn--): verify this is the site you expect"
             }
             ConfusableReason::ConfusableBlock => {
-                "Look-alike letters (Cyrillic/Greek) \u{2014} this host may impersonate another site"
+                "Look-alike letters (Cyrillic/Greek): this host may impersonate another site"
             }
             ConfusableReason::MixedScript => {
-                "Mixed-script host \u{2014} letters from more than one alphabet can spoof a name"
+                "Mixed-script host: letters from more than one alphabet can spoof a name"
             }
         }
         .to_owned()
@@ -3127,7 +5404,7 @@ pub(super) fn site_info_permission_summary(state: &WebState) -> Option<SiteInfoP
 pub(super) fn site_info_summary(page_url: &str) -> SiteInfoSummary {
     let display = omnibox_display(page_url);
     let cert_line = matches!(display.security, SecurityLevel::Secure)
-        .then_some("Certificate: valid \u{2014} the connection is encrypted");
+        .then_some("Certificate: valid; the connection is encrypted");
     let confusable = confusable_warning(&display.host);
     SiteInfoSummary {
         security: display.security,
@@ -3144,6 +5421,17 @@ pub(super) fn security_chip_popup_id() -> egui::Id {
     egui::Id::new("mde_web_security_chip_popup")
 }
 
+fn site_info_status_row(ui: &mut egui::Ui, icon: ChromeIcon, text: String, color: Color32) {
+    ui.horizontal(|ui| {
+        let (icon_rect, _) = ui.allocate_exact_size(
+            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+            egui::Sense::hover(),
+        );
+        paint_chrome_icon(ui.painter(), icon_rect, icon, color);
+        ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
+    });
+}
+
 /// SECURITY-INFO — the Chrome-style "site information" popup opened by the
 /// omnibox's security chip.
 pub(super) fn site_info_panel(
@@ -3157,10 +5445,15 @@ pub(super) fn site_info_panel(
     let security_color = tone_color(summary.security.tone());
     ui.set_max_width(300.0);
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(summary.security.glyph())
-                .size(CHROME_FONT)
-                .color(security_color),
+        let (icon_rect, _) = ui.allocate_exact_size(
+            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+            egui::Sense::hover(),
+        );
+        paint_chrome_icon(
+            ui.painter(),
+            icon_rect,
+            summary.security.icon(),
+            security_color,
         );
         ui.label(
             egui::RichText::new(summary.headline)
@@ -3194,11 +5487,7 @@ pub(super) fn site_info_panel(
         ui.label(job);
     }
     if let Some(warn) = summary.confusable.as_deref() {
-        ui.label(
-            egui::RichText::new(format!("\u{26A0} {warn}"))
-                .small()
-                .color(CHROME_WARN),
-        );
+        site_info_status_row(ui, ChromeIcon::Warning, warn.to_owned(), CHROME_WARN);
     }
     if let Some(cert_line) = summary.cert_line {
         ui.label(
@@ -3213,13 +5502,14 @@ pub(super) fn site_info_panel(
         } else {
             "s"
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "\u{26A0} Managed policy blocked: {} resource{suffix}",
+        site_info_status_row(
+            ui,
+            ChromeIcon::Warning,
+            format!(
+                "Managed policy blocked: {} resource{suffix}",
                 resources.managed_policy_blocks
-            ))
-            .small()
-            .color(CHROME_WARN),
+            ),
+            CHROME_WARN,
         );
         if !resources.managed_policy_rules.is_empty() {
             ui.add(
@@ -3241,13 +5531,14 @@ pub(super) fn site_info_panel(
         } else {
             "s"
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "\u{26A0} Unsafe content blocked: {} resource{suffix}",
+        site_info_status_row(
+            ui,
+            ChromeIcon::Warning,
+            format!(
+                "Unsafe content blocked: {} resource{suffix}",
                 resources.safe_browsing_blocks
-            ))
-            .small()
-            .color(CHROME_WARN),
+            ),
+            CHROME_WARN,
         );
         if !resources.safe_browsing_hosts.is_empty() {
             ui.add(
@@ -3269,13 +5560,14 @@ pub(super) fn site_info_panel(
         } else {
             "s"
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "\u{26A0} Insecure content blocked: {} public HTTP subresource{suffix}",
+        site_info_status_row(
+            ui,
+            ChromeIcon::Warning,
+            format!(
+                "Insecure content blocked: {} public HTTP subresource{suffix}",
                 resources.mixed_content_blocks
-            ))
-            .small()
-            .color(CHROME_WARN),
+            ),
+            CHROME_WARN,
         );
         if !resources.mixed_content_hosts.is_empty() {
             ui.add(
@@ -3297,13 +5589,14 @@ pub(super) fn site_info_panel(
         } else {
             "s"
         };
-        ui.label(
-            egui::RichText::new(format!(
+        site_info_status_row(
+            ui,
+            ChromeIcon::Privacy,
+            format!(
                 "Privacy protection blocked: {} tracker/filter resource{suffix}",
                 resources.tracker_blocks
-            ))
-            .small()
-            .color(CHROME_TEXT_DIM),
+            ),
+            CHROME_TEXT_DIM,
         );
         if !resources.tracker_hosts.is_empty() {
             ui.add(
@@ -3320,7 +5613,7 @@ pub(super) fn site_info_panel(
         }
     }
     if let Some(permissions) = permissions {
-        ui.separator();
+        chrome_separator(ui);
         ui.label(
             egui::RichText::new("Permissions")
                 .small()
@@ -3362,20 +5655,18 @@ pub(super) fn site_info_panel(
             );
         }
         if permissions.forgotten {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!(
-                        "{} permissions were forgotten; future requests re-prompt under default deny",
-                        permissions.host
-                    ))
-                    .small()
-                    .color(CHROME_WARN),
-                )
-                .wrap(),
+            site_info_status_row(
+                ui,
+                ChromeIcon::Warning,
+                format!(
+                    "{} permissions were forgotten; future requests re-prompt under default deny",
+                    permissions.host
+                ),
+                CHROME_WARN,
             );
         }
     }
-    ui.separator();
+    chrome_separator(ui);
     ui.label(
         egui::RichText::new("Cookies & site data clear when you close the browser")
             .small()
@@ -3392,25 +5683,57 @@ pub(super) fn security_chip(
 ) {
     let security = omnibox_display(page_url).security;
     let popup_id = security_chip_popup_id();
-    let resp = ui
-        .add(
-            egui::Button::new(
-                egui::RichText::new(security.glyph())
-                    .size(CHROME_FONT)
-                    .color(tone_color(security.tone())),
-            )
-            .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-        )
-        .on_hover_text(security.label());
+    let enabled = ui.is_enabled();
+    let (rect, resp) = allocate_browser_icon_button(
+        ui,
+        enabled,
+        egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+        security.label(),
+    );
+    paint_transparent_icon_button_state(
+        ui,
+        &resp,
+        rect,
+        ICON_BUTTON_RADIUS,
+        tone_color(security.tone()),
+        enabled,
+    );
+    paint_chrome_icon(
+        ui.painter(),
+        rect,
+        security.icon(),
+        tone_color(security.tone()),
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, resp.has_focus());
+    let resp = chrome_hover_text(resp, security.label());
     if resp.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
     egui::popup_below_widget(
         ui,
         popup_id,
         &resp,
         egui::PopupCloseBehavior::CloseOnClickOutside,
-        |ui| site_info_panel(ui, page_url, recent_resources, permissions),
+        |ui| {
+            if motion.active {
+                ui.ctx().request_repaint();
+            }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.anchor_offset > 0.0 {
+                ui.add_space(motion.anchor_offset);
+            }
+            let scale_inset = ((1.0 - motion.scale) * 16.0).clamp(0.0, 1.0);
+            if scale_inset > 0.0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(scale_inset);
+                    ui.vertical(|ui| site_info_panel(ui, page_url, recent_resources, permissions));
+                });
+            } else {
+                site_info_panel(ui, page_url, recent_resources, permissions);
+            }
+        },
     );
 }
 
@@ -3420,6 +5743,51 @@ pub(super) fn security_chip(
 /// repeats). Pure and paint-free so it's directly unit-testable.
 pub(super) fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a String> {
     items.iter().filter(|s| !history.contains(s)).collect()
+}
+
+fn suggestion_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: ChromeIcon,
+    text_color: Color32,
+    fill: Color32,
+) -> egui::Response {
+    let font = font_id(CHROME_FONT);
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), font.clone(), text_color)
+            .size()
+            .x
+    });
+    let width = (OPTION_ICON_SIZE + 30.0 + text_width).clamp(96.0, 280.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, CHROME_BUTTON), egui::Sense::click());
+    let fill = animated_response_fill(ui, &response, fill, CHROME_TEXT, true);
+    ui.painter().rect(
+        rect,
+        ICON_BUTTON_RADIUS,
+        fill,
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 15.0, rect.center().y),
+        egui::vec2(OPTION_ICON_SIZE - 2.0, OPTION_ICON_SIZE - 2.0),
+    );
+    paint_chrome_icon(ui.painter(), icon_rect, icon, text_color);
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right() + 7.0, rect.top()),
+        egui::pos2(rect.right() - 8.0, rect.bottom()),
+    );
+    ui.painter().with_clip_rect(text_rect).text(
+        egui::pos2(text_rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        text_color,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    response
 }
 
 pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
@@ -3449,20 +5817,18 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
     ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_XL * 4.0);
         if !bookmarks.is_empty() {
-            muted_note(ui, "Bookmarks");
+            browser_muted_note(ui, "Bookmarks");
             for bm in bookmarks {
-                let clicked = ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(format!("\u{2605} {}", ellipsize(&bm.title, 32)))
-                                .size(CHROME_FONT)
-                                .color(CHROME_PRIMARY),
-                        )
-                        .fill(fill_for(idx))
-                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                    )
-                    .on_hover_text(format!("Bookmark: {}", bm.url))
-                    .clicked();
+                let label = ellipsize(&bm.title, 32);
+                let clicked = suggestion_chip(
+                    ui,
+                    &label,
+                    ChromeIcon::Bookmark,
+                    CHROME_PRIMARY,
+                    fill_for(idx),
+                )
+                .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Bookmark: {}", bm.url)))
+                .clicked();
                 if clicked {
                     accepted = Some(bm.url.clone());
                 }
@@ -3470,20 +5836,13 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
             }
         }
         if !history.is_empty() {
-            muted_note(ui, "History");
+            browser_muted_note(ui, "History");
             for url in history {
-                let clicked = ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(ellipsize(url, 36))
-                                .size(CHROME_FONT)
-                                .color(CHROME_TEXT),
-                        )
-                        .fill(fill_for(idx))
-                        .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                    )
-                    .on_hover_text(format!("Visited: {url}"))
-                    .clicked();
+                let label = ellipsize(url, 36);
+                let clicked =
+                    suggestion_chip(ui, &label, ChromeIcon::History, CHROME_TEXT, fill_for(idx))
+                        .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Visited: {url}")))
+                        .clicked();
                 if clicked {
                     accepted = Some(url.clone());
                 }
@@ -3491,18 +5850,11 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
             }
         }
         for suggestion in search_items {
-            let clicked = ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(ellipsize(suggestion, 36))
-                            .size(CHROME_FONT)
-                            .color(CHROME_TEXT),
-                    )
-                    .fill(fill_for(idx))
-                    .min_size(egui::vec2(96.0, CHROME_BUTTON)),
-                )
-                .on_hover_text(format!("Search for {suggestion}"))
-                .clicked();
+            let label = ellipsize(suggestion, 36);
+            let clicked =
+                suggestion_chip(ui, &label, ChromeIcon::Search, CHROME_TEXT, fill_for(idx))
+                    .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Search for {suggestion}")))
+                    .clicked();
             if clicked {
                 accepted = Some(suggestion.clone());
             }
@@ -3510,7 +5862,7 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
         }
         if state.suggestions.items.is_empty() && history.is_empty() {
             if let Some(notice) = state.suggestions.notice.as_deref() {
-                muted_note(ui, notice);
+                browser_muted_note(ui, notice);
             }
         }
     });
@@ -3558,6 +5910,71 @@ pub(super) fn bookmark_bar_visible_count(
     count.min(total.saturating_sub(1))
 }
 
+fn bookmark_bar_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    accessibility_label: &str,
+    width: f32,
+    tip: &str,
+) -> egui::Response {
+    let target_size = egui::vec2(width.max(44.0), CHROME_BUTTON);
+    let (rect, response) = ui.allocate_exact_size(target_size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            accessibility_label,
+        )
+    });
+    let fill = animated_response_fill(ui, &response, CHROME_SURFACE, CHROME_TEXT, true);
+    ui.painter().rect(
+        rect,
+        6.0,
+        fill,
+        egui::Stroke::new(1.0, CHROME_OUTLINE),
+        egui::StrokeKind::Inside,
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::vec2(14.0, 14.0),
+    );
+    paint_chrome_icon(
+        ui.painter(),
+        icon_rect,
+        ChromeIcon::Bookmark,
+        CHROME_TEXT_DIM,
+    );
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + 7.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font_id(CHROME_FONT),
+        CHROME_TEXT,
+    );
+    mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
+    chrome_hover_text(response, tip)
+}
+
+fn bookmark_overflow_rows(
+    ui: &mut egui::Ui,
+    links: &[super::BookmarkBarLink],
+) -> Option<(String, bool)> {
+    let mut chosen = None;
+    for link in links {
+        let label = ellipsize(&link.title, 40);
+        let width = ui.available_width().max(180.0);
+        let resp = bookmark_bar_button(ui, &label, &link.title, width, link.url.as_str());
+        if resp.clicked() {
+            chosen = Some((link.url.clone(), false));
+            ui.close_menu();
+        } else if resp.middle_clicked() {
+            chosen = Some((link.url.clone(), true));
+            ui.close_menu();
+        }
+    }
+    chosen
+}
+
 /// Single-row bookmarks bar below the nav chrome.
 pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.bookmarks_bar_visible {
@@ -3570,9 +5987,9 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
         .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             if links.is_empty() {
-                muted_note(
+                browser_muted_note(
                     ui,
-                    "No bookmarks yet \u{2014} add one from Bookmarks \u{2192} Add Bookmark",
+                    "No bookmarks yet: add one from Bookmarks > Add Bookmark",
                 );
                 return;
             }
@@ -3585,17 +6002,14 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                     BOOKMARK_OVERFLOW_W,
                 );
                 for link in &links[..visible] {
-                    let resp = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(ellipsize(&link.title, BOOKMARK_TITLE_CHARS))
-                                    .size(CHROME_FONT)
-                                    .color(CHROME_TEXT),
-                            )
-                            .fill(control_fill(false))
-                            .min_size(egui::vec2(BOOKMARK_BTN_W, CHROME_BUTTON)),
-                        )
-                        .on_hover_text(format!("{}\n{}", link.title, link.url));
+                    let label = ellipsize(&link.title, BOOKMARK_TITLE_CHARS);
+                    let resp = bookmark_bar_button(
+                        ui,
+                        &label,
+                        &link.title,
+                        BOOKMARK_BTN_W,
+                        &format!("{}\n{}", link.title, link.url),
+                    );
                     if resp.clicked() {
                         chosen = Some((link.url.clone(), false));
                     } else if resp.middle_clicked() {
@@ -3603,40 +6017,58 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                     }
                 }
                 if visible < links.len() {
-                    ui.menu_button(
-                        egui::RichText::new("\u{00BB}")
-                            .size(CHROME_FONT)
-                            .color(CHROME_TEXT),
+                    let popup_id = egui::Id::new("mde_web_bookmark_overflow_popup");
+                    let response = toolbar_icon_menu_anchor(
+                        ui,
+                        popup_id,
+                        ChromeIcon::Down,
+                        CHROME_TEXT,
+                        "More bookmarks",
+                    );
+                    if response.clicked() || menu_anchor_keyboard_toggle(ui, &response) {
+                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                    }
+                    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+                    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
+                    egui::popup_below_widget(
+                        ui,
+                        popup_id,
+                        &response,
+                        egui::PopupCloseBehavior::CloseOnClickOutside,
                         |ui| {
-                            for link in &links[visible..] {
-                                let resp = ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(ellipsize(&link.title, 40))
-                                                .size(CHROME_FONT)
-                                                .color(CHROME_TEXT),
-                                        )
-                                        .fill(control_fill(false)),
-                                    )
-                                    .on_hover_text(link.url.clone());
-                                if resp.clicked() {
-                                    chosen = Some((link.url.clone(), false));
-                                    ui.close_menu();
-                                } else if resp.middle_clicked() {
-                                    chosen = Some((link.url.clone(), true));
-                                    ui.close_menu();
-                                }
+                            if motion.active {
+                                ui.ctx().request_repaint();
+                            }
+                            ui.multiply_opacity(motion.opacity.max(0.2));
+                            if motion.anchor_offset > 0.0 {
+                                ui.add_space(motion.anchor_offset);
+                            }
+                            if let Some(choice) = bookmark_overflow_rows(ui, &links[visible..]) {
+                                chosen = Some(choice);
+                                ui.memory_mut(|mem| mem.close_popup());
                             }
                         },
-                    )
-                    .response
-                    .on_hover_text("More bookmarks");
+                    );
                 }
             });
         });
     if let Some((url, new_tab)) = chosen {
         state.open_bookmark(url, new_tab);
     }
+}
+
+fn find_text_field(ui: &mut egui::Ui, enabled: bool, text: &mut String) -> egui::Response {
+    chrome_text_field(
+        ui,
+        enabled,
+        text,
+        "Find in page",
+        220.0,
+        160.0,
+        false,
+        "Find in page",
+        None,
+    )
 }
 
 pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
@@ -3659,15 +6091,7 @@ pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                         .size(CHROME_FONT)
                         .color(CHROME_TEXT_DIM),
                 );
-                let resp = ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut state.find_query)
-                        .desired_width(220.0)
-                        .hint_text("Find in page")
-                        .text_color(CHROME_TEXT)
-                        .font(egui::TextStyle::Small)
-                        .min_size(egui::vec2(160.0, CHROME_OMNIBOX_H)),
-                );
+                let resp = find_text_field(ui, enabled, &mut state.find_query);
                 state.chrome_edit_focus |= resp.has_focus();
                 if let Some((active, count)) = find_tally {
                     let label = if count == 0 {
@@ -3687,13 +6111,13 @@ pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 } else if enter {
                     submit_forward = true;
                 }
-                if nav_button(ui, "\u{2191}", "Previous match", enabled) {
+                if nav_button(ui, ChromeIcon::Up, "Previous match", enabled) {
                     submit_backward = true;
                 }
-                if nav_button(ui, "\u{2193}", "Next match", enabled) {
+                if nav_button(ui, ChromeIcon::Down, "Next match", enabled) {
                     submit_forward = true;
                 }
-                if nav_button(ui, "\u{00D7}", "Close find", true) {
+                if nav_button(ui, ChromeIcon::Close, "Close find", true) {
                     state.close_find_bar();
                 }
             });
@@ -3707,6 +6131,117 @@ pub(super) fn find_chrome(ui: &mut egui::Ui, state: &mut WebState) {
 
 /// The toolbar password menu: fill a saved login into the current site's form, or
 /// save a new credential for it. Session-only store, user-initiated fill.
+#[derive(Default)]
+struct PasswordMenuOutcome {
+    fill: Option<(String, String)>,
+    remove: Option<usize>,
+    save: bool,
+}
+
+fn password_menu_matches(state: &WebState, host: &str) -> Vec<(usize, String, String)> {
+    if host.is_empty() {
+        return Vec::new();
+    }
+    state
+        .session_logins
+        .iter()
+        .enumerate()
+        .filter(|(_, login)| login.host == host)
+        .map(|(idx, login)| (idx, login.username.clone(), login.password.clone()))
+        .collect()
+}
+
+fn password_menu_contents(
+    ui: &mut egui::Ui,
+    state: &mut WebState,
+    host: &str,
+    matches: &[(usize, String, String)],
+    has_page: bool,
+    can_fill: bool,
+) -> PasswordMenuOutcome {
+    ui.set_min_width(260.0);
+    if host.is_empty() {
+        browser_muted_note(ui, "No site loaded");
+        return PasswordMenuOutcome::default();
+    }
+
+    let mut outcome = PasswordMenuOutcome::default();
+    ui.label(
+        RichText::new("Saved logins (this session)")
+            .size(CHROME_FONT)
+            .strong()
+            .color(CHROME_TEXT),
+    );
+    if matches.is_empty() {
+        browser_muted_note(ui, &format!("None saved for {host}"));
+    } else {
+        for (idx, username, password) in matches {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        has_page && can_fill,
+                        action_button(format!("Fill {username}"), BrowserActionRole::Primary),
+                    )
+                    .clicked()
+                {
+                    outcome.fill = Some((username.clone(), password.clone()));
+                    ui.close_menu();
+                }
+                if action_icon_button(
+                    ui,
+                    ChromeIcon::Close,
+                    BrowserActionRole::Quiet,
+                    "Delete saved login",
+                    egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+                )
+                .clicked()
+                {
+                    outcome.remove = Some(*idx);
+                    ui.close_menu();
+                }
+            });
+        }
+    }
+    chrome_separator(ui);
+    ui.label(
+        RichText::new(format!("Save a login for {host}"))
+            .size(CHROME_FONT)
+            .color(CHROME_TEXT),
+    );
+    let user_resp = chrome_text_field(
+        ui,
+        true,
+        &mut state.login_user_draft,
+        "username",
+        f32::INFINITY,
+        160.0,
+        false,
+        "Username",
+        None,
+    );
+    state.chrome_edit_focus |= user_resp.has_focus();
+    let pass_resp = chrome_text_field(
+        ui,
+        true,
+        &mut state.login_pass_draft,
+        "password",
+        f32::INFINITY,
+        160.0,
+        true,
+        "Password",
+        None,
+    );
+    state.chrome_edit_focus |= pass_resp.has_focus();
+    if ui
+        .add(action_button("Save", BrowserActionRole::Primary))
+        .clicked()
+    {
+        outcome.save = true;
+        ui.close_menu();
+    }
+    outcome
+}
+
 fn password_menu(
     ui: &mut egui::Ui,
     state: &mut WebState,
@@ -3718,80 +6253,40 @@ fn password_menu(
     let mut fill: Option<(String, String)> = None;
     let mut remove: Option<usize> = None;
     let mut save = false;
-    let matches: Vec<(usize, String, String)> = if host.is_empty() {
-        Vec::new()
-    } else {
-        state
-            .session_logins
-            .iter()
-            .enumerate()
-            .filter(|(_, login)| login.host == host)
-            .map(|(idx, login)| (idx, login.username.clone(), login.password.clone()))
-            .collect()
-    };
-    ui.menu_button(
-        RichText::new("\u{1F511}")
-            .size(CHROME_FONT)
-            .color(CHROME_TEXT_DIM),
+    let matches = password_menu_matches(state, &host);
+    let popup_id = egui::Id::new("mde_web_password_menu_popup");
+    let response = toolbar_icon_menu_anchor(
+        ui,
+        popup_id,
+        ChromeIcon::Lock,
+        button_text(has_page),
+        "Passwords and autofill",
+    );
+    if response.clicked() || menu_anchor_keyboard_toggle(ui, &response) {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            ui.set_min_width(260.0);
-            if host.is_empty() {
-                ui.weak("No site loaded");
-                return;
+            if motion.active {
+                ui.ctx().request_repaint();
             }
-            ui.label(
-                RichText::new("Saved logins (this session)")
-                    .size(CHROME_FONT)
-                    .strong(),
-            );
-            if matches.is_empty() {
-                ui.weak(format!("None saved for {host}"));
-            } else {
-                for (idx, username, password) in &matches {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                has_page && can_fill,
-                                action_button(
-                                    format!("Fill {username}"),
-                                    BrowserActionRole::Primary,
-                                ),
-                            )
-                            .clicked()
-                        {
-                            fill = Some((username.clone(), password.clone()));
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add(action_button("\u{00D7}", BrowserActionRole::Quiet))
-                            .on_hover_text("Delete saved login")
-                            .clicked()
-                        {
-                            remove = Some(*idx);
-                            ui.close_menu();
-                        }
-                    });
-                }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.anchor_offset > 0.0 {
+                ui.add_space(motion.anchor_offset);
             }
-            ui.separator();
-            ui.label(RichText::new(format!("Save a login for {host}")).size(CHROME_FONT));
-            ui.add(
-                egui::TextEdit::singleline(&mut state.login_user_draft)
-                    .hint_text("username")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut state.login_pass_draft)
-                    .password(true)
-                    .hint_text("password")
-                    .desired_width(f32::INFINITY),
-            );
-            if ui
-                .add(action_button("Save", BrowserActionRole::Primary))
-                .clicked()
-            {
-                save = true;
-                ui.close_menu();
+            let outcome = password_menu_contents(ui, state, &host, &matches, has_page, can_fill);
+            let close_popup = outcome.fill.is_some() || outcome.remove.is_some() || outcome.save;
+            fill = outcome.fill;
+            remove = outcome.remove;
+            save = outcome.save;
+            if close_popup {
+                ui.memory_mut(|mem| mem.close_popup());
             }
         },
     );
@@ -3813,23 +6308,21 @@ pub(super) fn insecure_prompt(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     };
     ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new("HTTP connection")
-                .size(CHROME_FONT)
-                .color(CHROME_WARN),
-        );
+        browser_status_note(ui, ChromeIcon::Warning, "HTTP connection", CHROME_WARN);
         ui.label(RichText::new(ellipsize(&url, 64)).color(CHROME_TEXT_DIM));
-        if ui
-            .add(action_button("Use HTTPS", BrowserActionRole::Primary))
-            .on_hover_text("Upgrade this navigation to HTTPS")
-            .clicked()
+        if chrome_hover_text(
+            ui.add(action_button("Use HTTPS", BrowserActionRole::Primary)),
+            "Upgrade this navigation to HTTPS",
+        )
+        .clicked()
         {
             state.upgrade_insecure_load();
         }
-        if ui
-            .add(action_button("Continue HTTP", BrowserActionRole::Warning))
-            .on_hover_text("Continue with the insecure HTTP URL")
-            .clicked()
+        if chrome_hover_text(
+            ui.add(action_button("Continue HTTP", BrowserActionRole::Warning)),
+            "Continue with the insecure HTTP URL",
+        )
+        .clicked()
         {
             state.continue_insecure_load();
         }
@@ -3846,29 +6339,32 @@ pub(super) fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
     let Some(notice) = state.capture_notice.clone() else {
         return;
     };
-    let tone = if notice.starts_with("Capture failed:")
+    let failed = notice.starts_with("Capture failed:")
         || notice.starts_with("PDF failed")
         || notice.starts_with("PDF viewer failed:")
-        || notice.starts_with("Print failed:")
-    {
-        CHROME_ERROR
+        || notice.starts_with("Print failed:");
+    let (icon, tone) = if failed {
+        (ChromeIcon::Warning, CHROME_ERROR)
     } else {
-        CHROME_PRIMARY
+        (ChromeIcon::Capture, CHROME_PRIMARY)
     };
     egui::Frame::NONE
         .fill(CHROME_SURFACE_CONTAINER)
+        .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+        .corner_radius(8.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.colored_label(tone, RichText::new(notice).size(Style::SMALL));
+                browser_status_note(ui, icon, &notice, tone);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            action_button("\u{00D7}", BrowserActionRole::Quiet)
-                                .min_size(egui::vec2(CHROME_BUTTON, CHROME_BUTTON)),
-                        )
-                        .on_hover_text("Dismiss capture notice")
-                        .clicked()
+                    if action_icon_button(
+                        ui,
+                        ChromeIcon::Close,
+                        BrowserActionRole::Quiet,
+                        "Dismiss capture notice",
+                        egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+                    )
+                    .clicked()
                     {
                         state.capture_notice = None;
                     }
@@ -3879,20 +6375,14 @@ pub(super) fn capture_notice(ui: &mut egui::Ui, state: &mut WebState) {
 
 pub(super) fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool) {
     centered(ui, |ui| {
-        ui.label(
-            RichText::new("This page crashed")
-                .size(Style::HEADING)
-                .color(CHROME_ERROR),
-        );
+        body_icon_heading(ui, ChromeIcon::Warning, "This page crashed", CHROME_ERROR);
         ui.add_space(Style::SP_S);
         if !reason.is_empty() {
             browser_body_note(ui, reason);
         }
         ui.add_space(Style::SP_M);
         if ui
-            .add(egui::Button::new(
-                RichText::new("\u{21BB} Reload").color(CHROME_TEXT),
-            ))
+            .add(action_button("Reload", BrowserActionRole::Primary))
             .clicked()
         {
             *respawn_requested = true;
@@ -3900,15 +6390,22 @@ pub(super) fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested:
     });
 }
 
+fn body_icon_heading(ui: &mut egui::Ui, icon: ChromeIcon, text: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        let icon_size = Style::HEADING.max(24.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(icon_size, icon_size), egui::Sense::hover());
+        paint_chrome_icon(ui.painter(), rect, icon, color);
+        ui.add_space(Style::SP_XS);
+        ui.label(RichText::new(text).size(Style::HEADING).color(color));
+    });
+}
+
 pub(super) fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> bool {
     let host = host_of(url).unwrap_or_else(|| url.trim().to_owned());
     let mut back = false;
     centered(ui, |ui| {
-        ui.label(
-            RichText::new("\u{26A0} Unsafe site blocked")
-                .size(Style::HEADING)
-                .color(CHROME_ERROR),
-        );
+        body_icon_heading(ui, ChromeIcon::Warning, "Unsafe site blocked", CHROME_ERROR);
         ui.add_space(Style::SP_M);
         ui.label(
             RichText::new(format!(
@@ -3918,9 +6415,7 @@ pub(super) fn safe_browsing_interstitial_body(ui: &mut egui::Ui, url: &str) -> b
         );
         ui.add_space(Style::SP_M);
         if ui
-            .add(egui::Button::new(
-                RichText::new("Back to safety").color(CHROME_TEXT),
-            ))
+            .add(action_button("Back to safety", BrowserActionRole::Primary))
             .clicked()
         {
             back = true;
@@ -3936,11 +6431,7 @@ pub(super) fn managed_policy_interstitial_body(
     let host = host_of(&block.url).unwrap_or_else(|| block.url.trim().to_owned());
     let mut back = false;
     centered(ui, |ui| {
-        ui.label(
-            RichText::new("\u{26D4} Blocked by policy")
-                .size(Style::HEADING)
-                .color(CHROME_ERROR),
-        );
+        body_icon_heading(ui, ChromeIcon::Warning, "Blocked by policy", CHROME_ERROR);
         ui.add_space(Style::SP_M);
         ui.label(
             RichText::new(format!(
@@ -3951,9 +6442,7 @@ pub(super) fn managed_policy_interstitial_body(
         );
         ui.add_space(Style::SP_M);
         if ui
-            .add(egui::Button::new(
-                RichText::new("Back to safety").color(CHROME_TEXT),
-            ))
+            .add(action_button("Back to safety", BrowserActionRole::Primary))
             .clicked()
         {
             back = true;
@@ -4038,20 +6527,51 @@ pub(super) fn passkey_consent_prompt_text(
     )
 }
 
+fn dialog_prompt_frame(ui: &mut egui::Ui, id: impl Hash, contents: impl FnOnce(&mut egui::Ui)) {
+    let motion = dialog_prompt_motion(ui.ctx(), id);
+    egui::Frame::NONE
+        .fill(prompt_fill())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            if motion.active {
+                ui.ctx().request_repaint();
+            }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.y_offset > 0.0 {
+                ui.add_space(motion.y_offset);
+            }
+            let scale_inset = ((1.0 - motion.scale) * 18.0).clamp(0.0, 1.0);
+            if scale_inset > 0.0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(scale_inset);
+                    ui.vertical(contents);
+                });
+            } else {
+                contents(ui);
+            }
+        });
+}
+
 pub(super) fn passkey_consent_prompt_bar(
     ui: &mut egui::Ui,
     pending: &PendingPasskeyConsent,
     active_tab_id: Option<u64>,
 ) -> Option<bool> {
     let mut decision = None;
-    egui::Frame::NONE
-        .fill(prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
+    dialog_prompt_frame(
+        ui,
+        (
+            "passkey",
+            pending.tab_id,
+            pending.client_request_id.as_str(),
+        ),
+        |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(passkey_consent_prompt_text(pending, active_tab_id))
-                        .color(CHROME_TEXT),
+                browser_status_note(
+                    ui,
+                    ChromeIcon::Lock,
+                    &passkey_consent_prompt_text(pending, active_tab_id),
+                    CHROME_TEXT,
                 );
                 if ui
                     .add(action_button("Approve", BrowserActionRole::Primary))
@@ -4066,7 +6586,35 @@ pub(super) fn passkey_consent_prompt_bar(
                     decision = Some(false);
                 }
             });
+        },
+    );
+    decision
+}
+
+pub(super) fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
+    let mut decision = None;
+    dialog_prompt_frame(ui, ("permission", origin, kind), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            browser_status_note(
+                ui,
+                ChromeIcon::Security,
+                &format!("{origin} wants to {}", permission_kind_label(kind)),
+                CHROME_TEXT,
+            );
+            if ui
+                .add(action_button("Allow", BrowserActionRole::Primary))
+                .clicked()
+            {
+                decision = Some(true);
+            }
+            if ui
+                .add(action_button("Block", BrowserActionRole::Secondary))
+                .clicked()
+            {
+                decision = Some(false);
+            }
         });
+    });
     decision
 }
 
@@ -4082,90 +6630,63 @@ pub(super) fn permission_kind_label(kind: u8) -> &'static str {
     }
 }
 
-pub(super) fn permission_prompt_bar(ui: &mut egui::Ui, origin: &str, kind: u8) -> Option<bool> {
-    let mut decision = None;
-    egui::Frame::NONE
-        .fill(prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("{origin} wants to {}", permission_kind_label(kind)))
-                        .color(CHROME_TEXT),
-                );
-                if ui
-                    .add(action_button("Allow", BrowserActionRole::Primary))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(action_button("Block", BrowserActionRole::Secondary))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
-        });
-    decision
-}
-
 pub(super) fn before_unload_prompt_bar(
     ui: &mut egui::Ui,
     prompt: &BeforeUnloadDialog,
 ) -> Option<bool> {
     let mut decision = None;
-    egui::Frame::NONE
-        .fill(prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(before_unload_prompt_text(prompt)).color(CHROME_TEXT));
-                if ui
-                    .add(action_button(
-                        before_unload_primary_label(prompt),
-                        BrowserActionRole::Primary,
-                    ))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(action_button("Stay", BrowserActionRole::Secondary))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
+    dialog_prompt_frame(ui, ("before-unload", prompt.id), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            browser_status_note(
+                ui,
+                ChromeIcon::Warning,
+                &before_unload_prompt_text(prompt),
+                CHROME_WARN,
+            );
+            if ui
+                .add(action_button(
+                    before_unload_primary_label(prompt),
+                    BrowserActionRole::Primary,
+                ))
+                .clicked()
+            {
+                decision = Some(true);
+            }
+            if ui
+                .add(action_button("Stay", BrowserActionRole::Secondary))
+                .clicked()
+            {
+                decision = Some(false);
+            }
         });
+    });
     decision
 }
 
 pub(super) fn login_save_prompt_bar(ui: &mut egui::Ui, host: &str, username: &str) -> Option<bool> {
     let mut decision = None;
-    egui::Frame::NONE
-        .fill(prompt_fill())
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("Save login for {host} ({username})?"))
-                        .color(CHROME_TEXT),
-                );
-                if ui
-                    .add(action_button("Save", BrowserActionRole::Primary))
-                    .clicked()
-                {
-                    decision = Some(true);
-                }
-                if ui
-                    .add(action_button("Not now", BrowserActionRole::Secondary))
-                    .clicked()
-                {
-                    decision = Some(false);
-                }
-            });
+    dialog_prompt_frame(ui, ("login-save", host, username), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            browser_status_note(
+                ui,
+                ChromeIcon::Lock,
+                &format!("Save login for {host} ({username})?"),
+                CHROME_TEXT,
+            );
+            if ui
+                .add(action_button("Save", BrowserActionRole::Primary))
+                .clicked()
+            {
+                decision = Some(true);
+            }
+            if ui
+                .add(action_button("Not now", BrowserActionRole::Secondary))
+                .clicked()
+            {
+                decision = Some(false);
+            }
         });
+    });
     decision
 }
 
@@ -4176,10 +6697,11 @@ pub(super) fn cert_error_host(err: &CertError) -> String {
 pub(super) fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool) -> bool {
     let mut back_to_safety = false;
     centered(ui, |ui| {
-        ui.label(
-            RichText::new("Your connection is not private")
-                .size(Style::HEADING)
-                .color(CHROME_ERROR),
+        body_icon_heading(
+            ui,
+            ChromeIcon::Warning,
+            "Your connection is not private",
+            CHROME_ERROR,
         );
         ui.add_space(Style::SP_S);
         ui.label(
@@ -4197,9 +6719,7 @@ pub(super) fn cert_error_body(ui: &mut egui::Ui, err: &CertError, can_back: bool
         );
         ui.add_space(Style::SP_M);
         if ui
-            .add(egui::Button::new(
-                RichText::new("\u{2190} Back to safety").color(CHROME_TEXT),
-            ))
+            .add(action_button("Back to safety", BrowserActionRole::Primary))
             .clicked()
         {
             back_to_safety = true;
@@ -4241,10 +6761,11 @@ pub(super) fn cached_offline_body(
                         .color(CHROME_TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy cached page text")
-                        .clicked()
+                    if chrome_hover_text(
+                        ui.add(action_button("Copy", BrowserActionRole::Secondary)),
+                        "Copy cached page text",
+                    )
+                    .clicked()
                     {
                         ui.ctx().copy_text(result.text.clone());
                     }
@@ -4383,8 +6904,11 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
     }) else {
         return;
     };
-    let size = ui.available_size();
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    if !rect.is_positive() {
+        return;
+    }
+    let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
     let image_rect = fit_rect_preserving_aspect(rect, texture_size);
     ui.painter().rect_filled(rect, 0.0, page_backdrop_fill());
     egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
@@ -4628,6 +7152,7 @@ pub(super) fn browser_input_event(
 
 #[cfg(test)]
 mod tests {
+    use super::super::BrowserInternalPage;
     use super::*;
 
     #[test]
@@ -4642,10 +7167,1834 @@ mod tests {
         assert_eq!(pressed, Color32::from_rgb(232, 232, 233));
     }
 
+    fn control_state_alpha_frame(
+        ctx: &egui::Context,
+        target_alpha: u8,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, f32) {
+        let mut alpha = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                alpha = Some(animate_control_state_alpha_with_mode(
+                    ctx,
+                    "browser-control-state-test",
+                    target_alpha,
+                    mode,
+                ));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            alpha.expect("control-state animation returned a value"),
+        )
+    }
+
+    fn popover_motion_frame(
+        ctx: &egui::Context,
+        visible: bool,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, BrowserPopoverMotion) {
+        let mut motion = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                motion = Some(popover_motion_with_mode(
+                    ctx,
+                    "browser-popover-motion-test",
+                    visible,
+                    mode,
+                ));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            motion.expect("popover animation returned a value"),
+        )
+    }
+
+    fn dialog_prompt_motion_frame(
+        ctx: &egui::Context,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, BrowserDialogMotion) {
+        let mut motion = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                motion = Some(dialog_prompt_motion_with_mode(
+                    ctx,
+                    "browser-dialog-motion-test",
+                    mode,
+                ));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            motion.expect("dialog prompt animation returned a value"),
+        )
+    }
+
+    fn panel_motion_frame(
+        ctx: &egui::Context,
+        visible: bool,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, BrowserPanelMotion) {
+        let mut motion = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                motion = Some(panel_motion_with_mode(
+                    ctx,
+                    "browser-panel-motion-test",
+                    visible,
+                    mode,
+                ));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            motion.expect("panel animation returned a value"),
+        )
+    }
+
+    fn page_motion_frame(
+        ctx: &egui::Context,
+        page_key: u64,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, BrowserPageMotion) {
+        let mut motion = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                motion = Some(page_motion_with_mode(
+                    ctx,
+                    "browser-page-motion-test",
+                    page_key,
+                    mode,
+                ));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            motion.expect("page animation returned a value"),
+        )
+    }
+
+    fn note_tab_drag_settle_frame(
+        ctx: &egui::Context,
+        tab_id: u64,
+        axis: TabAxis,
+        direction: f32,
+        time: f64,
+    ) -> Duration {
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                note_tab_drag_settle(ctx, tab_id, axis, direction);
+            },
+        );
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay
+    }
+
+    fn tab_drag_settle_motion_frame(
+        ctx: &egui::Context,
+        tab_id: u64,
+        axis: TabAxis,
+        mode: MotionMode,
+        time: f64,
+    ) -> (Duration, BrowserDragSettleMotion) {
+        let mut motion = None;
+        let out = ctx.run(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                motion = Some(tab_drag_settle_motion_with_mode(ctx, tab_id, axis, mode));
+            },
+        );
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        (
+            repaint_delay,
+            motion.expect("tab drag settle animation returned a value"),
+        )
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
+            if let Some(color) = text.override_text_color {
+                return color;
+            }
+            text.galley
+                .job
+                .sections
+                .iter()
+                .find_map(|section| {
+                    (section.format.color != egui::Color32::PLACEHOLDER)
+                        .then_some(section.format.color)
+                })
+                .unwrap_or(text.fallback_color)
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_line_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Stroke> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Stroke>) {
+            match shape {
+                egui::Shape::LineSegment { stroke, .. } => out.push(*stroke),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_path_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Stroke> {
+        fn solid_stroke(path: &egui::epaint::PathShape) -> Option<egui::Stroke> {
+            let color = match &path.stroke.color {
+                egui::epaint::ColorMode::Solid(color) => *color,
+                egui::epaint::ColorMode::UV(_) => return None,
+            };
+            (color != egui::Color32::TRANSPARENT && path.stroke.width > 0.0)
+                .then_some(egui::Stroke::new(path.stroke.width, color))
+        }
+
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Stroke>) {
+            match shape {
+                egui::Shape::Path(path) => {
+                    if let Some(stroke) = solid_stroke(path) {
+                        out.push(stroke);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.fill != egui::Color32::TRANSPARENT {
+                        out.push(rect.fill);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_rect_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Stroke> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Stroke>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if rect.stroke.color != egui::Color32::TRANSPARENT && rect.stroke.width > 0.0 {
+                        out.push(rect.stroke);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_chrome_separator_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(260.0, 80.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        chrome_separator(ui);
+                        page_context_separator(ui);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_omnibox_chrome_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        let (shell, _helper) = std::os::unix::net::UnixStream::pair().expect("omnibox socketpair");
+        let session =
+            mde_web_preview_client::WebSession::from_stream(shell, None).expect("omnibox session");
+        state.push_session(session);
+        state.address = "https://example.test/mesh".to_owned();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(860.0, 96.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        nav_chrome(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_engine_toolbar_chip_frame(
+        ctx: &egui::Context,
+        engine: BrowserEngine,
+    ) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.engine = engine;
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(96.0, 64.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = engine_toolbar_chip(ui, &state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_password_menu_contents_frame(
+        ctx: &egui::Context,
+        host: &str,
+        saved_login: bool,
+    ) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.login_user_draft = "operator".to_owned();
+        state.login_pass_draft = "secret".to_owned();
+        if saved_login {
+            state.save_login(host, "alice", "hunter2");
+        }
+        let matches = password_menu_matches(&state, host);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 220.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = password_menu_contents(ui, &mut state, host, &matches, true, true);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_password_menu_button_frame(ctx: &egui::Context, page_url: &str) -> egui::FullOutput {
+        let mut state = WebState::default();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(96.0, 56.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        password_menu(ui, &mut state, page_url, !page_url.is_empty(), true);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_capture_notice_frame(ctx: &egui::Context, notice: &str) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.capture_notice = Some(notice.to_owned());
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 80.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        capture_notice(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_insecure_prompt_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.insecure_prompt = Some("http://plain.example/sensitive".to_owned());
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(680.0, 80.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        insecure_prompt(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_dialog_prompt_bars_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let passkey = PendingPasskeyConsent::from_handoff(
+            7,
+            BrowserEngine::Cef,
+            r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example"}"#
+                .to_owned(),
+            "passkey-render-test".to_owned(),
+        )
+        .expect("valid passkey handoff body");
+        let before_unload = BeforeUnloadDialog {
+            id: 11,
+            message: "Unsaved work".to_owned(),
+            origin: "https://docs.example.com/edit".to_owned(),
+            is_reload: false,
+        };
+
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 220.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        passkey_consent_prompt_bar(ui, &passkey, Some(7));
+                        permission_prompt_bar(ui, "https://camera.example", 3);
+                        before_unload_prompt_bar(ui, &before_unload);
+                        login_save_prompt_bar(ui, "docs.example.com", "mm");
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_inline_close_button_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(64.0, 48.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = inline_close_button(ui);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_audio_buttons_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(96.0, 48.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let _ = tab_audio_button(ui, true, false);
+                            let _ = tab_audio_button(ui, false, true);
+                        });
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_status_chips_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let chips = [
+            TabStatusChip {
+                icon: ChromeIcon::Privacy,
+                label: "Work",
+                tone: TabStatusChipTone::Accent,
+            },
+            TabStatusChip {
+                icon: ChromeIcon::View,
+                label: "Secondary Display",
+                tone: TabStatusChipTone::Accent,
+            },
+            TabStatusChip {
+                icon: ChromeIcon::DarkMode,
+                label: "Force dark",
+                tone: TabStatusChipTone::Accent,
+            },
+        ];
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(280.0, 56.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = tab_pill_sized(
+                            ui,
+                            "Example page",
+                            true,
+                            240.0,
+                            BrowserEngine::Cef,
+                            None,
+                            &chips,
+                        );
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_hover_card_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        let (shell, _helper) =
+            std::os::unix::net::UnixStream::pair().expect("tab hover socketpair");
+        let session =
+            mde_web_preview_client::WebSession::from_stream(shell, None).expect("tab session");
+        state.push_session_with_engine(session, BrowserEngine::Cef);
+        state.tabs[0].force_dark = true;
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 120.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        tab_hover_card(ui, &state.tabs[0]);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_chrome_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 96.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        chrome_tooltip(ui, "Search tabs");
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_bookmarks_bar_overflow_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.bookmarks_bar_visible = true;
+        state.bookmark_bar_links = (0..5)
+            .map(|idx| super::super::BookmarkBarLink {
+                title: format!("Bookmark {idx}"),
+                url: format!("https://bookmark-{idx}.example/"),
+            })
+            .collect();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(190.0, 56.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        bookmarks_bar(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_bookmark_overflow_rows_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let links: Vec<super::super::BookmarkBarLink> = (3..5)
+            .map(|idx| super::super::BookmarkBarLink {
+                title: format!("Bookmark {idx}"),
+                url: format!("https://bookmark-{idx}.example/"),
+            })
+            .collect();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 120.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        let _ = bookmark_overflow_rows(ui, &links);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_page_context_rows_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 320.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_min_width(210.0);
+                    ui.visuals_mut().override_text_color = Some(CHROME_TEXT);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let _ = page_context_row(ui, "Back", ChromeIcon::Back, false);
+                    let _ = page_context_row(ui, "Forward", ChromeIcon::Forward, true);
+                    let _ = page_context_row(ui, "Reload", ChromeIcon::Reload, true);
+                    page_context_separator(ui);
+                    let _ =
+                        page_context_row(ui, "Cut", page_context_edit_icon(EditCommand::Cut), true);
+                    let _ = page_context_row(
+                        ui,
+                        "Copy",
+                        page_context_edit_icon(EditCommand::Copy),
+                        true,
+                    );
+                    let _ = page_context_row(
+                        ui,
+                        "Paste",
+                        page_context_edit_icon(EditCommand::Paste),
+                        true,
+                    );
+                    let _ = page_context_row(
+                        ui,
+                        "Select all",
+                        page_context_edit_icon(EditCommand::SelectAll),
+                        true,
+                    );
+                    page_context_separator(ui);
+                    let _ = page_context_row(ui, "Copy page URL", ChromeIcon::Share, true);
+                });
+            },
+        )
+    }
+
+    fn render_tab_context_rows_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 320.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        let _ = tab_context_menu_row(ui, "Move tab left", ChromeIcon::Back, false);
+                        let _ =
+                            tab_context_menu_row(ui, "Move tab right", ChromeIcon::Forward, true);
+                        let _ = tab_context_menu_row(ui, "Pin tab", ChromeIcon::Bookmark, true);
+                        let _ = tab_context_menu_row(ui, "Duplicate tab", ChromeIcon::Page, true);
+                        chrome_separator(ui);
+                        let _ =
+                            tab_context_menu_row(ui, "Work container", ChromeIcon::Privacy, false);
+                        let _ = tab_context_menu_row(ui, "Display 2", ChromeIcon::View, true);
+                        let _ = tab_context_menu_row(ui, "Close tab", ChromeIcon::Close, true);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_page_actions_menu_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        page_actions_menu(
+                            ui,
+                            None,
+                            Some(BrowserEngine::Cef),
+                            "https://example.test/",
+                            "Example",
+                        );
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_page_actions_button_frame(ctx: &egui::Context) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(160.0, 56.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            page_actions_button(ui, false, false, None, None, "", "");
+                            page_actions_button(
+                                ui,
+                                true,
+                                false,
+                                None,
+                                Some(BrowserEngine::Cef),
+                                "https://example.test/",
+                                "Example",
+                            );
+                            page_actions_button(
+                                ui,
+                                true,
+                                true,
+                                None,
+                                Some(BrowserEngine::Cef),
+                                "https://example.test/",
+                                "Example",
+                            );
+                        });
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_body_frame(
+        ctx: &egui::Context,
+        mut render: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 480.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render(ui);
+                });
+            },
+        )
+    }
+
+    fn render_security_chrome_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let recent_resources = vec![
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 1,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 2,
+                url: "https://tracker.example.test/pixel.gif".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Image,
+                ),
+                allowed: false,
+                blocked_by: Some("google-analytics.com".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 3,
+                url: "https://cdn.malware.test/payload.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::Script,
+                ),
+                allowed: false,
+                blocked_by: Some("safe-browsing:malware.test".to_owned()),
+            },
+            mde_web_preview_client::ResourceRequestStatus {
+                seq: 4,
+                url: "https://admin.example.test/private/audit.json".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(
+                    mde_web_preview_client::ResourceType::XmlHttpRequest,
+                ),
+                allowed: false,
+                blocked_by: Some(
+                    "managed-policy:url:https://admin.example.test/private/".to_owned(),
+                ),
+            },
+        ];
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(680.0, 560.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        site_info_panel(ui, "https://xn--pple-43d.com/", &recent_resources, None);
+                        chrome_separator(ui);
+                        for url in [
+                            "https://example.test/",
+                            "http://example.test/",
+                            "mesh://files.mesh/",
+                            "about:blank",
+                        ] {
+                            ui.horizontal(|ui| {
+                                security_chip(ui, url, &[], None);
+                                site_info_panel(ui, url, &[], None);
+                            });
+                            chrome_separator(ui);
+                        }
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_ad_filter_chrome_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let blocked = vec![("ads.example".to_owned(), 3)];
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(260.0, 120.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ad_filter_chip(ui, 7, &blocked);
+                        ad_filter_domain_row(ui, "ads.example", 3);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_suggestions_panel_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.suggestions.bookmarks = vec![super::super::BookmarkBarLink {
+            title: "Example bookmark".to_owned(),
+            url: "https://example.test/bookmark".to_owned(),
+        }];
+        state.suggestions.history = vec!["https://example.test/history".to_owned()];
+        state.suggestions.items = vec![
+            "example search".to_owned(),
+            "https://example.test/history".to_owned(),
+        ];
+        state.suggestions.selected = Some(0);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 140.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = suggestions_panel(ui, &state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_history_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.history_open = true;
+        state
+            .history
+            .record("https://example.test/", "Example Page", 1_000);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::history_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_qr_share_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_qr_share = Some(super::super::BrowserQrShareResult {
+            host: "phone".to_owned(),
+            url: "https://example.test/qr".to_owned(),
+            title: "Example QR".to_owned(),
+            preview: "https://example.test/qr".to_owned(),
+            request_id: "01HQR-share-material".to_owned(),
+            modules: vec![
+                vec![true, true, true, false, true],
+                vec![true, false, true, false, false],
+                vec![true, true, true, true, false],
+                vec![false, false, true, false, true],
+                vec![true, false, false, true, true],
+            ],
+        });
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::qr_share_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_empty_downloads_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.downloads_open = true;
+        state.download_notice = Some("Open failed: file vanished".to_owned());
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::downloads_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_progress_downloads_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.downloads_open = true;
+        let mut job = mde_files_egui::transfers::TransferJob::new(
+            "/tmp/movie.webm",
+            "/home/mm/Downloads",
+            mde_files_egui::transfers::Method::BrowserDownload,
+            mde_files_egui::transfers::TransferPolicy::default(),
+        );
+        job.id = "browser-running".to_owned();
+        job.state = mde_files_egui::transfers::TransferState::Running;
+        job.progress = Some(42);
+        state.download_jobs = vec![job];
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::downloads_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_failed_downloads_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.downloads_open = true;
+        let mut job = mde_files_egui::transfers::TransferJob::new(
+            "/tmp/setup.exe",
+            "/home/mm/Downloads",
+            mde_files_egui::transfers::Method::BrowserDownload,
+            mde_files_egui::transfers::TransferPolicy::default(),
+        );
+        job.id = "browser-failed".to_owned();
+        job.state = mde_files_egui::transfers::TransferState::Failed;
+        job.error = Some("checksum mismatch".to_owned());
+        state.download_jobs = vec![job];
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::downloads_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_dangerous_downloads_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.downloads_open = true;
+        state.pending_dangerous_download = Some(super::super::PendingDangerousDownload {
+            id: 42,
+            url: "https://downloads.example.test/setup.exe".to_owned(),
+            filename: "setup.exe".to_owned(),
+        });
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::downloads_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_print_settings_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.print_settings_open = true;
+        state.cups_settings.copies = 12;
+        state.cups_settings.duplex = true;
+        state.cups_settings.page_ranges = "1-5".to_owned();
+        state.cups_notice = Some("CUPS service unavailable".to_owned());
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::print_settings_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_site_styles_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.site_styles_open = true;
+        state.site_style_host_draft = "example.test".to_owned();
+        state.site_style_css_draft = "body { max-width: 80ch; }".to_owned();
+        state.add_user_site_style();
+        state.site_style_host_draft = "reader.example".to_owned();
+        state.site_style_css_draft = "main { line-height: 1.6; }".to_owned();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::site_styles_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_spellcheck_error_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_spellcheck = Some(super::super::BrowserSpellcheckResult::from_result(
+            0,
+            Err("hunspell not installed".to_owned()),
+        ));
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 180.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::spellcheck_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_engine_and_speech_status_drawers_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_security_update = Some(BrowserSecurityUpdateStatus {
+            node: "node-1".to_owned(),
+            state: "mismatch".to_owned(),
+            expected_cef_version: Some("149.0.6".to_owned()),
+            expected_chromium_version: Some("149.0.7827.201".to_owned()),
+            expected_channel: Some("stable".to_owned()),
+            active_runtime: Some("/opt/mde/cef".to_owned()),
+            installed_version: Some("old".to_owned()),
+            installed_chromium: Some("old".to_owned()),
+            libcef_present: true,
+            updater_state: "failed".to_owned(),
+            last_update_ms: Some(123),
+            last_update_exit_code: Some(69),
+            last_update_error: Some("installer unavailable".to_owned()),
+            last_error: Some("active CEF runtime does not match packaged manifest".to_owned()),
+            updated_ms: 124,
+        });
+        state.latest_read_aloud_status = Some(BrowserReadAloudStatus {
+            node: "node-1".to_owned(),
+            last_title: Some("Example".to_owned()),
+            last_url: Some("https://example.test/".to_owned()),
+            state: "speaking".to_owned(),
+            last_error: None,
+            accepted: 1,
+            spoken: 0,
+            rejected: 0,
+            last_request_ms: Some(123),
+            updated_ms: 124,
+        });
+        state.latest_voice_command_status = Some(BrowserVoiceCommandStatus {
+            node: "node-1".to_owned(),
+            last_url: Some("https://example.test/".to_owned()),
+            last_mode: Some("command".to_owned()),
+            state: "unavailable".to_owned(),
+            last_error: Some("STT runtime is not configured".to_owned()),
+            accepted: 1,
+            transcribed: 0,
+            rejected: 0,
+            last_transcript_chars: None,
+            last_request_ms: Some(223),
+            updated_ms: 224,
+        });
+
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::security_update_drawer(ui, &mut state);
+                        drawers::speech_status_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_new_tab_dashboard_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.dashboard_query = "mesh docs".to_owned();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 360.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        new_tab_dashboard(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_search_results_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.open_options_tab();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 320.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        ui.set_min_width(300.0);
+                        state.tab_search_query = "options".to_owned();
+                        let _ = tab_search_results(ui, &state);
+                        state.tab_search_query = "does-not-match".to_owned();
+                        let _ = tab_search_results(ui, &state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_search_menu_contents_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.open_options_tab();
+        state.tab_search_query = "options".to_owned();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 320.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        let _ = tab_search_menu_contents(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_tab_search_menu_button_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.open_options_tab();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(96.0, 56.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        tab_search_menu(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn render_find_chrome_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        let (shell, _helper) = std::os::unix::net::UnixStream::pair().expect("find socketpair");
+        let session =
+            mde_web_preview_client::WebSession::from_stream(shell, None).expect("find session");
+        state.push_session(session);
+        state.find_open = true;
+        state.find_query = "mesh search".to_owned();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 160.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        find_chrome(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
+    fn assert_painted_text_color(
+        painted: &[(String, egui::Color32)],
+        label: &str,
+        color: egui::Color32,
+    ) {
+        assert!(
+            painted
+                .iter()
+                .any(|(text, painted_color)| text == label && *painted_color == color),
+            "expected {label:?} to paint with {color:?}, got {painted:?}"
+        );
+    }
+
+    fn assert_no_blank_painted_text(painted: &[(String, egui::Color32)], surface: &str) {
+        assert!(
+            painted.iter().all(|(text, _)| !text.trim().is_empty()),
+            "{surface} must not paint blank stock button labels: {painted:?}"
+        );
+    }
+
+    fn assert_browser_text_field_paint(out: &egui::FullOutput, label: &str, surface: &str) {
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, label, CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, color)| text == label
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "{surface} text field leaked shared shell text color for {label:?}: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "{surface} text field must paint a Browser surface fill: {fills:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "{surface} text field must paint Browser outline strokes: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_control_state_layers_use_shared_motion_driver() {
+        let ctx = egui::Context::default();
+        let _ = control_state_alpha_frame(&ctx, 0, MotionMode::Normal, 0.0);
+        let (active_repaint, hover_alpha) =
+            control_state_alpha_frame(&ctx, STATE_HOVER_ALPHA, MotionMode::Normal, 1.0 / 60.0);
+
+        assert!(
+            hover_alpha > 0.0 && hover_alpha < f32::from(STATE_HOVER_ALPHA),
+            "normal control-state motion should ease toward hover alpha, got {hover_alpha}"
+        );
+        assert_eq!(
+            active_repaint,
+            Duration::ZERO,
+            "active Browser control-state motion must keep the DRM loop warm"
+        );
+
+        let disabled = egui::Context::default();
+        let _ = control_state_alpha_frame(&disabled, 0, MotionMode::Normal, 0.0);
+        let (disabled_repaint, disabled_alpha) = control_state_alpha_frame(
+            &disabled,
+            STATE_HOVER_ALPHA,
+            MotionMode::Disabled,
+            1.0 / 60.0,
+        );
+        assert_eq!(disabled_alpha, f32::from(STATE_HOVER_ALPHA));
+        assert_eq!(
+            disabled_repaint,
+            Duration::MAX,
+            "disabled control-state motion should land at the endpoint and idle"
+        );
+    }
+
+    #[test]
+    fn browser_popovers_use_shared_popover_motion_driver() {
+        let ctx = egui::Context::default();
+        let _ = popover_motion_frame(&ctx, false, MotionMode::Normal, 0.0);
+        let (active_repaint, entering) =
+            popover_motion_frame(&ctx, true, MotionMode::Normal, 1.0 / 60.0);
+
+        assert!(
+            entering.opacity > 0.0 && entering.opacity < 1.0,
+            "normal popover should fade toward visible, got {entering:?}"
+        );
+        assert!(
+            (0.98..1.0).contains(&entering.scale),
+            "normal popover should use a restrained anchor scale, got {entering:?}"
+        );
+        assert!(
+            entering.anchor_offset > 0.0 && entering.anchor_offset <= 4.0,
+            "normal popover should stay visually connected to the anchor, got {entering:?}"
+        );
+        assert!(entering.active);
+        assert_eq!(
+            active_repaint,
+            Duration::ZERO,
+            "active Browser popover motion must keep the DRM loop warm"
+        );
+
+        let reduced = egui::Context::default();
+        let _ = popover_motion_frame(&reduced, false, MotionMode::Reduced, 0.0);
+        let (reduced_repaint, reduced_entering) =
+            popover_motion_frame(&reduced, true, MotionMode::Reduced, 1.0 / 60.0);
+        assert!(
+            reduced_entering.opacity > 0.0 && reduced_entering.opacity < 1.0,
+            "reduced popover motion should keep a short fade, got {reduced_entering:?}"
+        );
+        assert_eq!(reduced_entering.scale, 1.0);
+        assert_eq!(reduced_entering.anchor_offset, 0.0);
+        assert_eq!(reduced_repaint, Duration::ZERO);
+
+        let disabled = egui::Context::default();
+        let _ = popover_motion_frame(&disabled, false, MotionMode::Disabled, 0.0);
+        let (disabled_repaint, disabled_visible) =
+            popover_motion_frame(&disabled, true, MotionMode::Disabled, 1.0 / 60.0);
+        assert_eq!(disabled_visible.opacity, 1.0);
+        assert_eq!(disabled_visible.scale, 1.0);
+        assert_eq!(disabled_visible.anchor_offset, 0.0);
+        assert!(!disabled_visible.active);
+        assert_eq!(
+            disabled_repaint,
+            Duration::MAX,
+            "disabled popover motion should land at the endpoint and idle"
+        );
+    }
+
+    #[test]
+    fn browser_prompt_bars_use_shared_dialog_motion_driver() {
+        let ctx = egui::Context::default();
+        let _ = dialog_prompt_motion_frame(&ctx, MotionMode::Normal, 0.0);
+        let (active_repaint, entering) =
+            dialog_prompt_motion_frame(&ctx, MotionMode::Normal, 1.0 / 60.0);
+
+        assert!(
+            entering.opacity > 0.0 && entering.opacity < 1.0,
+            "normal prompt dialog should fade toward visible, got {entering:?}"
+        );
+        assert!(
+            (0.97..1.0).contains(&entering.scale),
+            "normal prompt dialog should use restrained scale, got {entering:?}"
+        );
+        assert!(
+            entering.y_offset > 0.0 && entering.y_offset <= 3.0,
+            "normal prompt dialog should use only a few px of travel, got {entering:?}"
+        );
+        assert!(entering.active);
+        assert_eq!(active_repaint, Duration::ZERO);
+
+        let reduced = egui::Context::default();
+        let _ = dialog_prompt_motion_frame(&reduced, MotionMode::Reduced, 0.0);
+        let (reduced_repaint, reduced_entering) =
+            dialog_prompt_motion_frame(&reduced, MotionMode::Reduced, 1.0 / 60.0);
+        assert!(
+            reduced_entering.opacity > 0.0 && reduced_entering.opacity < 1.0,
+            "reduced prompt dialog should keep a short fade, got {reduced_entering:?}"
+        );
+        assert_eq!(reduced_entering.scale, 1.0);
+        assert_eq!(reduced_entering.y_offset, 0.0);
+        assert_eq!(reduced_repaint, Duration::ZERO);
+
+        let disabled = egui::Context::default();
+        let _ = dialog_prompt_motion_frame(&disabled, MotionMode::Disabled, 0.0);
+        let (disabled_repaint, disabled_visible) =
+            dialog_prompt_motion_frame(&disabled, MotionMode::Disabled, 1.0 / 60.0);
+        assert_eq!(disabled_visible.opacity, 1.0);
+        assert_eq!(disabled_visible.scale, 1.0);
+        assert_eq!(disabled_visible.y_offset, 0.0);
+        assert!(!disabled_visible.active);
+        assert_eq!(disabled_repaint, Duration::MAX);
+    }
+
+    #[test]
+    fn browser_drawer_stack_uses_shared_panel_motion_driver() {
+        let ctx = egui::Context::default();
+        let _ = panel_motion_frame(&ctx, false, MotionMode::Normal, 0.0);
+        let (active_repaint, entering) =
+            panel_motion_frame(&ctx, true, MotionMode::Normal, 1.0 / 60.0);
+
+        assert!(
+            entering.opacity > 0.0 && entering.opacity < 1.0,
+            "normal drawer panel should fade toward visible, got {entering:?}"
+        );
+        assert!(
+            entering.y_offset > 0.0 && entering.y_offset <= 7.0,
+            "normal drawer panel should travel a restrained distance, got {entering:?}"
+        );
+        assert!(entering.active);
+        assert_eq!(active_repaint, Duration::ZERO);
+
+        let reduced = egui::Context::default();
+        let _ = panel_motion_frame(&reduced, false, MotionMode::Reduced, 0.0);
+        let (reduced_repaint, reduced_entering) =
+            panel_motion_frame(&reduced, true, MotionMode::Reduced, 1.0 / 60.0);
+        assert!(
+            reduced_entering.opacity > 0.0 && reduced_entering.opacity < 1.0,
+            "reduced drawer panel should keep a short fade, got {reduced_entering:?}"
+        );
+        assert!(
+            reduced_entering.y_offset > 0.0 && reduced_entering.y_offset <= 2.0,
+            "reduced drawer panel should use shortened travel, got {reduced_entering:?}"
+        );
+        assert_eq!(reduced_repaint, Duration::ZERO);
+
+        let disabled = egui::Context::default();
+        let _ = panel_motion_frame(&disabled, false, MotionMode::Disabled, 0.0);
+        let (disabled_repaint, disabled_visible) =
+            panel_motion_frame(&disabled, true, MotionMode::Disabled, 1.0 / 60.0);
+        assert_eq!(disabled_visible.opacity, 1.0);
+        assert_eq!(disabled_visible.y_offset, 0.0);
+        assert!(!disabled_visible.active);
+        assert_eq!(disabled_repaint, Duration::MAX);
+
+        let mut state = WebState::default();
+        assert!(!drawer_stack_visible(&state));
+        state.downloads_open = true;
+        assert!(drawer_stack_visible(&state));
+    }
+
+    #[test]
+    fn browser_active_body_switches_use_shared_page_motion_driver() {
+        let ctx = egui::Context::default();
+        let (_, initial) = page_motion_frame(&ctx, 1, MotionMode::Normal, 0.0);
+        assert_eq!(
+            initial.opacity, 1.0,
+            "first Browser page body render should land settled so existing render tests stay stable"
+        );
+        assert!(!initial.active);
+
+        let (active_repaint, entering) = page_motion_frame(&ctx, 2, MotionMode::Normal, 1.0 / 60.0);
+        assert!(
+            entering.opacity > 0.0 && entering.opacity < 1.0,
+            "normal page switch should fade the incoming body, got {entering:?}"
+        );
+        assert!(entering.active);
+        assert_eq!(
+            active_repaint,
+            Duration::ZERO,
+            "active Browser page motion must keep the DRM loop warm"
+        );
+
+        let reduced = egui::Context::default();
+        let _ = page_motion_frame(&reduced, 1, MotionMode::Reduced, 0.0);
+        let (reduced_repaint, reduced_entering) =
+            page_motion_frame(&reduced, 2, MotionMode::Reduced, 1.0 / 60.0);
+        assert!(
+            reduced_entering.opacity > 0.0 && reduced_entering.opacity < 1.0,
+            "reduced page motion should keep a short cross-fade, got {reduced_entering:?}"
+        );
+        assert_eq!(reduced_repaint, Duration::ZERO);
+
+        let disabled = egui::Context::default();
+        let _ = page_motion_frame(&disabled, 1, MotionMode::Disabled, 0.0);
+        let (disabled_repaint, disabled_visible) =
+            page_motion_frame(&disabled, 2, MotionMode::Disabled, 1.0 / 60.0);
+        assert_eq!(disabled_visible.opacity, 1.0);
+        assert!(!disabled_visible.active);
+        assert_eq!(
+            disabled_repaint,
+            Duration::MAX,
+            "disabled page motion should land at the endpoint and idle"
+        );
+
+        let mut state = WebState::default();
+        let new_tab_key = active_body_page_motion_key(&state);
+        state
+            .push_internal_page(BrowserInternalPage::Options)
+            .expect("internal options page opens");
+        let options_key = active_body_page_motion_key(&state);
+        assert_ne!(
+            new_tab_key, options_key,
+            "Browser body motion key must change across internal page switches"
+        );
+    }
+
+    #[test]
+    fn browser_tab_drag_release_uses_shared_drag_settle_motion_driver() {
+        let ctx = egui::Context::default();
+        let (_, idle) =
+            tab_drag_settle_motion_frame(&ctx, 42, TabAxis::Horizontal, MotionMode::Normal, 0.0);
+        assert_eq!(idle, BrowserDragSettleMotion::settled());
+
+        let release_repaint =
+            note_tab_drag_settle_frame(&ctx, 42, TabAxis::Horizontal, 1.0, 1.0 / 60.0);
+        assert_eq!(
+            release_repaint,
+            Duration::ZERO,
+            "recording a tab drag release should wake the DRM loop for the settle frame"
+        );
+        let (active_repaint, settling) = tab_drag_settle_motion_frame(
+            &ctx,
+            42,
+            TabAxis::Horizontal,
+            MotionMode::Normal,
+            2.0 / 60.0,
+        );
+        assert!(
+            settling.offset.x > 0.0 && settling.offset.x <= TAB_DRAG_SETTLE_TRAVEL,
+            "normal horizontal drag settle should start with restrained travel, got {settling:?}"
+        );
+        assert_eq!(settling.offset.y, 0.0);
+        assert!(settling.accent_alpha > 0);
+        assert!(settling.active);
+        assert_eq!(
+            active_repaint,
+            Duration::ZERO,
+            "active Browser drag-settle motion must keep the DRM loop warm"
+        );
+
+        let (_, other_tab) = tab_drag_settle_motion_frame(
+            &ctx,
+            7,
+            TabAxis::Horizontal,
+            MotionMode::Normal,
+            3.0 / 60.0,
+        );
+        assert_eq!(
+            other_tab,
+            BrowserDragSettleMotion::settled(),
+            "drag-settle state must be keyed to the moved tab id, not the tab index"
+        );
+
+        let disabled = egui::Context::default();
+        let _ = note_tab_drag_settle_frame(&disabled, 42, TabAxis::Vertical, -1.0, 0.0);
+        let (disabled_repaint, disabled_motion) = tab_drag_settle_motion_frame(
+            &disabled,
+            42,
+            TabAxis::Vertical,
+            MotionMode::Disabled,
+            1.0 / 60.0,
+        );
+        assert_eq!(disabled_motion, BrowserDragSettleMotion::settled());
+        assert_eq!(
+            disabled_repaint,
+            Duration::ZERO,
+            "the release notification should schedule exactly one frame before disabled mode snaps"
+        );
+        let (disabled_idle_repaint, disabled_idle) = tab_drag_settle_motion_frame(
+            &disabled,
+            42,
+            TabAxis::Vertical,
+            MotionMode::Disabled,
+            2.0 / 60.0,
+        );
+        assert_eq!(disabled_idle, BrowserDragSettleMotion::settled());
+        assert_eq!(
+            disabled_idle_repaint,
+            Duration::MAX,
+            "disabled drag-settle motion should land at the endpoint and idle"
+        );
+    }
+
     #[test]
     fn browser_chrome_tokens_are_local_material_roles() {
-        assert_eq!(tab_fill(true), CHROME_TOOLBAR);
-        assert_eq!(tab_fill(false), CHROME_SURFACE_CONTAINER);
         assert_eq!(tab_stroke(true), CHROME_OUTLINE);
         assert_eq!(tab_stroke(false), CHROME_SURFACE_CONTAINER_HIGH);
         assert_eq!(tab_text(false), CHROME_TEXT_DIM);
@@ -4659,6 +9008,54 @@ mod tests {
         assert_eq!(tab_group_color(3), CHROME_GROUP_RED);
         assert_eq!(tab_group_color(4), CHROME_GROUP_PURPLE);
         assert_eq!(tab_group_color(5), CHROME_GROUP_BLUE);
+    }
+
+    #[test]
+    fn required_browser_icons_have_non_empty_painters() {
+        for icon in REQUIRED_BROWSER_ICONS {
+            assert!(
+                chrome_icon_painted_shape_count(*icon) > 0,
+                "required Browser icon {icon:?} must paint at least one shape"
+            );
+        }
+        assert!(
+            chrome_icon_painted_shape_count(ChromeIcon::Lock) > 0,
+            "disabled command lock affordance must also be painted locally"
+        );
+        assert_eq!(
+            chrome_icon_painted_shape_count(ChromeIcon::Minus),
+            1,
+            "Browser stepper minus icon should paint one local line"
+        );
+        assert_eq!(
+            chrome_icon_painted_shape_count(ChromeIcon::Plus),
+            2,
+            "Browser stepper plus icon should paint two local lines"
+        );
+    }
+
+    #[test]
+    fn loading_globe_honors_reduce_motion_without_losing_the_static_status() {
+        let (animated_phase, animated_repaint) = loading_globe_phase(0.75, false);
+        assert!(animated_phase > 0.0, "motion-on globe advances phase");
+        assert!(
+            animated_repaint,
+            "motion-on globe requests the throbber loop"
+        );
+
+        let (static_phase, static_repaint) = loading_globe_phase(0.75, true);
+        assert_eq!(
+            static_phase, 0.0,
+            "reduced-motion globe parks on a stable frame"
+        );
+        assert!(
+            !static_repaint,
+            "reduced-motion globe must not schedule a 33 ms repaint loop"
+        );
+        assert!(
+            loading_globe_painted_shape_count() > 0,
+            "the parked globe still paints a real non-text loading status"
+        );
     }
 
     #[test]
@@ -4701,89 +9098,70 @@ mod tests {
     #[test]
     fn engine_selector_uses_browser_local_labels_and_state() {
         assert_eq!(engine_display_name(BrowserEngine::Cef), "CEF / Chromium");
-        assert_eq!(engine_primary_label(BrowserEngine::Cef), "CEF");
-        assert_eq!(engine_supporting_label(BrowserEngine::Cef), "Chromium");
         assert_eq!(engine_marker(BrowserEngine::Cef), "CEF");
         assert_eq!(engine_glyph(BrowserEngine::Cef), "C");
         assert_eq!(engine_display_name(BrowserEngine::Servo), "Servo");
-        assert_eq!(engine_primary_label(BrowserEngine::Servo), "Servo");
-        assert_eq!(engine_supporting_label(BrowserEngine::Servo), "Rust web");
         assert_eq!(engine_marker(BrowserEngine::Servo), "Servo");
         assert_eq!(engine_glyph(BrowserEngine::Servo), "S");
+        assert_eq!(engine_accent(BrowserEngine::Cef), CHROME_PRIMARY);
+        assert_eq!(engine_accent(BrowserEngine::Servo), CHROME_SUCCESS);
         assert_eq!(
-            engine_segment_fill(BrowserEngine::Cef, BrowserEngine::Cef),
+            engine_container(BrowserEngine::Cef),
             CHROME_PRIMARY_CONTAINER
         );
         assert_eq!(
-            engine_segment_text(BrowserEngine::Cef, BrowserEngine::Cef),
-            CHROME_ON_PRIMARY_CONTAINER
-        );
-        assert_eq!(
-            engine_segment_stroke(BrowserEngine::Cef, BrowserEngine::Cef),
-            CHROME_PRIMARY
-        );
-        assert_eq!(
-            engine_segment_fill(BrowserEngine::Servo, BrowserEngine::Servo),
+            engine_container(BrowserEngine::Servo),
             CHROME_SUCCESS_CONTAINER
         );
         assert_eq!(
-            engine_segment_text(BrowserEngine::Servo, BrowserEngine::Servo),
+            engine_on_container(BrowserEngine::Cef),
+            CHROME_ON_PRIMARY_CONTAINER
+        );
+        assert_eq!(
+            engine_on_container(BrowserEngine::Servo),
             CHROME_ON_SUCCESS_CONTAINER
-        );
-        assert_eq!(
-            engine_segment_stroke(BrowserEngine::Servo, BrowserEngine::Servo),
-            CHROME_SUCCESS
-        );
-        assert_eq!(
-            engine_segment_fill(BrowserEngine::Servo, BrowserEngine::Cef),
-            CHROME_TOOLBAR
-        );
-        assert_eq!(
-            engine_segment_text(BrowserEngine::Servo, BrowserEngine::Cef),
-            CHROME_TEXT
-        );
-        assert_eq!(
-            engine_segment_stroke(BrowserEngine::Servo, BrowserEngine::Cef),
-            CHROME_OUTLINE
-        );
-        assert_eq!(engine_new_tab_fill(BrowserEngine::Cef), CHROME_PRIMARY);
-        assert_eq!(engine_new_tab_fill(BrowserEngine::Servo), CHROME_SUCCESS);
-        assert_eq!(engine_new_tab_text(BrowserEngine::Cef), "New tab");
-        assert_eq!(engine_new_tab_text(BrowserEngine::Servo), "New tab");
-        assert_eq!(
-            engine_new_tab_supporting_text(BrowserEngine::Cef),
-            "CEF / Chromium"
-        );
-        assert_eq!(
-            engine_new_tab_supporting_text(BrowserEngine::Servo),
-            "Servo"
-        );
-        assert_eq!(engine_tab_count_label(0), "0 tabs");
-        assert_eq!(engine_tab_count_label(1), "1 tab");
-        assert_eq!(engine_tab_count_label(2), "2 tabs");
-        assert_eq!(
-            engine_segment_chip_label(BrowserEngine::Cef, BrowserEngine::Cef, 0),
-            "Default"
-        );
-        assert_eq!(
-            engine_segment_chip_label(BrowserEngine::Servo, BrowserEngine::Cef, 2),
-            "2 tabs"
         );
     }
 
     #[test]
-    fn engine_selector_stays_compact_and_touch_sized() {
-        assert_eq!(ENGINE_NEW_TAB_W, 42.0);
-        assert_eq!(ENGINE_CONTROL_H, 40.0);
-        assert_eq!(ENGINE_SEGMENT_RADIUS, 18.0);
-        assert!(
-            engine_selector_horizontal_content_width() <= 324.0,
-            "horizontal engine selector should stay compact enough for the tab strip"
-        );
-        assert!(
-            ENGINE_CONTROL_H >= CHROME_TAB_H,
-            "engine targets should remain at least tab-height touch targets"
-        );
+    fn engine_toolbar_chip_uses_icon_first_badge_not_full_text_marker() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for engine in [BrowserEngine::Cef, BrowserEngine::Servo] {
+            let out = render_engine_toolbar_chip_frame(&ctx, engine);
+            let texts = painted_text(&out.shapes);
+
+            assert_painted_text_color(&texts, engine_glyph(engine), CHROME_TOOLBAR);
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, _)| text == engine_marker(engine)),
+                "toolbar engine chip must not paint the full engine marker as button text: {texts:?}"
+            );
+
+            let fills = painted_rect_fills(&out.shapes);
+            assert!(
+                fills.contains(&engine_container(engine)),
+                "toolbar engine chip must paint the Browser engine container: {fills:?}"
+            );
+
+            let rect_strokes = painted_rect_strokes(&out.shapes);
+            assert!(
+                rect_strokes.iter().any(|stroke| {
+                    stroke.color == engine_accent(engine) && (stroke.width - 1.0).abs() < 0.01
+                }),
+                "toolbar engine chip must paint the Browser engine outline: {rect_strokes:?}"
+            );
+
+            let icon_lines = painted_line_strokes(&out.shapes);
+            assert!(
+                icon_lines.iter().any(|stroke| {
+                    stroke.color == engine_on_container(engine) && (stroke.width - 1.7).abs() < 0.01
+                }),
+                "toolbar engine chip must paint the Browser engine icon: {icon_lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -4802,14 +9180,9 @@ mod tests {
 
     #[test]
     fn page_action_tokens_cover_disabled_plain_and_bookmarked_states() {
-        assert_eq!(page_action_text(true), CHROME_TEXT);
-        assert_eq!(page_action_text(false), CHROME_TEXT_DIM);
-        assert_eq!(
-            page_action_star(false, false),
-            ("\u{2606}", CHROME_TEXT_DIM)
-        );
-        assert_eq!(page_action_star(true, false), ("\u{2606}", CHROME_TEXT));
-        assert_eq!(page_action_star(true, true), ("\u{2605}", CHROME_PRIMARY));
+        assert_eq!(page_action_icon_color(false, false), CHROME_TEXT_DIM);
+        assert_eq!(page_action_icon_color(true, false), CHROME_TEXT);
+        assert_eq!(page_action_icon_color(true, true), CHROME_PRIMARY);
     }
 
     #[test]
@@ -4817,6 +9190,1551 @@ mod tests {
         let font = font_id(13.0);
         assert_eq!(omnibox_dim_format(font.clone()).color, CHROME_TEXT_DIM);
         assert_eq!(omnibox_strong_format(font).color, CHROME_TEXT);
+    }
+
+    #[test]
+    fn browser_omnibox_text_field_uses_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_omnibox_chrome_frame(&ctx);
+
+        assert_browser_text_field_paint(&out, "https://example.test/mesh", "omnibox");
+
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "example.test/mesh", CHROME_TEXT);
+    }
+
+    #[test]
+    fn page_context_menu_rows_use_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_page_context_rows_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Back", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Forward", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Reload", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Cut", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Copy", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Paste", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Select all", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Copy page URL", CHROME_TEXT);
+    }
+
+    #[test]
+    fn tab_context_menu_rows_use_browser_material_icons_and_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_tab_context_rows_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Move tab left", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Move tab right", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Pin tab", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Duplicate tab", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Work container", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Display 2", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Close tab", CHROME_TEXT);
+        for label in [
+            "Move tab left",
+            "Move tab right",
+            "Pin tab",
+            "Duplicate tab",
+            "Work container",
+            "Display 2",
+            "Close tab",
+        ] {
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "tab context label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_TOOLBAR),
+            "tab context rows must paint Browser toolbar fill: {fills:?}"
+        );
+        let outlines = painted_rect_strokes(&out.shapes);
+        assert!(
+            outlines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "tab context rows must paint Browser outline strokes: {outlines:?}"
+        );
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "enabled tab context rows must paint Browser line icons: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
+            "disabled tab context rows must paint dim Browser line icons: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn page_actions_menu_rows_use_browser_painted_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_page_actions_menu_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        for label in [
+            "Add bookmark",
+            "Copy URL",
+            "Send in Chat",
+            "Share to Peer",
+            "Share to Phone",
+            "Share to Email",
+            "Share to QR",
+            "Send tab to Node",
+            "Send tab to Phone",
+        ] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+        }
+        for legacy in ['\u{2606}', '\u{29C9}', '\u{1F4AC}', '\u{21AA}', '\u{21E5}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "page action rows must not paint legacy glyph prefixes as text: {texts:?}"
+            );
+        }
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "page action rows must paint Browser line icons: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn page_actions_toolbar_anchor_uses_painted_bookmark_icon() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_page_actions_button_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "page actions toolbar anchor");
+
+        for legacy in ['\u{2605}', '\u{2606}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "page actions toolbar anchor must not paint legacy star glyph text: {texts:?}"
+            );
+        }
+
+        let path_strokes = painted_path_strokes(&out.shapes);
+        for color in [CHROME_TEXT_DIM, CHROME_TEXT, CHROME_PRIMARY] {
+            assert!(
+                path_strokes
+                    .iter()
+                    .any(|stroke| stroke.color == color && (stroke.width - 1.7).abs() < 0.01),
+                "page actions toolbar anchor must paint bookmark icon color {color:?}: {path_strokes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_body_interstitials_use_painted_warning_icons_not_glyph_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let assert_warning_icon = |out: &egui::FullOutput| {
+            let lines = painted_line_strokes(&out.shapes);
+            assert!(
+                lines
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
+                "body interstitial warning icon must paint Browser error line strokes: {lines:?}"
+            );
+
+            let paths = painted_path_strokes(&out.shapes);
+            assert!(
+                paths
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
+                "body interstitial warning icon must paint Browser error path strokes: {paths:?}"
+            );
+        };
+
+        let assert_no_legacy_glyphs = |texts: &[(String, egui::Color32)]| {
+            for legacy in ['\u{2190}', '\u{21BB}', '\u{26A0}', '\u{26D4}'] {
+                assert!(
+                    !texts.iter().any(|(text, _)| text.contains(legacy)),
+                    "body interstitials must not paint legacy glyph prefixes as text: {texts:?}"
+                );
+            }
+        };
+
+        let err = CertError {
+            url: "https://bad.example.com/".to_owned(),
+            code: -202,
+            message: "not trusted".to_owned(),
+        };
+        let out = render_body_frame(&ctx, |ui| {
+            cert_error_body(ui, &err, false);
+        });
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Your connection is not private", CHROME_ERROR);
+        assert_painted_text_color(&texts, "Back to safety", CHROME_TOOLBAR);
+        assert_no_legacy_glyphs(&texts);
+        assert_warning_icon(&out);
+
+        let mut respawn_requested = false;
+        let out = render_body_frame(&ctx, |ui| {
+            crashed_body(ui, "renderer exited".to_owned(), &mut respawn_requested);
+        });
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "This page crashed", CHROME_ERROR);
+        assert_painted_text_color(&texts, "Reload", CHROME_TOOLBAR);
+        assert_no_legacy_glyphs(&texts);
+        assert_warning_icon(&out);
+
+        let out = render_body_frame(&ctx, |ui| {
+            safe_browsing_interstitial_body(ui, "https://blocked.example/");
+        });
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Unsafe site blocked", CHROME_ERROR);
+        assert_painted_text_color(&texts, "Back to safety", CHROME_TOOLBAR);
+        assert_no_legacy_glyphs(&texts);
+        assert_warning_icon(&out);
+
+        let block = ManagedPolicyBlock {
+            url: "https://policy.example/".to_owned(),
+            rule: "blocked-host".to_owned(),
+        };
+        let out = render_body_frame(&ctx, |ui| {
+            managed_policy_interstitial_body(ui, &block);
+        });
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Blocked by policy", CHROME_ERROR);
+        assert_painted_text_color(&texts, "Back to safety", CHROME_TOOLBAR);
+        assert_no_legacy_glyphs(&texts);
+        assert_warning_icon(&out);
+    }
+
+    #[test]
+    fn browser_security_chip_and_panel_use_painted_icons() {
+        assert_eq!(SecurityLevel::Secure.icon(), ChromeIcon::Lock);
+        assert_eq!(SecurityLevel::NotSecure.icon(), ChromeIcon::Warning);
+        assert_eq!(SecurityLevel::Mesh.icon(), ChromeIcon::Security);
+        assert_eq!(SecurityLevel::Neutral.icon(), ChromeIcon::Page);
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_security_chrome_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "security chip");
+
+        assert_painted_text_color(&texts, "Connection is secure", CHROME_TEXT_DIM);
+        assert_painted_text_color(
+            &texts,
+            "Your connection to this site is not secure",
+            CHROME_WARN,
+        );
+        assert_painted_text_color(&texts, "Mesh service: trusted overlay", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "About this page", CHROME_TEXT_DIM);
+        assert_painted_text_color(
+            &texts,
+            "Punycode/IDN host (xn--): verify this is the site you expect",
+            CHROME_WARN,
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains('\u{2014}') || text.contains('\u{2192}')),
+            "security chip and panel must not paint typographic dash/arrow glyph copy: {texts:?}"
+        );
+        for label in [
+            "Managed policy blocked: 1 resource",
+            "Unsafe content blocked: 1 resource",
+            "Insecure content blocked: 1 public HTTP subresource",
+        ] {
+            assert_painted_text_color(&texts, label, CHROME_WARN);
+        }
+        assert_painted_text_color(
+            &texts,
+            "Privacy protection blocked: 1 tracker/filter resource",
+            CHROME_TEXT_DIM,
+        );
+        for legacy in ['\u{1F512}', '\u{26A0}', '\u{1F6E1}', '\u{1F50E}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "security chip and panel must not paint legacy security emoji as text: {texts:?}"
+            );
+        }
+
+        let line_strokes = painted_line_strokes(&out.shapes);
+        assert!(
+            line_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
+            "secure/neutral security icons must paint Browser dim line strokes: {line_strokes:?}"
+        );
+        assert!(
+            line_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "not-secure security icon must paint Browser warning line strokes: {line_strokes:?}"
+        );
+
+        let path_strokes = painted_path_strokes(&out.shapes);
+        assert!(
+            path_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "not-secure security icon must paint a Browser warning path stroke: {path_strokes:?}"
+        );
+        assert!(
+            path_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
+            "mesh security icon must paint a Browser primary shield path: {path_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn ad_filter_chip_uses_browser_icon_and_count_rows() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_ad_filter_chrome_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "7", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "3", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "ads.example", CHROME_TEXT_DIM);
+        for legacy in ['\u{2298}', '\u{00D7}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "ad-filter chip and domain rows must not paint legacy glyph text: {texts:?}"
+            );
+        }
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
+            "ad-filter chip must paint a Browser shield/privacy line icon: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn bookmark_suggestions_use_browser_painted_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_suggestions_panel_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Bookmarks", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Example bookmark", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "History", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "https://example.test/history", CHROME_TEXT);
+        assert_painted_text_color(&texts, "example search", CHROME_TEXT);
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains('\u{2605}') || text.contains('\u{2606}')),
+            "bookmark suggestions must not paint legacy star glyph text: {texts:?}"
+        );
+
+        let path_strokes = painted_path_strokes(&out.shapes);
+        assert!(
+            path_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
+            "bookmark suggestions must paint a Browser bookmark path icon: {path_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn tab_search_results_use_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_tab_search_results_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Browser Options", CHROME_ON_PRIMARY_CONTAINER);
+        assert_painted_text_color(&texts, "No matching tabs", CHROME_TEXT_DIM);
+        for label in ["Browser Options", "No matching tabs"] {
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "tab-search label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_search_toolbar_anchor_uses_browser_icon_button() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_tab_search_menu_button_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().all(|(text, _)| !text.trim().is_empty()),
+            "tab-search toolbar anchor must not paint a blank stock menu-button text label: {texts:?}"
+        );
+
+        let line_strokes = painted_line_strokes(&out.shapes);
+        assert!(
+            line_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "tab-search toolbar anchor must paint the Browser search line icon: {line_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_chrome_text_fields_use_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let tab_search = render_tab_search_menu_contents_frame(&ctx);
+        assert_browser_text_field_paint(&tab_search, "options", "tab search");
+
+        let dashboard = render_new_tab_dashboard_frame(&ctx);
+        assert_browser_text_field_paint(&dashboard, "mesh docs", "dashboard search");
+
+        let password = render_password_menu_contents_frame(&ctx, "example.test", false);
+        assert_browser_text_field_paint(&password, "operator", "password menu");
+    }
+
+    #[test]
+    fn browser_new_tab_privacy_note_uses_painted_lock_icon() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_new_tab_dashboard_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, PRIVATE_MODE_EXPLAINER, CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, _)| text.contains('\u{1F512}')),
+            "new-tab privacy note must not paint the legacy lock emoji as text: {texts:?}"
+        );
+
+        let rect_strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            rect_strokes.iter().any(|stroke| {
+                stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
+            }),
+            "new-tab privacy note must paint a Browser lock body stroke: {rect_strokes:?}"
+        );
+        let line_strokes = painted_line_strokes(&out.shapes);
+        assert!(
+            line_strokes.iter().any(|stroke| {
+                stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
+            }),
+            "new-tab privacy note must paint Browser lock shackle strokes: {line_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_drawer_actions_use_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_history_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "History", CHROME_TEXT);
+        assert_painted_text_color(&texts, "this session only", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Clear", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Example Page", CHROME_TEXT);
+        for label in ["History", "this session only", "Clear", "Example Page"] {
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "drawer label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_qr_share_drawer_uses_browser_material_matrix_colors() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_qr_share_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "QR share", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Example QR", CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "QR share"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "QR share drawer heading leaked shared shell text color: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert_eq!(drawers::QR_MATRIX_LIGHT, CHROME_TOOLBAR);
+        assert_eq!(drawers::QR_MATRIX_DARK, CHROME_TEXT);
+        assert!(
+            fills.contains(&drawers::QR_MATRIX_LIGHT),
+            "QR share matrix must paint its quiet zone with Browser toolbar color: {fills:?}"
+        );
+        assert!(
+            fills.contains(&drawers::QR_MATRIX_DARK),
+            "QR share matrix dark modules must paint with Browser text color: {fills:?}"
+        );
+        assert!(
+            !fills.contains(&egui::Color32::BLACK),
+            "QR share matrix must not paint raw black fills inside Browser chrome: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn browser_history_drawer_rows_use_browser_material_icon_rows() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_history_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Example Page", CHROME_TEXT);
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_TOOLBAR),
+            "history visit rows must use the Browser Material row fill: {fills:?}"
+        );
+
+        let rect_strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            rect_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "history visit rows must paint Browser outline strokes: {rect_strokes:?}"
+        );
+
+        let icon_strokes = painted_line_strokes(&out.shapes);
+        assert!(
+            icon_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "history visit rows must paint a Browser History icon: {icon_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_drawer_close_buttons_use_painted_close_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for (name, out) in [
+            ("history", render_history_drawer_frame(&ctx)),
+            ("downloads", render_empty_downloads_drawer_frame(&ctx)),
+            ("print", render_print_settings_drawer_frame(&ctx)),
+            ("site-styles", render_site_styles_drawer_frame(&ctx)),
+        ] {
+            let texts = painted_text(&out.shapes);
+            assert!(
+                texts.iter().all(|(text, _)| !text.trim().is_empty()),
+                "{name} drawer icon controls must not paint blank stock button labels: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains('\u{00D7}')),
+                "{name} drawer close button must not paint the legacy multiplication glyph as text: {texts:?}"
+            );
+
+            let lines = painted_line_strokes(&out.shapes);
+            assert!(
+                lines
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_TEXT_DIM
+                        && (stroke.width - 1.7).abs() < 0.01),
+                "{name} drawer close button must paint a Browser dim close line icon: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_drawer_refresh_and_danger_warning_use_painted_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for (name, out) in [
+            ("downloads", render_empty_downloads_drawer_frame(&ctx)),
+            ("print", render_print_settings_drawer_frame(&ctx)),
+        ] {
+            let texts = painted_text(&out.shapes);
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains('\u{21BB}')),
+                "{name} refresh control must not paint the legacy reload glyph as text: {texts:?}"
+            );
+
+            let dim_lines = painted_line_strokes(&out.shapes)
+                .into_iter()
+                .filter(|stroke| {
+                    stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
+                })
+                .count();
+            assert!(
+                dim_lines >= 4,
+                "{name} drawer must paint Browser close and reload line icons: {dim_lines}"
+            );
+        }
+
+        let out = render_dangerous_downloads_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(
+            &texts,
+            "This type of file can harm your device",
+            CHROME_WARN,
+        );
+        assert_painted_text_color(&texts, "setup.exe", CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, _)| text.contains('\u{26A0}')),
+            "dangerous download warning must not paint the legacy warning glyph as text: {texts:?}"
+        );
+
+        let warning_lines = painted_line_strokes(&out.shapes);
+        assert!(
+            warning_lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "dangerous download warning must paint a Browser warning line icon: {warning_lines:?}"
+        );
+        let warning_paths = painted_path_strokes(&out.shapes);
+        assert!(
+            warning_paths
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "dangerous download warning must paint a Browser warning path icon: {warning_paths:?}"
+        );
+    }
+
+    #[test]
+    fn browser_drawer_error_notices_use_warning_icons_not_bang_prefixes() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for (name, out, labels) in [
+            (
+                "print",
+                render_print_settings_drawer_frame(&ctx),
+                &["CUPS service unavailable"][..],
+            ),
+            (
+                "download-notice",
+                render_empty_downloads_drawer_frame(&ctx),
+                &["Open failed: file vanished"][..],
+            ),
+            (
+                "download-error",
+                render_failed_downloads_drawer_frame(&ctx),
+                &["checksum mismatch"][..],
+            ),
+        ] {
+            let texts = painted_text(&out.shapes);
+            for label in labels {
+                assert_painted_text_color(&texts, label, CHROME_ERROR);
+            }
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, _)| text.trim_start().starts_with("! ")),
+                "{name} drawer must not paint exclamation-prefixed warning text: {texts:?}"
+            );
+
+            let warning_lines = painted_line_strokes(&out.shapes);
+            assert!(
+                warning_lines
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_ERROR
+                        && (stroke.width - 1.7).abs() < 0.01),
+                "{name} drawer must paint a Browser error warning line icon: {warning_lines:?}"
+            );
+            let warning_paths = painted_path_strokes(&out.shapes);
+            assert!(
+                warning_paths
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_ERROR
+                        && (stroke.width - 1.7).abs() < 0.01),
+                "{name} drawer must paint a Browser error warning path icon: {warning_paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_status_drawers_use_material_icon_status_rows() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_engine_and_speech_status_drawers_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        for label in ["Browser engine update", "Browser speech"] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "status drawer heading {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+        assert_painted_text_color(&texts, "mismatch", CHROME_WARN);
+        assert_painted_text_color(&texts, "TTS speaking", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "Voice unavailable", CHROME_WARN);
+        assert_painted_text_color(&texts, "Example", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "https://example.test/", CHROME_TEXT_DIM);
+        assert_painted_text_color(
+            &texts,
+            "active CEF runtime does not match packaged manifest",
+            CHROME_WARN,
+        );
+        assert_painted_text_color(&texts, "installer unavailable", CHROME_WARN);
+        assert_painted_text_color(&texts, "STT runtime is not configured", CHROME_WARN);
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "status drawers must paint Browser heading line icons: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
+            "speech drawer must paint Browser primary audio status icons: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|stroke| stroke.color == CHROME_WARN
+                    && (stroke.width - 1.7).abs() < 0.01)
+                .count()
+                >= 5,
+            "status drawer warning state and detail rows must paint Browser warning line icons: {lines:?}"
+        );
+
+        let paths = painted_path_strokes(&out.shapes);
+        assert!(
+            paths
+                .iter()
+                .filter(|stroke| stroke.color == CHROME_WARN
+                    && (stroke.width - 1.7).abs() < 0.01)
+                .count()
+                >= 5,
+            "status drawer warning state and detail rows must paint Browser warning path icons: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn browser_spellcheck_error_uses_material_warning_status_row() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_spellcheck_error_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Spelling", CHROME_TEXT);
+        assert_painted_text_color(&texts, "hunspell not installed", CHROME_WARN);
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "hunspell not installed"
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "spellcheck error leaked shared shell text color: {texts:?}"
+        );
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "spellcheck error must paint a Browser warning line icon: {lines:?}"
+        );
+
+        let paths = painted_path_strokes(&out.shapes);
+        assert!(
+            paths
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "spellcheck error must paint a Browser warning path icon: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn browser_download_progress_uses_browser_material_progress_bar() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_progress_downloads_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "42%", CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "42%"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "download progress text must not inherit shared shell text colors: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_PRIMARY),
+            "download progress fill must use Browser primary color: {fills:?}"
+        );
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "download progress track must use Browser surface color: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn browser_muted_notes_use_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_empty_downloads_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        let empty_note = texts
+            .iter()
+            .find(|(text, _)| {
+                text == "No browser downloads yet"
+                    || text == "Transfers worker ledger is not present on this node"
+            })
+            .unwrap_or_else(|| panic!("empty downloads drawer note was not painted: {texts:?}"));
+
+        assert_eq!(
+            empty_note.1, CHROME_TEXT_DIM,
+            "Browser muted notes must use Browser Material dim text: {texts:?}"
+        );
+        assert!(
+            !matches!(
+                empty_note.1,
+                Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG
+            ),
+            "Browser muted notes must not inherit shared shell text colors: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_password_menu_text_uses_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let no_site = painted_text(&render_password_menu_contents_frame(&ctx, "", false).shapes);
+        assert_painted_text_color(&no_site, "No site loaded", CHROME_TEXT_DIM);
+
+        let empty =
+            painted_text(&render_password_menu_contents_frame(&ctx, "example.test", false).shapes);
+        assert_painted_text_color(&empty, "Saved logins (this session)", CHROME_TEXT);
+        assert_painted_text_color(&empty, "None saved for example.test", CHROME_TEXT_DIM);
+        assert_painted_text_color(&empty, "Save a login for example.test", CHROME_TEXT);
+        assert_painted_text_color(&empty, "Save", CHROME_TOOLBAR);
+
+        let saved =
+            painted_text(&render_password_menu_contents_frame(&ctx, "example.test", true).shapes);
+        assert_painted_text_color(&saved, "Fill alice", CHROME_TOOLBAR);
+
+        for (set_name, texts, labels) in [
+            ("no-site", &no_site, &["No site loaded"][..]),
+            (
+                "empty",
+                &empty,
+                &[
+                    "Saved logins (this session)",
+                    "None saved for example.test",
+                    "Save a login for example.test",
+                    "Save",
+                ][..],
+            ),
+            ("saved", &saved, &["Fill alice"][..]),
+        ] {
+            for label in labels {
+                assert!(
+                    !texts.iter().any(|(text, color)| text == *label
+                        && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                    "password menu {set_name} label {label:?} leaked shared shell text color: {texts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn browser_password_menu_toolbar_anchor_uses_painted_lock_icon() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_password_menu_button_frame(&ctx, "https://example.test/");
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "password toolbar anchor");
+        assert!(
+            !texts.iter().any(|(text, _)| text.contains('\u{1F511}')),
+            "password toolbar anchor must not paint the legacy key emoji as text: {texts:?}"
+        );
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "password toolbar anchor must paint a Browser line icon: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn browser_dialog_prompt_messages_use_material_status_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_dialog_prompt_bars_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        for label in [
+            "login.example wants to use a passkey on login.example via CEF",
+            "https://camera.example wants to use your camera",
+            "Save login for docs.example.com (mm)?",
+        ] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "prompt label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+        assert_painted_text_color(
+            &texts,
+            "docs.example.com wants to leave this page: Unsaved work",
+            CHROME_WARN,
+        );
+        for label in ["Approve", "Allow", "Leave", "Save"] {
+            assert_painted_text_color(&texts, label, CHROME_TOOLBAR);
+        }
+        for label in ["Deny", "Block", "Stay", "Not now"] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+        }
+
+        let prompt_text_icon = CHROME_TEXT.gamma_multiply(0.2);
+        let prompt_warn_icon = CHROME_WARN.gamma_multiply(0.2);
+        let text_lines = painted_line_strokes(&out.shapes);
+        assert!(
+            text_lines
+                .iter()
+                .any(|stroke| stroke.color == prompt_text_icon
+                    && (stroke.width - 1.7).abs() < 0.01),
+            "prompt bars must paint Browser lock/status line icons: {text_lines:?}"
+        );
+        assert!(
+            text_lines
+                .iter()
+                .any(|stroke| stroke.color == prompt_warn_icon
+                    && (stroke.width - 1.7).abs() < 0.01),
+            "before-unload prompt must paint a Browser warning line icon: {text_lines:?}"
+        );
+
+        let path_strokes = painted_path_strokes(&out.shapes);
+        assert!(
+            path_strokes
+                .iter()
+                .any(|stroke| stroke.color == prompt_text_icon
+                    && (stroke.width - 1.7).abs() < 0.01),
+            "prompt bars must paint Browser security path icons: {path_strokes:?}"
+        );
+        assert!(
+            path_strokes
+                .iter()
+                .any(|stroke| stroke.color == prompt_warn_icon
+                    && (stroke.width - 1.7).abs() < 0.01),
+            "before-unload prompt must paint a Browser warning path icon: {path_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_insecure_prompt_uses_material_warning_status_row() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_insecure_prompt_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "HTTP connection", CHROME_WARN);
+        assert_painted_text_color(&texts, "http://plain.example/sensitive", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Use HTTPS", CHROME_TOOLBAR);
+        assert_painted_text_color(&texts, "Continue HTTP", CHROME_TOOLBAR);
+        assert_painted_text_color(&texts, "Cancel", CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "HTTP connection"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "HTTP prompt heading leaked shared shell text color: {texts:?}"
+        );
+
+        let warning_lines = painted_line_strokes(&out.shapes);
+        assert!(
+            warning_lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "HTTP prompt must paint a Browser warning line icon: {warning_lines:?}"
+        );
+        let warning_paths = painted_path_strokes(&out.shapes);
+        assert!(
+            warning_paths
+                .iter()
+                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
+            "HTTP prompt must paint a Browser warning path icon: {warning_paths:?}"
+        );
+    }
+
+    #[test]
+    fn browser_capture_notice_uses_material_icon_status_rows() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let success = render_capture_notice_frame(&ctx, "Capture saved");
+        let success_texts = painted_text(&success.shapes);
+        assert_painted_text_color(&success_texts, "Capture saved", CHROME_PRIMARY);
+        assert!(
+            !success_texts
+                .iter()
+                .any(|(text, color)| text == "Capture saved"
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "capture notice leaked shared shell text color: {success_texts:?}"
+        );
+        let success_fills = painted_rect_fills(&success.shapes);
+        assert!(
+            success_fills.contains(&CHROME_SURFACE_CONTAINER),
+            "capture notice must use the Browser status surface: {success_fills:?}"
+        );
+        let success_rect_strokes = painted_rect_strokes(&success.shapes);
+        assert!(
+            success_rect_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "capture notice must paint a Browser outline stroke: {success_rect_strokes:?}"
+        );
+        assert!(
+            success_rect_strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
+            "successful capture notice must paint the Browser Capture icon: {success_rect_strokes:?}"
+        );
+
+        let failed = render_capture_notice_frame(&ctx, "Capture failed: no painted page");
+        let failed_texts = painted_text(&failed.shapes);
+        assert_painted_text_color(
+            &failed_texts,
+            "Capture failed: no painted page",
+            CHROME_ERROR,
+        );
+        assert!(
+            !failed_texts
+                .iter()
+                .any(|(text, _)| text.starts_with("! ")),
+            "capture error notice must not paint exclamation-prefixed warning text: {failed_texts:?}"
+        );
+        let failed_lines = painted_line_strokes(&failed.shapes);
+        assert!(
+            failed_lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
+            "failed capture notice must paint a Browser warning line icon: {failed_lines:?}"
+        );
+        let failed_paths = painted_path_strokes(&failed.shapes);
+        assert!(
+            failed_paths
+                .iter()
+                .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
+            "failed capture notice must paint a Browser warning path icon: {failed_paths:?}"
+        );
+    }
+
+    #[test]
+    fn browser_close_action_buttons_use_painted_close_icons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for (name, out) in [
+            (
+                "password-delete",
+                render_password_menu_contents_frame(&ctx, "example.test", true),
+            ),
+            (
+                "capture-notice",
+                render_capture_notice_frame(&ctx, "Capture saved"),
+            ),
+        ] {
+            let texts = painted_text(&out.shapes);
+            assert_no_blank_painted_text(&texts, name);
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains('\u{00D7}')),
+                "{name} close action must not paint the legacy multiplication glyph as text: {texts:?}"
+            );
+
+            let lines = painted_line_strokes(&out.shapes);
+            assert!(
+                lines
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_TEXT_DIM
+                        && (stroke.width - 1.7).abs() < 0.01),
+                "{name} close action must paint a Browser dim close line icon: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_inline_close_button_uses_painted_close_icon() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_inline_close_button_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "tab close button");
+        assert!(
+            !texts.iter().any(|(text, _)| text.contains('\u{00D7}')),
+            "tab close button must not paint the legacy multiplication glyph as text: {texts:?}"
+        );
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
+            "tab close button must paint a Browser close line icon: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn browser_tab_audio_buttons_use_painted_volume_icons() {
+        assert_eq!(
+            audio_icon_for(true, false),
+            Some((ChromeIcon::VolumeUp, "Mute tab"))
+        );
+        assert_eq!(
+            audio_icon_for(false, true),
+            Some((ChromeIcon::VolumeOff, "Unmute tab"))
+        );
+        assert_eq!(audio_icon_for(false, false), None);
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_tab_audio_buttons_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "tab audio controls");
+        for legacy in ['\u{1F507}', '\u{1F50A}'] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "tab audio controls must not paint legacy speaker emoji as text: {texts:?}"
+            );
+        }
+
+        let lines = painted_line_strokes(&out.shapes);
+        let dim_icon_lines = lines
+            .iter()
+            .filter(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01)
+            .count();
+        assert!(
+            dim_icon_lines >= 8,
+            "tab audio controls must paint Browser volume line icons, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn browser_tab_status_chips_use_painted_icons_not_title_prefixes() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_tab_status_chips_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Example page", CHROME_TEXT);
+        for legacy in ["W ", "D2 ", "D ", "\u{25D2} "] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(legacy)),
+                "tab status must not be embedded as title-prefix text: {texts:?}"
+            );
+        }
+
+        let primary_lines = painted_line_strokes(&out.shapes)
+            .into_iter()
+            .filter(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01)
+            .count();
+        let primary_paths = painted_path_strokes(&out.shapes)
+            .into_iter()
+            .filter(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01)
+            .count();
+        assert!(
+            primary_lines + primary_paths >= 4,
+            "tab status chips must paint Browser icon geometry, got lines={primary_lines} paths={primary_paths}"
+        );
+    }
+
+    #[test]
+    fn browser_tab_hover_card_uses_browser_material_icon_and_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_tab_hover_card_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert!(
+            texts.iter().any(|(text, color)| {
+                text.contains("Engine: CEF / Chromium") && *color == CHROME_TEXT_DIM
+            }),
+            "tab hover card must paint the engine summary with Browser dim text: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(text, color)| {
+                text.contains("Engine: CEF / Chromium")
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)
+            }),
+            "tab hover card leaked shared shell text color: {texts:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes.iter().any(|stroke| {
+                stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
+            }),
+            "tab hover card must paint a Browser tab icon stroke: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_chrome_tooltips_use_browser_material_text() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_chrome_tooltip_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Search tabs", CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "Search tabs"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "Browser tooltip leaked shared shell text color: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_bookmarks_overflow_anchor_uses_painted_down_icon() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_bookmarks_bar_overflow_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+        assert_no_blank_painted_text(&texts, "bookmarks overflow anchor");
+        assert!(
+            !texts.iter().any(|(text, _)| text.contains('\u{00BB}')),
+            "bookmarks overflow anchor must not paint the legacy guillemet as text: {texts:?}"
+        );
+
+        let lines = painted_line_strokes(&out.shapes);
+        assert!(
+            lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
+            "bookmarks overflow anchor must paint a Browser line icon: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn browser_bookmarks_bar_items_use_browser_material_buttons() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        for (surface, out, label) in [
+            (
+                "bookmarks bar",
+                render_bookmarks_bar_overflow_frame(&ctx),
+                "Bookmark 0",
+            ),
+            (
+                "bookmarks overflow rows",
+                render_bookmark_overflow_rows_frame(&ctx),
+                "Bookmark 3",
+            ),
+        ] {
+            let texts = painted_text(&out.shapes);
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "{surface} bookmark label leaked shared shell text color: {texts:?}"
+            );
+
+            let fills = painted_rect_fills(&out.shapes);
+            assert!(
+                fills.contains(&CHROME_SURFACE),
+                "{surface} bookmark button must paint a Browser surface fill: {fills:?}"
+            );
+
+            let strokes = painted_rect_strokes(&out.shapes);
+            assert!(
+                strokes
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_OUTLINE
+                        && (stroke.width - 1.0).abs() < 0.01),
+                "{surface} bookmark button must paint Browser outline strokes: {strokes:?}"
+            );
+
+            let paths = painted_path_strokes(&out.shapes);
+            assert!(
+                paths
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_TEXT_DIM
+                        && (stroke.width - 1.7).abs() < 0.01),
+                "{surface} bookmark button must paint a Browser bookmark path icon: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_print_drawer_toggles_use_browser_material_text_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_print_settings_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Duplex", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Grayscale", CHROME_TEXT);
+        for label in ["Duplex", "Grayscale"] {
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "print drawer toggle label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_print_drawer_selectors_use_browser_material_chips() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_print_settings_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        for label in ["System default", "Portrait", "Printer default"] {
+            assert_painted_text_color(&texts, label, CHROME_ON_PRIMARY_CONTAINER);
+        }
+        for label in ["Landscape", "A4", "Letter", "Legal"] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+        }
+        for label in [
+            "System default",
+            "Portrait",
+            "Landscape",
+            "Printer default",
+            "A4",
+            "Letter",
+            "Legal",
+        ] {
+            assert!(
+                !texts.iter().any(|(text, color)| text == label
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+                "print drawer selector label {label:?} leaked shared shell text color: {texts:?}"
+            );
+        }
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_PRIMARY_CONTAINER),
+            "selected print drawer selector chips must paint Browser selected fill: {fills:?}"
+        );
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "unselected print drawer selector chips must paint Browser surface fill: {fills:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.0).abs() < 0.01),
+            "selected print drawer selector chips must paint Browser primary stroke: {strokes:?}"
+        );
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "unselected print drawer selector chips must paint Browser outline stroke: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_print_drawer_stepper_uses_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_print_settings_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "12", CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "12"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "print drawer copy stepper leaked shared shell text color: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "print drawer copy stepper must paint a Browser surface value fill: {fills:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "print drawer copy stepper must paint Browser outline strokes: {strokes:?}"
+        );
+
+        let dim_icon_lines = painted_line_strokes(&out.shapes)
+            .iter()
+            .filter(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01)
+            .count();
+        assert!(
+            dim_icon_lines >= 3,
+            "print drawer copy stepper must paint Browser plus/minus icon strokes: {dim_icon_lines}"
+        );
+    }
+
+    #[test]
+    fn browser_drawer_text_fields_use_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        assert!(drawers::PRINT_PAGE_RANGE_HELP.is_ascii());
+        assert!(
+            !drawers::PRINT_PAGE_RANGE_HELP.contains('\u{2014}'),
+            "print drawer page-range helper must avoid typographic dash glyphs"
+        );
+
+        let print_out = render_print_settings_drawer_frame(&ctx);
+        let print_texts = painted_text(&print_out.shapes);
+        assert_painted_text_color(&print_texts, "1-5", CHROME_TEXT);
+        assert!(
+            !print_texts.iter().any(|(text, color)| text == "1-5"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "print drawer text field leaked shared shell text color: {print_texts:?}"
+        );
+
+        let site_out = render_site_styles_drawer_frame(&ctx);
+        let site_texts = painted_text(&site_out.shapes);
+        assert_painted_text_color(&site_texts, "reader.example", CHROME_TEXT);
+        assert!(
+            !site_texts
+                .iter()
+                .any(|(text, color)| text == "reader.example"
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "site-styles drawer text field leaked shared shell text color: {site_texts:?}"
+        );
+
+        for (name, out) in [("print", print_out), ("site-styles", site_out)] {
+            let fills = painted_rect_fills(&out.shapes);
+            assert!(
+                fills.contains(&CHROME_SURFACE),
+                "{name} drawer text field must paint a Browser surface fill: {fills:?}"
+            );
+
+            let strokes = painted_rect_strokes(&out.shapes);
+            assert!(
+                strokes
+                    .iter()
+                    .any(|stroke| stroke.color == CHROME_OUTLINE
+                        && (stroke.width - 1.0).abs() < 0.01),
+                "{name} drawer text field must paint a Browser outline stroke: {strokes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_site_styles_css_editor_uses_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_site_styles_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "main { line-height: 1.6; }", CHROME_TEXT);
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, color)| text == "main { line-height: 1.6; }"
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "site-styles CSS editor leaked shared shell text color: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "site-styles CSS editor must paint a Browser surface fill: {fills:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "site-styles CSS editor must paint Browser outline strokes: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_find_bar_text_field_uses_browser_material_tokens() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_find_chrome_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "mesh search", CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "mesh search"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "find bar text field leaked shared shell text color: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "find bar text field must paint a Browser surface fill: {fills:?}"
+        );
+
+        let strokes = painted_rect_strokes(&out.shapes);
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "find bar text field must paint Browser outline strokes: {strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_drawer_separators_use_browser_material_outline() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let print_out = render_print_settings_drawer_frame(&ctx);
+        let print_lines = painted_line_strokes(&print_out.shapes);
+        assert!(
+            print_lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "print drawer inline divider must paint Browser outline strokes: {print_lines:?}"
+        );
+
+        let site_out = render_site_styles_drawer_frame(&ctx);
+        let site_lines = painted_line_strokes(&site_out.shapes);
+        assert!(
+            site_lines
+                .iter()
+                .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "site-styles drawer section divider must paint Browser outline strokes: {site_lines:?}"
+        );
+    }
+
+    #[test]
+    fn browser_chrome_separators_use_browser_material_outline() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_chrome_separator_frame(&ctx);
+        let lines = painted_line_strokes(&out.shapes);
+        assert_eq!(
+            lines.len(),
+            2,
+            "full-width and inset Browser separators should each paint one divider line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
+            "Browser separators must paint only Material outline strokes: {lines:?}"
+        );
     }
 
     #[test]
