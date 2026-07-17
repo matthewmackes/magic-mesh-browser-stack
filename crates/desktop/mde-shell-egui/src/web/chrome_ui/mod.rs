@@ -5984,7 +5984,7 @@ pub(super) fn site_info_panel(
         );
         ui.add(
             egui::Label::new(
-                egui::RichText::new("Sensitive capabilities default to deny")
+                egui::RichText::new("Sensitive capabilities are blocked by default")
                     .small()
                     .color(CHROME_TEXT_DIM),
             )
@@ -6021,7 +6021,7 @@ pub(super) fn site_info_panel(
                 ui,
                 ChromeIcon::Warning,
                 format!(
-                    "{} permissions were forgotten; future requests re-prompt under default deny",
+                    "{} permissions were forgotten; future requests must be approved again",
                     permissions.host
                 ),
                 CHROME_WARN,

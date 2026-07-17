@@ -17480,13 +17480,23 @@ mod tests {
         assert!(
             state
                 .active_site_permission_summary()
-                .is_some_and(|summary| summary
-                    .contains("example.test: camera denied; helper default deny remains active")),
+                .is_some_and(|summary| summary.contains(
+                    "example.test: camera denied; sensitive prompts stay blocked by default"
+                ) && !summary.contains("helper")),
             "prompt history should be reflected in the active-site permission summary"
         );
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Camera prompt denied for example.test; helper default deny remains active")
+            Some(
+                "Camera prompt denied for example.test; sensitive prompts stay blocked by default"
+            )
+        );
+        assert!(
+            state
+                .capture_notice
+                .as_deref()
+                .is_some_and(|notice| !notice.contains("helper")),
+            "permission prompt notice must not expose helper internals"
         );
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
         let entries = persist
@@ -18861,10 +18871,17 @@ mod tests {
         }
         assert!(
             texts.iter().any(|(text, color)| {
-                text.contains("Sensitive capabilities default to deny")
+                text.contains("Sensitive capabilities are blocked by default")
                     && *color == chrome_ui::CHROME_TEXT_DIM
             }),
             "site-info explanatory copy should use Browser dim token: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("helper") || lower.contains("default deny")
+            }),
+            "site-info panel must not expose implementation policy wording: {texts:?}"
         );
         assert!(
             !texts.iter().any(|(_, color)| *color == Style::TEXT_DIM

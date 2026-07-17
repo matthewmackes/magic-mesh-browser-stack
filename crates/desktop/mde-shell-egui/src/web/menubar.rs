@@ -764,7 +764,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption(s.safe_browsing.clone()),
                 Entry::Caption(s.managed_policy.clone()),
                 Entry::Caption(format!(
-                    "Permissions: default deny ({DEFAULT_DENIED_PERMISSIONS})"
+                    "Permissions: blocked by default ({DEFAULT_DENIED_PERMISSIONS})"
                 )),
                 Entry::Separator,
                 Entry::Item(
@@ -1438,7 +1438,7 @@ mod tests {
             blocked: 3,
             current_site: Some("example.com".to_owned()),
             current_site_permissions: Some(
-                "example.com: all sensitive prompts denied by default".to_owned(),
+                "example.com: all sensitive prompts blocked by default".to_owned(),
             ),
             site_blocking_enabled: true,
             filter_lists: "Filter lists: 3 filter sources loaded".to_owned(),
@@ -2555,8 +2555,8 @@ mod tests {
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Permissions: default deny")),
-            "the default-deny permission manager policy is visible"
+                .any(|c| c.contains("Permissions: blocked by default")),
+            "the blocked-by-default permission manager policy is visible"
         );
         assert!(
             captions

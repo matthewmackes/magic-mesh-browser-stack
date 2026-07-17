@@ -284,7 +284,9 @@ impl WebState {
             .iter()
             .any(|site| site == &host)
         {
-            return Some(format!("{host}: forgotten; default deny remains active"));
+            return Some(format!(
+                "{host}: forgotten; sensitive prompts stay blocked by default"
+            ));
         }
         let prompts = self
             .site_permission_prompts
@@ -293,10 +295,10 @@ impl WebState {
             .map(|prompt| format!("{} {}", prompt.kind.wire(), prompt.decision))
             .collect::<Vec<_>>();
         if prompts.is_empty() {
-            Some(format!("{host}: all sensitive prompts denied by default"))
+            Some(format!("{host}: all sensitive prompts blocked by default"))
         } else {
             Some(format!(
-                "{host}: {}; helper default deny remains active",
+                "{host}: {}; sensitive prompts stay blocked by default",
                 prompts.join(", ")
             ))
         }
@@ -378,7 +380,7 @@ impl WebState {
             &body,
         );
         self.capture_notice = Some(format!(
-            "{} prompt denied for {host}; helper default deny remains active",
+            "{} prompt denied for {host}; sensitive prompts stay blocked by default",
             kind.label()
         ));
     }
