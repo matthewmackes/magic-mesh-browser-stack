@@ -6576,11 +6576,13 @@ fn bookmark_bar_button(
     ui: &mut egui::Ui,
     label: &str,
     accessibility_label: &str,
+    accessibility_value: &str,
     width: f32,
     tip: &str,
 ) -> egui::Response {
     let target_size = egui::vec2(width.max(44.0), CHROME_BUTTON);
     let (rect, response) = ui.allocate_exact_size(target_size, egui::Sense::click());
+    install_bookmark_button_accessibility(ui.ctx(), rect, accessibility_label, accessibility_value);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -6617,6 +6619,25 @@ fn bookmark_bar_button(
     chrome_hover_text(response, tip)
 }
 
+fn bookmark_button_accesskit_id(label: &str, value: &str) -> egui::Id {
+    egui::Id::new(("browser-bookmark-button", label, value))
+}
+
+fn install_bookmark_button_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    label: &str,
+    value: &str,
+) {
+    let _ = ctx.accesskit_node_builder(bookmark_button_accesskit_id(label, value), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(format!("Open bookmark {label}"));
+        node.set_value(value);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 fn bookmark_overflow_rows(
     ui: &mut egui::Ui,
     links: &[super::BookmarkBarLink],
@@ -6625,7 +6646,8 @@ fn bookmark_overflow_rows(
     for link in links {
         let label = ellipsize(&link.title, 40);
         let width = ui.available_width().max(180.0);
-        let resp = bookmark_bar_button(ui, &label, &link.title, width, link.url.as_str());
+        let resp =
+            bookmark_bar_button(ui, &label, &link.title, &link.url, width, link.url.as_str());
         if resp.clicked() {
             chosen = Some((link.url.clone(), false));
             ui.close_menu();
@@ -6669,6 +6691,7 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                         ui,
                         &label,
                         &link.title,
+                        &link.url,
                         BOOKMARK_BTN_W,
                         &format!("{}\n{}", link.title, link.url),
                     );
@@ -11968,6 +11991,47 @@ mod tests {
                 "{surface} bookmark button must paint a Browser bookmark path icon: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn browser_bookmark_buttons_export_accesskit_links() {
+        fn assert_bookmark_node(out: &egui::FullOutput, label: &str, value: &str, surface: &str) {
+            let nodes = accesskit_nodes(out);
+            let row = nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing {surface} AccessKit node {label:?}: {nodes:?}"));
+
+            assert_eq!(row.role(), egui::accesskit::Role::Button);
+            assert_eq!(row.value(), Some(value));
+            assert!(
+                row.supports_action(egui::accesskit::Action::Click),
+                "{surface} bookmark rows should expose the same click action as the painted button"
+            );
+        }
+
+        let bar_ctx = egui::Context::default();
+        bar_ctx.enable_accesskit();
+        mde_egui::fonts::install(&bar_ctx);
+        let bar = render_bookmarks_bar_overflow_frame(&bar_ctx);
+        assert_bookmark_node(
+            &bar,
+            "Open bookmark Bookmark 0",
+            "https://bookmark-0.example/",
+            "bookmarks bar",
+        );
+
+        let overflow_ctx = egui::Context::default();
+        overflow_ctx.enable_accesskit();
+        mde_egui::fonts::install(&overflow_ctx);
+        let overflow = render_bookmark_overflow_rows_frame(&overflow_ctx);
+        assert_bookmark_node(
+            &overflow,
+            "Open bookmark Bookmark 3",
+            "https://bookmark-3.example/",
+            "bookmarks overflow",
+        );
     }
 
     #[test]
