@@ -908,7 +908,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         ),
                         Entry::Separator,
                         Entry::Caption(
-                            "Native blocking, passkeys, reader mode, userscripts, and site \
+                            "Blocking, passkeys, reader mode, site fixups, and site \
                              styles are active for this Browser build."
                                 .to_owned(),
                         ),

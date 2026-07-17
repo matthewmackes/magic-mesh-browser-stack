@@ -2353,7 +2353,7 @@ pub(super) fn tab_status_chips(tab: &Tab) -> Vec<TabStatusChip> {
     if tab.user_scripts {
         chips.push(TabStatusChip {
             icon: ChromeIcon::Edit,
-            label: "Curated userscripts",
+            label: "Site fixups",
             tone: TabStatusChipTone::Accent,
         });
     }
@@ -3598,7 +3598,7 @@ pub(super) fn tab_hover(tab: &Tab) -> String {
     let force_dark = if tab.force_dark { " - Force dark" } else { "" };
     let reader = if tab.reader_mode { " - Reader" } else { "" };
     let user_scripts = if tab.user_scripts {
-        " - Curated userscripts"
+        " - Site fixups"
     } else {
         ""
     };
@@ -4092,9 +4092,9 @@ fn horizontal_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 ui.close_menu();
                             }
                             let scripts_label = if tab.user_scripts {
-                                "Disable userscripts"
+                                "Disable site fixups"
                             } else {
-                                "Enable userscripts"
+                                "Enable site fixups"
                             };
                             if tab_context_menu_row(ui, scripts_label, ChromeIcon::Edit, true)
                                 .clicked()
@@ -4475,9 +4475,9 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                         ui.close_menu();
                                     }
                                     let scripts_label = if tab.user_scripts {
-                                        "Disable userscripts"
+                                        "Disable site fixups"
                                     } else {
-                                        "Enable userscripts"
+                                        "Enable site fixups"
                                     };
                                     if tab_context_menu_row(
                                         ui,
@@ -8199,6 +8199,11 @@ mod tests {
                 label: "Force dark",
                 tone: TabStatusChipTone::Accent,
             },
+            TabStatusChip {
+                icon: ChromeIcon::Edit,
+                label: "Site fixups",
+                tone: TabStatusChipTone::Accent,
+            },
         ];
         ctx.run(
             egui::RawInput {
@@ -8235,6 +8240,7 @@ mod tests {
             mde_web_preview_client::WebSession::from_stream(shell, None).expect("tab session");
         state.push_session_with_engine(session, BrowserEngine::Cef);
         state.tabs[0].force_dark = true;
+        state.tabs[0].user_scripts = true;
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -8399,6 +8405,8 @@ mod tests {
                         let _ =
                             tab_context_menu_row(ui, "Work container", ChromeIcon::Privacy, false);
                         let _ = tab_context_menu_row(ui, "Display 2", ChromeIcon::View, true);
+                        let _ =
+                            tab_context_menu_row(ui, "Enable site fixups", ChromeIcon::Edit, true);
                         let _ = tab_context_menu_row(ui, "Close tab", ChromeIcon::Close, true);
                     });
                 });
@@ -9925,6 +9933,7 @@ mod tests {
         assert_painted_text_color(&texts, "Duplicate tab", CHROME_TEXT);
         assert_painted_text_color(&texts, "Work container", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Display 2", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Enable site fixups", CHROME_TEXT);
         assert_painted_text_color(&texts, "Close tab", CHROME_TEXT);
         for label in [
             "Move tab left",
@@ -9933,6 +9942,7 @@ mod tests {
             "Duplicate tab",
             "Work container",
             "Display 2",
+            "Enable site fixups",
             "Close tab",
         ] {
             assert!(
@@ -11262,6 +11272,13 @@ mod tests {
         let out = render_tab_status_chips_frame(&ctx);
         let texts = painted_text(&out.shapes);
         assert_painted_text_color(&texts, "Example page", CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("userscripts") || lower.contains("curated userscripts")
+            }),
+            "tab status paint must not expose Userscripts wording: {texts:?}"
+        );
         for legacy in ["W ", "D2 ", "D ", "\u{25D2} "] {
             assert!(
                 !texts.iter().any(|(text, _)| text.contains(legacy)),
@@ -11295,6 +11312,19 @@ mod tests {
                 text.contains("Engine: Chromium") && *color == CHROME_TEXT_DIM
             }),
             "tab hover card must paint the engine summary with Browser dim text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, color)| text.contains("Site fixups") && *color == CHROME_TEXT_DIM),
+            "tab hover card must paint Site fixups with Browser dim text: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("userscripts") || lower.contains("curated userscripts")
+            }),
+            "tab hover card must not expose Userscripts wording: {texts:?}"
         );
         assert!(
             !texts.iter().any(|(text, color)| {

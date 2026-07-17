@@ -55,7 +55,7 @@ fn tab_accessibility_tools(tab: &Tab) -> String {
         tools.push("reader mode");
     }
     if tab.user_scripts {
-        tools.push("userscripts");
+        tools.push("site fixups");
     }
     if tab.page_focused {
         tools.push("page keyboard focus");
