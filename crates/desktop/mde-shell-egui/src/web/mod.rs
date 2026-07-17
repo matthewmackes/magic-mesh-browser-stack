@@ -2462,8 +2462,23 @@ impl WebState {
         })
     }
 
-    fn request_active_live_page_repaint(&self, ctx: &egui::Context) {
-        if self.active_live_page_needs_repaint() {
+    fn media_pip_needs_repaint(&self) -> bool {
+        if !self.media_pip_open {
+            return false;
+        }
+        let Some(index) = browser_media_status_tab_index(self) else {
+            return false;
+        };
+        self.tabs.get(index).is_some_and(|tab| {
+            tab.internal_page.is_none()
+                && !tab.idle_suspended
+                && !tab.session.is_crashed()
+                && tab_media_is_playing(tab)
+        })
+    }
+
+    fn request_browser_frame_repaint(&self, ctx: &egui::Context) {
+        if self.active_live_page_needs_repaint() || self.media_pip_needs_repaint() {
             ctx.request_repaint_after(LIVE_PAGE_REPAINT_INTERVAL);
         }
     }
@@ -6694,7 +6709,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.finish_browser_panel_poll();
     state.upload_active_frame(ui.ctx());
     state.upload_media_pip_frame(ui.ctx());
-    state.request_active_live_page_repaint(ui.ctx());
+    state.request_browser_frame_repaint(ui.ctx());
     chrome_ui::install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
 
     // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
@@ -6823,6 +6838,17 @@ fn media_metadata_chip_label(body: &str) -> Option<String> {
         |artist| format!("Now: {title} - {artist}"),
     );
     Some(ellipsize(&label, 32))
+}
+
+fn tab_media_is_playing(tab: &Tab) -> bool {
+    if tab.session.audible() {
+        return true;
+    }
+    tab.session
+        .media_metadata()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata.body).ok())
+        .and_then(|value| value.get("paused").and_then(serde_json::Value::as_bool))
+        .is_some_and(|paused| !paused)
 }
 
 /// The crash reason string for a session, or empty if it has not crashed.
@@ -11320,6 +11346,50 @@ mod tests {
         assert!(
             page_texture_rect(&prims, media_texture).is_some(),
             "PiP should paint the background media tab texture"
+        );
+    }
+
+    #[test]
+    fn browser_media_pip_requests_idle_repaint_when_active_tab_is_internal_page() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background PiP","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        assert!(run_until_texture(&mut state));
+
+        state.open_options_tab();
+        state.media_pip_open = true;
+
+        assert_eq!(
+            state.active_internal_page(),
+            Some(BrowserInternalPage::Options)
+        );
+        assert!(
+            !state.active_live_page_needs_repaint(),
+            "the regression setup must not be satisfied by the active page heartbeat"
+        );
+        assert!(
+            state.media_pip_needs_repaint(),
+            "playing background PiP media must keep polling without pointer input"
+        );
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        assert!(
+            repaint_delay <= LIVE_PAGE_REPAINT_INTERVAL,
+            "background Browser PiP media must schedule frame polling without mouse input (delay {repaint_delay:?})"
         );
     }
 
