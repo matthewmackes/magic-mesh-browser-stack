@@ -921,17 +921,15 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Media Manifest exports observed image/media/HLS/DASH requests; \
                              Download Observed Media queues per-asset request files through \
                              Transfers, Download Observed Images narrows that batch to every \
-                             observed image candidate, and blocked resources are marked for \
-                             Power-mode ignore-blocking retrieval. Transfers now performs native \
-                             direct/HLS/DASH fetches."
+                             observed image candidate, and blocked resources can be retried with \
+                             a direct fetch. Transfers handles direct, HLS, and DASH downloads."
                                 .to_owned(),
                         ),
                         Entry::Caption(
                             "Export Page Scrape requests visible text plus DOM links/headings, writes \
                              bounded crawl seed/article/crawl-manifest JSON/CSV/Markdown artifacts, \
-                             and submits the files through Transfers; the daemon executes bounded \
-                             same-origin depth-1 crawl packages while deeper recursive discovery remains \
-                             open."
+                             and sends the files to Transfers. Crawl packages are limited to same-site \
+                             depth 1 so exports stay predictable."
                                 .to_owned(),
                         ),
                     ],
@@ -1654,6 +1652,9 @@ mod tests {
                     && !c.contains("placeholder")
                     && !c.contains("stub")
                     && !c.contains("v1")
+                    && !c.contains("Power-mode")
+                    && !c.contains("recursive discovery")
+                    && !c.contains("remains open")
             }),
             "Power menu captions must not expose internal planning terms: {captions:?}"
         );
