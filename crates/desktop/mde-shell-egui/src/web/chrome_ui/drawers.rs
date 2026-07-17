@@ -44,6 +44,45 @@ pub(super) fn download_drawer_subtitle(
     }
 }
 
+fn download_row_accesskit_id(job: &mde_files_egui::transfers::TransferJob) -> egui::Id {
+    egui::Id::new(("browser-download-row", job.id.as_str()))
+}
+
+fn download_row_accesskit_value(job: &mde_files_egui::transfers::TransferJob) -> String {
+    let mut parts = vec![
+        format!("State {}", job.state.label()),
+        format!("Route {}", job.route()),
+    ];
+    if let Some(progress) = job.progress {
+        parts.push(format!("Progress {}%", progress.min(100)));
+    }
+    if job.policy.verify {
+        parts.push("Verification enabled".to_owned());
+    }
+    if let Some(error) = &job.error {
+        parts.push(format!("Error {error}"));
+    }
+    parts.join(", ")
+}
+
+fn install_download_row_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    job: &mde_files_egui::transfers::TransferJob,
+) {
+    let _ = ctx.accesskit_node_builder(download_row_accesskit_id(job), |node| {
+        node.set_role(egui::accesskit::Role::Row);
+        node.set_label(format!("Download {}", short_transfer_name(job)));
+        node.set_value(download_row_accesskit_value(job));
+        node.set_bounds(accesskit_rect(rect));
+        if let Some(progress) = job.progress {
+            node.set_numeric_value(f64::from(progress.min(100)));
+            node.set_min_numeric_value(0.0);
+            node.set_max_numeric_value(100.0);
+        }
+    });
+}
+
 fn drawer_button_widget(
     label: impl Into<String>,
     role: BrowserActionRole,
@@ -907,7 +946,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             for job in jobs.iter().take(6) {
                 drawer_separator(ui);
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
@@ -1001,6 +1040,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         }
                     });
                 });
+                install_download_row_accessibility(ui.ctx(), row.response.rect, job);
             }
 
             let hidden = jobs.len().saturating_sub(6);

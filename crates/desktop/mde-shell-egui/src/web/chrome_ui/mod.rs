@@ -11343,6 +11343,34 @@ mod tests {
     }
 
     #[test]
+    fn browser_download_rows_export_accesskit_status() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_progress_downloads_drawer_frame(&ctx);
+        let nodes = accesskit_nodes(&out);
+        let row = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Download movie.webm"))
+            .unwrap_or_else(|| panic!("missing download row AccessKit node: {nodes:?}"));
+
+        assert_eq!(row.role(), egui::accesskit::Role::Row);
+        let value = row.value().expect("download row value");
+        assert!(value.contains("State running"), "{value}");
+        assert!(value.contains("Route /tmp/movie.webm"), "{value}");
+        assert!(value.contains("/home/mm/Downloads"), "{value}");
+        assert!(value.contains("Progress 42%"), "{value}");
+        assert_eq!(row.numeric_value(), Some(42.0));
+        assert_eq!(row.min_numeric_value(), Some(0.0));
+        assert_eq!(row.max_numeric_value(), Some(100.0));
+        assert!(
+            !row.supports_action(egui::accesskit::Action::Click),
+            "download rows are read-only summaries; command buttons own actions"
+        );
+    }
+
+    #[test]
     fn browser_download_drawer_header_uses_user_facing_status() {
         assert_eq!(
             drawers::download_drawer_subtitle(false, 0, 0),
