@@ -3120,6 +3120,84 @@ fn option_row_width(available_width: f32) -> f32 {
     available_width.max(0.0).min(OPTION_ROW_MAX_W)
 }
 
+fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
+    use super::menubar::MenuAction;
+    match action {
+        MenuAction::OpenAddress => "Type an address in a live tab first",
+        MenuAction::Back => "No back-history entry is available",
+        MenuAction::Forward => "No forward-history entry is available",
+        MenuAction::ReopenClosedTab => "No closed Browser tab is available to reopen",
+        MenuAction::Reload => "Open a Browser tab first",
+        MenuAction::TogglePowerMode => "Power Mode requires a live or internal Browser tab",
+        MenuAction::CycleContainer
+        | MenuAction::CycleDisplayTarget
+        | MenuAction::ZoomIn
+        | MenuAction::ZoomOut
+        | MenuAction::ResetZoom
+        | MenuAction::OpenFind
+        | MenuAction::ToggleAudioMute
+        | MenuAction::ToggleMediaPlayback
+        | MenuAction::ToggleAutoplayBlock
+        | MenuAction::ToggleForceDark
+        | MenuAction::ToggleReaderMode
+        | MenuAction::ToggleUserScripts
+        | MenuAction::OpenSiteStyles
+        | MenuAction::CheckSpelling
+        | MenuAction::ReadAloud
+        | MenuAction::TranslatePage
+        | MenuAction::SaveOfflineCopy
+        | MenuAction::VoiceCommand
+        | MenuAction::Dictate
+        | MenuAction::PrintPage
+        | MenuAction::TogglePrintSettings
+        | MenuAction::SavePdf
+        | MenuAction::CycleUserAgent
+        | MenuAction::CycleDeviceProfile => "Requires a live helper-backed page",
+        MenuAction::CaptureViewport
+        | MenuAction::CaptureFullPage
+        | MenuAction::CaptureMhtml
+        | MenuAction::CaptureAnnotatedViewport
+        | MenuAction::CaptureCalloutViewport
+        | MenuAction::CaptureFreehandViewport
+        | MenuAction::CaptureRegion => "Requires a live page with a painted frame",
+        MenuAction::TogglePictureInPicture => {
+            "Requires Browser media metadata and a retained video frame"
+        }
+        MenuAction::OpenLastPdf => "Requires a readable PDF saved from Browser",
+        MenuAction::OpenChromiumDevtools => "Requires a live CEF / Chromium page",
+        MenuAction::OpenViewSource
+        | MenuAction::ExportActivePageScrape
+        | MenuAction::ExportMediaManifest
+        | MenuAction::DownloadObservedMedia
+        | MenuAction::DownloadObservedImages
+        | MenuAction::CopyUrl
+        | MenuAction::AddBookmark
+        | MenuAction::SendInChat
+        | MenuAction::ShareToPeer
+        | MenuAction::ShareToPhone
+        | MenuAction::ShareToEmail
+        | MenuAction::ShareToQr
+        | MenuAction::SendTabToNode
+        | MenuAction::SendTabToPhone => "Requires a loaded page URL",
+        MenuAction::PromptCameraPermission
+        | MenuAction::PromptMicrophonePermission
+        | MenuAction::PromptLocationPermission
+        | MenuAction::PromptNotificationsPermission
+        | MenuAction::PromptClipboardPermission
+        | MenuAction::ToggleSiteBlocking
+        | MenuAction::ForgetSitePermissions => "Requires a loaded first-party site",
+        MenuAction::ClearCurrentTabData | MenuAction::ClearAllBrowsingData => {
+            "Open a non-crashed Browser tab first"
+        }
+        MenuAction::SelectEngine(_)
+        | MenuAction::ToggleVerticalTabs
+        | MenuAction::ToggleDownloads
+        | MenuAction::ToggleHistory
+        | MenuAction::ToggleBookmarksBar
+        | MenuAction::OpenBookmarksManager => "Available from Browser Options",
+    }
+}
+
 fn bounded_available_width(ui: &egui::Ui) -> f32 {
     let clip_remaining = (ui.clip_rect().right() - ui.next_widget_position().x).max(0.0);
     ui.available_width().max(0.0).min(clip_remaining)
@@ -3231,7 +3309,7 @@ fn option_row(
     let response = if item.enabled {
         response
     } else {
-        chrome_hover_text(response, "Unavailable in the current browser context")
+        chrome_hover_text(response, disabled_option_tip(item.id))
     };
     (response.clicked() && item.enabled).then_some(item.id)
 }
@@ -9004,6 +9082,52 @@ mod tests {
         assert_eq!(option_row_width(0.0), 0.0);
         assert_eq!(option_row_width(180.0), 180.0);
         assert_eq!(option_row_width(OPTION_ROW_MAX_W + 200.0), OPTION_ROW_MAX_W);
+    }
+
+    #[test]
+    fn browser_options_disabled_rows_explain_their_command_gate() {
+        use super::super::menubar::MenuAction;
+
+        assert_eq!(
+            disabled_option_tip(MenuAction::OpenAddress),
+            "Type an address in a live tab first"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::Back),
+            "No back-history entry is available"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::ReopenClosedTab),
+            "No closed Browser tab is available to reopen"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::OpenFind),
+            "Requires a live helper-backed page"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::CaptureViewport),
+            "Requires a live page with a painted frame"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::OpenLastPdf),
+            "Requires a readable PDF saved from Browser"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::OpenChromiumDevtools),
+            "Requires a live CEF / Chromium page"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::DownloadObservedMedia),
+            "Requires a loaded page URL"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::PromptCameraPermission),
+            "Requires a loaded first-party site"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::ClearAllBrowsingData),
+            "Open a non-crashed Browser tab first"
+        );
     }
 
     #[test]
