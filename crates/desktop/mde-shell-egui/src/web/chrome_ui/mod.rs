@@ -289,7 +289,7 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
 
 pub(super) const fn engine_display_name(engine: BrowserEngine) -> &'static str {
     match engine {
-        BrowserEngine::Cef => "CEF / Chromium",
+        BrowserEngine::Cef => "Chromium",
         BrowserEngine::Servo => "Servo",
     }
 }
@@ -3176,7 +3176,7 @@ fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
         | MenuAction::CaptureRegion => "Requires a live page with a painted frame",
         MenuAction::TogglePictureInPicture => "Start video playback in a Browser tab first",
         MenuAction::OpenLastPdf => "Requires a readable PDF saved from Browser",
-        MenuAction::OpenChromiumDevtools => "Requires a live CEF / Chromium page",
+        MenuAction::OpenChromiumDevtools => "Requires a live Chromium page",
         MenuAction::OpenViewSource
         | MenuAction::ExportActivePageScrape
         | MenuAction::ExportMediaManifest
@@ -9164,7 +9164,7 @@ mod tests {
         );
         assert_eq!(
             disabled_option_tip(MenuAction::OpenChromiumDevtools),
-            "Requires a live CEF / Chromium page"
+            "Requires a live Chromium page"
         );
         assert_eq!(
             disabled_option_tip(MenuAction::DownloadObservedMedia),
@@ -9688,7 +9688,7 @@ mod tests {
 
     #[test]
     fn engine_selector_uses_browser_local_labels_and_state() {
-        assert_eq!(engine_display_name(BrowserEngine::Cef), "CEF / Chromium");
+        assert_eq!(engine_display_name(BrowserEngine::Cef), "Chromium");
         assert_eq!(engine_marker(BrowserEngine::Cef), "CEF");
         assert_eq!(engine_glyph(BrowserEngine::Cef), "C");
         assert_eq!(engine_display_name(BrowserEngine::Servo), "Servo");
@@ -11065,13 +11065,13 @@ mod tests {
         let texts = painted_text(&out.shapes);
         assert!(
             texts.iter().any(|(text, color)| {
-                text.contains("Engine: CEF / Chromium") && *color == CHROME_TEXT_DIM
+                text.contains("Engine: Chromium") && *color == CHROME_TEXT_DIM
             }),
             "tab hover card must paint the engine summary with Browser dim text: {texts:?}"
         );
         assert!(
             !texts.iter().any(|(text, color)| {
-                text.contains("Engine: CEF / Chromium")
+                text.contains("Engine: Chromium")
                     && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)
             }),
             "tab hover card leaked shared shell text color: {texts:?}"

@@ -6603,7 +6603,7 @@ impl WebState {
         if engine == BrowserEngine::Cef {
             if let Some(missing) = cef_runtime_missing_path() {
                 self.gate_notice = Some(format!(
-                    "The Chromium/CEF runtime is not installed (missing {}).",
+                    "The Chromium engine is not installed (missing {}).",
                     missing.display()
                 ));
                 return None;
@@ -6663,7 +6663,7 @@ impl WebState {
             .or(status.last_update_error.as_deref())
             .unwrap_or("runtime verification failed");
         Some(format!(
-            "The Chromium/CEF runtime is not current (state: {}; expected {}; installed {}; reason: {}).",
+            "The Chromium engine is not current (state: {}; expected {}; installed {}; reason: {}).",
             status.state, expected, installed, reason
         ))
     }
@@ -10902,7 +10902,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|(text, color)| text == "Use CEF / Chromium for New Tabs"
+                .any(|(text, color)| text == "Use Chromium for New Tabs"
                     && *color == chrome_ui::CHROME_TEXT),
             "engine controls render through the Options command model: {texts:?}"
         );
@@ -13532,8 +13532,12 @@ mod tests {
             "CEF/Chromium tabs should carry a compact CEF badge marker"
         );
         assert!(
-            chrome_ui::tab_hover(&state.tabs[0]).contains("Engine: CEF / Chromium"),
-            "CEF/Chromium hover card should name the engine stack"
+            chrome_ui::tab_hover(&state.tabs[0]).contains("Engine: Chromium"),
+            "CEF-backed hover card should name the user-facing engine"
+        );
+        assert!(
+            !chrome_ui::tab_hover(&state.tabs[0]).contains("CEF / Chromium"),
+            "CEF-backed hover card should not expose implementation pairing"
         );
         assert!(
             chrome_ui::engine_marker(state.tabs[1].engine) == "Servo",
@@ -22756,7 +22760,7 @@ mod tests {
         assert!(state.tabs.is_empty());
         let notice = state.gate_notice.as_deref().unwrap_or_default();
         assert!(
-            notice.contains("Chromium/CEF runtime") && notice.contains(CEF_LIB_NAME),
+            notice.contains("Chromium engine") && notice.contains(CEF_LIB_NAME),
             "the CEF runtime gate names the missing library: {notice}"
         );
     }

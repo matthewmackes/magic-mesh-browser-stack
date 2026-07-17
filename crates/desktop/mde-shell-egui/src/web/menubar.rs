@@ -469,7 +469,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Item(
                     Item::new(
                         MenuAction::SelectEngine(BrowserEngine::Cef),
-                        "Use CEF / Chromium for New Tabs",
+                        "Use Chromium for New Tabs",
                     )
                     .checked(s.future_engine == BrowserEngine::Cef),
                 ),
@@ -1483,7 +1483,7 @@ mod tests {
                 _ => None,
             })
             .expect("Servo engine row present");
-        assert_eq!(cef.label, "Use CEF / Chromium for New Tabs");
+        assert_eq!(cef.label, "Use Chromium for New Tabs");
         assert_eq!(cef.checked, Some(false));
         assert_eq!(servo.checked, Some(true));
 
@@ -2374,7 +2374,7 @@ mod tests {
                         item.enabled,
                         matches!(
                             item.label.as_str(),
-                            "Use CEF / Chromium for New Tabs"
+                            "Use Chromium for New Tabs"
                                 | "Use Servo for New Tabs"
                                 | "Vertical Tabs"
                                 | "Show Downloads"
