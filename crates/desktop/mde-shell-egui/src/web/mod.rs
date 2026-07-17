@@ -338,6 +338,9 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Active live Browser pages must keep the DRM loop waking even without pointer
 /// input; otherwise video/canvas pages only advance when another event arrives.
 const LIVE_PAGE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+/// Static Browser pages still need a light heartbeat so helper events are drained
+/// without pointer input, but they must not pin the bare DRM shell at 60 Hz.
+const LIVE_PAGE_IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Debounces browser-panel viewport-size changes (browser-1, item 2).
 ///
@@ -2570,16 +2573,24 @@ impl WebState {
     }
 
     fn active_live_page_needs_repaint(&self) -> bool {
-        self.tabs.get(self.active).is_some_and(|tab| {
-            tab.internal_page.is_none()
-                && !tab.idle_suspended
-                && !tab.session.is_crashed()
-                && (tab.texture.is_some()
-                    || tab.last_frame.is_some()
-                    || tab.session.nav().loading
-                    || tab.session.media_metadata().is_some()
-                    || tab.session.audible())
-        })
+        self.active_live_page_repaint_interval().is_some()
+    }
+
+    fn active_live_page_repaint_interval(&self) -> Option<Duration> {
+        let tab = self.tabs.get(self.active)?;
+        if tab.internal_page.is_some() || tab.idle_suspended || tab.session.is_crashed() {
+            return None;
+        }
+        if tab.session.nav().loading
+            || tab.session.media_metadata().is_some()
+            || tab.session.audible()
+        {
+            return Some(LIVE_PAGE_REPAINT_INTERVAL);
+        }
+        if tab.texture.is_some() || tab.last_frame.is_some() {
+            return Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL);
+        }
+        None
     }
 
     fn media_pip_needs_repaint(&self) -> bool {
@@ -2598,8 +2609,13 @@ impl WebState {
     }
 
     fn request_browser_frame_repaint(&self, ctx: &egui::Context) {
-        if self.active_live_page_needs_repaint() || self.media_pip_needs_repaint() {
-            ctx.request_repaint_after(LIVE_PAGE_REPAINT_INTERVAL);
+        let delay = if self.media_pip_needs_repaint() {
+            Some(LIVE_PAGE_REPAINT_INTERVAL)
+        } else {
+            self.active_live_page_repaint_interval()
+        };
+        if let Some(delay) = delay {
+            ctx.request_repaint_after(delay);
         }
     }
 
@@ -14400,6 +14416,11 @@ mod tests {
         let mut state = WebState::default();
         state.push_session(session);
         assert!(run_until_texture(&mut state));
+        assert_eq!(
+            state.active_live_page_repaint_interval(),
+            Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
+            "a settled static page should keep a low-rate helper heartbeat"
+        );
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -14410,8 +14431,29 @@ mod tests {
             .expect("root viewport output")
             .repaint_delay;
         assert!(
-            repaint_delay <= LIVE_PAGE_REPAINT_INTERVAL,
-            "active live Browser pages must keep polling frames without mouse input (delay {repaint_delay:?})"
+            repaint_delay <= LIVE_PAGE_IDLE_REPAINT_INTERVAL,
+            "settled Browser pages must keep polling frames without mouse input at a bounded low rate (delay {repaint_delay:?})"
+        );
+    }
+
+    #[test]
+    fn active_browser_media_page_keeps_fast_repaint_heartbeat() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Google video","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            state.active_live_page_repaint_interval(),
+            Some(LIVE_PAGE_REPAINT_INTERVAL),
+            "active media pages need the fast idle repaint cadence"
         );
     }
 
