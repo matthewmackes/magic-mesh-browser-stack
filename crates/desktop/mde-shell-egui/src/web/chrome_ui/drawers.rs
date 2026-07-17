@@ -83,6 +83,26 @@ fn install_download_row_accessibility(
     });
 }
 
+fn history_row_accesskit_id(index: usize, url: &str) -> egui::Id {
+    egui::Id::new(("browser-history-row", index, url))
+}
+
+fn install_history_row_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    index: usize,
+    label: &str,
+    url: &str,
+) {
+    let _ = ctx.accesskit_node_builder(history_row_accesskit_id(index, url), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(format!("Open history entry {label}"));
+        node.set_value(url);
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
 fn drawer_button_widget(
     label: impl Into<String>,
     role: BrowserActionRole,
@@ -798,19 +818,23 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 .max_height(220.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for visit in state.history.visits() {
+                    for (index, visit) in state.history.visits().enumerate() {
                         let label = if visit.title.trim().is_empty() {
                             visit.url.clone()
                         } else {
                             visit.title.clone()
                         };
                         let elided = ellipsize(&label, 72);
-                        if chrome_hover_text(
-                            super::chrome_menu_row(ui, &elided, ChromeIcon::History, true, ""),
-                            visit.url.clone(),
-                        )
-                        .clicked()
-                        {
+                        let response =
+                            super::chrome_menu_row(ui, &elided, ChromeIcon::History, true, "");
+                        install_history_row_accessibility(
+                            ui.ctx(),
+                            response.rect,
+                            index,
+                            &label,
+                            &visit.url,
+                        );
+                        if chrome_hover_text(response, visit.url.clone()).clicked() {
                             open_url = Some(visit.url.clone());
                         }
                     }

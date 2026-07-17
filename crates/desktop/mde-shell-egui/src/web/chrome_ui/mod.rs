@@ -11052,6 +11052,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_history_rows_export_accesskit_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_history_drawer_frame(&ctx);
+        let nodes = accesskit_nodes(&out);
+        let row = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Open history entry Example Page"))
+            .unwrap_or_else(|| panic!("missing history row AccessKit node: {nodes:?}"));
+
+        assert_eq!(row.role(), egui::accesskit::Role::Button);
+        assert_eq!(row.value(), Some("https://example.test/"));
+        assert!(
+            row.supports_action(egui::accesskit::Action::Click),
+            "history rows should expose the same click action as the painted row"
+        );
+    }
+
+    #[test]
     fn browser_drawer_close_buttons_use_painted_close_icons() {
         let ctx = egui::Context::default();
         mde_egui::fonts::install(&ctx);
