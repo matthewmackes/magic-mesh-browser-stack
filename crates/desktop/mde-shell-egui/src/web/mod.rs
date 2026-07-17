@@ -9107,6 +9107,8 @@ mod tests {
         state.push_session(session);
         state.tabs[state.active].force_dark = true;
         state.tabs[state.active].reader_mode = true;
+        state.tabs[state.active].container = ContainerProfile::Work;
+        state.tabs[state.active].display_target = DisplayTarget::Secondary;
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         Style::install(&ctx);
@@ -9126,6 +9128,8 @@ mod tests {
         assert!(browser_value.contains("https://example.test/"));
         assert!(browser_value.contains("force dark"));
         assert!(browser_value.contains("reader mode"));
+        assert!(browser_value.contains("Work browsing profile"));
+        assert!(browser_value.contains("opens on secondary display"));
 
         let page = nodes
             .iter()
@@ -9134,15 +9138,17 @@ mod tests {
             .expect("browser page accesskit node");
         assert_eq!(page.role(), egui::accesskit::Role::Button);
         let page_value = page.value().expect("browser page value");
-        assert!(
-            !page_value.contains("CEF"),
-            "test session defaults to Servo"
-        );
         assert!(page_value.contains("Click the page canvas to focus keyboard input"));
+        for leaked in ["CEF", "Servo", "internal", "container", "display target"] {
+            assert!(
+                !browser_value.contains(leaked) && !page_value.contains(leaked),
+                "Browser AccessKit copy must stay user-facing; leaked {leaked:?}: {browser_value} / {page_value}"
+            );
+        }
     }
 
     #[test]
-    fn browser_options_tab_accesskit_names_the_internal_page() {
+    fn browser_options_tab_accesskit_uses_user_facing_page_summary() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         Style::install(&ctx);
@@ -9157,9 +9163,21 @@ mod tests {
             .find(|node| node.label() == Some("Browser status"))
             .expect("browser status accesskit node");
         let value = browser.value().expect("browser status value");
-        assert!(value.contains("Browser internal page"));
+        assert!(value.contains("Browser Options page"));
         assert!(value.contains("Browser Options"));
         assert!(value.contains(BROWSER_OPTIONS_URL));
+        for leaked in [
+            "Browser internal page",
+            "internal",
+            "container",
+            "display target",
+            "helper session",
+        ] {
+            assert!(
+                !value.contains(leaked),
+                "Options AccessKit summary must not expose implementation wording {leaked:?}: {value}"
+            );
+        }
         assert!(
             !value.contains("Untitled") && !value.contains("about:blank"),
             "Options AccessKit summary must not leak the inert helper session: {value}"

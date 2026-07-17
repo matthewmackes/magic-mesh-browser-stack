@@ -67,16 +67,26 @@ fn tab_accessibility_tools(tab: &Tab) -> String {
     }
 }
 
+fn tab_accessibility_context(tab: &Tab) -> Vec<String> {
+    let mut context = Vec::new();
+    if tab.container != ContainerProfile::None {
+        context.push(format!("{} browsing profile", tab.container.label()));
+    }
+    if tab.display_target != DisplayTarget::Current {
+        context.push(format!(
+            "opens on {}",
+            tab.display_target.label().to_ascii_lowercase()
+        ));
+    }
+    context
+}
+
 fn tab_accessibility_summary(tab: &Tab) -> String {
     if let Some(page) = tab.internal_page {
-        return format!(
-            "Browser internal page, {}, {}, internal, container {}, display target {}, {}",
-            page.title(),
-            page.url(),
-            tab.container.label(),
-            tab.display_target.label(),
-            tab_accessibility_tools(tab)
-        );
+        let mut details = vec![format!("{} page", page.title()), page.url().to_owned()];
+        details.extend(tab_accessibility_context(tab));
+        details.push(tab_accessibility_tools(tab));
+        return details.join(", ");
     }
 
     let nav = tab.session.nav();
@@ -93,17 +103,18 @@ fn tab_accessibility_summary(tab: &Tab) -> String {
     } else if url.starts_with("http://") {
         "not secure"
     } else {
-        "local or internal"
+        "local or browser page"
     };
-    format!(
-        "{} page, {title}, {url}, {}, {}, container {}, display target {}, {}",
-        engine_display_name(tab.engine),
+    let mut details = vec![
+        "Web page".to_owned(),
+        title.to_owned(),
+        url.to_owned(),
         tab_accessibility_state(tab),
-        security,
-        tab.container.label(),
-        tab.display_target.label(),
-        tab_accessibility_tools(tab)
-    )
+        security.to_owned(),
+    ];
+    details.extend(tab_accessibility_context(tab));
+    details.push(tab_accessibility_tools(tab));
+    details.join(", ")
 }
 
 fn browser_gate_notice(state: &WebState) -> &str {
