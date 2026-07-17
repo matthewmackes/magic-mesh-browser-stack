@@ -2843,11 +2843,11 @@ impl WebState {
     fn open_chromium_devtools(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else {
             self.capture_notice =
-                Some("Chromium DevTools unavailable: no live CEF page".to_owned());
+                Some("Chromium DevTools unavailable: no live Chromium page".to_owned());
             return;
         };
         if tab.engine != BrowserEngine::Cef || tab.session.is_crashed() {
-            self.capture_notice = Some("Chromium DevTools requires a live CEF tab".to_owned());
+            self.capture_notice = Some("Chromium DevTools requires a live Chromium tab".to_owned());
             return;
         }
         let active_url = tab.session.nav().url.trim().to_owned();
@@ -4722,7 +4722,7 @@ impl WebState {
     fn open_last_saved_pdf(&mut self) {
         match self.last_saved_pdf_viewer_url() {
             Ok(url) => {
-                self.capture_notice = Some("Opening PDF in CEF viewer".to_owned());
+                self.capture_notice = Some("Opening PDF in Chromium viewer".to_owned());
                 self.request_new_tab_with_url(BrowserEngine::Cef, url);
             }
             Err(err) => {
@@ -5093,7 +5093,7 @@ impl WebState {
             Ok(handoff_body) => {
                 let Some(client_request_id) = passkey_client_request_id(body) else {
                     self.capture_notice =
-                        Some("Passkey: ignored helper event (missing request id)".to_owned());
+                        Some("Passkey: ignored page request (missing request id)".to_owned());
                     return;
                 };
                 if self.pending_passkey_consent.is_some() {
@@ -5120,12 +5120,12 @@ impl WebState {
                     }
                     Err(err) => {
                         self.capture_notice =
-                            Some(format!("Passkey: ignored helper event ({err})"));
+                            Some(format!("Passkey: ignored page request ({err})"));
                     }
                 }
             }
             Err(err) => {
-                self.capture_notice = Some(format!("Passkey: ignored helper event ({err})"));
+                self.capture_notice = Some(format!("Passkey: ignored page request ({err})"));
             }
         }
     }
@@ -9534,7 +9534,7 @@ mod tests {
         );
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Opening PDF in CEF viewer")
+            Some("Opening PDF in Chromium viewer")
         );
     }
 
@@ -16989,7 +16989,7 @@ mod tests {
         assert_eq!(state.take_open_request(), None);
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Chromium DevTools requires a live CEF tab")
+            Some("Chromium DevTools requires a live Chromium tab")
         );
     }
 
@@ -19555,6 +19555,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_passkey_request_notice_uses_page_copy() {
+        let mut state = WebState::default();
+
+        state.handle_passkey_event(
+            1,
+            BrowserEngine::Cef,
+            r#"{
+                "ceremony":"get",
+                "origin":"https://login.example/auth",
+                "rp_id":"login.example",
+                "challenge_b64url":"abcdefghijklmnopqrstuvwxyz123456"
+            }"#,
+        );
+
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: ignored page request (missing request id)")
+        );
+        let notice = state.capture_notice.as_deref().unwrap_or_default();
+        assert!(
+            !notice.contains("helper"),
+            "malformed passkey notice leaked helper wording: {notice}"
+        );
+    }
+
+    #[test]
     fn browser_passkey_daemon_completion_returns_to_helper_page() {
         let bus = tempfile::tempdir().expect("temp bus");
         let (session, helper, _writer) = live_page_session();
@@ -20994,9 +21020,17 @@ mod tests {
             "This export records bounded same-origin crawl targets and does not recursively fetch them."
         ));
         assert!(
-            ["follow-up", "hook", "placeholder", "stub"]
-                .iter()
-                .all(|term| !md.contains(term)),
+            [
+                "follow-up",
+                "hook",
+                "placeholder",
+                "stub",
+                "helper",
+                "handoff",
+                "CEF"
+            ]
+            .iter()
+            .all(|term| !md.contains(term)),
             "scrape markdown must stay user-facing: {md}"
         );
 
@@ -21214,9 +21248,17 @@ mod tests {
             "This export records bounded same-origin crawl targets and does not recursively fetch them."
         ));
         assert!(
-            ["follow-up", "hook", "placeholder", "stub"]
-                .iter()
-                .all(|term| !md.contains(term)),
+            [
+                "follow-up",
+                "hook",
+                "placeholder",
+                "stub",
+                "helper",
+                "handoff",
+                "CEF"
+            ]
+            .iter()
+            .all(|term| !md.contains(term)),
             "scrape markdown must stay user-facing: {md}"
         );
 
@@ -21229,6 +21271,49 @@ mod tests {
             assert_eq!(job.method, TransferMethod::BrowserDownload);
             assert_eq!(job.dest, dest.path().to_string_lossy().as_ref());
             assert!(job.policy.verify);
+        }
+    }
+
+    #[test]
+    fn scrape_export_empty_markdown_uses_user_facing_copy() {
+        let docs = active_page_scrape_documents(
+            "https://example.test/empty",
+            "Empty Page",
+            BrowserEngine::Cef,
+            1234,
+            &[],
+            Some(""),
+            Some(""),
+        )
+        .expect("empty scrape documents");
+        let md = docs
+            .iter()
+            .find(|(ext, _)| *ext == "md")
+            .map(|(_, body)| String::from_utf8(body.clone()).expect("markdown is utf8"))
+            .expect("markdown export");
+
+        for expected in [
+            "- Engine: `Chromium`",
+            "No visible page text was available for this page.",
+            "No article/main-body text was available for this page.",
+            "No DOM links were available for this page.",
+            "No DOM headings were available for this page.",
+            "No same-origin crawl targets were available for this export.",
+            "No same-origin crawl seed URLs were observed for this page.",
+        ] {
+            assert!(md.contains(expected), "missing {expected:?}: {md}");
+        }
+        for forbidden in [
+            "helper",
+            "handoff manifest",
+            "helper resource telemetry",
+            "returned by the helper",
+            "CEF",
+        ] {
+            assert!(
+                !md.contains(forbidden),
+                "scrape markdown leaked internal copy {forbidden:?}: {md}"
+            );
         }
     }
 

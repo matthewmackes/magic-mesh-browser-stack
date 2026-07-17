@@ -395,7 +395,7 @@ pub(super) fn active_page_scrape_documents(
     }
     let csv = csv.into_bytes();
     let seed_md = if crawl_seed.is_empty() {
-        "No same-origin crawl seed URLs were observed in helper resource telemetry.".to_owned()
+        "No same-origin crawl seed URLs were observed for this page.".to_owned()
     } else {
         crawl_seed
             .iter()
@@ -414,11 +414,11 @@ pub(super) fn active_page_scrape_documents(
         Some(text) if !text.is_empty() => {
             format!("```text\n{}\n```", text.replace("```", "`\\`\\`"))
         }
-        Some(_) => "No visible page text was returned by the helper.".to_owned(),
+        Some(_) => "No visible page text was available for this page.".to_owned(),
         None => "Visible page text was not requested for this export path.".to_owned(),
     };
     let crawl_manifest_md = if crawl_manifest.is_empty() {
-        "No same-origin crawl targets were available for the handoff manifest.".to_owned()
+        "No same-origin crawl targets were available for this export.".to_owned()
     } else {
         crawl_manifest
             .iter()
@@ -438,7 +438,7 @@ pub(super) fn active_page_scrape_documents(
     let links_md = if dom_extract.links.is_empty() {
         match dom_extract.status {
             "not_requested" => "DOM links were not requested for this export path.".to_owned(),
-            _ => "No DOM links were returned by the helper.".to_owned(),
+            _ => "No DOM links were available for this page.".to_owned(),
         }
     } else {
         dom_extract
@@ -460,7 +460,7 @@ pub(super) fn active_page_scrape_documents(
     let headings_md = if dom_extract.headings.is_empty() {
         match dom_extract.status {
             "not_requested" => "DOM headings were not requested for this export path.".to_owned(),
-            _ => "No DOM headings were returned by the helper.".to_owned(),
+            _ => "No DOM headings were available for this page.".to_owned(),
         }
     } else {
         dom_extract
@@ -509,19 +509,19 @@ pub(super) fn active_page_scrape_documents(
             lines.push("```".to_owned());
             lines.join("\n")
         }
-        Some(_) => "No article/main-body text was returned by the helper.".to_owned(),
+        Some(_) => "No article/main-body text was available for this page.".to_owned(),
         None => match dom_extract.status {
             "not_requested" => {
                 "Article/main-body extraction was not requested for this export path.".to_owned()
             }
-            _ => "No article/main-body text was returned by the helper.".to_owned(),
+            _ => "No article/main-body text was available for this page.".to_owned(),
         },
     };
     let md = format!(
         "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 same-origin targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nThis export records bounded same-origin crawl targets and does not recursively fetch them.\n",
         markdown_heading_text(&label),
         url.replace('`', "\\`"),
-        engine.label(),
+        browser_engine_export_label(engine),
         unix_ms,
         crawl_seed.len(),
         crawl_manifest.len(),
@@ -543,6 +543,13 @@ pub(super) fn active_page_scrape_documents(
     )
     .into_bytes();
     Ok(vec![("json", json), ("csv", csv), ("md", md)])
+}
+
+fn browser_engine_export_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Servo",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
