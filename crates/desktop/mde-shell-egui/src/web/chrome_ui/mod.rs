@@ -11580,7 +11580,27 @@ mod tests {
         let out = render_site_styles_drawer_frame(&ctx);
         let texts = painted_text(&out.shapes);
 
+        assert_painted_text_color(&texts, "Site Styles", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Custom CSS for matching websites", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Website", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "main { line-height: 1.6; }", CHROME_TEXT);
+        assert_painted_text_color(
+            &texts,
+            "example.test - body { max-width: 80ch; }",
+            CHROME_TEXT_DIM,
+        );
+        assert!(
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("injected")
+                    && !lower.contains("userscripts")
+                    && !lower.contains("matching hosts")
+                    && !lower.contains("site host")
+                    && !lower.contains("css injected")
+                    && !lower.contains("host")
+            }),
+            "site-styles drawer must not expose implementation delivery terms: {texts:?}"
+        );
         assert!(
             !texts
                 .iter()

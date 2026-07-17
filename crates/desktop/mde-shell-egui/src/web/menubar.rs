@@ -646,8 +646,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                     "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
                 )),
                 Entry::Item(
-                    Item::new(MenuAction::OpenSiteStyles, "Site Styles (your CSS)...")
-                        .enabled(can_page_tools),
+                    Item::new(MenuAction::OpenSiteStyles, "Site Styles...").enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_page_tools),
@@ -1770,6 +1769,8 @@ mod tests {
             "Enable Curated Userscripts"
         );
         assert!(item(MenuAction::ToggleUserScripts).enabled);
+        assert_eq!(item(MenuAction::OpenSiteStyles).label, "Site Styles...");
+        assert!(item(MenuAction::OpenSiteStyles).enabled);
         assert_eq!(item(MenuAction::CheckSpelling).label, "Check Spelling");
         assert!(item(MenuAction::CheckSpelling).enabled);
         assert_eq!(item(MenuAction::ReadAloud).label, "Read Aloud");

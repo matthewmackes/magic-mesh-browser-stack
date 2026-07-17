@@ -619,8 +619,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         });
 }
 
-/// The user-authored Site Styles editor (safe userscript slice — CSS only): add a
-/// host + CSS rule that folds into the injected userscript bundle, or remove one.
+/// The user-authored Site Styles editor: add a website + CSS rule, or remove one.
 /// Session-only, like the other browser chrome toggles.
 pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if !state.site_styles_open {
@@ -638,7 +637,7 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new("your CSS, injected on matching hosts (Userscripts must be on)")
+                    RichText::new("Custom CSS for matching websites")
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -650,7 +649,7 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Host")
+                    RichText::new("Website")
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -659,7 +658,7 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     &mut state.site_style_host_draft,
                     "example.com",
                     140.0,
-                    "Site host for this CSS rule",
+                    "Website for this style",
                 );
                 if drawer_button(ui, "Add", BrowserActionRole::Secondary, "Add site style")
                     .clicked()
@@ -673,16 +672,20 @@ pub(super) fn site_styles_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 "body{max-width:80ch;margin-inline:auto}",
                 320.0,
                 2,
-                "CSS injected on matching hosts",
+                "Custom CSS for matching websites",
             );
             if !state.user_site_styles.is_empty() {
                 drawer_separator(ui);
                 for (i, style) in state.user_site_styles.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("{}: {}", style.host, ellipsize(&style.css, 36)))
-                                .size(Style::SMALL)
-                                .color(super::CHROME_TEXT_DIM),
+                            RichText::new(format!(
+                                "{} - {}",
+                                style.host,
+                                ellipsize(&style.css, 36)
+                            ))
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
                         );
                         if drawer_button(
                             ui,
