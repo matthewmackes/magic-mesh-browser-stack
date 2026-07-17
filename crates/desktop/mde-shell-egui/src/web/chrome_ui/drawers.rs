@@ -1,6 +1,6 @@
 //! Secondary browser overlay drawers — the dismissible panels that render
 //! *below* the navigation chrome for the active tab: print settings,
-//! downloads ledger, QR share, translation, spellcheck, offline copy,
+//! downloads status, QR share, translation, spellcheck, offline copy,
 //! browser-engine update, and speech status. Extracted verbatim from
 //! `web/mod.rs` (P2 shell-ux-7); each `*_drawer` is invoked once per
 //! render pass from the `chrome_ui` drawer stack and reads/writes the

@@ -605,6 +605,20 @@ pub(super) fn chrome_hover_text(
     response.on_hover_ui(move |ui| chrome_tooltip(ui, text.as_str()))
 }
 
+fn downloads_toolbar_tip(active: usize, total: usize) -> String {
+    if total == 0 {
+        "Downloads".to_owned()
+    } else if active > 0 && active < total {
+        format!("Downloads: {active} active / {total} total")
+    } else if active > 0 {
+        format!("Downloads: {active} active")
+    } else if total == 1 {
+        "Downloads: 1 complete".to_owned()
+    } else {
+        format!("Downloads: {total} complete")
+    }
+}
+
 fn action_icon_button(
     ui: &mut egui::Ui,
     icon: ChromeIcon,
@@ -5280,15 +5294,11 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         }
 
         let (active_downloads, total_downloads) = state.download_counts();
-        let downloads_tip = if total_downloads == 0 {
-            "Downloads"
-        } else {
-            "Downloads from the shared Transfers ledger"
-        };
+        let downloads_tip = downloads_toolbar_tip(active_downloads, total_downloads);
         if chrome_icon_button(
             ui,
             ChromeIcon::Downloads,
-            downloads_tip,
+            &downloads_tip,
             true,
             state.downloads_open,
         )
@@ -10552,6 +10562,29 @@ mod tests {
                 .all(|(text, _)| !text.contains("browser_download") && !text.contains("ledger")),
             "download drawer header must not expose internal transfer names: {texts:?}"
         );
+    }
+
+    #[test]
+    fn browser_download_toolbar_tip_uses_user_facing_status() {
+        assert_eq!(downloads_toolbar_tip(0, 0), "Downloads");
+        assert_eq!(downloads_toolbar_tip(1, 1), "Downloads: 1 active");
+        assert_eq!(downloads_toolbar_tip(2, 3), "Downloads: 2 active / 3 total");
+        assert_eq!(downloads_toolbar_tip(0, 1), "Downloads: 1 complete");
+        assert_eq!(downloads_toolbar_tip(0, 4), "Downloads: 4 complete");
+
+        for tip in [
+            downloads_toolbar_tip(0, 0),
+            downloads_toolbar_tip(1, 1),
+            downloads_toolbar_tip(2, 3),
+            downloads_toolbar_tip(0, 4),
+        ] {
+            assert!(
+                !tip.contains("browser_download")
+                    && !tip.contains("ledger")
+                    && !tip.contains("helper"),
+                "download toolbar tooltip must stay user-facing: {tip:?}"
+            );
+        }
     }
 
     #[test]

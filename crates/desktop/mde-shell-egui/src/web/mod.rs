@@ -8632,6 +8632,29 @@ mod tests {
     }
 
     #[test]
+    fn browser_empty_accesskit_status_uses_user_facing_notice() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let nodes = accesskit_nodes(&out);
+        let browser = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser status"))
+            .expect("browser status accesskit node");
+        let value = browser.value().expect("browser status value");
+        assert!(value.contains("No active tab"));
+        assert!(value.contains("No live browser page is available"));
+        assert!(
+            !value.contains("helper session") && !value.contains("helper unavailable"),
+            "empty Browser AccessKit status must not expose helper internals: {value}"
+        );
+    }
+
+    #[test]
     fn loading_tab_renders_netscape_style_globe_status() {
         let (mut session, helper) = raw_session_pair();
         write_helper_event(
