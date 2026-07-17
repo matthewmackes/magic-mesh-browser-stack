@@ -9,10 +9,13 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-browser-verify-engines [--engine cef|servo|all] [--budget SECONDS] [--timeout DURATION]
+browser-verify-engines [--engine cef|servo|all] [--budget SECONDS] [--timeout DURATION] [--idle-media]
 
 Default:
   browser-verify-engines --engine all
+
+Idle media proof:
+  browser-verify-engines --engine cef --idle-media --budget 70 --timeout 90s
 
 Environment overrides:
   MDE_BROWSER_VERIFY_VERIFIER=/usr/libexec/mackesd/cef-verify
@@ -24,6 +27,9 @@ Environment overrides:
   MDE_BROWSER_VERIFY_TIMEOUT=45s
   MDE_BROWSER_VERIFY_KEEP_LOGS=1
   MDE_BROWSER_VERIFY_SKIP_PROCESS_CHECK=1
+  MDE_BROWSER_VERIFY_IDLE_MEDIA=1
+  MDE_BROWSER_VERIFY_IDLE_MIN_SECONDS=60
+  MDE_BROWSER_VERIFY_IDLE_MIN_FRAMES=4
 
 The CEF root/bridge overrides are only exported for the CEF run. Existing
 MDE_CEF_ROOT and MDE_CEF_BRIDGE_BIN are otherwise inherited.
@@ -42,9 +48,10 @@ need_cmd() {
 VERIFIER="${MDE_BROWSER_VERIFY_VERIFIER:-/usr/libexec/mackesd/cef-verify}"
 CEF_HELPER="${MDE_BROWSER_VERIFY_CEF_HELPER:-/usr/bin/mde-web-cef}"
 SERVO_HELPER="${MDE_BROWSER_VERIFY_SERVO_HELPER:-/usr/bin/mde-web-preview}"
-BUDGET="${MDE_BROWSER_VERIFY_BUDGET:-30}"
+BUDGET="${MDE_BROWSER_VERIFY_BUDGET:-}"
 RUN_TIMEOUT="${MDE_BROWSER_VERIFY_TIMEOUT:-45s}"
 ENGINE="all"
+IDLE_MEDIA="${MDE_BROWSER_VERIFY_IDLE_MEDIA:-0}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -63,6 +70,10 @@ while [ "$#" -gt 0 ]; do
       RUN_TIMEOUT="$2"
       shift 2
       ;;
+    --idle-media)
+      IDLE_MEDIA=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -77,6 +88,33 @@ case "$ENGINE" in
   cef|servo|all) ;;
   *) die "--engine must be cef, servo, or all" ;;
 esac
+
+case "${IDLE_MEDIA}" in
+  1|true|TRUE|yes|YES|on|ON)
+    IDLE_MEDIA=1
+    ;;
+  0|false|FALSE|no|NO|off|OFF|'')
+    IDLE_MEDIA=0
+    ;;
+  *)
+    die "MDE_BROWSER_VERIFY_IDLE_MEDIA/--idle-media must be boolean"
+    ;;
+esac
+if [ "$IDLE_MEDIA" = "1" ]; then
+  if [ "$ENGINE" = "servo" ]; then
+    die "--idle-media is CEF-only; use --engine cef"
+  fi
+  if [ "$ENGINE" = "all" ]; then
+    ENGINE="cef"
+  fi
+fi
+if [ -z "$BUDGET" ]; then
+  if [ "$IDLE_MEDIA" = "1" ]; then
+    BUDGET=70
+  else
+    BUDGET=30
+  fi
+fi
 case "$BUDGET" in
   ''|*[!0-9]*) die "--budget must be an integer number of seconds" ;;
 esac
@@ -136,7 +174,12 @@ run_engine() {
   [ -x "$helper" ] || die "$engine helper is not executable: $helper"
   log "running $engine verifier helper=$helper budget=${BUDGET}s timeout=$RUN_TIMEOUT"
 
-  local env_args=("MDE_BROWSER_VERIFY_INPUT=1")
+  local env_args=()
+  if [ "$IDLE_MEDIA" = "1" ]; then
+    env_args+=("MDE_BROWSER_VERIFY_IDLE_MEDIA=1")
+  else
+    env_args+=("MDE_BROWSER_VERIFY_INPUT=1")
+  fi
   if [ "$engine" = "cef" ]; then
     if [ -n "${MDE_BROWSER_VERIFY_CEF_ROOT:-}" ]; then
       env_args+=("MDE_CEF_ROOT=$MDE_BROWSER_VERIFY_CEF_ROOT")
@@ -147,12 +190,20 @@ run_engine() {
   fi
 
   if env "${env_args[@]}" timeout "$RUN_TIMEOUT" "$VERIFIER" "$helper" "" "$BUDGET" \
-      >"$log_file" 2>&1 \
-      && grep -q 'VERIFY RESULT=PASS' "$log_file" \
-      && grep -q 'VERIFY on_paint_ready' "$log_file" \
-      && grep -Eq 'mde-browser-verify-p1-k1-tm|P:1 K:1 T:m' "$log_file"; then
-    log "$engine display/input verifier passed"
-    return 0
+      >"$log_file" 2>&1; then
+    if grep -q 'VERIFY RESULT=PASS' "$log_file" \
+        && grep -q 'VERIFY on_paint_ready' "$log_file"; then
+      if [ "$IDLE_MEDIA" = "1" ]; then
+        if grep -q 'idle media advanced without pointer input' "$log_file" \
+            && grep -q 'VERIFY media_metadata .* playing=true' "$log_file"; then
+          log "$engine idle-media verifier passed"
+          return 0
+        fi
+      elif grep -Eq 'mde-browser-verify-p1-k1-tm|P:1 K:1 T:m' "$log_file"; then
+        log "$engine display/input verifier passed"
+        return 0
+      fi
+    fi
   fi
 
   echo "browser-verify-engines: $engine verifier failed" >&2

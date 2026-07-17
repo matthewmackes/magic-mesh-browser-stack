@@ -402,6 +402,9 @@ impl CefInitPaths {
             // — the OS sandbox (mde-web-sandbox) is the operative confinement.
             "--no-sandbox".to_owned(),
             "--ozone-platform=headless".to_owned(),
+            "--disable-background-timer-throttling".to_owned(),
+            "--disable-renderer-backgrounding".to_owned(),
+            "--disable-backgrounding-occluded-windows".to_owned(),
             format!("--lang={CEF_GENERIC_LOCALE}"),
             format!("--user-agent={CEF_GENERIC_USER_AGENT}"),
             format!("--accept-lang={CEF_GENERIC_ACCEPT_LANGUAGE}"),
@@ -417,10 +420,6 @@ impl CefInitPaths {
             ),
         ];
         let browser_power_mode = browser_power_mode_enabled();
-        if !browser_power_mode {
-            switches.push("--disable-gpu".to_owned());
-            switches.push("--disable-gpu-compositing".to_owned());
-        }
         // SECURITY (security-4): only expose the unauthenticated CDP
         // remote-debugging endpoint when explicitly opted in — never on the
         // default/shipped launch path. See [`remote_debugging_port`].
@@ -825,7 +824,6 @@ mod tests {
         );
         let switches = paths.command_line_switches();
         assert!(switches.contains(&"--no-sandbox".to_owned()));
-        assert!(switches.contains(&"--disable-gpu".to_owned()));
         assert!(switches.contains(&"--ozone-platform=headless".to_owned()));
         assert!(switches
             .iter()
@@ -839,6 +837,23 @@ mod tests {
         assert!(switches
             .iter()
             .any(|s| s.starts_with("--browser-subprocess-path=")));
+    }
+
+    #[test]
+    fn init_paths_keep_compositor_available_and_disable_background_throttling() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(!switches.contains(&"--disable-gpu".to_owned()));
+        assert!(!switches.contains(&"--disable-gpu-compositing".to_owned()));
+        assert!(switches.contains(&"--disable-background-timer-throttling".to_owned()));
+        assert!(switches.contains(&"--disable-renderer-backgrounding".to_owned()));
+        assert!(switches.contains(&"--disable-backgrounding-occluded-windows".to_owned()));
     }
 
     #[test]

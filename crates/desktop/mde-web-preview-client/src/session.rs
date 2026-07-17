@@ -24,6 +24,7 @@ use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Child;
+use std::time::{Duration, Instant};
 
 use crate::egui::{self, ColorImage};
 use crate::filter::{self, RequestFilter};
@@ -42,6 +43,12 @@ const MAX_PENDING_BEFORE_UNLOADS: usize = 16;
 /// a handful at most; the bound stops a hostile page from growing the queue (and the
 /// engine's held-callback set) without limit. An overflow auto-denies the oldest.
 const MAX_PENDING_PERMISSIONS: usize = 16;
+const HELPER_GRACEFUL_SHUTDOWN: Duration = Duration::from_millis(250);
+const SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 /// A session's live status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1182,18 +1189,47 @@ impl Drop for WebSession {
     /// deliberately does **not** signal the child (it detaches it) — which is how
     /// orphaned `tab` helper pairs accumulated live (BUG-BROWSER-4) across shell
     /// restarts, closed tabs, and respawn-on-reload swaps that drop the old
-    /// session. So this KILLs then WAITs: `kill` stops a still-running helper and
-    /// `wait` reaps it (leaving no zombie either — an already-exited child was
-    /// reaped by [`Self::poll`]'s `try_wait`, so `wait` is then a cheap cached
-    /// read). Best-effort: an already-gone child makes `kill` error, which is the
-    /// goal state and is ignored, and `wait` never blocks on a reaped pid. A
-    /// test / fake-helper session carries no child and this is a no-op.
+    /// session. So this first closes the session socket, giving a cooperative
+    /// helper a short EOF-driven exit window, then KILLs and WAITs on failure.
+    /// `wait` reaps the child (leaving no zombie either — an already-exited child
+    /// was reaped by [`Self::poll`]'s `try_wait`, so `wait` is then a cheap cached
+    /// read). CEF adds one wrapper hop (`mde-web-cef` → renderer bridge), so the
+    /// live spawn starts a helper process group and teardown kills that whole
+    /// group if the grace window does not exit cleanly.
+    /// Best-effort: an already-gone child makes `kill` error, which is the goal
+    /// state and is ignored, and `wait` never blocks on a reaped pid. A test /
+    /// fake-helper session carries no child and this is a no-op.
     fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !wait_for_child_exit(&mut child, HELPER_GRACEFUL_SHUTDOWN) {
+                kill_helper_process_group(&child);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn kill_helper_process_group(child: &Child) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: helpers spawned by `WebSession::spawn` are made process-group
+    // leaders. Sending SIGKILL to `-pid` kills that helper tree; if the caller
+    // supplied a non-group-leader test child, `kill` fails harmlessly.
+    let _ = unsafe { kill(-pid, SIGKILL) };
 }
 
 /// Everything the live spawn needs to launch a sandboxed browser helper
@@ -1225,9 +1261,12 @@ impl WebSession {
     /// # Errors
     /// Fails if the socketpair or the child process cannot be created.
     pub fn spawn(spec: &SpawnSpec) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
         let (shell_end, helper_end) = UnixStream::pair()?;
-        let child = Command::new(&spec.helper_bin)
+        let mut command = Command::new(&spec.helper_bin);
+        command
             .arg("tab")
             .args([
                 "--url",
@@ -1239,7 +1278,8 @@ impl WebSession {
             ])
             .envs(spec.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
-            .spawn()?;
+            .process_group(0);
+        let child = command.spawn()?;
         Self::from_stream(shell_end, Some(child))
     }
 }
@@ -2479,10 +2519,22 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    fn wait_until_pids_are_gone(pids: &[u32], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pids.iter().all(|pid| !pid_alive(*pid)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn drop_reaps_the_live_helper_child_leaving_no_orphan() {
         use std::process::Command;
-        use std::time::{Duration, Instant};
 
         // Servo (the real helper) isn't spawnable in-test, so a long-lived `sleep`
         // stands in for the sandboxed helper child: its pid is unambiguously alive
@@ -2504,16 +2556,51 @@ mod tests {
         // its `/proc` entry — both keep the path present. `wait` in Drop is
         // synchronous, so this settles at once; the short poll only guards against
         // scheduler jitter.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut gone = !pid_alive(pid);
-        while !gone && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-            gone = !pid_alive(pid);
-        }
+        let gone = wait_until_pids_are_gone(&[pid], Duration::from_secs(2));
         assert!(
             gone,
             "the helper child leaked past the session drop (orphan or zombie)"
         );
+    }
+
+    #[test]
+    fn drop_kills_the_live_helper_process_group_leaving_no_renderer_child() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // CEF is launched through an `mde-web-cef` wrapper which starts the real
+        // renderer bridge beneath it. Model that shape with a shell parent and a
+        // background child; dropping the session must not leave the child alive.
+        let (shell, _helper) = UnixStream::pair().expect("socketpair");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 600 & printf '%s\\n' \"$!\"; wait")
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a stand-in helper process tree");
+        let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("read background child pid");
+        let renderer_pid: u32 = line
+            .trim()
+            .parse()
+            .expect("background child pid should be numeric");
+        let wrapper_pid = child.id();
+        assert!(pid_alive(wrapper_pid), "the wrapper should be running");
+        assert!(
+            pid_alive(renderer_pid),
+            "the renderer stand-in should be running"
+        );
+
+        let session = WebSession::from_stream(shell, Some(child)).expect("session");
+        drop(session);
+
+        let gone = wait_until_pids_are_gone(&[wrapper_pid, renderer_pid], Duration::from_secs(2));
+        assert!(gone, "the helper process group leaked past session drop");
     }
 
     #[test]

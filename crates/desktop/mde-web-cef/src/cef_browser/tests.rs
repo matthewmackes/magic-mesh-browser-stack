@@ -1905,6 +1905,40 @@ fn pump_interval_backs_off_when_idle_but_stays_fast_while_active() {
 }
 
 #[test]
+fn view_invalidation_tracks_first_paint_and_active_media_only() {
+    assert!(should_invalidate_view(true, false));
+    assert!(should_invalidate_view(false, true));
+    assert!(should_invalidate_view(true, true));
+    assert!(
+        !should_invalidate_view(false, false),
+        "settled non-media pages must still be allowed to idle without paint nudges"
+    );
+}
+
+#[test]
+fn resize_nudge_is_bounded_to_first_paint_and_active_media() {
+    assert!(
+        !should_resize_view(false, false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL),
+        "settled non-media pages must not receive resize pulses"
+    );
+    assert!(
+        !should_resize_view(true, false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL / 2),
+        "first-paint resize pulses must be rate-limited"
+    );
+    assert!(should_resize_view(
+        true,
+        false,
+        MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
+    ));
+    assert!(should_resize_view(
+        false,
+        true,
+        MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
+    ));
+    assert!(MEDIA_VIEW_RESIZE_NUDGE_INTERVAL >= PUMP_ACTIVE * 10);
+}
+
+#[test]
 fn callback_media_state_keeps_the_pump_active_until_pause_or_navigation() {
     let callbacks = CefBrowserCallbacks::new(
         320,

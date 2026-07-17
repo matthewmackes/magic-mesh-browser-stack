@@ -878,6 +878,12 @@ const PASSKEY_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 /// Cadence for now-playing metadata probes. The script dedupes in-page before
 /// beaconing, so an unchanged media page remains quiet while this poll runs.
 const MEDIA_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Cadence for a stronger OSR repaint nudge while waiting for the first frame
+/// or while media is actively playing.
+/// `invalidate(PET_VIEW)` alone can be too sparse on the pinned CEF 149 farm
+/// runtime; a same-size `was_resized` pulse reliably wakes the compositor path,
+/// but stops once a non-media page has painted so settled static pages still idle.
+const MEDIA_VIEW_RESIZE_NUDGE_INTERVAL: Duration = Duration::from_millis(250);
 /// Emergency/privacy override: when set to `1`/`true`/`yes`/`on`, CEF keeps the
 /// legacy best-effort JS WebRTC block. The operational default is enabled WebRTC
 /// with CEF's real IP-handling policy plus the native media permission callback.
@@ -899,6 +905,25 @@ fn pump_interval(idle_for: Duration, awaiting_first_paint: bool, active_media: b
     } else {
         PUMP_IDLE
     }
+}
+
+/// Whether the windowless CEF view should be explicitly invalidated on this pump.
+///
+/// Static pages paint naturally after the initial resize/invalidate. Time-driven
+/// pages and media can advance without input, and on the farm CEF 149 windowless
+/// runtime does not always schedule an OSR paint for that alone. While waiting for
+/// first paint or while media is known playing, nudge CEF's view invalidation at
+/// the active cadence; idle non-media pages still back off.
+fn should_invalidate_view(awaiting_first_paint: bool, active_media: bool) -> bool {
+    awaiting_first_paint || active_media
+}
+
+fn should_resize_view(
+    awaiting_first_paint: bool,
+    active_media: bool,
+    since_last_nudge: Duration,
+) -> bool {
+    (awaiting_first_paint || active_media) && since_last_nudge >= MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
 }
 
 /// browser-8: decides when to (re)inject the per-context document shims (optional
@@ -1038,6 +1063,9 @@ pub fn run_windowless_tab(
     let mut last_media_metadata_poll = Instant::now()
         .checked_sub(MEDIA_METADATA_POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut last_media_view_resize = Instant::now()
+        .checked_sub(MEDIA_VIEW_RESIZE_NUDGE_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     // perf-6: adaptive pump. `last_activity` tracks the last paint / control
     // frame / navigation so the pump runs fast while the tab is active and backs
@@ -1084,6 +1112,17 @@ pub fn run_windowless_tab(
         let now = Instant::now();
         let idle_for = now.duration_since(last_activity);
         let awaiting_first_paint = first_paint.is_none();
+        let active_media = callbacks.state.active_media();
+        if should_resize_view(
+            awaiting_first_paint,
+            active_media,
+            now.duration_since(last_media_view_resize),
+        ) {
+            resize_and_invalidate_browser_view(browser);
+            last_media_view_resize = now;
+        } else if should_invalidate_view(awaiting_first_paint, active_media) {
+            invalidate_browser_view(browser);
+        }
         // A freshly-navigated document is still "settling" while awaiting the
         // first paint or within SHIM_SETTLE of the last activity; re-inject the
         // shims through the commit, then leave the stable context alone.
@@ -1112,7 +1151,7 @@ pub fn run_windowless_tab(
 
         wait_for_readable(
             fd,
-            pump_interval(idle_for, awaiting_first_paint, callbacks.state.active_media()),
+            pump_interval(idle_for, awaiting_first_paint, active_media),
         );
     }
 
@@ -4461,10 +4500,21 @@ fn callback_size(key: usize) -> Option<usize> {
 }
 
 fn notify_browser_view_ready(browser: *mut c_void) {
+    resize_and_invalidate_browser_view(browser);
+}
+
+fn resize_and_invalidate_browser_view(browser: *mut c_void) {
     let Some(host) = browser_host(browser) else {
         return;
     };
     call_host_void(host, CEF_BROWSER_HOST_WAS_RESIZED_OFFSET);
+    invalidate_browser_view(browser);
+}
+
+fn invalidate_browser_view(browser: *mut c_void) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
     call_host_paint_type(host, CEF_BROWSER_HOST_INVALIDATE_OFFSET, PET_VIEW);
 }
 
