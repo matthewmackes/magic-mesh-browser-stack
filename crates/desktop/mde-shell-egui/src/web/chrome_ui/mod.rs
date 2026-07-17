@@ -3046,7 +3046,7 @@ fn menu_icon(title: &str) -> ChromeIcon {
 fn technical_menu_label(title: &str) -> &'static str {
     match title {
         "Page" => "Navigation",
-        "Engine" => "Runtime",
+        "Engine" => "Engines",
         "Edit" => "Input",
         "View" => "Rendering",
         "History" => "Session",
@@ -3142,7 +3142,7 @@ fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
         MenuAction::Forward => "No forward-history entry is available",
         MenuAction::ReopenClosedTab => "No closed Browser tab is available to reopen",
         MenuAction::Reload => "Open a Browser tab first",
-        MenuAction::TogglePowerMode => "Power Mode requires a live or internal Browser tab",
+        MenuAction::TogglePowerMode => "Power Mode requires an open Browser tab",
         MenuAction::CycleContainer
         | MenuAction::CycleDisplayTarget
         | MenuAction::ZoomIn
@@ -3166,7 +3166,7 @@ fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
         | MenuAction::TogglePrintSettings
         | MenuAction::SavePdf
         | MenuAction::CycleUserAgent
-        | MenuAction::CycleDeviceProfile => "Requires a live helper-backed page",
+        | MenuAction::CycleDeviceProfile => "Requires a live web page",
         MenuAction::CaptureViewport
         | MenuAction::CaptureFullPage
         | MenuAction::CaptureMhtml
@@ -3382,7 +3382,7 @@ fn render_options_category_index(
                 ui.set_width(OPTIONS_RAIL_W);
             }
             ui.label(
-                RichText::new("Runtime")
+                RichText::new("Controls")
                     .size(CHROME_FONT + 3.0)
                     .color(CHROME_TEXT),
             );
@@ -3461,7 +3461,7 @@ fn render_options_command_page(
             .color(CHROME_TEXT),
     );
     ui.label(
-        RichText::new("Command and runtime controls")
+        RichText::new("Browser commands and site controls")
             .size(CHROME_FONT)
             .color(CHROME_TEXT_DIM),
     );
@@ -9135,8 +9135,21 @@ mod tests {
         );
         assert_eq!(
             disabled_option_tip(MenuAction::OpenFind),
-            "Requires a live helper-backed page"
+            "Requires a live web page"
         );
+        assert_eq!(
+            disabled_option_tip(MenuAction::TogglePowerMode),
+            "Power Mode requires an open Browser tab"
+        );
+        for action in [MenuAction::OpenFind, MenuAction::TogglePowerMode] {
+            let tip = disabled_option_tip(action);
+            assert!(
+                !tip.contains("helper-backed")
+                    && !tip.contains("internal")
+                    && !tip.contains("runtime"),
+                "disabled Browser Options help must stay user-facing: {tip}"
+            );
+        }
         assert_eq!(
             disabled_option_tip(MenuAction::CaptureViewport),
             "Requires a live page with a painted frame"
@@ -9181,7 +9194,7 @@ mod tests {
         assert_painted_text_color(&texts, super::super::BROWSER_OPTIONS_URL, CHROME_TEXT_DIM);
         for label in [
             "Navigation",
-            "Runtime",
+            "Engines",
             "Input",
             "Rendering",
             "Instrumentation",
@@ -9200,7 +9213,7 @@ mod tests {
         let out = render_options_page_frame(&ctx, egui::vec2(900.0, 640.0));
         let texts = painted_text(&out.shapes);
 
-        assert_painted_text_color(&texts, "Runtime", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Controls", CHROME_TEXT);
         assert_painted_text_color(&texts, super::super::BROWSER_OPTIONS_URL, CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Browser Options", CHROME_TEXT);
         assert_rects_inside_viewport(&out, 900.0, "wide Browser Options page");

@@ -10883,7 +10883,7 @@ mod tests {
         let labels: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
         for label in [
             "Navigation",
-            "Runtime",
+            "Engines",
             "Input",
             "Rendering",
             "Instrumentation",
