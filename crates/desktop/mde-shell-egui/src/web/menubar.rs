@@ -643,15 +643,15 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                     Item::new(
                         MenuAction::ToggleUserScripts,
                         if s.user_scripts {
-                            "Disable Curated Userscripts"
+                            "Disable Site Fixups"
                         } else {
-                            "Enable Curated Userscripts"
+                            "Enable Site Fixups"
                         },
                     )
                     .enabled(can_page_tools),
                 ),
                 Entry::Caption(format!(
-                    "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
+                    "Site fixups: {CURATED_USERSCRIPT_COUNT} bundled compatibility rules"
                 )),
                 Entry::Item(
                     Item::new(MenuAction::OpenSiteStyles, "Site Styles...").enabled(can_page_tools),
@@ -754,11 +754,11 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
         Menu::new("Privacy", {
             let mut entries = vec![
                 Entry::Caption("Cookies: blocked for this session".to_owned()),
-                Entry::Caption("Third-party cookies: blocked (no cookie store)".to_owned()),
+                Entry::Caption("Third-party cookies: blocked".to_owned()),
                 Entry::Caption("Session data: cleared on tab close".to_owned()),
                 Entry::Caption(s.site_data.clone()),
                 Entry::Caption(
-                    "Extensions: native blocker, passkeys, reader mode, userscripts, and site styles active"
+                    "Protections: blocking, passkeys, reader mode, site fixups, and site styles active"
                         .to_owned(),
                 ),
                 Entry::Caption(s.safe_browsing.clone()),
@@ -1063,7 +1063,7 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
         chips.push(StatusChip::new("Reader", ChipTone::Info));
     }
     if s.has_tab && s.user_scripts {
-        chips.push(StatusChip::new("Userscripts", ChipTone::Info));
+        chips.push(StatusChip::new("Fixups", ChipTone::Info));
     }
     if s.has_tab {
         let user_agent = s.user_agent.chip();
@@ -1790,7 +1790,7 @@ mod tests {
         assert!(item(MenuAction::ToggleReaderMode).enabled);
         assert_eq!(
             item(MenuAction::ToggleUserScripts).label,
-            "Enable Curated Userscripts"
+            "Enable Site Fixups"
         );
         assert!(item(MenuAction::ToggleUserScripts).enabled);
         assert_eq!(item(MenuAction::OpenSiteStyles).label, "Site Styles...");
@@ -1861,7 +1861,7 @@ mod tests {
         assert!(texts.contains(&"Autoplay".to_owned()));
         assert!(texts.contains(&"Dark".to_owned()));
         assert!(texts.contains(&"Reader".to_owned()));
-        assert!(texts.contains(&"Userscripts".to_owned()));
+        assert!(texts.contains(&"Fixups".to_owned()));
 
         let muted = Snapshot {
             audio_muted: true,
@@ -1918,8 +1918,8 @@ mod tests {
                 Entry::Item(i) if i.id == MenuAction::ToggleUserScripts => Some(i),
                 _ => None,
             })
-            .expect("userscripts item present");
-        assert_eq!(disable_scripts.label, "Disable Curated Userscripts");
+            .expect("site-fixups item present");
+        assert_eq!(disable_scripts.label, "Disable Site Fixups");
     }
 
     #[test]
@@ -2523,8 +2523,8 @@ mod tests {
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Extensions: native blocker")),
-            "the native Browser tool policy is visible"
+                .any(|c| c.contains("Protections: blocking, passkeys, reader mode")),
+            "the Browser protection policy is visible"
         );
         assert!(
             captions.iter().all(|c| {
@@ -2532,6 +2532,9 @@ mod tests {
                 !lower.contains("follow-up")
                     && !lower.contains("placeholder")
                     && !lower.contains("stub")
+                    && !lower.contains("no cookie store")
+                    && !lower.contains("native blocker")
+                    && !lower.contains("userscript")
                     && !(lower.contains("unsafe") && lower.contains("host"))
                     && !lower.contains("mesh-hosted")
             }),
