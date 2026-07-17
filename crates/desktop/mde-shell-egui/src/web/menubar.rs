@@ -9,9 +9,9 @@
 #[cfg(test)]
 use super::media_metadata_chip_label;
 use super::{
-    bookmark_add_body, chat_share_body, local_hostname, publish, publish_browser_send_tab,
-    publish_browser_share, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
-    BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
+    bookmark_add_body, chat_share_body, local_hostname, pdf_file_looks_readable, publish,
+    publish_browser_send_tab, publish_browser_share, BrowserEngine, BrowserPasskeyStatus,
+    BrowserReadAloudStatus, BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
     BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
     DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
     ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
@@ -206,6 +206,8 @@ struct Snapshot {
     future_engine: BrowserEngine,
     /// The active tab has crashed.
     crashed: bool,
+    /// The active tab is a Browser-owned internal page, not helper page content.
+    internal_page: bool,
     /// A back-history entry exists.
     can_back: bool,
     /// A forward-history entry exists.
@@ -306,7 +308,7 @@ impl Snapshot {
     /// Whether there is a live page (a non-crashed tab with a URL) to act on —
     /// the gate the page-family items (Copy URL / bookmark / share) share.
     fn has_page(&self) -> bool {
-        self.has_tab && !self.crashed && !self.url.trim().is_empty()
+        self.has_tab && !self.crashed && !self.internal_page && !self.url.trim().is_empty()
     }
 }
 
@@ -323,6 +325,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 active_engine: Some(tab.engine),
                 future_engine: state.engine,
                 crashed: tab.session.is_crashed(),
+                internal_page: tab.internal_page.is_some(),
                 can_back: nav.can_back,
                 can_forward: nav.can_forward,
                 #[cfg(test)]
@@ -368,7 +371,10 @@ fn snapshot(state: &WebState) -> Snapshot {
                 capture_region_mode: state.capture_region_mode,
                 print_settings_open: state.print_settings_open,
                 print_options_active: print_options_active(&state.cups_settings),
-                has_saved_pdf: state.last_saved_pdf.is_some(),
+                has_saved_pdf: state
+                    .last_saved_pdf
+                    .as_ref()
+                    .is_some_and(|saved| pdf_file_looks_readable(&saved.path)),
                 read_aloud_status: state.latest_read_aloud_status.clone(),
                 voice_command_status: state.latest_voice_command_status.clone(),
                 passkey_status: state.latest_passkey_status.clone(),
@@ -392,7 +398,10 @@ fn snapshot(state: &WebState) -> Snapshot {
     snap.capture_region_mode = state.capture_region_mode;
     snap.print_settings_open = state.print_settings_open;
     snap.print_options_active = print_options_active(&state.cups_settings);
-    snap.has_saved_pdf = state.last_saved_pdf.is_some();
+    snap.has_saved_pdf = state
+        .last_saved_pdf
+        .as_ref()
+        .is_some_and(|saved| pdf_file_looks_readable(&saved.path));
     snap.active_downloads = active_downloads;
     snap.total_downloads = total_downloads;
     snap.safe_browsing = state.safe_browsing_summary();
@@ -442,7 +451,8 @@ const fn reload_label(crashed: bool) -> &'static str {
 fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
     let has_page = s.has_page();
     let can_tools = s.has_tab && !s.crashed;
-    let can_chromium_devtools = can_tools && s.active_engine == Some(BrowserEngine::Cef);
+    let can_page_tools = can_tools && !s.internal_page;
+    let can_chromium_devtools = can_page_tools && s.active_engine == Some(BrowserEngine::Cef);
     let can_prompt_device_api = has_page && s.current_site.is_some();
     let mut menus = vec![
         Menu::new(
@@ -532,35 +542,35 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         MenuAction::CycleContainer,
                         format!("Container: {}", s.container.label()),
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CycleDisplayTarget,
                         format!("Display Target: {}", s.display_target.label()),
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Separator,
                 Entry::Item(
                     Item::new(MenuAction::ZoomIn, "Zoom In")
                         .shortcut("Ctrl++")
-                        .enabled(can_tools && s.page_zoom_percent < super::PAGE_ZOOM_MAX),
+                        .enabled(can_page_tools && s.page_zoom_percent < super::PAGE_ZOOM_MAX),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ZoomOut, "Zoom Out")
                         .shortcut("Ctrl+-")
-                        .enabled(can_tools && s.page_zoom_percent > super::PAGE_ZOOM_MIN),
+                        .enabled(can_page_tools && s.page_zoom_percent > super::PAGE_ZOOM_MIN),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ResetZoom, "Actual Size")
                         .shortcut("Ctrl+0")
-                        .enabled(can_tools && s.page_zoom_percent != 100),
+                        .enabled(can_page_tools && s.page_zoom_percent != 100),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::OpenFind, "Find in Page")
                         .shortcut("Ctrl+F")
-                        .enabled(can_tools),
+                        .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -571,11 +581,11 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Mute Tab"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ToggleMediaPlayback, "Play/Pause Media")
-                        .enabled(can_tools),
+                        .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -597,7 +607,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Block Autoplay"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -608,7 +618,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Enable Force Dark"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -619,7 +629,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Enable Reader Mode"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -630,58 +640,59 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Enable Curated Userscripts"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Caption(format!(
                     "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
                 )),
-                Entry::Item(Item::new(
-                    MenuAction::OpenSiteStyles,
-                    "Site Styles (your CSS)...",
-                )),
                 Entry::Item(
-                    Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_tools),
-                ),
-                Entry::Item(Item::new(MenuAction::ReadAloud, "Read Aloud").enabled(can_tools)),
-                Entry::Item(
-                    Item::new(MenuAction::TranslatePage, "Translate Page").enabled(can_tools),
+                    Item::new(MenuAction::OpenSiteStyles, "Site Styles (your CSS)...")
+                        .enabled(can_page_tools),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::SaveOfflineCopy, "Save Offline Copy").enabled(can_tools),
+                    Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_page_tools),
+                ),
+                Entry::Item(Item::new(MenuAction::ReadAloud, "Read Aloud").enabled(can_page_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::TranslatePage, "Translate Page").enabled(can_page_tools),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::VoiceCommand, "Voice Command").enabled(can_tools),
+                    Item::new(MenuAction::SaveOfflineCopy, "Save Offline Copy")
+                        .enabled(can_page_tools),
                 ),
-                Entry::Item(Item::new(MenuAction::Dictate, "Dictate").enabled(can_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::VoiceCommand, "Voice Command").enabled(can_page_tools),
+                ),
+                Entry::Item(Item::new(MenuAction::Dictate, "Dictate").enabled(can_page_tools)),
                 Entry::Item(
                     Item::new(MenuAction::CaptureViewport, "Capture Viewport")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CaptureFullPage, "Capture Full Page")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CaptureMhtml, "Capture MHTML")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CaptureAnnotatedViewport,
                         "Capture with Annotation",
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CaptureCalloutViewport, "Capture with Callout")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CaptureFreehandViewport,
                         "Capture Freehand Markup",
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
@@ -692,9 +703,9 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Capture Region"
                         },
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
-                Entry::Item(Item::new(MenuAction::PrintPage, "Print Page").enabled(can_tools)),
+                Entry::Item(Item::new(MenuAction::PrintPage, "Print Page").enabled(can_page_tools)),
                 Entry::Item(
                     Item::new(
                         MenuAction::TogglePrintSettings,
@@ -704,9 +715,11 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Print Settings"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
-                Entry::Item(Item::new(MenuAction::SavePdf, "Save Page as PDF").enabled(can_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::SavePdf, "Save Page as PDF").enabled(can_page_tools),
+                ),
                 Entry::Item(
                     Item::new(MenuAction::OpenLastPdf, "Open Last PDF").enabled(s.has_saved_pdf),
                 ),
@@ -843,14 +856,14 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                                 MenuAction::CycleUserAgent,
                                 format!("User Agent: {}", s.user_agent.label()),
                             )
-                            .enabled(can_tools),
+                            .enabled(can_page_tools),
                         ),
                         Entry::Item(
                             Item::new(
                                 MenuAction::CycleDeviceProfile,
                                 format!("Device Profile: {}", s.device_profile.label()),
                             )
-                            .enabled(can_tools),
+                            .enabled(can_page_tools),
                         ),
                         Entry::Item(
                             Item::new(MenuAction::PromptCameraPermission, "Prompt Camera Access")
@@ -1379,6 +1392,7 @@ mod tests {
             active_engine: Some(BrowserEngine::Servo),
             future_engine: BrowserEngine::Servo,
             crashed: false,
+            internal_page: false,
             can_back: true,
             can_forward: false,
             loading: false,
@@ -1848,6 +1862,134 @@ mod tests {
     }
 
     #[test]
+    fn internal_browser_pages_do_not_advertise_page_content_tools() {
+        let internal = Snapshot {
+            internal_page: true,
+            power_mode: true,
+            can_capture: true,
+            url: "mde://browser/options".to_owned(),
+            ..https_page()
+        };
+        let menus = build_menus(&internal);
+        let item = |menu_title: &str, id: MenuAction| {
+            menus
+                .iter()
+                .find(|m| m.title == menu_title)
+                .unwrap_or_else(|| panic!("{menu_title} menu present"))
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == id => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{menu_title} item {id:?} present"))
+        };
+
+        assert!(
+            item("View", MenuAction::TogglePowerMode).enabled,
+            "Browser chrome settings remain reachable on internal pages"
+        );
+        for id in [
+            MenuAction::CycleContainer,
+            MenuAction::CycleDisplayTarget,
+            MenuAction::ZoomIn,
+            MenuAction::OpenFind,
+            MenuAction::ToggleAudioMute,
+            MenuAction::ToggleMediaPlayback,
+            MenuAction::ToggleAutoplayBlock,
+            MenuAction::ToggleForceDark,
+            MenuAction::ToggleReaderMode,
+            MenuAction::ToggleUserScripts,
+            MenuAction::OpenSiteStyles,
+            MenuAction::CheckSpelling,
+            MenuAction::ReadAloud,
+            MenuAction::TranslatePage,
+            MenuAction::SaveOfflineCopy,
+            MenuAction::VoiceCommand,
+            MenuAction::Dictate,
+            MenuAction::CaptureViewport,
+            MenuAction::CaptureFullPage,
+            MenuAction::CaptureMhtml,
+            MenuAction::CaptureAnnotatedViewport,
+            MenuAction::CaptureCalloutViewport,
+            MenuAction::CaptureFreehandViewport,
+            MenuAction::CaptureRegion,
+            MenuAction::PrintPage,
+            MenuAction::TogglePrintSettings,
+            MenuAction::SavePdf,
+        ] {
+            assert!(
+                !item("View", id).enabled,
+                "{id:?} must wait for a helper-backed page, not an internal page"
+            );
+        }
+
+        for id in [
+            MenuAction::OpenViewSource,
+            MenuAction::OpenChromiumDevtools,
+            MenuAction::ExportActivePageScrape,
+            MenuAction::ExportMediaManifest,
+            MenuAction::DownloadObservedMedia,
+            MenuAction::DownloadObservedImages,
+            MenuAction::CycleUserAgent,
+            MenuAction::CycleDeviceProfile,
+            MenuAction::PromptCameraPermission,
+            MenuAction::PromptMicrophonePermission,
+            MenuAction::PromptLocationPermission,
+            MenuAction::PromptNotificationsPermission,
+            MenuAction::PromptClipboardPermission,
+        ] {
+            assert!(
+                !item("Power", id).enabled,
+                "{id:?} must not advertise against Browser-owned internal pages"
+            );
+        }
+        assert!(!item("Edit", MenuAction::CopyUrl).enabled);
+        assert!(!item("Bookmarks", MenuAction::AddBookmark).enabled);
+        assert!(item("Bookmarks", MenuAction::OpenBookmarksManager).enabled);
+    }
+
+    #[test]
+    fn open_last_pdf_menu_requires_a_readable_pdf_path() {
+        let item_enabled = |state: &WebState| {
+            super::chrome_menus(state)
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("View menu present")
+                .entries
+                .into_iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == MenuAction::OpenLastPdf => Some(i.enabled),
+                    _ => None,
+                })
+                .expect("Open Last PDF item present")
+        };
+        let tmp = tempfile::tempdir().expect("pdf menu tempdir");
+        let path = tmp.path().join("page.pdf");
+        let mut state = WebState::default();
+        state.last_saved_pdf = Some(crate::web::SavedPdf {
+            path: path.clone(),
+            url: "https://example.com/report".to_owned(),
+            title: "Report".to_owned(),
+        });
+
+        assert!(
+            !item_enabled(&state),
+            "a remembered but missing PDF path must not enable the viewer row"
+        );
+        std::fs::write(&path, b"%PDF-1.7\n").expect("write readable PDF header");
+        assert!(
+            item_enabled(&state),
+            "a readable PDF path enables the CEF viewer row"
+        );
+        std::fs::remove_file(&path).expect("remove PDF");
+        assert!(
+            !item_enabled(&state),
+            "deleting the remembered PDF disables the row again"
+        );
+    }
+
+    #[test]
     fn picture_in_picture_menu_tracks_selected_browser_media() {
         let media = Snapshot {
             media_metadata_chip: Some("Now: Track".to_owned()),
@@ -2221,7 +2363,6 @@ mod tests {
                                 | "Show History"
                                 | "Show Bookmarks Bar"
                                 | "Open Bookmarks Manager"
-                                | "Site Styles (your CSS)..."
                         ),
                         "{} has the expected no-page gate",
                         item.label
