@@ -10508,18 +10508,34 @@ mod tests {
                 "status drawer heading {label:?} leaked shared shell text color: {texts:?}"
             );
         }
-        assert_painted_text_color(&texts, "mismatch", CHROME_WARN);
+        assert_painted_text_color(&texts, "Update needed", CHROME_WARN);
+        assert_painted_text_color(&texts, "Update failed", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Target Chromium 149.0.7827.201", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Installed Chromium old", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Stable channel", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "TTS speaking", CHROME_PRIMARY);
         assert_painted_text_color(&texts, "Voice unavailable", CHROME_WARN);
         assert_painted_text_color(&texts, "Example", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "https://example.test/", CHROME_TEXT_DIM);
         assert_painted_text_color(
             &texts,
-            "active CEF runtime does not match packaged manifest",
+            "Installed Chromium files do not match this build",
             CHROME_WARN,
         );
-        assert_painted_text_color(&texts, "installer unavailable", CHROME_WARN);
+        assert_painted_text_color(&texts, "Installer unavailable", CHROME_WARN);
         assert_painted_text_color(&texts, "STT runtime is not configured", CHROME_WARN);
+        for forbidden in [
+            "CEF",
+            "/opt/mde/cef",
+            "packaged manifest",
+            "updater failed",
+            "mismatch",
+        ] {
+            assert!(
+                !texts.iter().any(|(text, _)| text.contains(forbidden)),
+                "status drawer leaked raw engine update copy {forbidden:?}: {texts:?}"
+            );
+        }
 
         let lines = painted_line_strokes(&out.shapes);
         assert!(

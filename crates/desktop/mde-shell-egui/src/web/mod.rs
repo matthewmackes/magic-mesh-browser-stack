@@ -6661,26 +6661,31 @@ impl WebState {
             return None;
         }
 
-        let expected = status
-            .expected_cef_version
-            .as_deref()
-            .or(status.expected_chromium_version.as_deref())
-            .unwrap_or("unknown");
-        let installed = status
-            .installed_version
-            .as_deref()
-            .or(status.installed_chromium.as_deref())
-            .or(status.active_runtime.as_deref())
-            .unwrap_or("unknown");
-        let reason = status
-            .last_error
-            .as_deref()
-            .or(status.last_update_error.as_deref())
-            .unwrap_or("runtime verification failed");
-        Some(format!(
-            "The Chromium engine is not current (state: {}; expected {}; installed {}; reason: {}).",
-            status.state, expected, installed, reason
-        ))
+        let mut notice = format!(
+            "The Chromium engine needs an update before this tab can open. {}.",
+            status.drawer_state_label()
+        );
+        if let Some(target) = status.target_chromium_label() {
+            notice.push(' ');
+            notice.push_str(&target);
+            notice.push('.');
+        }
+        if let Some(installed) = status.installed_chromium_label() {
+            notice.push(' ');
+            notice.push_str(&installed);
+            notice.push('.');
+        }
+        let details = status.user_facing_details();
+        if details.is_empty() {
+            notice.push_str(" Update verification failed.");
+        } else {
+            for detail in details {
+                notice.push(' ');
+                notice.push_str(&detail);
+                notice.push('.');
+            }
+        }
+        Some(notice)
     }
 }
 
@@ -7467,16 +7472,148 @@ impl BrowserSecurityUpdateStatus {
         }
     }
 
+    fn drawer_state_label(&self) -> &'static str {
+        if self.updater_state == "installing" {
+            return "Installing update";
+        }
+        if self.state == "current" && self.updater_state == "failed" {
+            return "Update check failed";
+        }
+        match self.state.as_str() {
+            "current" => "Current",
+            "missing" => "Install needed",
+            "mismatch" => "Update needed",
+            "manifest_missing" => "Update details missing",
+            _ => "Needs attention",
+        }
+    }
+
+    fn updater_label(&self) -> &'static str {
+        match self.updater_state.as_str() {
+            "attempted" => "Checked for updates",
+            "failed" => "Update failed",
+            "idle" => "Ready to update",
+            "installing" => "Installing update",
+            _ => "Update status unavailable",
+        }
+    }
+
+    fn target_chromium_label(&self) -> Option<String> {
+        self.expected_chromium_version
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+            .map(|version| format!("Target Chromium {}", version.trim()))
+            .or_else(|| {
+                self.expected_cef_version
+                    .as_deref()
+                    .filter(|version| !version.trim().is_empty())
+                    .map(|version| format!("Target engine {}", version.trim()))
+            })
+    }
+
+    fn installed_chromium_label(&self) -> Option<String> {
+        self.installed_chromium
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+            .map(|version| format!("Installed Chromium {}", version.trim()))
+            .or_else(|| {
+                self.installed_version
+                    .as_deref()
+                    .filter(|version| !version.trim().is_empty())
+                    .map(|version| format!("Installed engine {}", version.trim()))
+            })
+            .or_else(|| {
+                if self
+                    .active_runtime
+                    .as_deref()
+                    .is_some_and(|runtime| !runtime.trim().is_empty())
+                {
+                    Some("Engine files detected".to_owned())
+                } else if self.libcef_present {
+                    None
+                } else {
+                    Some("Engine files missing".to_owned())
+                }
+            })
+    }
+
+    fn channel_label(&self) -> Option<String> {
+        self.expected_channel
+            .as_deref()
+            .filter(|channel| !channel.trim().is_empty())
+            .map(|channel| format!("{} channel", sentence_case_ascii(channel.trim())))
+    }
+
+    fn user_facing_details(&self) -> Vec<String> {
+        let mut details = Vec::new();
+        for raw in [
+            self.last_update_error.as_deref(),
+            self.last_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(detail) = browser_security_update_detail_label(raw) else {
+                continue;
+            };
+            if !details.iter().any(|existing| existing == &detail) {
+                details.push(detail);
+            }
+        }
+        details
+    }
+
     #[cfg(test)]
     fn chip_label(&self) -> String {
         match self.state.as_str() {
-            "current" => "CEF current".to_owned(),
-            "missing" => "CEF missing".to_owned(),
-            "mismatch" => "CEF mismatch".to_owned(),
-            "manifest_missing" => "CEF manifest".to_owned(),
-            other => format!("CEF {other}"),
+            "current" => "Chromium current".to_owned(),
+            "missing" => "Chromium missing".to_owned(),
+            "mismatch" => "Chromium mismatch".to_owned(),
+            "manifest_missing" => "Chromium update details".to_owned(),
+            other => format!("Chromium {}", sentence_case_ascii(other)),
         }
     }
+}
+
+fn browser_security_update_detail_label(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("sha256") && lower.contains("mismatch") {
+        return Some("Downloaded update did not pass verification".to_owned());
+    }
+    if lower.contains("active cef runtime") && lower.contains("packaged manifest") {
+        return Some("Installed Chromium files do not match this build".to_owned());
+    }
+    if lower.contains("packaged manifest") {
+        return Some("Installed Chromium files do not match this build".to_owned());
+    }
+    if lower.contains("/opt/") || lower.contains('\\') || lower.contains("runtime path") {
+        return Some("Chromium engine update could not be verified".to_owned());
+    }
+    if lower.contains("libcef") {
+        return Some("Chromium engine files are incomplete".to_owned());
+    }
+    let label = trimmed
+        .replace("CEF", "Chromium")
+        .replace("cef", "Chromium")
+        .replace("packaged manifest", "this build")
+        .replace("manifest", "update details");
+    Some(sentence_case_ascii(&label))
+}
+
+fn sentence_case_ascii(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(trimmed.len());
+    out.extend(first.to_uppercase());
+    out.extend(chars);
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17291,11 +17428,23 @@ mod tests {
         assert!(!spawned.get(), "mismatched CEF must gate before spawn");
         assert!(state.tabs.is_empty());
         let notice = state.gate_notice.as_deref().unwrap_or_default();
-        assert!(notice.contains("not current"), "{notice}");
-        assert!(notice.contains("mismatch"), "{notice}");
-        assert!(notice.contains("149.0.6"), "{notice}");
-        assert!(notice.contains("148.0.0"), "{notice}");
-        assert!(notice.contains("sha256 mismatch"), "{notice}");
+        assert!(notice.contains("needs an update"), "{notice}");
+        assert!(notice.contains("Update needed"), "{notice}");
+        assert!(
+            notice.contains("Target Chromium 149.0.7827.201"),
+            "{notice}"
+        );
+        assert!(notice.contains("Installed Chromium 148.0.0.1"), "{notice}");
+        assert!(
+            notice.contains("Downloaded update did not pass verification"),
+            "{notice}"
+        );
+        for raw in ["state:", "reason:", "CEF", "149.0.6", "sha256 mismatch"] {
+            assert!(
+                !notice.contains(raw),
+                "launch gate leaked raw engine update copy {raw:?}: {notice}"
+            );
+        }
 
         std::env::remove_var(CEF_ROOT_ENV);
         let _ = std::fs::remove_dir_all(runtime);

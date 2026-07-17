@@ -2299,7 +2299,7 @@ mod tests {
 
         assert!(chips
             .iter()
-            .any(|c| { c.text == "CEF mismatch" && c.tone == ChipTone::Warn }));
+            .any(|c| { c.text == "Chromium mismatch" && c.tone == ChipTone::Warn }));
     }
 
     #[test]

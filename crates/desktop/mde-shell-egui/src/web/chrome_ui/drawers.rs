@@ -1488,7 +1488,7 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 drawer_status_row(
                     ui,
                     drawer_tone_icon(tone, ChromeIcon::Engine),
-                    status.state.as_str(),
+                    status.drawer_state_label(),
                     super::tone_color(tone),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1500,34 +1500,35 @@ pub(super) fn security_update_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(format!("updater {}", status.updater_state))
+                    RichText::new(status.updater_label())
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
-                if let Some(chromium) = &status.expected_chromium_version {
+                if let Some(target) = status.target_chromium_label() {
                     ui.label(
-                        RichText::new(format!("Chromium {chromium}"))
+                        RichText::new(target)
                             .size(Style::SMALL)
                             .color(super::CHROME_TEXT_DIM),
                     );
                 }
-                if let Some(runtime) = &status.active_runtime {
+                if let Some(installed) = status.installed_chromium_label() {
                     ui.label(
-                        RichText::new(runtime)
+                        RichText::new(installed)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
+                    );
+                }
+                if let Some(channel) = status.channel_label() {
+                    ui.label(
+                        RichText::new(channel)
                             .size(Style::SMALL)
                             .color(super::CHROME_TEXT_DIM),
                     );
                 }
             });
 
-            for detail in [
-                status.last_update_error.as_deref(),
-                status.last_error.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                drawer_status_row(ui, ChromeIcon::Warning, detail, super::CHROME_WARN);
+            for detail in status.user_facing_details() {
+                drawer_status_row(ui, ChromeIcon::Warning, &detail, super::CHROME_WARN);
             }
         });
 }
