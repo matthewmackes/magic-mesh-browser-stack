@@ -752,7 +752,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption(s.site_data.clone()),
                 Entry::Caption("Filter lists: bundled seed + synced/custom rules".to_owned()),
                 Entry::Caption(
-                    "Extensions: v1 disabled; native blocker, passkeys, reader mode active"
+                    "Extensions: native blocker, passkeys, reader mode, userscripts, and site styles active"
                         .to_owned(),
                 ),
                 Entry::Caption(s.safe_browsing.clone()),
@@ -896,14 +896,13 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         ),
                         Entry::Separator,
                         Entry::Caption(
-                            "WebExtensions are skipped for v1; native blocking, passkeys, \
-                             reader mode, userscripts, and site styles are the supported path."
+                            "Native blocking, passkeys, reader mode, userscripts, and site \
+                             styles are active for this Browser build."
                                 .to_owned(),
                         ),
                         Entry::Caption(
                             "UA/device overrides change page-visible navigator, screen, and \
-                             viewport metadata; native request-header and compositor emulation \
-                             remain follow-up hooks."
+                             viewport metadata for the active tab."
                                 .to_owned(),
                         ),
                         Entry::Caption(
@@ -915,7 +914,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         Entry::Caption(
                             "Chromium DevTools opens the CEF helper's loopback debugging portal; \
                              active CEF pages are selected from Chromium's target list when \
-                             discovery is available. Servo DevTools remain a follow-up hook."
+                             discovery is available."
                                 .to_owned(),
                         ),
                         Entry::Caption(
@@ -924,8 +923,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                              Transfers, Download Observed Images narrows that batch to every \
                              observed image candidate, and blocked resources are marked for \
                              Power-mode ignore-blocking retrieval. Transfers now performs native \
-                             direct/HLS/DASH fetches; native device emulation remains a follow-up \
-                             tool."
+                             direct/HLS/DASH fetches."
                                 .to_owned(),
                         ),
                         Entry::Caption(
@@ -1636,10 +1634,29 @@ mod tests {
                 && i.label == "Prompt Clipboard Access"
                 && i.enabled
         )));
-        assert!(power.entries.iter().any(|e| matches!(
-            e,
-            Entry::Caption(c) if c.contains("WebExtensions are skipped for v1")
-        )));
+        let captions: Vec<&str> = power
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Caption(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Native blocking, passkeys, reader mode")),
+            "Power menu should describe active native Browser tools: {captions:?}"
+        );
+        assert!(
+            captions.iter().all(|c| {
+                !c.contains("follow-up")
+                    && !c.contains("placeholder")
+                    && !c.contains("stub")
+                    && !c.contains("v1")
+            }),
+            "Power menu captions must not expose internal planning terms: {captions:?}"
+        );
         let chips = build_status(&snap);
         assert!(
             chips.iter().any(|chip| chip.text == "Power"),
@@ -2451,8 +2468,14 @@ mod tests {
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Extensions: v1 disabled")),
-            "the v1 native-over-WebExtensions policy is visible"
+                .any(|c| c.contains("Extensions: native blocker")),
+            "the native Browser tool policy is visible"
+        );
+        assert!(
+            captions.iter().all(|c| {
+                !c.contains("follow-up") && !c.contains("placeholder") && !c.contains("stub")
+            }),
+            "privacy captions must stay user-facing: {captions:?}"
         );
         assert!(
             captions
