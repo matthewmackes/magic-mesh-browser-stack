@@ -6230,8 +6230,10 @@ fn suggestion_chip(
 pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
     let history = &state.suggestions.history;
     let bookmarks = &state.suggestions.bookmarks;
+    let files = &state.suggestions.files;
     let search_items = dedup_search_items(&state.suggestions.items, history);
     if bookmarks.is_empty()
+        && files.is_empty()
         && history.is_empty()
         && search_items.is_empty()
         && state.suggestions.notice.is_none()
@@ -6268,6 +6270,22 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
                 .clicked();
                 if clicked {
                     accepted = Some(bm.url.clone());
+                }
+                idx += 1;
+            }
+        }
+        if !files.is_empty() {
+            browser_muted_note(ui, "Files");
+            for file in files {
+                let label = ellipsize(&file.title, 32);
+                let clicked =
+                    suggestion_chip(ui, &label, ChromeIcon::Page, CHROME_TEXT, fill_for(idx))
+                        .on_hover_ui(|ui| {
+                            chrome_tooltip(ui, &format!("Open file: {}", file.path.display()))
+                        })
+                        .clicked();
+                if clicked {
+                    accepted = Some(file.url.clone());
                 }
                 idx += 1;
             }
@@ -8682,6 +8700,11 @@ mod tests {
             title: "Example bookmark".to_owned(),
             url: "https://example.test/bookmark".to_owned(),
         }];
+        state.suggestions.files = vec![super::super::BrowserFileSuggestion {
+            title: "home-notes.md".to_owned(),
+            path: std::path::PathBuf::from("/home/mm/home-notes.md"),
+            url: "file:///home/mm/home-notes.md".to_owned(),
+        }];
         state.suggestions.history = vec!["https://example.test/history".to_owned()];
         state.suggestions.items = vec![
             "example search".to_owned(),
@@ -10354,6 +10377,8 @@ mod tests {
 
         assert_painted_text_color(&texts, "Bookmarks", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Example bookmark", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "Files", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "home-notes.md", CHROME_TEXT);
         assert_painted_text_color(&texts, "History", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "https://example.test/history", CHROME_TEXT);
         assert_painted_text_color(&texts, "example search", CHROME_TEXT);

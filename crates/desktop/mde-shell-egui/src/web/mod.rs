@@ -30,6 +30,7 @@ use mde_chat::{MessageKind, Severity};
 use mde_editor_egui::spell::{self, SpellMiss};
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{ChipTone, Style};
+use mde_files_egui::model::FileSearchTarget;
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
     TransferVerb, TransfersClient,
@@ -688,6 +689,18 @@ struct BookmarkBarLink {
     url: String,
 }
 
+/// One local file projected into Browser omnibox suggestions.
+///
+/// The shell supplies these from the Files model; Browser only ranks and commits
+/// the already-built `file://` URL, so it does not crawl the filesystem or persist
+/// private paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserFileSuggestion {
+    title: String,
+    path: PathBuf,
+    url: String,
+}
+
 /// Fold a converged [`mde_bookmarks::Collection`] into the bar's top-level bookmark
 /// links, in the collection's own render order (`roots()` is order-key sorted).
 /// Folders are omitted — the bar is a flat quick-launch strip of the top-level
@@ -755,6 +768,54 @@ fn matching_bookmarks(index: &[BookmarkBarLink], draft: &str, cap: usize) -> Vec
             bookmark.title.clone(),
             bookmark.url.clone(),
             bookmark,
+        )
+        .with_source_rank(idx)
+    });
+    ranked_hits(draft, items, cap)
+        .into_iter()
+        .map(|hit| hit.item.payload)
+        .collect()
+}
+
+fn browser_file_suggestion_from_item(
+    item: SearchItem<FileSearchTarget>,
+) -> Option<BrowserFileSuggestion> {
+    let path = item.payload.path?;
+    let url = file_url_for_path(&path).ok()?;
+    Some(BrowserFileSuggestion {
+        title: item.title,
+        path,
+        url,
+    })
+}
+
+fn browser_file_suggestions(
+    items: impl IntoIterator<Item = SearchItem<FileSearchTarget>>,
+) -> Vec<BrowserFileSuggestion> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let Some(file) = browser_file_suggestion_from_item(item) else {
+            continue;
+        };
+        if seen.insert(file.url.clone()) {
+            out.push(file);
+        }
+    }
+    out
+}
+
+fn matching_file_suggestions(
+    index: &[BrowserFileSuggestion],
+    draft: &str,
+    cap: usize,
+) -> Vec<BrowserFileSuggestion> {
+    let items = index.iter().cloned().enumerate().map(|(idx, file)| {
+        SearchItem::new(
+            SearchDomain::File,
+            file.title.clone(),
+            file.path.display().to_string(),
+            file,
         )
         .with_source_rank(idx)
     });
@@ -1497,6 +1558,9 @@ pub(crate) struct WebState {
     /// fetched off-thread from the mesh-local service; the UI only polls this
     /// small state object so typing never blocks a frame.
     suggestions: SuggestionState,
+    /// Local file candidates supplied by the shell-owned Files model. Browser
+    /// ranks them into omnibox suggestions but does not crawl or persist them.
+    file_omnibox_index: Vec<BrowserFileSuggestion>,
     /// BROWSER-DD-11 offline spellcheck worker. Page text is extracted by the
     /// helper, then Hunspell runs off the UI thread and reports an honest result.
     spellcheck: SpellcheckState,
@@ -1805,6 +1869,7 @@ impl Default for WebState {
             find_open: false,
             page_zoom_percent: 100,
             suggestions: SuggestionState::default(),
+            file_omnibox_index: Vec::new(),
             spellcheck: SpellcheckState::default(),
             latest_spellcheck: None,
             next_page_text_request_id: 1,
@@ -1982,6 +2047,21 @@ impl WebState {
     /// (no second read, §7). Backs the Start Menu Browser tile's live fact.
     pub(crate) fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// Whether the shell should refresh local file candidates for the Browser
+    /// omnibox this frame. Avoids a per-frame Files home snapshot while the
+    /// Browser is merely displaying a page.
+    pub(crate) fn wants_file_omnibox_items(&self) -> bool {
+        self.omnibox_focused && !self.address.trim().is_empty()
+    }
+
+    /// Refresh Browser's local file suggestion source from the shell-owned Files
+    /// model. The source is kept in memory only and re-ranked for the current
+    /// omnibox draft; Browser does not scan directories itself.
+    pub(crate) fn set_file_omnibox_items(&mut self, items: Vec<SearchItem<FileSearchTarget>>) {
+        self.file_omnibox_index = browser_file_suggestions(items);
+        self.update_file_suggestions_for_address();
     }
 
     /// Browser candidates for the shell-owned front door: persisted bookmarks,
@@ -5468,6 +5548,7 @@ impl WebState {
 
     fn update_suggestions_for_address(&mut self) {
         self.suggestions.update_for_draft(&self.address);
+        self.update_file_suggestions_for_address();
         // History matches independently of the SearXNG fetch gate
         // (`should_fetch_suggestions`): a URL-like draft that skips the search
         // round-trip should still surface a matching visit. Guarded on a
@@ -5491,6 +5572,15 @@ impl WebState {
         // URL; otherwise nothing is preselected and arrow keys drive the highlight.
         let ordered = self.suggestions.ordered_commit_values();
         self.suggestions.selected = inline_top_hit(&ordered, &self.address);
+    }
+
+    fn update_file_suggestions_for_address(&mut self) {
+        let files = if self.address.trim().is_empty() {
+            Vec::new()
+        } else {
+            matching_file_suggestions(&self.file_omnibox_index, &self.address, 5)
+        };
+        self.suggestions.set_file_matches(files);
     }
 
     fn accept_suggestion(&mut self, suggestion: String) {
@@ -8069,8 +8159,12 @@ struct SuggestionState {
     /// Matching bookmarks (`{title, url}`) for the current draft — rendered ABOVE
     /// history in the dropdown (Chrome ranks a saved bookmark above a mere visit).
     bookmarks: Vec<BookmarkBarLink>,
+    /// Matching local files supplied by the shell Files model. Rendered after
+    /// bookmarks and before browsing history so local paths remain high-signal
+    /// without displacing saved page destinations.
+    files: Vec<BrowserFileSuggestion>,
     /// Keyboard-highlighted suggestion — a flat index into
-    /// [`Self::ordered_commit_values`] (bookmarks, then history, then search).
+    /// [`Self::ordered_commit_values`] (bookmarks, files, history, then search).
     /// `None` = nothing highlighted (Enter submits the typed draft). Reset whenever
     /// the draft changes; moved by Up/Down while the omnibox has focus.
     selected: Option<usize>,
@@ -8136,6 +8230,7 @@ impl SuggestionState {
         self.rx = None;
         self.history.clear();
         self.bookmarks.clear();
+        self.files.clear();
         self.selected = None;
     }
 
@@ -8149,9 +8244,15 @@ impl SuggestionState {
         self.bookmarks = matches;
     }
 
+    /// Replace the local file-match list (see [`SuggestionState::files`]).
+    fn set_file_matches(&mut self, matches: Vec<BrowserFileSuggestion>) {
+        self.files = matches;
+    }
+
     /// Browser's local contribution to the shared unified-omnibox model, in the
-    /// same render/commit order the dropdown exposes: bookmarks, history, then
-    /// deduped web suggestions. The payload is the exact value accepted on Enter.
+    /// same render/commit order the dropdown exposes: bookmarks, local files,
+    /// history, then deduped web suggestions. The payload is the exact value
+    /// accepted on Enter.
     fn ordered_search_items(&self) -> Vec<SearchItem<String>> {
         let mut items: Vec<SearchItem<String>> = Vec::new();
         items.extend(self.bookmarks.iter().enumerate().map(|(idx, bookmark)| {
@@ -8162,6 +8263,16 @@ impl SuggestionState {
                 bookmark.url.clone(),
             )
             .with_source_rank(idx)
+        }));
+        let file_offset = items.len();
+        items.extend(self.files.iter().enumerate().map(|(idx, file)| {
+            SearchItem::new(
+                SearchDomain::File,
+                file.title.clone(),
+                file.path.display().to_string(),
+                file.url.clone(),
+            )
+            .with_source_rank(file_offset + idx)
         }));
         let history_offset = items.len();
         items.extend(self.history.iter().enumerate().map(|(idx, url)| {
@@ -8798,6 +8909,7 @@ mod tests {
     use mde_web_preview_client::{scm, testkit, wire, EditCommand};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     /// A headless 960×640 shell body, mirroring the VDI + shell render tests.
@@ -21385,6 +21497,58 @@ mod tests {
     }
 
     #[test]
+    fn browser_omnibox_accepts_file_candidates_from_the_files_model() {
+        let temp = tempfile::tempdir().expect("file suggestion dir");
+        let file = temp.path().join("home-notes.md");
+        std::fs::write(&file, b"notes").expect("file suggestion fixture");
+        let file_target = FileSearchTarget {
+            pane: 0,
+            row: 0,
+            path: Some(file.clone()),
+        };
+        let mut state = WebState::default();
+        state.set_file_omnibox_items(vec![
+            SearchItem::new(
+                SearchDomain::File,
+                "home-notes.md",
+                file.display().to_string(),
+                file_target.clone(),
+            ),
+            SearchItem::new(
+                SearchDomain::File,
+                "virtual-row",
+                "local:home/virtual-row",
+                FileSearchTarget {
+                    pane: 0,
+                    row: 1,
+                    path: None,
+                },
+            ),
+            SearchItem::new(
+                SearchDomain::File,
+                "home-notes duplicate",
+                file.display().to_string(),
+                file_target,
+            ),
+        ]);
+
+        state.address = "home-notes".to_owned();
+        state.update_suggestions_for_address();
+
+        assert_eq!(state.file_omnibox_index.len(), 1);
+        assert_eq!(state.suggestions.files.len(), 1);
+        let file_hit = &state.suggestions.files[0];
+        assert_eq!(file_hit.title, "home-notes.md");
+        assert_eq!(file_hit.path, file);
+        assert!(file_hit.url.starts_with("file://"));
+        assert_eq!(
+            state.suggestions.ordered_search_items()[0].domain,
+            SearchDomain::File,
+            "file-only suggestions should flow through the shared Browser search adapter"
+        );
+    }
+
+    #[test]
     fn browser_shell_omnibox_target_opens_a_foreground_tab_when_empty() {
         let mut state = WebState::default();
 
@@ -21432,13 +21596,19 @@ mod tests {
             title: "BM".into(),
             url: "https://bm.example/".into(),
         }]);
+        s.set_file_matches(vec![BrowserFileSuggestion {
+            title: "home-notes.md".into(),
+            path: PathBuf::from("/home/me/home-notes.md"),
+            url: "file:///home/me/home-notes.md".into(),
+        }]);
         s.set_history_matches(vec!["https://hist.example/".into()]);
         s.items = vec!["search term".into()];
-        // Render order: bookmark, history, deduped search.
+        // Render order: bookmark, file, history, deduped search.
         assert_eq!(
             s.ordered_commit_values(),
             vec![
                 "https://bm.example/".to_string(),
+                "file:///home/me/home-notes.md".to_string(),
                 "https://hist.example/".to_string(),
                 "search term".to_string(),
             ]
@@ -21448,6 +21618,11 @@ mod tests {
         // Arrow down walks the list; the committed value follows the highlight.
         s.move_selection(1);
         assert_eq!(s.selected_value().as_deref(), Some("https://bm.example/"));
+        s.move_selection(1);
+        assert_eq!(
+            s.selected_value().as_deref(),
+            Some("file:///home/me/home-notes.md")
+        );
         s.move_selection(1);
         assert_eq!(s.selected_value().as_deref(), Some("https://hist.example/"));
         s.move_selection(1); // -> search
@@ -21462,6 +21637,11 @@ mod tests {
             title: "Mesh Bookmark".into(),
             url: "https://bookmark.example/mesh".into(),
         }]);
+        s.set_file_matches(vec![BrowserFileSuggestion {
+            title: "mesh-plan.md".into(),
+            path: PathBuf::from("/home/me/mesh-plan.md"),
+            url: "file:///home/me/mesh-plan.md".into(),
+        }]);
         s.set_history_matches(vec!["https://history.example/mesh".into()]);
         s.items = vec!["https://history.example/mesh".into(), "mesh browser".into()];
 
@@ -21474,22 +21654,24 @@ mod tests {
             domains,
             [
                 SearchDomain::BrowserBookmark,
+                SearchDomain::File,
                 SearchDomain::BrowserHistory,
                 SearchDomain::WebSuggestion,
             ],
-            "Browser adapter must expose bookmarks, history, then deduped web suggestions"
+            "Browser adapter must expose bookmarks, files, history, then deduped web suggestions"
         );
         assert_eq!(
             payloads,
             [
                 "https://bookmark.example/mesh",
+                "file:///home/me/mesh-plan.md",
                 "https://history.example/mesh",
                 "mesh browser",
             ],
             "payloads remain the exact values committed by Enter/click"
         );
         assert_eq!(
-            targets[2],
+            targets[3],
             "https://search.mesh/search?q=mesh+browser",
             "web suggestion rows carry their real search target while keeping the typed commit payload"
         );
