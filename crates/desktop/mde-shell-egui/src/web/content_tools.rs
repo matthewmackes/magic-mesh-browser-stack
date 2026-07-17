@@ -35,19 +35,54 @@ impl BrowserSpellcheckResult {
         self.error.is_some() || !self.misses.is_empty()
     }
 
+    pub(super) fn user_facing_error(&self) -> Option<String> {
+        self.error.as_deref().and_then(spellcheck_error_label)
+    }
+
     pub(super) fn summary(&self) -> String {
-        if let Some(error) = self.error.as_deref() {
-            if error.trim().is_empty() {
-                "Spellcheck unavailable".to_owned()
-            } else {
-                format!("Spellcheck unavailable: {error}")
-            }
+        if let Some(error) = self.user_facing_error() {
+            format!("Spellcheck unavailable: {error}")
+        } else if self.error.is_some() {
+            "Spellcheck unavailable".to_owned()
         } else {
             let count = self.misses.len();
             let plural = if count == 1 { "" } else { "s" };
             format!("{count} possible misspelling{plural}")
         }
     }
+}
+
+pub(super) fn spellcheck_error_label(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("hunspell") {
+        if lower.contains("not installed") || lower.contains("missing") {
+            return Some("Spelling dictionary is not installed".to_owned());
+        }
+        if lower.contains("permission") || lower.contains("denied") {
+            return Some("Spelling dictionary cannot be opened".to_owned());
+        }
+        return Some("Spelling dictionary unavailable".to_owned());
+    }
+    if lower.contains("spell-check unavailable") || lower.contains("spellcheck unavailable") {
+        return Some("Spelling service unavailable".to_owned());
+    }
+    if lower.contains("worker")
+        || lower.contains("runtime")
+        || lower.contains("backend")
+        || lower.contains("/opt/")
+        || lower.contains("/usr/")
+        || lower.contains('\\')
+        || lower.contains(" path")
+    {
+        return Some("Spelling service unavailable".to_owned());
+    }
+
+    Some(sentence_case_ascii(trimmed))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

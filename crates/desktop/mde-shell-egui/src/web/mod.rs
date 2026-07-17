@@ -7729,8 +7729,10 @@ fn spellcheck_notice(result: Result<Vec<SpellMiss>, String>) -> String {
                 .unwrap_or_default();
             format!("Spelling: {count} possible misspelling{plural}{first}")
         }
-        Err(err) if err.is_empty() => "Spelling unavailable".to_owned(),
-        Err(err) => format!("Spelling unavailable: {err}"),
+        Err(err) => spellcheck_error_label(&err).map_or_else(
+            || "Spelling unavailable".to_owned(),
+            |label| format!("Spelling unavailable: {label}"),
+        ),
     }
 }
 
@@ -10414,7 +10416,7 @@ mod tests {
         );
         assert_eq!(
             spellcheck_notice(Err("hunspell not installed".to_owned())),
-            "Spelling unavailable: hunspell not installed"
+            "Spelling unavailable: Spelling dictionary is not installed"
         );
     }
 
@@ -10446,9 +10448,14 @@ mod tests {
             BrowserSpellcheckResult::from_result(4, Err("hunspell not installed".to_owned()));
         assert!(unavailable.is_visible());
         assert_eq!(unavailable.tab_index, 4);
+        assert_eq!(unavailable.error.as_deref(), Some("hunspell not installed"));
+        assert_eq!(
+            unavailable.user_facing_error().as_deref(),
+            Some("Spelling dictionary is not installed")
+        );
         assert_eq!(
             unavailable.summary(),
-            "Spellcheck unavailable: hunspell not installed"
+            "Spellcheck unavailable: Spelling dictionary is not installed"
         );
     }
 

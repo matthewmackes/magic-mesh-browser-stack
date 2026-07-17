@@ -1240,8 +1240,8 @@ pub(super) fn spellcheck_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 });
             });
 
-            if let Some(error) = result.error.as_deref() {
-                drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
+            if let Some(error) = result.user_facing_error() {
+                drawer_status_row(ui, ChromeIcon::Warning, &error, super::CHROME_WARN);
                 return;
             }
 

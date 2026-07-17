@@ -10580,12 +10580,22 @@ mod tests {
         let texts = painted_text(&out.shapes);
 
         assert_painted_text_color(&texts, "Spelling", CHROME_TEXT);
-        assert_painted_text_color(&texts, "hunspell not installed", CHROME_WARN);
+        assert_painted_text_color(&texts, "Spelling dictionary is not installed", CHROME_WARN);
         assert!(
-            !texts
-                .iter()
-                .any(|(text, color)| text == "hunspell not installed"
-                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("hunspell")
+                    && !lower.contains("runtime")
+                    && !lower.contains("backend")
+                    && !lower.contains("worker")
+            }),
+            "spellcheck drawer leaked backend copy: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(
+                |(text, color)| text == "Spelling dictionary is not installed"
+                    && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)
+            ),
             "spellcheck error leaked shared shell text color: {texts:?}"
         );
 
