@@ -278,6 +278,8 @@ struct Snapshot {
     current_site_permissions: Option<String>,
     /// Whether the native blocker is enabled for the current first-party host.
     site_blocking_enabled: bool,
+    /// Operator custom filter-rule source status.
+    custom_filters: String,
     /// Safe-browsing mesh blocklist status.
     safe_browsing: String,
     /// Operator-managed URL policy status.
@@ -336,6 +338,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 current_site: state.active_first_party(),
                 current_site_permissions: state.active_site_permission_summary(),
                 site_blocking_enabled: state.active_site_blocking_enabled(),
+                custom_filters: state.custom_filter_rules_summary(),
                 safe_browsing: state.safe_browsing_summary(),
                 managed_policy: state.managed_policy_summary(),
                 site_data: state.site_data_summary(),
@@ -404,6 +407,7 @@ fn snapshot(state: &WebState) -> Snapshot {
         .is_some_and(|saved| pdf_file_looks_readable(&saved.path));
     snap.active_downloads = active_downloads;
     snap.total_downloads = total_downloads;
+    snap.custom_filters = state.custom_filter_rules_summary();
     snap.safe_browsing = state.safe_browsing_summary();
     snap.managed_policy = state.managed_policy_summary();
     snap.site_data = state.site_data_summary();
@@ -784,6 +788,9 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         .enabled(s.has_tab && !s.crashed),
                 ),
             ];
+            if !s.custom_filters.trim().is_empty() {
+                entries.insert(5, Entry::Caption(s.custom_filters.clone()));
+            }
             if let Some(site) = &s.current_site {
                 entries.insert(4, Entry::Caption(format!("This site: {site}")));
             }
@@ -1420,6 +1427,7 @@ mod tests {
                 "example.com: all sensitive prompts denied by default".to_owned(),
             ),
             site_blocking_enabled: true,
+            custom_filters: "Custom filters: 2 custom rules loaded".to_owned(),
             safe_browsing: "Safe browsing: 2 unsafe site rules loaded".to_owned(),
             managed_policy: "Managed policy: 3 URL block rules loaded".to_owned(),
             site_data: "Site data: 1 tracked site; 1 open tab; example.com cleared 0 times"
@@ -2486,6 +2494,12 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("Filter lists: bundled seed + synced/custom rules")),
             "the filter-list policy source is visible"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Custom filters: 2 custom rules loaded")),
+            "the operator custom-filter source status is visible"
         );
         assert!(
             captions

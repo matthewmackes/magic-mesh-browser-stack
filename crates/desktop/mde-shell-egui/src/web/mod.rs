@@ -1227,6 +1227,7 @@ impl BrowserEngine {
 enum BrowserPolicySourceKind {
     SafeBrowsing,
     ManagedUrl,
+    CustomFilterRules,
 }
 
 impl BrowserPolicySourceKind {
@@ -1234,6 +1235,7 @@ impl BrowserPolicySourceKind {
         match self {
             Self::SafeBrowsing => "safe_browsing",
             Self::ManagedUrl => "managed_url",
+            Self::CustomFilterRules => "custom_filter_rules",
         }
     }
 
@@ -1241,6 +1243,7 @@ impl BrowserPolicySourceKind {
         match self {
             Self::SafeBrowsing => "browser_safe_browsing_source_status",
             Self::ManagedUrl => "browser_managed_url_policy_source_status",
+            Self::CustomFilterRules => "browser_custom_filter_rules_source_status",
         }
     }
 
@@ -1248,6 +1251,7 @@ impl BrowserPolicySourceKind {
         match self {
             Self::SafeBrowsing => "Safe browsing",
             Self::ManagedUrl => "Managed policy",
+            Self::CustomFilterRules => "Custom filters",
         }
     }
 
@@ -1255,6 +1259,7 @@ impl BrowserPolicySourceKind {
         match self {
             Self::SafeBrowsing => "unsafe site rule",
             Self::ManagedUrl => "URL block rule",
+            Self::CustomFilterRules => "custom rule",
         }
     }
 
@@ -1262,6 +1267,7 @@ impl BrowserPolicySourceKind {
         match self {
             Self::SafeBrowsing => browser_safe_browsing_source_topic(host),
             Self::ManagedUrl => browser_managed_policy_source_topic(host),
+            Self::CustomFilterRules => browser_custom_filter_rules_source_topic(host),
         }
     }
 }
@@ -1515,6 +1521,8 @@ pub(crate) struct WebState {
     /// toggles mutate this store, then every open tab receives a freshly compiled
     /// [`RequestFilter`].
     adfilter_store: FilterListStore,
+    /// Current read posture for the operator-managed custom filter rules file.
+    custom_filter_rules_source_status: BrowserPolicySourceStatus,
     /// Mesh-hosted safe-browsing host blocklists. The worker/file-sync half can
     /// replace these hosts; the Browser compiles them into every live session.
     safe_browsing_hosts: Vec<String>,
@@ -1736,6 +1744,8 @@ pub(crate) struct WebState {
     bookmarks_collection_cursor: Option<String>,
     /// Throttle for the relaxed bookmark-collection re-read.
     bookmarks_collection_last_poll: Option<Instant>,
+    /// Throttle for the operator-managed custom filter rules re-read.
+    custom_filter_rules_last_poll: Option<Instant>,
     /// Throttle for the operator-curated safe-browsing blocklist re-read.
     safe_browsing_last_poll: Option<Instant>,
     /// Throttle for the operator-managed URL policy re-read.
@@ -1801,6 +1811,10 @@ impl Default for WebState {
             pending_translate_requests: BTreeMap::new(),
             pending_offline_cache_requests: BTreeMap::new(),
             adfilter_store: FilterListStore::with_bundled(),
+            custom_filter_rules_source_status: BrowserPolicySourceStatus::unknown(
+                BrowserPolicySourceKind::CustomFilterRules,
+                default_workgroup_root().join(CUSTOM_FILTER_RULES_PATH),
+            ),
             safe_browsing_hosts: Vec::new(),
             safe_browsing_source_status: BrowserPolicySourceStatus::unknown(
                 BrowserPolicySourceKind::SafeBrowsing,
@@ -1889,6 +1903,7 @@ impl Default for WebState {
             site_style_host_draft: String::new(),
             site_style_css_draft: String::new(),
             bookmarks_collection_cursor: None,
+            custom_filter_rules_last_poll: None,
             safe_browsing_last_poll: None,
             managed_policy_last_poll: None,
             bookmarks_collection_last_poll: None,
@@ -2264,6 +2279,7 @@ impl WebState {
         self.poll_offline_cache_results();
         self.poll_security_update_status();
         self.poll_bookmarks_collection();
+        self.poll_custom_filter_rules();
         self.poll_safe_browsing_hosts();
         self.poll_managed_url_policy();
         self.suspend_idle_tabs(Instant::now());
@@ -5922,6 +5938,10 @@ impl WebState {
             .is_some_and(|host| !self.adfilter_store.allowlist().is_allowed(&host))
     }
 
+    fn custom_filter_rules_summary(&self) -> String {
+        self.custom_filter_rules_source_status.summary()
+    }
+
     fn safe_browsing_summary(&self) -> String {
         self.safe_browsing_source_status.summary()
     }
@@ -5991,19 +6011,34 @@ impl WebState {
         self.publish_site_blocking(engine, &url, &title, &host, enabled, now);
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "wired to synced browser policy follow-up")
-    )]
-    fn add_custom_filter_rules(&mut self, name: &str, raw: &str) {
+    fn add_custom_filter_rules(&mut self, name: &str, raw: &str, source_path: Option<&Path>) {
         let name = name.trim();
         let raw = raw.trim();
-        if name.is_empty() || raw.is_empty() {
+        if name.is_empty() {
             return;
         }
+        let source_url = source_path.map(|path| path.to_string_lossy().into_owned());
         self.adfilter_store
-            .add_source(FilterListSource::custom(name, None, raw, unix_ms()));
+            .add_source(FilterListSource::custom(name, source_url, raw, unix_ms()));
         self.apply_adfilter_to_open_tabs();
+    }
+
+    fn current_custom_filter_rule_count(&self) -> usize {
+        self.adfilter_store
+            .source(CUSTOM_FILTER_SOURCE_NAME)
+            .map_or(0, |source| custom_filter_rule_count(&source.raw))
+    }
+
+    fn set_custom_filter_rules(&mut self, raw: &str, source_path: &Path) {
+        let raw = raw.trim();
+        let unchanged = self
+            .adfilter_store
+            .source(CUSTOM_FILTER_SOURCE_NAME)
+            .is_some_and(|source| source.raw.trim() == raw);
+        if unchanged {
+            return;
+        }
+        self.add_custom_filter_rules(CUSTOM_FILTER_SOURCE_NAME, raw, Some(source_path));
     }
 
     fn set_safe_browsing_hosts(&mut self, hosts: impl IntoIterator<Item = impl AsRef<str>>) {
@@ -6401,6 +6436,49 @@ impl WebState {
         self.publish_policy_source_status(&self.safe_browsing_source_status);
     }
 
+    /// Populate operator custom EasyList-format rules from
+    /// `browser/custom-filter-rules.txt` under the workgroup root. A loaded empty
+    /// file clears the custom source; missing/error keeps the last-good source.
+    fn poll_custom_filter_rules(&mut self) {
+        if self
+            .custom_filter_rules_last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.custom_filter_rules_last_poll = Some(Instant::now());
+        let path = default_workgroup_root().join(CUSTOM_FILTER_RULES_PATH);
+        let checked_ms = unix_ms();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let item_count = custom_filter_rule_count(&text);
+                let status = BrowserPolicySourceStatus::loaded(
+                    BrowserPolicySourceKind::CustomFilterRules,
+                    path.clone(),
+                    item_count,
+                    checked_ms,
+                );
+                self.set_custom_filter_rules(&text, &path);
+                self.custom_filter_rules_source_status = status;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.custom_filter_rules_source_status = self
+                    .custom_filter_rules_source_status
+                    .missing(path, checked_ms, self.current_custom_filter_rule_count());
+            }
+            Err(err) => {
+                self.custom_filter_rules_source_status =
+                    self.custom_filter_rules_source_status.error(
+                        path,
+                        checked_ms,
+                        self.current_custom_filter_rule_count(),
+                        err.to_string(),
+                    );
+            }
+        }
+        self.publish_policy_source_status(&self.custom_filter_rules_source_status);
+    }
+
     /// Populate the operator-managed URL policy from
     /// `browser/managed-url-policy.txt` under the workgroup root. Lines are host
     /// suffixes or URL prefixes; changes are applied to all open tabs.
@@ -6450,8 +6528,21 @@ impl WebState {
 
 /// The operator-curated safe-browsing blocklist path, relative to the workgroup root.
 const SAFE_BROWSING_HOSTS_PATH: &str = "browser/safe-browsing-hosts.txt";
+/// The operator-managed custom filter rules path, relative to the workgroup root.
+const CUSTOM_FILTER_RULES_PATH: &str = "browser/custom-filter-rules.txt";
+/// The stable source name used inside the Browser filter-list store.
+const CUSTOM_FILTER_SOURCE_NAME: &str = "Operator custom rules";
 /// The operator-managed URL policy path, relative to the workgroup root.
 const MANAGED_URL_POLICY_PATH: &str = "browser/managed-url-policy.txt";
+
+/// Count configured EasyList-style custom rule lines for operator status. This is
+/// intentionally line-based; the matcher parser still owns detailed rule validity.
+fn custom_filter_rule_count(text: &str) -> usize {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count()
+}
 
 /// Parse the safe-browsing blocklist file: one host per line, `#` comments and blank
 /// lines skipped, hosts trimmed + lowercased. Pure so the parse is unit-tested.
@@ -7043,6 +7134,10 @@ const STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX: &str = "state/browser-safe-brow
 
 /// Browser managed URL policy source-read status prefix.
 const STATE_BROWSER_MANAGED_POLICY_SOURCE_PREFIX: &str = "state/browser-managed-url-policy-source/";
+
+/// Browser custom filter rules source-read status prefix.
+const STATE_BROWSER_CUSTOM_FILTER_RULES_SOURCE_PREFIX: &str =
+    "state/browser-custom-filter-rules-source/";
 
 /// Browser managed-policy block audit event. Operators/admin tooling can consume
 /// this without scraping UI notices.
@@ -16003,14 +16098,57 @@ mod tests {
     }
 
     #[test]
-    fn custom_filter_rules_compile_into_open_tabs() {
+    fn custom_filter_rules_file_compiles_into_open_tabs_and_publishes_status() {
         use mde_web_preview_client::{ControlMsg, EventMsg, ResourceType};
 
+        let _env = browser_env_lock();
+        let _workgroup = EnvRestore::capture("MDE_WORKGROUP_ROOT");
+        let workgroup = tempfile::tempdir().expect("temp workgroup");
+        let browser_dir = workgroup.path().join("browser");
+        std::fs::create_dir_all(&browser_dir).expect("browser policy dir");
+        let source_path = browser_dir.join("custom-filter-rules.txt");
+        std::fs::write(&source_path, "# operator rules\n||ads.custom.test^\n")
+            .expect("custom filter source");
+        std::env::set_var("MDE_WORKGROUP_ROOT", workgroup.path());
+
+        let bus = tempfile::tempdir().expect("temp bus");
         let (shell, helper) = UnixStream::pair().expect("socketpair");
         helper.set_nonblocking(true).expect("helper nonblocking");
-        let mut state = WebState::default();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
         state.push_session(WebSession::from_stream(shell, None).expect("session"));
-        state.add_custom_filter_rules("TestCustom", "||ads.custom.test^");
+        state.poll_custom_filter_rules();
+
+        assert_eq!(
+            state.custom_filter_rules_source_status.state,
+            BrowserPolicySourceState::Loaded
+        );
+        assert_eq!(
+            state.custom_filter_rules_source_status.summary(),
+            "Custom filters: 1 custom rule loaded"
+        );
+        let expected_source_url = source_path.to_string_lossy().into_owned();
+        assert_eq!(
+            state
+                .adfilter_store
+                .source(CUSTOM_FILTER_SOURCE_NAME)
+                .and_then(|source| source.url.as_deref()),
+            Some(expected_source_url.as_str())
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_custom_filter_rules_source_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list custom filter status");
+        assert_eq!(msgs.len(), 1);
+        let loaded: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("loaded body"))
+                .expect("valid loaded JSON");
+        assert_eq!(loaded["op"], "browser_custom_filter_rules_source_status");
+        assert_eq!(loaded["policy"], "custom_filter_rules");
+        assert_eq!(loaded["state"], "loaded");
+        assert_eq!(loaded["item_count"], 1);
+        assert_eq!(loaded["effective_count"], 1);
 
         let mut peer: &UnixStream = &helper;
         peer.write_all(&wire::frame(
@@ -16045,6 +16183,41 @@ mod tests {
                     }
                 )),
             "custom EasyList-style rules are compiled into active tab verdicts"
+        );
+
+        std::fs::remove_file(&source_path).expect("remove source");
+        state.custom_filter_rules_last_poll = None;
+        state.poll_custom_filter_rules();
+        assert_eq!(
+            state.custom_filter_rules_source_status.state,
+            BrowserPolicySourceState::Missing
+        );
+        assert!(state
+            .custom_filter_rules_source_status
+            .summary()
+            .contains("last-good custom rule active"));
+
+        peer.write_all(&wire::frame(
+            &EventMsg::ResourceRequest {
+                id: 42,
+                url: "https://ads.custom.test/again.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Script),
+            }
+            .encode(),
+        ))
+        .expect("custom request after missing source");
+        state.tabs[0].session.poll();
+        assert!(
+            drain_control_messages(&helper)
+                .into_iter()
+                .any(|m| matches!(
+                    m,
+                    ControlMsg::ResourceVerdict {
+                        id: 42,
+                        allow: false
+                    }
+                )),
+            "missing custom source must retain last-good active rules"
         );
     }
 
@@ -16759,6 +16932,10 @@ mod tests {
             browser_managed_policy_source_topic("node-a"),
             "state/browser-managed-url-policy-source/node-a"
         );
+        assert_eq!(
+            browser_custom_filter_rules_source_topic("node-a"),
+            "state/browser-custom-filter-rules-source/node-a"
+        );
 
         let source = Path::new("/mesh/browser/safe-browsing-hosts.txt");
         let body = browser_policy_source_status_body(
@@ -16804,6 +16981,26 @@ mod tests {
         assert_eq!(v["effective_count"], 2);
         assert_eq!(v["loaded_ms"], 400);
         assert_eq!(v["error"], "is a directory");
+
+        let body = browser_policy_source_status_body(
+            BrowserPolicySourceKind::CustomFilterRules.op(),
+            BrowserPolicySourceKind::CustomFilterRules.policy(),
+            Path::new("/mesh/browser/custom-filter-rules.txt"),
+            BrowserPolicySourceState::Loaded.wire(),
+            2,
+            2,
+            789,
+            Some(780),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_custom_filter_rules_source_status");
+        assert_eq!(v["policy"], "custom_filter_rules");
+        assert_eq!(v["state"], "loaded");
+        assert_eq!(v["source_path"], "/mesh/browser/custom-filter-rules.txt");
+        assert_eq!(v["item_count"], 2);
+        assert_eq!(v["effective_count"], 2);
+        assert_eq!(v["loaded_ms"], 780);
     }
 
     #[test]
