@@ -8674,6 +8674,46 @@ mod tests {
         )
     }
 
+    fn render_offline_cache_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_offline_cache = Some(BrowserOfflineCacheResult {
+            host: "browser-helper".to_owned(),
+            cache_id: "01HARchivecopy-test".to_owned(),
+            tab_index: 0,
+            engine: BrowserEngine::Cef,
+            url: "https://example.test/archive".to_owned(),
+            title: "Example archive".to_owned(),
+            text: "Cached page text".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            archive_mhtml: Some(super::super::OfflineCacheArchive {
+                mime: "multipart/related".to_owned(),
+                filename: "mde-browser-example.mhtml".to_owned(),
+                bytes: 4096,
+                data_base64: "bWVzaA==".to_owned(),
+            }),
+            pdf_snapshot: None,
+            cached_ms: Some(123),
+        });
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 240.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::offline_cache_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
     fn render_empty_downloads_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
         let mut state = WebState::default();
         state.downloads_open = true;
@@ -10315,6 +10355,24 @@ mod tests {
         assert!(
             !fills.contains(&egui::Color32::BLACK),
             "QR share matrix must not paint raw black fills inside Browser chrome: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn browser_offline_copy_drawer_uses_user_facing_archive_copy() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_offline_cache_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Offline copy", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Archive", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Web archive 4096 bytes", CHROME_TEXT_DIM);
+        assert!(
+            texts
+                .iter()
+                .all(|(text, _)| !text.to_ascii_lowercase().contains("mhtml")),
+            "offline copy drawer must not expose archive file-format terminology: {texts:?}"
         );
     }
 

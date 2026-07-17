@@ -4111,7 +4111,7 @@ impl WebState {
     fn capture_active_mhtml(&mut self) {
         match self.capture_active_mhtml_to_dir(browser_capture_dir()) {
             Ok(path) => {
-                self.record_capture_success("Captured MHTML", &path);
+                self.record_capture_success("Captured web archive", &path);
             }
             Err(err) => {
                 self.capture_notice = Some(format!("Capture failed: {err}"));
@@ -20532,7 +20532,7 @@ mod tests {
         let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
         let path = PathBuf::from("/tmp/mde-browser-capture.png");
 
-        state.record_capture_success("Captured", &path);
+        state.record_capture_success("Captured web archive", &path);
 
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
         let msgs = persist
@@ -20543,7 +20543,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
         assert_eq!(v["severity"], "info");
         assert_eq!(v["source"], "browser");
-        assert_eq!(v["summary"], "Captured /tmp/mde-browser-capture.png");
+        assert_eq!(
+            v["summary"],
+            "Captured web archive /tmp/mde-browser-capture.png"
+        );
+        assert!(
+            !v["summary"]
+                .as_str()
+                .expect("summary string")
+                .contains("MHTML"),
+            "capture summary must keep archive implementation terminology out of Browser chrome"
+        );
         assert_eq!(v["detail"], "/tmp/mde-browser-capture.png");
         assert_eq!(v["action"], "action/shell/goto/browser");
     }

@@ -1356,9 +1356,9 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     if result.archive_mhtml.is_some()
                         && drawer_button(
                             ui,
-                            "MHTML",
+                            "Archive",
                             BrowserActionRole::Secondary,
-                            "Save cached offline MHTML archive",
+                            "Save cached offline web archive",
                         )
                         .clicked()
                     {
@@ -1418,7 +1418,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 }
                 if let Some(archive) = &result.archive_mhtml {
                     ui.label(
-                        RichText::new(format!("MHTML {} bytes", archive.bytes))
+                        RichText::new(format!("Web archive {} bytes", archive.bytes))
                             .size(Style::SMALL)
                             .color(super::CHROME_TEXT_DIM),
                     );

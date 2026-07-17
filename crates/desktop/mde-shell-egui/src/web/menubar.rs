@@ -673,7 +673,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::CaptureMhtml, "Capture MHTML")
+                    Item::new(MenuAction::CaptureMhtml, "Capture Web Archive")
                         .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
@@ -1782,6 +1782,7 @@ mod tests {
         assert!(item(MenuAction::Dictate).enabled);
         assert!(item(MenuAction::CaptureViewport).enabled);
         assert!(item(MenuAction::CaptureFullPage).enabled);
+        assert_eq!(item(MenuAction::CaptureMhtml).label, "Capture Web Archive");
         assert!(item(MenuAction::CaptureMhtml).enabled);
         assert!(item(MenuAction::CaptureAnnotatedViewport).enabled);
         assert!(item(MenuAction::CaptureCalloutViewport).enabled);
@@ -1830,7 +1831,7 @@ mod tests {
         assert!(texts.contains(&"Work".to_owned()));
         assert!(texts.contains(&"Display 2".to_owned()));
         assert!(texts.contains(&"Find".to_owned()));
-        assert!(texts.contains(&"2".to_owned()));
+        assert!(texts.contains(&"Downloads 2".to_owned()));
         assert!(texts.contains(&"Muted".to_owned()));
         assert!(texts.contains(&"Autoplay".to_owned()));
         assert!(texts.contains(&"Dark".to_owned()));
