@@ -40,7 +40,7 @@ pub(super) fn download_drawer_subtitle(
     } else if worker_present {
         "No downloads".to_owned()
     } else {
-        "Transfers unavailable".to_owned()
+        "Downloads unavailable".to_owned()
     }
 }
 
@@ -898,7 +898,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 let message = if worker_present {
                     "No browser downloads yet"
                 } else {
-                    "Transfers worker is not available on this node"
+                    "Downloads are unavailable on this node"
                 };
                 browser_muted_note(ui, message);
                 return;

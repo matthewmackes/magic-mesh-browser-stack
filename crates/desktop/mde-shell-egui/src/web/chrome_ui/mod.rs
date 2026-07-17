@@ -10619,7 +10619,7 @@ mod tests {
     fn browser_download_drawer_header_uses_user_facing_status() {
         assert_eq!(
             drawers::download_drawer_subtitle(false, 0, 0),
-            "Transfers unavailable"
+            "Downloads unavailable"
         );
         assert_eq!(
             drawers::download_drawer_subtitle(true, 0, 0),
@@ -10642,7 +10642,9 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .all(|(text, _)| !text.contains("browser_download") && !text.contains("ledger")),
+                .all(|(text, _)| !text.contains("browser_download")
+                    && !text.contains("ledger")
+                    && !text.contains("worker")),
             "download drawer header must not expose internal transfer names: {texts:?}"
         );
     }
@@ -10680,10 +10682,19 @@ mod tests {
             .iter()
             .find(|(text, _)| {
                 text == "No browser downloads yet"
-                    || text == "Transfers worker is not available on this node"
+                    || text == "Downloads are unavailable on this node"
             })
             .unwrap_or_else(|| panic!("empty downloads drawer note was not painted: {texts:?}"));
 
+        assert!(
+            texts.iter().all(|(text, _)| {
+                !text.contains("browser_download")
+                    && !text.contains("ledger")
+                    && !text.contains("worker")
+                    && !text.contains("helper")
+            }),
+            "downloads drawer muted notes must stay user-facing: {texts:?}"
+        );
         assert_eq!(
             empty_note.1, CHROME_TEXT_DIM,
             "Browser muted notes must use Browser Material dim text: {texts:?}"
