@@ -15946,6 +15946,7 @@ mod tests {
                         ui,
                         None,
                         Some(BrowserEngine::Cef),
+                        false,
                         "https://example.com/",
                         "Example Domain",
                     );

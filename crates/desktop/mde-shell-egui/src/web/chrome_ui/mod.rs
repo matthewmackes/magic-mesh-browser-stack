@@ -5410,6 +5410,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 ui,
                 state.bus_root.as_deref(),
                 active_engine,
+                is_bookmarked,
                 &page_url,
                 &page_title,
             );
@@ -5467,16 +5468,28 @@ pub(super) fn page_actions_menu(
     ui: &mut egui::Ui,
     bus_root: Option<&Path>,
     engine: Option<BrowserEngine>,
+    is_bookmarked: bool,
     url: &str,
     title: &str,
 ) {
     let has_page = !url.trim().is_empty();
+    let bookmark_label = if is_bookmarked {
+        "Bookmarked"
+    } else {
+        "Add bookmark"
+    };
+    let bookmark_enabled = has_page && !is_bookmarked;
+    let bookmark_disabled_tip = if is_bookmarked {
+        "Already in Bookmarks"
+    } else {
+        "No loaded page to bookmark"
+    };
     if chrome_menu_row(
         ui,
-        "Add bookmark",
+        bookmark_label,
         ChromeIcon::Bookmark,
-        has_page,
-        "No loaded page to bookmark",
+        bookmark_enabled,
+        bookmark_disabled_tip,
     )
     .clicked()
     {
@@ -5553,6 +5566,14 @@ pub(super) fn page_actions_menu(
     }
 }
 
+const fn page_actions_tip(is_bookmarked: bool) -> &'static str {
+    if is_bookmarked {
+        "Bookmarked: copy URL, share, send tab"
+    } else {
+        "Page actions: bookmark, copy URL, share"
+    }
+}
+
 /// The toolbar star that opens the BOOKMARKS-10 [`page_actions_menu`].
 pub(super) fn page_actions_button(
     ui: &mut egui::Ui,
@@ -5564,11 +5585,7 @@ pub(super) fn page_actions_button(
     title: &str,
 ) {
     let color = page_action_icon_color(has_page, is_bookmarked);
-    let tip = if is_bookmarked {
-        "Bookmarked: page actions, edit bookmark, copy URL, share"
-    } else {
-        "Page actions: bookmark, copy URL, share"
-    };
+    let tip = page_actions_tip(is_bookmarked);
     let popup_id = egui::Id::new("mde_web_page_actions_menu_popup");
     let response = toolbar_icon_menu_anchor(ui, popup_id, ChromeIcon::Bookmark, color, tip);
     if response.clicked() || menu_anchor_keyboard_toggle(ui, &response) {
@@ -5589,7 +5606,7 @@ pub(super) fn page_actions_button(
             if motion.anchor_offset > 0.0 {
                 ui.add_space(motion.anchor_offset);
             }
-            page_actions_menu(ui, bus_root, engine, url, title);
+            page_actions_menu(ui, bus_root, engine, is_bookmarked, url, title);
         },
     );
 }
@@ -8382,7 +8399,10 @@ mod tests {
         )
     }
 
-    fn render_page_actions_menu_frame(ctx: &egui::Context) -> egui::FullOutput {
+    fn render_page_actions_menu_frame(
+        ctx: &egui::Context,
+        is_bookmarked: bool,
+    ) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -8400,6 +8420,7 @@ mod tests {
                             ui,
                             None,
                             Some(BrowserEngine::Cef),
+                            is_bookmarked,
                             "https://example.test/",
                             "Example",
                         );
@@ -9740,6 +9761,14 @@ mod tests {
         assert_eq!(page_action_icon_color(false, false), CHROME_TEXT_DIM);
         assert_eq!(page_action_icon_color(true, false), CHROME_TEXT);
         assert_eq!(page_action_icon_color(true, true), CHROME_PRIMARY);
+        assert_eq!(
+            page_actions_tip(true),
+            "Bookmarked: copy URL, share, send tab"
+        );
+        assert!(
+            !page_actions_tip(true).contains("edit"),
+            "the toolbar must not advertise an edit flow the menu does not implement"
+        );
     }
 
     #[test]
@@ -9839,7 +9868,7 @@ mod tests {
     fn page_actions_menu_rows_use_browser_painted_icons() {
         let ctx = egui::Context::default();
         mde_egui::fonts::install(&ctx);
-        let out = render_page_actions_menu_frame(&ctx);
+        let out = render_page_actions_menu_frame(&ctx, false);
         let texts = painted_text(&out.shapes);
 
         for label in [
@@ -9869,6 +9898,22 @@ mod tests {
                 .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
             "page action rows must paint Browser line icons: {lines:?}"
         );
+    }
+
+    #[test]
+    fn page_actions_menu_marks_existing_bookmarks_without_duplicate_add() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_page_actions_menu_frame(&ctx, true);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Bookmarked", CHROME_TEXT_DIM);
+        assert!(
+            !texts.iter().any(|(text, _)| text == "Add bookmark"),
+            "a page already present in the system bookmark manager must not offer a duplicate add row: {texts:?}"
+        );
+        assert_painted_text_color(&texts, "Copy URL", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Send in Chat", CHROME_TEXT);
     }
 
     #[test]
