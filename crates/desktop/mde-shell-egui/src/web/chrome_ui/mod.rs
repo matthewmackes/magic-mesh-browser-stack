@@ -3174,9 +3174,7 @@ fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
         | MenuAction::CaptureCalloutViewport
         | MenuAction::CaptureFreehandViewport
         | MenuAction::CaptureRegion => "Requires a live page with a painted frame",
-        MenuAction::TogglePictureInPicture => {
-            "Requires Browser media metadata and a retained video frame"
-        }
+        MenuAction::TogglePictureInPicture => "Start video playback in a Browser tab first",
         MenuAction::OpenLastPdf => "Requires a readable PDF saved from Browser",
         MenuAction::OpenChromiumDevtools => "Requires a live CEF / Chromium page",
         MenuAction::OpenViewSource
@@ -9121,6 +9119,10 @@ mod tests {
         assert_eq!(
             disabled_option_tip(MenuAction::CaptureViewport),
             "Requires a live page with a painted frame"
+        );
+        assert_eq!(
+            disabled_option_tip(MenuAction::TogglePictureInPicture),
+            "Start video playback in a Browser tab first"
         );
         assert_eq!(
             disabled_option_tip(MenuAction::OpenLastPdf),
