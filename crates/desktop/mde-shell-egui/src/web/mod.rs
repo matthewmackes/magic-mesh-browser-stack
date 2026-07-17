@@ -2572,10 +2572,6 @@ impl WebState {
         }
     }
 
-    fn active_live_page_needs_repaint(&self) -> bool {
-        self.active_live_page_repaint_interval().is_some()
-    }
-
     fn active_live_page_repaint_interval(&self) -> Option<Duration> {
         let tab = self.tabs.get(self.active)?;
         if tab.internal_page.is_some() || tab.idle_suspended || tab.session.is_crashed() {
@@ -12267,7 +12263,7 @@ mod tests {
             Some(BrowserInternalPage::Options)
         );
         assert!(
-            !state.active_live_page_needs_repaint(),
+            state.active_live_page_repaint_interval().is_none(),
             "the regression setup must not be satisfied by the active page heartbeat"
         );
         assert!(
