@@ -4664,8 +4664,8 @@ impl WebState {
 
     fn print_active_page(&mut self) {
         match self.queue_active_page_cups_print_to_dir(browser_print_spool_dir()) {
-            Ok(path) => {
-                self.capture_notice = Some(format!("CUPS print queued {}", path.display()));
+            Ok(_path) => {
+                self.capture_notice = Some("Print job queued".to_owned());
             }
             Err(err) => {
                 self.capture_notice = Some(format!("Print failed: {err}"));
@@ -4683,15 +4683,21 @@ impl WebState {
     fn handle_pdf_event(&mut self, path: String, ok: bool) -> String {
         if let Some(request) = self.pending_cups_prints.remove(&path) {
             if !ok {
-                return format!("CUPS print failed: PDF write failed {}", request.path);
+                return "Print failed: PDF could not be created".to_owned();
             }
             return match submit_pdf_to_cups(
                 Path::new(&request.path),
                 &request.title,
                 &request.settings,
             ) {
-                Ok(job) => format!("CUPS print submitted {job}"),
-                Err(err) => format!("CUPS print failed: {err}"),
+                Ok(job) if job.trim().is_empty() || job.contains('/') || job.contains('\\') => {
+                    "Print job submitted".to_owned()
+                }
+                Ok(job) => format!("Print job submitted: {}", job.trim()),
+                Err(err) => printer_error_label(&err).map_or_else(
+                    || "Print failed".to_owned(),
+                    |label| format!("Print failed: {label}"),
+                ),
             };
         }
         if ok {
@@ -10685,6 +10691,65 @@ mod tests {
         .expect_err("lp failure is surfaced");
 
         assert_eq!(err, "lp: Error - no default destination available");
+    }
+
+    #[test]
+    fn printer_error_labels_hide_backend_terms_for_browser_chrome() {
+        assert_eq!(
+            printer_error_label("lp: Error - no default destination available").as_deref(),
+            Some("No default printer is available")
+        );
+        assert_eq!(
+            printer_error_label("CUPS service unavailable").as_deref(),
+            Some("Printer service unavailable")
+        );
+        assert_eq!(
+            printer_error_label("/tmp/page.pdf is not a file").as_deref(),
+            Some("Print output was not found")
+        );
+        assert_eq!(
+            printer_error_label("lp failed without an error message").as_deref(),
+            Some("Printer did not accept the job")
+        );
+    }
+
+    #[test]
+    fn browser_print_pdf_events_use_user_facing_notices() {
+        let mut state = WebState::default();
+        let path = "/tmp/quazar-print-missing.pdf".to_owned();
+        state.pending_cups_prints.insert(
+            path.clone(),
+            CupsPrintRequest {
+                path: path.clone(),
+                title: "Example".to_owned(),
+                settings: CupsPrintSettings::default(),
+            },
+        );
+        let failed_notice = state.handle_pdf_event(path.clone(), false);
+        assert_eq!(failed_notice, "Print failed: PDF could not be created");
+        assert!(
+            !failed_notice.contains("CUPS")
+                && !failed_notice.contains("lp")
+                && !failed_notice.contains("/tmp/"),
+            "print PDF failure leaked backend copy: {failed_notice}"
+        );
+
+        state.pending_cups_prints.insert(
+            path.clone(),
+            CupsPrintRequest {
+                path: path.clone(),
+                title: "Example".to_owned(),
+                settings: CupsPrintSettings::default(),
+            },
+        );
+        let missing_notice = state.handle_pdf_event(path, true);
+        assert_eq!(missing_notice, "Print failed: Print output was not found");
+        assert!(
+            !missing_notice.contains("CUPS")
+                && !missing_notice.contains("lp")
+                && !missing_notice.contains("/tmp/"),
+            "print PDF missing-output notice leaked backend copy: {missing_notice}"
+        );
     }
 
     #[test]

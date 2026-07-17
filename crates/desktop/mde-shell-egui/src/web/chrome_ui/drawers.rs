@@ -8,7 +8,7 @@
 
 use super::super::{
     offline_cache_viewport_display_size, offline_cache_viewport_texture, plural,
-    short_transfer_name, spellcheck_occurrence_index, spellcheck_results_text,
+    printer_error_label, short_transfer_name, spellcheck_occurrence_index, spellcheck_results_text,
     BrowserReadAloudStatus, BrowserVoiceCommandStatus, PaperSize, PrintOrientation,
 };
 use super::*;
@@ -453,7 +453,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new("CUPS destination")
+                    RichText::new("Printer destination")
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -465,7 +465,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         ui,
                         ChromeIcon::Reload,
                         BrowserActionRole::Quiet,
-                        "Refresh CUPS destinations",
+                        "Refresh printers",
                     )
                     .clicked()
                     {
@@ -475,7 +475,9 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if let Some(notice) = &state.cups_notice {
-                drawer_status_row(ui, ChromeIcon::Warning, notice, super::CHROME_ERROR);
+                let notice = printer_error_label(notice)
+                    .unwrap_or_else(|| "Printer list unavailable".into());
+                drawer_status_row(ui, ChromeIcon::Warning, &notice, super::CHROME_ERROR);
             }
 
             ui.horizontal_wrapped(|ui| {
@@ -488,7 +490,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     ui,
                     "System default",
                     state.cups_settings.destination.is_none(),
-                    "Use the system default CUPS destination",
+                    "Use the system default printer",
                 )
                 .clicked()
                 {
@@ -507,8 +509,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     } else {
                         printer.name.clone()
                     };
-                    if drawer_choice_chip(ui, &label, selected, "Select CUPS destination").clicked()
-                    {
+                    if drawer_choice_chip(ui, &label, selected, "Select printer").clicked() {
                         state.cups_settings.destination = Some(printer.name.clone());
                     }
                 }
@@ -519,7 +520,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         ui,
                         &destination,
                         true,
-                        "The selected CUPS destination is not in the latest printer list",
+                        "The selected printer is not in the latest printer list",
                     );
                 }
 
@@ -542,7 +543,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 );
                 chrome_hover_text(
                     drawer_toggle(ui, &mut state.cups_settings.grayscale, "Grayscale"),
-                    "Request grayscale output from CUPS",
+                    "Request grayscale output from the printer",
                 );
                 drawer_inline_separator(ui);
                 ui.label(
@@ -604,7 +605,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     state.can_drive_page_tools(),
                     "Print",
                     BrowserActionRole::Primary,
-                    "Queue this page PDF and submit it to CUPS",
+                    "Queue this page as a print job",
                 )
                 .clicked()
                 {
@@ -613,10 +614,7 @@ pub(super) fn print_settings_drawer(ui: &mut egui::Ui, state: &mut WebState) {
             });
 
             if printers.is_empty() {
-                browser_muted_note(
-                    ui,
-                    "No CUPS destinations discovered; system default is still usable",
-                );
+                browser_muted_note(ui, "No printers discovered; system default is still usable");
             }
         });
 }

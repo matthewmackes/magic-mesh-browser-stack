@@ -10447,7 +10447,7 @@ mod tests {
             (
                 "print",
                 render_print_settings_drawer_frame(&ctx),
-                &["CUPS service unavailable"][..],
+                &["Printer service unavailable"][..],
             ),
             (
                 "download-notice",
@@ -11198,6 +11198,29 @@ mod tests {
                 "{surface} bookmark button must paint a Browser bookmark path icon: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn browser_print_drawer_uses_user_facing_printer_copy() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_print_settings_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Printer destination", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Printer service unavailable", CHROME_ERROR);
+        assert_painted_text_color(
+            &texts,
+            "No printers discovered; system default is still usable",
+            CHROME_TEXT_DIM,
+        );
+        assert!(
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("cups") && !lower.contains("lpstat") && !lower.starts_with("lp:")
+            }),
+            "print drawer leaked printer backend copy: {texts:?}"
+        );
     }
 
     #[test]
