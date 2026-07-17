@@ -4157,11 +4157,11 @@ impl WebState {
             .export_active_media_manifest_to_dirs(browser_media_spool_dir(), browser_capture_dir())
         {
             Ok(id) => {
-                self.capture_notice = Some(format!("Power mode: queued media manifest ({id})"));
+                self.capture_notice = Some(Self::media_export_queued_notice(&id));
                 self.refresh_downloads();
             }
             Err(err) => {
-                self.capture_notice = Some(format!("Media manifest failed: {err}"));
+                self.capture_notice = Some(Self::media_export_failed_notice(&err));
             }
         }
     }
@@ -4200,6 +4200,43 @@ impl WebState {
             &path.to_string_lossy(),
             dest_dir.to_string_lossy().as_ref(),
         )
+    }
+
+    fn media_export_queued_notice(id: &str) -> String {
+        format!("Power mode: queued media list ({id})")
+    }
+
+    fn media_export_failed_notice(detail: &str) -> String {
+        let label = Self::media_export_error_label(detail);
+        if label.is_empty() {
+            "Media export failed".to_owned()
+        } else {
+            format!("Media export failed: {label}")
+        }
+    }
+
+    fn media_export_error_label(detail: &str) -> String {
+        let trimmed = detail.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("no live page") || lower.contains("no active tab") {
+            return "no live page".to_owned();
+        }
+        if lower.contains("write media manifest") {
+            return "could not save the media list".to_owned();
+        }
+        if lower.contains("create media spool dir") {
+            return "could not prepare the media export".to_owned();
+        }
+        if lower.contains("create media destination dir") {
+            return "could not open the media export folder".to_owned();
+        }
+        if lower.contains('/') || lower.contains('\\') || lower.contains("manifest") {
+            return "could not complete the media export".to_owned();
+        }
+        sentence_case_ascii(trimmed)
     }
 
     fn download_observed_media_assets(&mut self) {
@@ -21456,6 +21493,32 @@ mod tests {
             assert!(
                 !md.contains(forbidden),
                 "scrape markdown leaked internal copy {forbidden:?}: {md}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_export_notices_use_user_facing_copy() {
+        let mut state = WebState::default();
+        state.export_active_media_manifest();
+        let no_live = state
+            .capture_notice
+            .as_deref()
+            .expect("media export notice");
+        assert_eq!(no_live, "Media export failed: no live page");
+
+        let queued = WebState::media_export_queued_notice("browser-media-123");
+        assert_eq!(queued, "Power mode: queued media list (browser-media-123)");
+
+        let failed =
+            WebState::media_export_failed_notice("write media manifest /tmp/page.json: denied");
+        assert_eq!(failed, "Media export failed: could not save the media list");
+
+        for notice in [no_live, queued.as_str(), failed.as_str()] {
+            let lower = notice.to_ascii_lowercase();
+            assert!(
+                !lower.contains("manifest") && !lower.contains("/tmp/"),
+                "media export notice leaked implementation copy: {notice}"
             );
         }
     }

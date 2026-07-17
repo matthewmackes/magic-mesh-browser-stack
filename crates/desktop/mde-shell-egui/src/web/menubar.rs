@@ -840,7 +840,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                                 .enabled(has_page),
                         ),
                         Entry::Item(
-                            Item::new(MenuAction::ExportMediaManifest, "Export Media Manifest")
+                            Item::new(MenuAction::ExportMediaManifest, "Export Media List")
                                 .enabled(has_page),
                         ),
                         Entry::Item(
@@ -907,29 +907,26 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         ),
                         Entry::Caption(
                             "Device API prompts record explicit per-site deny decisions for camera, \
-                             microphone, location, notifications, and clipboard while helper \
-                             enforcement remains default-deny."
+                             microphone, location, notifications, and clipboard while the default \
+                             stays deny."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Chromium DevTools opens the CEF helper's loopback debugging portal; \
-                             active CEF pages are selected from Chromium's target list when \
-                             discovery is available."
+                            "Chromium DevTools opens the local debugging portal; active Chromium \
+                             pages are selected from the target list when discovery is available."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Media Manifest exports observed image/media/HLS/DASH requests; \
-                             Download Observed Media queues per-asset request files through \
-                             Transfers, Download Observed Images narrows that batch to every \
-                             observed image candidate, and blocked resources can be retried with \
-                             a direct fetch. Transfers handles direct, HLS, and DASH downloads."
+                            "Export Media List saves observed image, video, HLS, and DASH requests; \
+                             Download Observed Media queues each asset through Transfers, Download \
+                             Observed Images narrows that batch to image candidates, and blocked \
+                             resources can be retried with a direct fetch."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Export Page Scrape requests visible text plus DOM links/headings, writes \
-                             bounded crawl seed/article/crawl-manifest JSON/CSV/Markdown artifacts, \
-                             and sends the files to Transfers. Crawl packages are limited to same-site \
-                             depth 1 so exports stay predictable."
+                            "Export Page Scrape saves visible text, links, headings, article details, \
+                             and same-site crawl seeds as JSON, CSV, and Markdown files, then sends \
+                             those files to Transfers. Crawl packages stay limited to same-site depth 1."
                                 .to_owned(),
                         ),
                     ],
@@ -1593,7 +1590,9 @@ mod tests {
         )));
         assert!(power.entries.iter().any(|e| matches!(
             e,
-            Entry::Item(i) if i.id == MenuAction::ExportMediaManifest && i.enabled
+            Entry::Item(i) if i.id == MenuAction::ExportMediaManifest
+                && i.label == "Export Media List"
+                && i.enabled
         )));
         assert!(power.entries.iter().any(|e| matches!(
             e,
@@ -1647,15 +1646,34 @@ mod tests {
         );
         assert!(
             captions.iter().all(|c| {
-                !c.contains("follow-up")
-                    && !c.contains("placeholder")
-                    && !c.contains("stub")
-                    && !c.contains("v1")
-                    && !c.contains("Power-mode")
-                    && !c.contains("recursive discovery")
-                    && !c.contains("remains open")
+                let lower = c.to_ascii_lowercase();
+                !lower.contains("follow-up")
+                    && !lower.contains("placeholder")
+                    && !lower.contains("stub")
+                    && !lower.contains("v1")
+                    && !lower.contains("power-mode")
+                    && !lower.contains("recursive discovery")
+                    && !lower.contains("remains open")
+                    && !lower.contains("manifest")
+                    && !lower.contains("helper")
+                    && !lower.contains("cef")
+                    && !lower.contains("dom")
             }),
             "Power menu captions must not expose internal planning terms: {captions:?}"
+        );
+        let labels: Vec<&str> = power
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item(i) => Some(i.label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.to_ascii_lowercase().contains("manifest")),
+            "Power menu item labels must not expose implementation terms: {labels:?}"
         );
         let chips = build_status(&snap);
         assert!(
