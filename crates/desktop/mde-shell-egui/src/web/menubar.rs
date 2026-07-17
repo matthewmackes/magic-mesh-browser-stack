@@ -1420,7 +1420,7 @@ mod tests {
                 "example.com: all sensitive prompts denied by default".to_owned(),
             ),
             site_blocking_enabled: true,
-            safe_browsing: "Safe browsing: 2 mesh-hosted unsafe hosts loaded".to_owned(),
+            safe_browsing: "Safe browsing: 2 unsafe site rules loaded".to_owned(),
             managed_policy: "Managed policy: 3 URL block rules loaded".to_owned(),
             site_data: "Site data: 1 tracked site; 1 open tab; example.com cleared 0 times"
                 .to_owned(),
@@ -2495,14 +2495,19 @@ mod tests {
         );
         assert!(
             captions.iter().all(|c| {
-                !c.contains("follow-up") && !c.contains("placeholder") && !c.contains("stub")
+                let lower = c.to_ascii_lowercase();
+                !lower.contains("follow-up")
+                    && !lower.contains("placeholder")
+                    && !lower.contains("stub")
+                    && !(lower.contains("unsafe") && lower.contains("host"))
+                    && !lower.contains("mesh-hosted")
             }),
             "privacy captions must stay user-facing: {captions:?}"
         );
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Safe browsing: 2 mesh-hosted unsafe hosts loaded")),
+                .any(|c| c.contains("Safe browsing: 2 unsafe site rules loaded")),
             "the safe-browsing mesh blocklist status is visible"
         );
         assert!(

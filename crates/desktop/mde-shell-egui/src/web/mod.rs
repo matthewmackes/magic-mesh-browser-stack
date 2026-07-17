@@ -1253,7 +1253,7 @@ impl BrowserPolicySourceKind {
 
     const fn item_label(self) -> &'static str {
         match self {
-            Self::SafeBrowsing => "unsafe host",
+            Self::SafeBrowsing => "unsafe site rule",
             Self::ManagedUrl => "URL block rule",
         }
     }
@@ -15185,7 +15185,7 @@ mod tests {
         .expect("nav");
         state.tabs[0].session.poll();
 
-        // ...then a top-level navigation to a mesh-flagged unsafe host is blocked,
+        // ...then a top-level navigation to a mesh-flagged unsafe site is blocked,
         // arming the full-page interstitial (a Document block, not a subresource).
         state.set_safe_browsing_hosts(["malware.test"]);
         peer.write_all(&wire::frame(
@@ -15739,6 +15739,10 @@ mod tests {
             state.safe_browsing_source_status.state,
             BrowserPolicySourceState::Loaded
         );
+        assert_eq!(
+            state.safe_browsing_source_status.summary(),
+            "Safe browsing: 1 unsafe site rule loaded"
+        );
         assert_eq!(state.safe_browsing_source_status.item_count, 1);
         assert_eq!(state.safe_browsing_source_status.effective_count, 1);
         let loaded_ms = state
@@ -15784,6 +15788,10 @@ mod tests {
             .safe_browsing_source_status
             .summary()
             .contains("source missing"));
+        assert!(state
+            .safe_browsing_source_status
+            .summary()
+            .contains("last-good unsafe site rule active"));
 
         let msgs = persist
             .list_since(&topic, None)
@@ -18175,13 +18183,17 @@ mod tests {
             .expect("punycode host warns");
         assert_eq!(
             punycode,
-            "Punycode/IDN host (xn--): verify this is the site you expect"
+            "Punycode/IDN address (xn--): verify this is the site you expect"
         );
         assert!(punycode.is_ascii());
         assert!(!punycode.contains('\u{2014}'));
         // ...a look-alike Cyrillic 'а' (U+0430) mixed with Latin trips it too...
         let confusable =
             chrome_ui::confusable_warning("\u{0430}pple.com").expect("confusable host warns");
+        assert_eq!(
+            confusable,
+            "Look-alike letters (Cyrillic/Greek): this site may impersonate another site"
+        );
         assert!(confusable.is_ascii());
         assert!(!confusable.contains('\u{2014}'));
         // ...and a plain ASCII host does not.

@@ -49,7 +49,7 @@ fn active_body_contents(ui: &mut egui::Ui, state: &mut WebState) {
         }
         return;
     }
-    // Safe-browsing: a top-level navigation to an unsafe host shows a full-page
+    // Safe-browsing: a top-level navigation to an unsafe site shows a full-page
     // "unsafe site" interstitial (the request was already dropped upstream). Taken
     // before the normal body, mirroring the cert-error precedence.
     let sb_block = state

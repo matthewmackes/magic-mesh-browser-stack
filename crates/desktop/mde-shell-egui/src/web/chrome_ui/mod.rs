@@ -5661,13 +5661,13 @@ pub(super) fn confusable_warning(host: &str) -> Option<String> {
     confusable_reason(host).map(|reason| {
         match reason {
             ConfusableReason::Punycode => {
-                "Punycode/IDN host (xn--): verify this is the site you expect"
+                "Punycode/IDN address (xn--): verify this is the site you expect"
             }
             ConfusableReason::ConfusableBlock => {
-                "Look-alike letters (Cyrillic/Greek): this host may impersonate another site"
+                "Look-alike letters (Cyrillic/Greek): this site may impersonate another site"
             }
             ConfusableReason::MixedScript => {
-                "Mixed-script host: letters from more than one alphabet can spoof a name"
+                "Mixed-script address: letters from more than one alphabet can spoof a site name"
             }
         }
         .to_owned()
@@ -5906,7 +5906,7 @@ pub(super) fn site_info_panel(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
-                        "Unsafe hosts: {}",
+                        "Unsafe sites: {}",
                         resources.safe_browsing_hosts.join(", ")
                     ))
                     .small()
@@ -5935,7 +5935,7 @@ pub(super) fn site_info_panel(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
-                        "Blocked content hosts: {}",
+                        "Blocked content sites: {}",
                         resources.mixed_content_hosts.join(", ")
                     ))
                     .small()
@@ -5964,7 +5964,7 @@ pub(super) fn site_info_panel(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
-                        "Blocked tracker hosts: {}",
+                        "Blocked tracker sites: {}",
                         resources.tracker_hosts.join(", ")
                     ))
                     .small()
@@ -10149,14 +10149,24 @@ mod tests {
         assert_painted_text_color(&texts, "About this page", CHROME_TEXT_DIM);
         assert_painted_text_color(
             &texts,
-            "Punycode/IDN host (xn--): verify this is the site you expect",
+            "Punycode/IDN address (xn--): verify this is the site you expect",
             CHROME_WARN,
         );
+        for label in [
+            "Unsafe sites: malware.test",
+            "Blocked content sites: cdn.example.test",
+            "Blocked tracker sites: tracker.example.test",
+        ] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT_DIM);
+        }
         assert!(
             !texts
                 .iter()
-                .any(|(text, _)| text.contains('\u{2014}') || text.contains('\u{2192}')),
-            "security chip and panel must not paint typographic dash/arrow glyph copy: {texts:?}"
+                .any(|(text, _)| {
+                    let lower = text.to_ascii_lowercase();
+                    text.contains('\u{2014}') || text.contains('\u{2192}') || lower.contains("host")
+                }),
+            "security chip and panel must not paint host wording or typographic dash/arrow glyph copy: {texts:?}"
         );
         for label in [
             "Managed policy blocked: 1 resource",
