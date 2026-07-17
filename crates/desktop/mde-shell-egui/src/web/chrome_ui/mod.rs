@@ -6262,6 +6262,12 @@ fn suggestion_chip(
     icon: ChromeIcon,
     text_color: Color32,
     fill: Color32,
+    access_label: &str,
+    access_value: &str,
+    access_kind: &'static str,
+    index: usize,
+    total: usize,
+    selected: bool,
 ) -> egui::Response {
     let font = font_id(CHROME_FONT);
     let text_width = ui.fonts(|fonts| {
@@ -6273,6 +6279,16 @@ fn suggestion_chip(
     let width = (OPTION_ICON_SIZE + 30.0 + text_width).clamp(96.0, 280.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, CHROME_BUTTON), egui::Sense::click());
+    install_suggestion_chip_accessibility(
+        ui.ctx(),
+        rect,
+        access_kind,
+        index,
+        access_label,
+        access_value,
+        total,
+        selected,
+    );
     let fill = animated_response_fill(ui, &response, fill, CHROME_TEXT, true);
     ui.painter().rect(
         rect,
@@ -6301,6 +6317,32 @@ fn suggestion_chip(
     response
 }
 
+fn suggestion_chip_accesskit_id(kind: &'static str, index: usize, label: &str) -> egui::Id {
+    egui::Id::new(("browser-omnibox-suggestion", kind, index, label))
+}
+
+fn install_suggestion_chip_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    kind: &'static str,
+    index: usize,
+    label: &str,
+    value: &str,
+    total: usize,
+    selected: bool,
+) {
+    let _ = ctx.accesskit_node_builder(suggestion_chip_accesskit_id(kind, index, label), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label);
+        node.set_value(format!("Suggestion {} of {total}: {value}", index + 1));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+        if selected {
+            node.set_selected(true);
+        }
+    });
+}
+
 pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<String> {
     let history = &state.suggestions.history;
     let bookmarks = &state.suggestions.bookmarks;
@@ -6319,6 +6361,7 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
     // across the bookmark → history → search sections, so a highlighted row gets an
     // accent fill and Up/Down move visibly.
     let selected = state.suggestions.selected;
+    let total = bookmarks.len() + files.len() + history.len() + search_items.len();
     let mut idx = 0usize;
     let fill_for = |idx: usize| {
         if Some(idx) == selected {
@@ -6333,12 +6376,20 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
             browser_muted_note(ui, "Bookmarks");
             for bm in bookmarks {
                 let label = ellipsize(&bm.title, 32);
+                let access_label = format!("Open bookmark {}", bm.title);
+                let access_value = format!("Bookmark, {}", bm.url);
                 let clicked = suggestion_chip(
                     ui,
                     &label,
                     ChromeIcon::Bookmark,
                     CHROME_PRIMARY,
                     fill_for(idx),
+                    &access_label,
+                    &access_value,
+                    "bookmark",
+                    idx,
+                    total,
+                    Some(idx) == selected,
                 )
                 .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Bookmark: {}", bm.url)))
                 .clicked();
@@ -6352,12 +6403,25 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
             browser_muted_note(ui, "Files");
             for file in files {
                 let label = ellipsize(&file.title, 32);
-                let clicked =
-                    suggestion_chip(ui, &label, ChromeIcon::Page, CHROME_TEXT, fill_for(idx))
-                        .on_hover_ui(|ui| {
-                            chrome_tooltip(ui, &format!("Open file: {}", file.path.display()))
-                        })
-                        .clicked();
+                let access_label = format!("Open file {}", file.title);
+                let access_value = format!("File, {}", file.path.display());
+                let clicked = suggestion_chip(
+                    ui,
+                    &label,
+                    ChromeIcon::Page,
+                    CHROME_TEXT,
+                    fill_for(idx),
+                    &access_label,
+                    &access_value,
+                    "file",
+                    idx,
+                    total,
+                    Some(idx) == selected,
+                )
+                .on_hover_ui(|ui| {
+                    chrome_tooltip(ui, &format!("Open file: {}", file.path.display()))
+                })
+                .clicked();
                 if clicked {
                     accepted = Some(file.url.clone());
                 }
@@ -6368,10 +6432,23 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
             browser_muted_note(ui, "History");
             for url in history {
                 let label = ellipsize(url, 36);
-                let clicked =
-                    suggestion_chip(ui, &label, ChromeIcon::History, CHROME_TEXT, fill_for(idx))
-                        .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Visited: {url}")))
-                        .clicked();
+                let access_label = format!("Open history entry {url}");
+                let access_value = format!("History, {url}");
+                let clicked = suggestion_chip(
+                    ui,
+                    &label,
+                    ChromeIcon::History,
+                    CHROME_TEXT,
+                    fill_for(idx),
+                    &access_label,
+                    &access_value,
+                    "history",
+                    idx,
+                    total,
+                    Some(idx) == selected,
+                )
+                .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Visited: {url}")))
+                .clicked();
                 if clicked {
                     accepted = Some(url.clone());
                 }
@@ -6380,10 +6457,23 @@ pub(super) fn suggestions_panel(ui: &mut egui::Ui, state: &WebState) -> Option<S
         }
         for suggestion in search_items {
             let label = ellipsize(suggestion, 36);
-            let clicked =
-                suggestion_chip(ui, &label, ChromeIcon::Search, CHROME_TEXT, fill_for(idx))
-                    .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Search for {suggestion}")))
-                    .clicked();
+            let access_label = format!("Search for {suggestion}");
+            let access_value = format!("Search, {suggestion}");
+            let clicked = suggestion_chip(
+                ui,
+                &label,
+                ChromeIcon::Search,
+                CHROME_TEXT,
+                fill_for(idx),
+                &access_label,
+                &access_value,
+                "search",
+                idx,
+                total,
+                Some(idx) == selected,
+            )
+            .on_hover_ui(|ui| chrome_tooltip(ui, &format!("Search for {suggestion}")))
+            .clicked();
             if clicked {
                 accepted = Some(suggestion.clone());
             }
@@ -10483,6 +10573,44 @@ mod tests {
                 .iter()
                 .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
             "bookmark suggestions must paint a Browser bookmark path icon: {path_strokes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_suggestion_chips_export_accesskit_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_suggestions_panel_frame(&ctx);
+        let nodes = accesskit_nodes(&out);
+        let find = |label: &str| {
+            nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing suggestion AccessKit node {label:?}"))
+        };
+
+        let bookmark = find("Open bookmark Example bookmark");
+        assert_eq!(bookmark.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            bookmark.value(),
+            Some("Suggestion 1 of 4: Bookmark, https://example.test/bookmark")
+        );
+        assert_eq!(bookmark.is_selected(), Some(true));
+        assert!(bookmark.supports_action(egui::accesskit::Action::Click));
+
+        assert_eq!(
+            find("Open file home-notes.md").value(),
+            Some("Suggestion 2 of 4: File, /home/mm/home-notes.md")
+        );
+        assert_eq!(
+            find("Open history entry https://example.test/history").value(),
+            Some("Suggestion 3 of 4: History, https://example.test/history")
+        );
+        assert_eq!(
+            find("Search for example search").value(),
+            Some("Suggestion 4 of 4: Search, example search")
         );
     }
 
