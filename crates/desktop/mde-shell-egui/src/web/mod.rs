@@ -7047,24 +7047,34 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
     } else {
-        chrome_ui::scope(ui, |ui| {
-            // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
-            // sessions and expose a real new-tab intent for the live-helper path.
-            chrome_ui::tab_strip(ui, state);
-            ui.add_space(CHROME_GAP);
+        let panel_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        if panel_rect.is_positive() {
+            ui.allocate_rect(panel_rect, egui::Sense::hover());
+            let mut panel_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(panel_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            panel_ui.set_clip_rect(panel_rect);
+            chrome_ui::scope(&mut panel_ui, |ui| {
+                // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
+                // sessions and expose a real new-tab intent for the live-helper path.
+                chrome_ui::tab_strip(ui, state);
+                ui.add_space(CHROME_GAP);
 
-            // The navigation chrome (back / forward / reload / address bar), wired
-            // to the active session's control socket.
-            chrome_ui::nav_chrome(ui, state);
-            chrome_ui::bookmarks_bar(ui, state);
-            chrome_ui::find_chrome(ui, state);
-        });
-        chrome_ui::insecure_prompt(ui, state);
-        chrome_ui::capture_notice(ui, state);
-        chrome_ui::drawer_stack(ui, state);
-        ui.add_space(CHROME_GAP);
-        chrome_ui::active_body(ui, state);
-        chrome_ui::media_pip_overlay(ui, state);
+                // The navigation chrome (back / forward / reload / address bar), wired
+                // to the active session's control socket.
+                chrome_ui::nav_chrome(ui, state);
+                chrome_ui::bookmarks_bar(ui, state);
+                chrome_ui::find_chrome(ui, state);
+            });
+            chrome_ui::insecure_prompt(&mut panel_ui, state);
+            chrome_ui::capture_notice(&mut panel_ui, state);
+            chrome_ui::drawer_stack(&mut panel_ui, state);
+            panel_ui.add_space(CHROME_GAP);
+            chrome_ui::active_body(&mut panel_ui, state);
+            chrome_ui::media_pip_overlay(&mut panel_ui, state);
+        }
     }
 }
 
@@ -8872,6 +8882,39 @@ mod tests {
             .and_then(|tab| tab.texture.as_ref())
             .map(|texture| texture.id())?;
         let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "Browser panel produced no egui output");
+        page_texture_rect(&prims, texture_id)
+    }
+
+    fn run_panel_page_image_rect_with_reserved_shell_chrome(
+        ctx: &egui::Context,
+        state: &mut WebState,
+        input: egui::RawInput,
+        left_gutter: f32,
+        bottom_strut: f32,
+    ) -> Option<egui::Rect> {
+        let texture_id = state
+            .tabs
+            .get(state.active)
+            .and_then(|tab| tab.texture.as_ref())
+            .map(|texture| texture.id())?;
+        let out = ctx.run(input, |ctx| {
+            if bottom_strut > 0.0 {
+                egui::TopBottomPanel::bottom("browser-test-taskbar-strut")
+                    .exact_height(bottom_strut)
+                    .show_separator_line(false)
+                    .show(ctx, |_| {});
+            }
+            if left_gutter > 0.0 {
+                egui::SidePanel::left("browser-test-dock-gutter")
+                    .exact_width(left_gutter)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .show(ctx, |_| {});
+            }
             egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -13993,6 +14036,27 @@ mod tests {
         assert!(
             rect.height() > 520.0,
             "horizontal Browser body should use the remaining workspace, not only the top slice: {rect:?}"
+        );
+
+        let shell_ctx = egui::Context::default();
+        Style::install(&shell_ctx);
+        let shell_rect = run_panel_page_image_rect_with_reserved_shell_chrome(
+            &shell_ctx,
+            &mut state,
+            body_input(),
+            48.0,
+            48.0,
+        )
+        .expect("horizontal Browser body should paint inside reserved shell chrome");
+        assert!(
+            shell_rect.left() >= 47.5
+                && shell_rect.right() <= 960.5
+                && shell_rect.bottom() <= 592.5,
+            "horizontal Browser body must stay inside the central workspace after shell gutters/struts: {shell_rect:?}"
+        );
+        assert!(
+            shell_rect.width() > 840.0 && shell_rect.height() > 470.0,
+            "horizontal Browser body should use the remaining central workspace, not collapse to a top slice: {shell_rect:?}"
         );
 
         let frame_size = state.tabs[state.active]
