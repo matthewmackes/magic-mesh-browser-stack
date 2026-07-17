@@ -22,6 +22,28 @@ pub(super) const QR_MATRIX_LIGHT: egui::Color32 = super::CHROME_TOOLBAR;
 pub(super) const QR_MATRIX_DARK: egui::Color32 = super::CHROME_TEXT;
 pub(super) const PRINT_PAGE_RANGE_HELP: &str = "Page range, e.g. 1-5,8: empty prints all pages";
 
+pub(super) fn download_drawer_subtitle(
+    worker_present: bool,
+    active: usize,
+    total: usize,
+) -> String {
+    if total > 0 {
+        if active > 0 && active < total {
+            format!("{active} active / {total} total")
+        } else if active > 0 {
+            format!("{active} active")
+        } else if total == 1 {
+            "1 complete".to_owned()
+        } else {
+            format!("{total} complete")
+        }
+    } else if worker_present {
+        "No downloads".to_owned()
+    } else {
+        "Transfers unavailable".to_owned()
+    }
+}
+
 fn drawer_button_widget(
     label: impl Into<String>,
     role: BrowserActionRole,
@@ -780,6 +802,8 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     let mut discard_dangerous = false;
     let worker_present = state.transfers.worker_present();
     let jobs = state.download_jobs.clone();
+    let active_jobs = jobs.iter().filter(|job| !job.state.is_terminal()).count();
+    let subtitle = download_drawer_subtitle(worker_present, active_jobs, jobs.len());
     let pending_dangerous = state.pending_dangerous_download.clone();
     egui::Frame::NONE
         .fill(super::CHROME_SURFACE_CONTAINER)
@@ -792,7 +816,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new("browser_download ledger")
+                    RichText::new(subtitle)
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -874,7 +898,7 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 let message = if worker_present {
                     "No browser downloads yet"
                 } else {
-                    "Transfers worker ledger is not present on this node"
+                    "Transfers worker is not available on this node"
                 };
                 browser_muted_note(ui, message);
                 return;

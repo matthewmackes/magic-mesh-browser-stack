@@ -10523,6 +10523,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_download_drawer_header_uses_user_facing_status() {
+        assert_eq!(
+            drawers::download_drawer_subtitle(false, 0, 0),
+            "Transfers unavailable"
+        );
+        assert_eq!(
+            drawers::download_drawer_subtitle(true, 0, 0),
+            "No downloads"
+        );
+        assert_eq!(drawers::download_drawer_subtitle(true, 1, 1), "1 active");
+        assert_eq!(
+            drawers::download_drawer_subtitle(true, 2, 3),
+            "2 active / 3 total"
+        );
+        assert_eq!(drawers::download_drawer_subtitle(true, 0, 2), "2 complete");
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let progress = render_progress_downloads_drawer_frame(&ctx);
+        let texts = painted_text(&progress.shapes);
+
+        assert_painted_text_color(&texts, "Downloads", CHROME_TEXT);
+        assert_painted_text_color(&texts, "1 active", CHROME_TEXT_DIM);
+        assert!(
+            texts
+                .iter()
+                .all(|(text, _)| !text.contains("browser_download") && !text.contains("ledger")),
+            "download drawer header must not expose internal transfer names: {texts:?}"
+        );
+    }
+
+    #[test]
     fn browser_muted_notes_use_browser_material_text_tokens() {
         let ctx = egui::Context::default();
         mde_egui::fonts::install(&ctx);
@@ -10532,7 +10564,7 @@ mod tests {
             .iter()
             .find(|(text, _)| {
                 text == "No browser downloads yet"
-                    || text == "Transfers worker ledger is not present on this node"
+                    || text == "Transfers worker is not available on this node"
             })
             .unwrap_or_else(|| panic!("empty downloads drawer note was not painted: {texts:?}"));
 
