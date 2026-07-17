@@ -62,6 +62,9 @@ pub(super) fn active_body(ui: &mut egui::Ui, state: &mut WebState) {
     body::active_body(ui, state);
 }
 
+pub(super) const BROWSER_NO_LIVE_PAGE_NOTICE: &str =
+    "No live browser page is available on this device";
+
 /// The browser-reserved tab accelerators (Chrome's tab-strip keyboard UX),
 /// live only while the Browser surface is painted — this runs from
 /// [`super::web_panel`].
@@ -7179,18 +7182,12 @@ pub(super) fn cached_offline_body(
 pub(super) fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
     centered(ui, |ui| {
         ui.label(
-            RichText::new("Sandboxed browser")
+            RichText::new("Browser")
                 .size(Style::HEADING)
                 .color(CHROME_TEXT),
         );
         ui.add_space(Style::SP_S);
-        browser_body_note(
-            ui,
-            notice.unwrap_or(
-                "The sandboxed Servo browser renders here in the shell. A live session \
-                 attaches on a GPU seat (BOOKMARKS-5/6 live path is gated).",
-            ),
-        );
+        browser_body_note(ui, notice.unwrap_or(BROWSER_NO_LIVE_PAGE_NOTICE));
     });
 }
 

@@ -107,15 +107,17 @@ fn tab_accessibility_summary(tab: &Tab) -> String {
 }
 
 fn browser_gate_notice(state: &WebState) -> &str {
-    const DEFAULT_NOTICE: &str = "No live browser page is available on this build or seat";
     #[cfg(feature = "live-helper")]
     {
-        state.gate_notice.as_deref().unwrap_or(DEFAULT_NOTICE)
+        state
+            .gate_notice
+            .as_deref()
+            .unwrap_or(BROWSER_NO_LIVE_PAGE_NOTICE)
     }
     #[cfg(not(feature = "live-helper"))]
     {
         let _ = state;
-        DEFAULT_NOTICE
+        BROWSER_NO_LIVE_PAGE_NOTICE
     }
 }
 

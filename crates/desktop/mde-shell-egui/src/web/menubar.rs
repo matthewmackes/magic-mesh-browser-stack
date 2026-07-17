@@ -984,11 +984,10 @@ fn truncate_url(url: &str) -> String {
     super::ellipsize(url, URL_MAX)
 }
 
-/// Build the live status cluster: the active engine (MENU-3 — every live
-/// session is the sandboxed Servo helper today, so the chip appears only when
-/// a tab actually runs one, §7), the committed URL, the lifecycle state, the
-/// http/https security state, and the blocked-request count (a `0` count stays
-/// hidden, §7).
+/// Build the live status cluster: the active engine (only while a tab is
+/// actually running a page engine, §7), the committed URL, the lifecycle state,
+/// the http/https security state, and the blocked-request count (a `0` count
+/// stays hidden, §7).
 #[cfg(test)]
 fn build_status(s: &Snapshot) -> Vec<StatusChip> {
     let mut chips = Vec::new();
@@ -2055,8 +2054,8 @@ mod tests {
 
     #[test]
     fn the_engine_chip_reads_the_live_helper() {
-        // A tab runs the sandboxed Servo helper → the engine chip shows; with
-        // no session there is no engine to claim (§7).
+        // A tab with a live page engine shows an engine chip; with no session
+        // there is no engine to claim (§7).
         let chips = build_status(&https_page());
         assert_eq!(chips[0].text, "Servo", "the engine chip leads the cluster");
         assert_eq!(chips[0].tone, ChipTone::Info);

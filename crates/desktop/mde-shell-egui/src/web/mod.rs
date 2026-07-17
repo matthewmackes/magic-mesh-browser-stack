@@ -1,14 +1,14 @@
-//! The **Browser** surface — the sandboxed Servo browser rendered egui-native.
+//! The **Browser** surface — first-party browser chrome rendered egui-native.
 //!
-//! BOOKMARKS-6 brokers the out-of-process `mde-web-preview` helper *into* the one
-//! shell (the same EMBED model as the VDI Desktop surface): the helper renders
-//! offscreen into a shared-memory frame; [`mde_web_preview_client`] receives that
-//! frame fd over the per-session socket, maps it read-only, and hands the shell an
+//! The Browser bridge brokers an out-of-process page engine *into* the one shell
+//! (the same EMBED model as the VDI Desktop surface): the engine renders offscreen
+//! into a shared-memory frame; [`mde_web_preview_client`] receives that frame fd
+//! over the per-session socket, maps it read-only, and hands the shell an
 //! [`egui::ColorImage`]. This panel uploads that image to a `TextureHandle` on a
 //! paint-ready (never a per-frame re-upload), paints it as the body, wires the
 //! navigation chrome (back / forward / reload / address bar, §4 tokens) to the
 //! control socket, maps page pointer positions into frame device pixels, and
-//! forwards page-owned keyboard/text/wheel input over the helper control socket.
+//! forwards page-owned keyboard/text/wheel input over the engine control socket.
 //!
 //! ```text
 //!   session.take_frame() ─▶ ColorImage ─▶ TextureHandle ─▶ ui paints the body
@@ -17,8 +17,8 @@
 //!
 //! Each tab is an independent [`WebSession`], so one page crashing surfaces an
 //! honest "page crashed" state for THAT tab only (respawn-on-reload) and never
-//! touches the others (per-session isolation). Spawning the live Servo helper is
-//! the client crate's `live-helper` path, honest-gated to a GPU seat; with no live
+//! touches the others (per-session isolation). Spawning a live page engine is the
+//! client crate's `live-helper` path, honest-gated to a GPU seat; with no live
 //! session attached this surface shows an honest gated `EmptyState`, never a fake
 //! page (§7).
 
@@ -61,7 +61,7 @@ use mde_egui::search_omnibox::{ranked_hits, SearchDomain, SearchItem};
 #[cfg(feature = "live-helper")]
 use mde_web_preview_client::session::SpawnSpec;
 
-/// The sandboxed Servo helper binary the RPM installs; overridable via
+/// The Servo page-engine binary the RPM installs; overridable via
 /// [`SERVO_HELPER_BIN_ENV`] for the test bed / dev builds.
 #[cfg(feature = "live-helper")]
 const DEFAULT_SERVO_HELPER_BIN: &str = "/usr/bin/mde-web-preview";
@@ -152,7 +152,8 @@ const DEFAULT_AUTOPLAY_BLOCKED: bool = true;
 const PRIVATE_MODE_EXPLAINER: &str =
     "Private by default: history and cookies clear when you close the browser";
 #[cfg(feature = "live-helper")]
-const NO_GPU_SEAT_NOTICE: &str = "The sandboxed browser needs a GPU seat: none is available here.";
+const NO_GPU_SEAT_NOTICE: &str =
+    "The Browser needs a GPU seat to open a live page; none is available here.";
 
 /// The fallback helper view geometry (device px) when no live seat size is known
 /// yet (hermetic tests, first frame before the seat is probed). A live spawn
@@ -6610,18 +6611,13 @@ impl WebState {
             return None;
         }
         if !helper_bin.exists() {
-            self.gate_notice = Some(format!(
-                "The sandboxed browser helper is not installed ({}).",
-                helper_bin.display()
-            ));
+            self.gate_notice = Some("The Browser engine is not installed.".to_owned());
             return None;
         }
         if engine == BrowserEngine::Cef {
-            if let Some(missing) = cef_runtime_missing_path() {
-                self.gate_notice = Some(format!(
-                    "The Chromium engine is not installed (missing {}).",
-                    missing.display()
-                ));
+            if cef_runtime_missing_path().is_some() {
+                self.gate_notice =
+                    Some("The Chromium engine is not installed completely.".to_owned());
                 return None;
             }
             self.refresh_security_update_status_for_launch();
@@ -6648,8 +6644,7 @@ impl WebState {
                 Some(session)
             }
             Err(e) => {
-                self.gate_notice =
-                    Some(format!("The sandboxed browser helper failed to start: {e}"));
+                self.gate_notice = Some(format!("The Browser engine failed to start: {e}"));
                 None
             }
         }
@@ -8867,9 +8862,12 @@ mod tests {
             .expect("browser status accesskit node");
         let value = browser.value().expect("browser status value");
         assert!(value.contains("No active tab"));
-        assert!(value.contains("No live browser page is available"));
+        assert!(value.contains(chrome_ui::BROWSER_NO_LIVE_PAGE_NOTICE));
         assert!(
-            !value.contains("helper session") && !value.contains("helper unavailable"),
+            !value.contains("helper session")
+                && !value.contains("helper unavailable")
+                && !value.contains("Servo")
+                && !value.contains("BOOKMARKS"),
             "empty Browser AccessKit status must not expose helper internals: {value}"
         );
     }
@@ -11000,9 +10998,34 @@ mod tests {
 
     #[test]
     fn no_session_paints_the_gated_empty_state() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
         let mut state = WebState::default();
-        assert!(run_panel(&mut state), "the gated EmptyState drew nothing");
+        let out = run_panel_output(&ctx, &mut state, body_input());
         assert!(state.tabs.is_empty());
+        let texts: Vec<String> = painted_text(&out.shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(texts.iter().any(|text| text == "Browser"));
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == chrome_ui::BROWSER_NO_LIVE_PAGE_NOTICE),
+            "empty Browser body must show the Browser-facing unavailable notice: {texts:?}"
+        );
+        for forbidden in [
+            "Sandboxed browser",
+            "Servo",
+            "BOOKMARKS",
+            "helper",
+            "live path",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text.contains(forbidden)),
+                "empty Browser body leaked implementation copy {forbidden:?}: {texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -19943,7 +19966,7 @@ mod tests {
 
     #[cfg(feature = "live-helper")]
     fn seed_gate_notice_for_test(state: &mut WebState) {
-        state.gate_notice = Some("helper unavailable".to_owned());
+        state.gate_notice = Some("Browser page unavailable".to_owned());
     }
 
     #[cfg(not(feature = "live-helper"))]
@@ -22960,6 +22983,12 @@ mod tests {
             !NO_GPU_SEAT_NOTICE.contains('\u{2014}'),
             "no-seat gate copy must avoid typographic dash glyphs"
         );
+        assert!(
+            !NO_GPU_SEAT_NOTICE.contains("sandboxed")
+                && !NO_GPU_SEAT_NOTICE.contains("helper")
+                && !NO_GPU_SEAT_NOTICE.contains("Servo"),
+            "no-seat gate copy must stay Browser-facing: {NO_GPU_SEAT_NOTICE}"
+        );
         // The panel draws the honest gated EmptyState, never a fake page.
         assert!(run_panel(&mut state));
     }
@@ -22987,8 +23016,12 @@ mod tests {
         assert!(state.tabs.is_empty());
         let notice = state.gate_notice.as_deref().unwrap_or_default();
         assert!(
-            notice.contains("not installed"),
+            notice == "The Browser engine is not installed.",
             "the absent-helper gate names it honestly: {notice}"
+        );
+        assert!(
+            !notice.contains("helper") && !notice.contains("mde-web-preview"),
+            "absent engine gate must not expose helper internals: {notice}"
         );
         assert!(run_panel(&mut state));
     }
@@ -23008,8 +23041,12 @@ mod tests {
         assert!(state.tabs.is_empty(), "a failed spawn attaches no tab");
         let notice = state.gate_notice.as_deref().unwrap_or_default();
         assert!(
-            notice.contains("failed to start") && notice.contains("exec denied"),
+            notice.contains("Browser engine failed to start") && notice.contains("exec denied"),
             "a spawn failure surfaces its reason: {notice}"
+        );
+        assert!(
+            !notice.contains("helper"),
+            "spawn failure notice must not expose helper internals: {notice}"
         );
         assert!(run_panel(&mut state), "the honest failure notice draws");
     }
@@ -23112,8 +23149,15 @@ mod tests {
         assert!(state.tabs.is_empty());
         let notice = state.gate_notice.as_deref().unwrap_or_default();
         assert!(
-            notice.contains("Chromium engine") && notice.contains(CEF_LIB_NAME),
-            "the CEF runtime gate names the missing library: {notice}"
+            notice.contains("Chromium engine") && notice.contains("not installed completely"),
+            "the Chromium runtime gate names the user-facing problem: {notice}"
+        );
+        assert!(
+            !notice.contains("CEF")
+                && !notice.contains("libcef")
+                && !notice.contains("/opt/")
+                && !notice.contains("runtime"),
+            "Chromium runtime gate must not expose engine internals: {notice}"
         );
     }
 
