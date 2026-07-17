@@ -4277,7 +4277,7 @@ impl WebState {
                 self.refresh_downloads();
             }
             Err(err) => {
-                self.capture_notice = Some(format!("Media download queue failed: {err}"));
+                self.capture_notice = Some(Self::media_download_queue_failed_notice("Media", &err));
             }
         }
     }
@@ -4295,9 +4295,43 @@ impl WebState {
                 self.refresh_downloads();
             }
             Err(err) => {
-                self.capture_notice = Some(format!("Image download queue failed: {err}"));
+                self.capture_notice = Some(Self::media_download_queue_failed_notice("Image", &err));
             }
         }
+    }
+
+    fn media_download_queue_failed_notice(kind: &str, detail: &str) -> String {
+        let label = Self::media_download_queue_error_label(detail);
+        if label.is_empty() {
+            format!("{kind} download queue failed")
+        } else {
+            format!("{kind} download queue failed: {label}")
+        }
+    }
+
+    fn media_download_queue_error_label(detail: &str) -> String {
+        let trimmed = detail.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("no live page") || lower.contains("no active tab") {
+            return "no live page".to_owned();
+        }
+        if lower.contains("create media download spool dir") {
+            return "could not prepare the download staging area".to_owned();
+        }
+        if lower.contains("create media download destination dir") {
+            return "could not open the download folder".to_owned();
+        }
+        if lower.contains("write media download request")
+            || lower.contains(".download.json")
+            || lower.contains('/')
+            || lower.contains('\\')
+        {
+            return "could not save the download request".to_owned();
+        }
+        sentence_case_ascii(trimmed)
     }
 
     fn download_observed_media_assets_to_dirs(
@@ -4467,11 +4501,26 @@ impl WebState {
     /// downloads drawer already renders the resulting `browser_download`
     /// ledger row).
     fn enqueue_download_to_ledger(&mut self, id: u64, url: &str, filename: &str) {
-        let spool = browser_media_spool_dir();
-        let dest = browser_capture_dir();
+        self.enqueue_download_to_ledger_dirs(
+            id,
+            url,
+            filename,
+            browser_media_spool_dir(),
+            browser_capture_dir(),
+        );
+    }
+
+    fn enqueue_download_to_ledger_dirs(
+        &mut self,
+        id: u64,
+        url: &str,
+        filename: &str,
+        spool: PathBuf,
+        dest: PathBuf,
+    ) {
         if std::fs::create_dir_all(&spool).is_err() || std::fs::create_dir_all(&dest).is_err() {
             self.capture_notice =
-                Some("Download failed: could not prepare the transfer spool".into());
+                Some("Download failed: could not prepare the transfer staging area".into());
             return;
         }
         let body = serde_json::json!({
@@ -22021,6 +22070,42 @@ mod tests {
     }
 
     #[test]
+    fn media_download_queue_notices_use_user_facing_copy() {
+        let media = WebState::media_download_queue_failed_notice(
+            "Media",
+            "create media download spool dir: permission denied",
+        );
+        assert_eq!(
+            media,
+            "Media download queue failed: could not prepare the download staging area"
+        );
+
+        let image = WebState::media_download_queue_failed_notice(
+            "Image",
+            "write media download request /tmp/mde-browser-media/page.download.json: denied",
+        );
+        assert_eq!(
+            image,
+            "Image download queue failed: could not save the download request"
+        );
+
+        let no_live =
+            WebState::media_download_queue_failed_notice("Media", "no live page to download from");
+        assert_eq!(no_live, "Media download queue failed: no live page");
+
+        for notice in [media.as_str(), image.as_str(), no_live.as_str()] {
+            let lower = notice.to_ascii_lowercase();
+            assert!(
+                !lower.contains("spool")
+                    && !lower.contains("manifest")
+                    && !lower.contains(".download.json")
+                    && !lower.contains("/tmp/"),
+                "media download queue notice leaked implementation copy: {notice}"
+            );
+        }
+    }
+
+    #[test]
     fn media_manifest_export_sniffs_media_requests_and_queues_transfer() {
         let transfers = RecordingTransfers::default();
         let mut state = WebState::default().with_transfers(Box::new(transfers.clone()));
@@ -22346,6 +22431,34 @@ mod tests {
         // The interception opens the Downloads drawer so the user sees it land.
         assert!(state.downloads_open);
         let _ = std::fs::remove_file(&job.source);
+    }
+
+    #[test]
+    fn download_queue_intercepted_directory_failure_notice_stays_user_facing() {
+        let transfers = RecordingTransfers::default();
+        let mut state = WebState::default().with_transfers(Box::new(transfers));
+        let tmp = tempfile::tempdir().expect("download staging tempdir");
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"not a directory").expect("staging blocker file");
+        let dest = tmp.path().join("captures");
+
+        state.enqueue_download_to_ledger_dirs(
+            17,
+            "https://files.example.test/report.pdf",
+            "report.pdf",
+            not_a_dir,
+            dest,
+        );
+
+        let notice = state.capture_notice.as_deref().expect("download notice");
+        assert_eq!(
+            notice,
+            "Download failed: could not prepare the transfer staging area"
+        );
+        assert!(
+            !notice.contains("spool"),
+            "download notice must not expose transfer spool internals: {notice}"
+        );
     }
 
     #[test]
