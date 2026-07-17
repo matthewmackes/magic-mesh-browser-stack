@@ -3222,6 +3222,48 @@ fn options_compact_layout(available_width: f32) -> bool {
     available_width < OPTIONS_COMPACT_BREAKPOINT
 }
 
+fn option_row_accesskit_id(action: super::menubar::MenuAction) -> egui::Id {
+    egui::Id::new(("browser-options-row", format!("{action:?}")))
+}
+
+fn option_row_accesskit_value(
+    item: &mde_egui::menubar::Item<super::menubar::MenuAction>,
+) -> String {
+    let mut parts = Vec::new();
+    if item.enabled {
+        match item.checked {
+            Some(true) => parts.push("On".to_owned()),
+            Some(false) => parts.push("Off".to_owned()),
+            None => parts.push("Available".to_owned()),
+        }
+    } else {
+        parts.push(format!("Unavailable: {}", disabled_option_tip(item.id)));
+    }
+    if let Some(shortcut) = &item.shortcut {
+        parts.push(format!("Shortcut {shortcut}"));
+    }
+    parts.join(", ")
+}
+
+fn install_option_row_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    item: &mde_egui::menubar::Item<super::menubar::MenuAction>,
+) {
+    let _ = ctx.accesskit_node_builder(option_row_accesskit_id(item.id), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(item.label.as_str());
+        node.set_value(option_row_accesskit_value(item));
+        node.set_bounds(accesskit_rect(rect));
+        if item.enabled {
+            node.add_action(egui::accesskit::Action::Click);
+        }
+        if item.checked == Some(true) {
+            node.set_selected(true);
+        }
+    });
+}
+
 fn option_row(
     ui: &mut egui::Ui,
     item: &mde_egui::menubar::Item<super::menubar::MenuAction>,
@@ -3257,6 +3299,7 @@ fn option_row(
         ),
         egui::StrokeKind::Inside,
     );
+    install_option_row_accessibility(ui.ctx(), rect, item);
     let text_color = button_text(item.enabled);
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 17.0, rect.center().y),
@@ -9611,6 +9654,56 @@ mod tests {
         assert_painted_text_color(&texts, "Open Typed Address", CHROME_TEXT);
         assert_painted_text_color(&texts, "Reload", CHROME_TEXT);
         assert_rects_inside_viewport(&out, 900.0, "wide Browser Options page");
+    }
+
+    #[test]
+    fn browser_options_rows_export_accesskit_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_options_page_frame(&ctx, egui::vec2(900.0, 640.0));
+        let nodes = accesskit_nodes(&out);
+        let find = |label: &str| {
+            nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing Browser Options AccessKit row {label:?}"))
+        };
+
+        let chromium = find("Use Chromium for New Tabs");
+        let lightweight = find("Use Lightweight for New Tabs");
+        for row in [chromium, lightweight] {
+            assert_eq!(row.role(), egui::accesskit::Role::Button);
+            assert!(
+                row.supports_action(egui::accesskit::Action::Click),
+                "enabled Browser Options rows must expose their command click action"
+            );
+        }
+        let engine_values = [chromium.value(), lightweight.value()];
+        assert!(
+            engine_values.contains(&Some("On")) && engine_values.contains(&Some("Off")),
+            "engine rows must expose checked state through AccessKit: {engine_values:?}"
+        );
+        assert_eq!(
+            [chromium.is_selected(), lightweight.is_selected()]
+                .into_iter()
+                .filter(|selected| *selected == Some(true))
+                .count(),
+            1,
+            "exactly one engine row should be selected"
+        );
+
+        let back = find("Back");
+        assert_eq!(back.role(), egui::accesskit::Role::Button);
+        assert_eq!(
+            back.value(),
+            Some("Unavailable: No back-history entry is available")
+        );
+        assert!(
+            !back.supports_action(egui::accesskit::Action::Click),
+            "disabled Browser Options rows must not expose a click action"
+        );
     }
 
     #[test]
