@@ -489,7 +489,7 @@ impl WebState {
         let archive = result
             .archive_mhtml
             .as_ref()
-            .ok_or_else(|| "offline copy has no MHTML archive".to_owned())?;
+            .ok_or_else(|| "offline copy has no saved archive".to_owned())?;
         let bytes = offline_cache_archive_bytes(archive)?;
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)

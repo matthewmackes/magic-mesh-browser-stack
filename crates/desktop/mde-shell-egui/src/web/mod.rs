@@ -19684,6 +19684,37 @@ mod tests {
     }
 
     #[test]
+    fn browser_offline_cache_archive_missing_notice_stays_user_facing() {
+        let mut state = WebState::default();
+        state.latest_offline_cache = Some(BrowserOfflineCacheResult {
+            host: local_hostname(),
+            cache_id: "cache-no-archive".to_owned(),
+            tab_index: 0,
+            engine: BrowserEngine::Cef,
+            url: "https://archive.example/".to_owned(),
+            title: "Archive".to_owned(),
+            text: "Archived text".to_owned(),
+            viewport: None,
+            resources: Vec::new(),
+            archive_mhtml: None,
+            pdf_snapshot: None,
+            cached_ms: Some(123),
+        });
+
+        state.save_latest_offline_cache_archive();
+
+        let notice = state.capture_notice.as_deref().expect("archive notice");
+        assert_eq!(
+            notice,
+            "Offline archive failed: offline copy has no saved archive"
+        );
+        assert!(
+            !notice.contains("MHTML") && !notice.contains("mhtml"),
+            "offline archive notice must not expose archive implementation details: {notice}"
+        );
+    }
+
+    #[test]
     fn browser_offline_cache_pdf_snapshot_saves_valid_pdf_to_disk() {
         let pdf_bytes = b"%PDF-1.7\n% cached PDF fixture\n";
         let pdf = OfflineCachePdf {
