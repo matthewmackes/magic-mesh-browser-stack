@@ -1470,11 +1470,15 @@ fn media_metadata_beacon_script_is_bounded_and_decodable() {
 
 #[test]
 fn media_metadata_playing_state_is_private_and_conservative() {
-    assert!(media_metadata_reports_playing(r#"{"title":"Track","paused":false}"#));
+    assert!(media_metadata_reports_playing(
+        r#"{"title":"Track","paused":false}"#
+    ));
     assert!(media_metadata_reports_playing(
         r#"{"title":"Track","artist":"Artist","paused" : false,"position_ms":42}"#
     ));
-    assert!(!media_metadata_reports_playing(r#"{"title":"Track","paused":true}"#));
+    assert!(!media_metadata_reports_playing(
+        r#"{"title":"Track","paused":true}"#
+    ));
     assert!(!media_metadata_reports_playing(r#"{"title":"Track"}"#));
     assert!(!media_metadata_reports_playing(""));
 }
@@ -1887,54 +1891,67 @@ fn cef_webrtc_block_env_defaults_to_operational_surface() {
 }
 
 #[test]
-fn pump_interval_backs_off_when_idle_but_stays_fast_while_active() {
+fn idle_media_pump_backs_off_only_after_discovery_window() {
     // perf-6: awaiting the first paint is always active regardless of the
     // idle clock, so initial load latency is never regressed.
-    assert_eq!(pump_interval(Duration::from_secs(30), true, false), PUMP_ACTIVE);
-    // Recent activity (paint/frame/nav within the grace window) stays fast.
+    assert_eq!(
+        pump_interval(Duration::from_secs(30), true, false),
+        PUMP_ACTIVE
+    );
+    // Recent activity and the bounded media-discovery window stay fast so CEF
+    // can observe muted/silent autoplay before backing off.
     assert_eq!(pump_interval(Duration::ZERO, false, false), PUMP_ACTIVE);
-    assert_eq!(pump_interval(PUMP_IDLE_AFTER / 2, false, false), PUMP_ACTIVE);
+    assert_eq!(pump_interval(SHIM_SETTLE / 2, false, false), PUMP_ACTIVE);
     // Active media stays fast even when the pointer is still and no new paint has
     // reached the shell yet; this prevents video advancing only on mouse motion.
-    assert_eq!(pump_interval(Duration::from_secs(30), false, true), PUMP_ACTIVE);
+    assert_eq!(
+        pump_interval(Duration::from_secs(30), false, true),
+        PUMP_ACTIVE
+    );
     // Sustained quiet backs off so an idle tab stops spinning at 125 Hz.
-    assert_eq!(pump_interval(PUMP_IDLE_AFTER, false, false), PUMP_IDLE);
-    assert_eq!(pump_interval(Duration::from_secs(5), false, false), PUMP_IDLE);
+    assert_eq!(pump_interval(SHIM_SETTLE, false, false), PUMP_IDLE);
+    assert_eq!(
+        pump_interval(Duration::from_secs(5), false, false),
+        PUMP_IDLE
+    );
     // The idle interval is a real, substantial back-off from the active spin.
     assert!(PUMP_IDLE >= PUMP_ACTIVE * 10);
 }
 
 #[test]
-fn view_invalidation_tracks_first_paint_and_active_media_only() {
-    assert!(should_invalidate_view(true, false));
-    assert!(should_invalidate_view(false, true));
-    assert!(should_invalidate_view(true, true));
+fn idle_media_pump_invalidation_tracks_discovery_window() {
+    assert!(should_invalidate_view(media_discovery_active(
+        Duration::from_secs(30),
+        true,
+        false
+    )));
+    assert!(should_invalidate_view(media_discovery_active(
+        Duration::from_secs(30),
+        false,
+        true
+    )));
+    assert!(should_invalidate_view(media_discovery_active(
+        SHIM_SETTLE / 2,
+        false,
+        false
+    )));
     assert!(
-        !should_invalidate_view(false, false),
-        "settled non-media pages must still be allowed to idle without paint nudges"
+        !should_invalidate_view(media_discovery_active(SHIM_SETTLE, false, false)),
+        "settled non-media pages must be allowed to idle without paint nudges"
     );
 }
 
 #[test]
-fn resize_nudge_is_bounded_to_first_paint_and_active_media() {
+fn idle_media_pump_resize_nudge_is_bounded() {
     assert!(
-        !should_resize_view(false, false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL),
+        !should_resize_view(false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL),
         "settled non-media pages must not receive resize pulses"
     );
     assert!(
-        !should_resize_view(true, false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL / 2),
-        "first-paint resize pulses must be rate-limited"
+        !should_resize_view(true, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL / 2),
+        "resize pulses must be rate-limited"
     );
-    assert!(should_resize_view(
-        true,
-        false,
-        MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
-    ));
-    assert!(should_resize_view(
-        false,
-        true,
-        MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
-    ));
+    assert!(should_resize_view(true, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL));
     assert!(MEDIA_VIEW_RESIZE_NUDGE_INTERVAL >= PUMP_ACTIVE * 10);
 }
 

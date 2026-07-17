@@ -862,9 +862,6 @@ const PUMP_ACTIVE: Duration = Duration::from_millis(8);
 /// This is also the passkey outbound-drain heartbeat, so it doubles as the idle
 /// floor rather than adding a second timer.
 const PUMP_IDLE: Duration = Duration::from_millis(250);
-/// Grace period of no paints/frames before the pump backs off to [`PUMP_IDLE`],
-/// so a brief lull mid-interaction does not thrash the interval.
-const PUMP_IDLE_AFTER: Duration = Duration::from_millis(200);
 /// How long after the last activity a freshly-navigated document is still
 /// treated as "settling", during which the per-context shims are re-applied (at
 /// [`ShimInjector::SETTLE_INTERVAL`]) so a slow document commit is still covered
@@ -889,18 +886,27 @@ const MEDIA_VIEW_RESIZE_NUDGE_INTERVAL: Duration = Duration::from_millis(250);
 /// with CEF's real IP-handling policy plus the native media permission callback.
 const CEF_WEBRTC_BLOCK_ENV: &str = "MDE_CEF_WEBRTC_BLOCKED";
 
+/// Whether a newly-loaded CEF page is still in the bounded media-discovery
+/// window. This lets the metadata/audio probes catch quiet autoplay or muted
+/// video before the OSR pump backs off.
+fn media_discovery_active(
+    idle_for: Duration,
+    awaiting_first_paint: bool,
+    active_media: bool,
+) -> bool {
+    awaiting_first_paint || active_media || idle_for < SHIM_SETTLE
+}
+
 /// perf-6: pick the next pump/poll interval from how active the tab is.
 ///
-/// While awaiting the first paint or within [`PUMP_IDLE_AFTER`] of the last
-/// paint/frame/navigation the tab is "active" and pumped at [`PUMP_ACTIVE`];
-/// active HTML media also stays on the active pump so offscreen Chromium keeps
-/// advancing video while the pointer is still. Sustained quiet with no active
-/// media backs off to [`PUMP_IDLE`] so an idle tab stops spinning at 125 Hz.
-/// Input latency is preserved because the loop waits on the session fd with
-/// `poll()`, which returns immediately when a control frame lands regardless of
-/// the interval.
+/// While awaiting the first paint, playing media, or still inside the bounded
+/// post-navigation media-discovery window the tab is "active" and pumped at
+/// [`PUMP_ACTIVE`]. Sustained quiet with no active media backs off to
+/// [`PUMP_IDLE`] so an idle tab stops spinning at 125 Hz. Input latency is
+/// preserved because the loop waits on the session fd with `poll()`, which
+/// returns immediately when a control frame lands regardless of the interval.
 fn pump_interval(idle_for: Duration, awaiting_first_paint: bool, active_media: bool) -> Duration {
-    if awaiting_first_paint || active_media || idle_for < PUMP_IDLE_AFTER {
+    if media_discovery_active(idle_for, awaiting_first_paint, active_media) {
         PUMP_ACTIVE
     } else {
         PUMP_IDLE
@@ -909,21 +915,17 @@ fn pump_interval(idle_for: Duration, awaiting_first_paint: bool, active_media: b
 
 /// Whether the windowless CEF view should be explicitly invalidated on this pump.
 ///
-/// Static pages paint naturally after the initial resize/invalidate. Time-driven
-/// pages and media can advance without input, and on the farm CEF 149 windowless
-/// runtime does not always schedule an OSR paint for that alone. While waiting for
-/// first paint or while media is known playing, nudge CEF's view invalidation at
-/// the active cadence; idle non-media pages still back off.
-fn should_invalidate_view(awaiting_first_paint: bool, active_media: bool) -> bool {
-    awaiting_first_paint || active_media
+/// Static pages paint naturally after the initial resize/invalidate. Media can
+/// advance before CEF reports audio or now-playing metadata, and on the farm CEF
+/// 149 windowless runtime does not always schedule an OSR paint for that alone.
+/// During the bounded discovery window, nudge CEF's view invalidation at the
+/// active cadence; settled non-media pages still back off.
+fn should_invalidate_view(media_discovery_active: bool) -> bool {
+    media_discovery_active
 }
 
-fn should_resize_view(
-    awaiting_first_paint: bool,
-    active_media: bool,
-    since_last_nudge: Duration,
-) -> bool {
-    (awaiting_first_paint || active_media) && since_last_nudge >= MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
+fn should_resize_view(media_discovery_active: bool, since_last_nudge: Duration) -> bool {
+    media_discovery_active && since_last_nudge >= MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
 }
 
 /// browser-8: decides when to (re)inject the per-context document shims (optional
@@ -1113,14 +1115,15 @@ pub fn run_windowless_tab(
         let idle_for = now.duration_since(last_activity);
         let awaiting_first_paint = first_paint.is_none();
         let active_media = callbacks.state.active_media();
+        let media_probe_active =
+            media_discovery_active(idle_for, awaiting_first_paint, active_media);
         if should_resize_view(
-            awaiting_first_paint,
-            active_media,
+            media_probe_active,
             now.duration_since(last_media_view_resize),
         ) {
             resize_and_invalidate_browser_view(browser);
             last_media_view_resize = now;
-        } else if should_invalidate_view(awaiting_first_paint, active_media) {
+        } else if should_invalidate_view(media_probe_active) {
             invalidate_browser_view(browser);
         }
         // A freshly-navigated document is still "settling" while awaiting the
