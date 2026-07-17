@@ -3766,10 +3766,41 @@ fn tab_search_result_row(ui: &mut egui::Ui, label: &str, active: bool) -> egui::
     response
 }
 
+fn tab_search_result_accesskit_id(tab_id: u64) -> egui::Id {
+    egui::Id::new(("browser-tab-search-result", tab_id))
+}
+
+fn install_tab_search_result_accessibility(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    tab_id: u64,
+    label: &str,
+    active: bool,
+    index: usize,
+    total: usize,
+) {
+    let _ = ctx.accesskit_node_builder(tab_search_result_accesskit_id(tab_id), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(format!("Switch to tab {label}"));
+        node.set_value(format!(
+            "Tab {} of {}{}",
+            index + 1,
+            total,
+            if active { ", active" } else { "" }
+        ));
+        node.set_bounds(accesskit_rect(rect));
+        node.add_action(egui::accesskit::Action::Click);
+        if active {
+            node.set_selected(true);
+        }
+    });
+}
+
 fn tab_search_results(ui: &mut egui::Ui, state: &WebState) -> Option<usize> {
     let mut select = None;
     tab_search_separator(ui);
     let matches = matching_tab_indices(&state.tabs, &state.tab_search_query);
+    let total = state.tabs.len();
     egui::ScrollArea::vertical()
         .max_height(260.0)
         .show(ui, |ui| {
@@ -3779,7 +3810,17 @@ fn tab_search_results(ui: &mut egui::Ui, state: &WebState) -> Option<usize> {
             for idx in matches {
                 let active = idx == state.active;
                 let label = tab_search_row_label(&state.tabs[idx]);
-                if tab_search_result_row(ui, &label, active).clicked() {
+                let response = tab_search_result_row(ui, &label, active);
+                install_tab_search_result_accessibility(
+                    ui.ctx(),
+                    response.rect,
+                    state.tabs[idx].id,
+                    &label,
+                    active,
+                    idx,
+                    total,
+                );
+                if response.clicked() {
                     select = Some(idx);
                 }
             }
@@ -7903,6 +7944,17 @@ mod tests {
         out
     }
 
+    fn accesskit_nodes(
+        out: &egui::FullOutput,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update")
+            .nodes
+            .clone()
+    }
+
     fn painted_line_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Stroke> {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Stroke>) {
             match shape {
@@ -10450,6 +10502,28 @@ mod tests {
                 "tab-search label {label:?} leaked shared shell text color: {texts:?}"
             );
         }
+    }
+
+    #[test]
+    fn tab_search_results_export_accesskit_buttons_for_switching_tabs() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_tab_search_results_frame(&ctx);
+        let nodes = accesskit_nodes(&out);
+        let row = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Switch to tab Browser Options"))
+            .expect("tab-search result row should expose a named AccessKit node");
+
+        assert_eq!(row.role(), egui::accesskit::Role::Button);
+        assert_eq!(row.value(), Some("Tab 1 of 1, active"));
+        assert_eq!(row.is_selected(), Some(true));
+        assert!(
+            row.supports_action(egui::accesskit::Action::Click),
+            "tab-search result row must expose the same click action as the painted row"
+        );
     }
 
     #[test]
