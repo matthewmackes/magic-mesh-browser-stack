@@ -164,6 +164,7 @@ const CHROME_FONT: f32 = 10.0;
 const CHROME_BUTTON: f32 = 20.0;
 const CHROME_TAB_H: f32 = 22.0;
 const CHROME_TAB_W: f32 = 132.0;
+const CHROME_TAB_RAIL_W: f32 = 160.0;
 /// The floor a horizontal tab pill shrinks to once the strip is crowded. Below
 /// this the strip stops shrinking and scrolls horizontally instead of wrapping
 /// onto a second row (the standard desktop-browser overflow behaviour).
@@ -6708,27 +6709,50 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.omnibox_focused = false;
 
     if state.vertical_tabs {
-        ui.horizontal(|ui| {
-            chrome_ui::scope(ui, |ui| {
+        let panel_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        if panel_rect.is_positive() {
+            ui.allocate_rect(panel_rect, egui::Sense::hover());
+            let rail_right = (panel_rect.left() + CHROME_TAB_RAIL_W).min(panel_rect.right());
+            let rail_rect = egui::Rect::from_min_max(
+                panel_rect.min,
+                egui::pos2(rail_right, panel_rect.bottom()),
+            );
+            let content_left = (rail_right + CHROME_GAP).min(panel_rect.right());
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(content_left, panel_rect.top()),
+                panel_rect.max,
+            );
+
+            let mut rail_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rail_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            chrome_ui::scope(&mut rail_ui, |ui| {
                 chrome_ui::tab_strip(ui, state);
             });
-            ui.add_space(CHROME_GAP);
-            ui.vertical(|ui| {
-                chrome_ui::scope(ui, |ui| {
+
+            if content_rect.is_positive() {
+                let mut content_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                chrome_ui::scope(&mut content_ui, |ui| {
                     // The navigation chrome (back / forward / reload / address bar),
                     // wired to the active session's control socket.
                     chrome_ui::nav_chrome(ui, state);
                     chrome_ui::bookmarks_bar(ui, state);
                     chrome_ui::find_chrome(ui, state);
                 });
-                chrome_ui::insecure_prompt(ui, state);
-                chrome_ui::capture_notice(ui, state);
-                chrome_ui::drawer_stack(ui, state);
-                ui.add_space(CHROME_GAP);
-                chrome_ui::active_body(ui, state);
-                chrome_ui::media_pip_overlay(ui, state);
-            });
-        });
+                chrome_ui::insecure_prompt(&mut content_ui, state);
+                chrome_ui::capture_notice(&mut content_ui, state);
+                chrome_ui::drawer_stack(&mut content_ui, state);
+                content_ui.add_space(CHROME_GAP);
+                chrome_ui::active_body(&mut content_ui, state);
+                chrome_ui::media_pip_overlay(&mut content_ui, state);
+            }
+        }
     } else {
         chrome_ui::scope(ui, |ui| {
             // First-class tab strip (BROWSER-DD-2): switch/close existing isolated
@@ -8276,8 +8300,12 @@ mod tests {
 
     /// A headless 960×640 shell body, mirroring the VDI + shell render tests.
     fn body_input() -> egui::RawInput {
+        body_input_with_size(vec2(960.0, 640.0))
+    }
+
+    fn body_input_with_size(size: egui::Vec2) -> egui::RawInput {
         egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
             ..Default::default()
         }
     }
@@ -13266,7 +13294,7 @@ mod tests {
             .expect("horizontal Browser body should paint the page texture");
 
         assert!(
-            rect.left() >= -0.5 && rect.right() <= 960.5,
+            rect.left() >= -0.5 && rect.right() <= 960.5 && rect.width() > 900.0,
             "horizontal Browser body must not paint off the visible right edge: {rect:?}"
         );
         assert!(
@@ -13274,8 +13302,56 @@ mod tests {
             "horizontal Browser body must remain inside the visible panel: {rect:?}"
         );
         assert!(
-            rect.height() > 360.0,
+            rect.height() > 520.0,
             "horizontal Browser body should use the remaining workspace, not only the top slice: {rect:?}"
+        );
+
+        let frame_size = state.tabs[state.active]
+            .last_frame
+            .as_ref()
+            .expect("painted frame")
+            .size;
+        let right_edge_click = egui::Event::PointerButton {
+            pos: pos2(rect.right() - 0.5, rect.center().y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let Some(egui::Event::PointerButton { pos, .. }) =
+            browser_input_event(&right_edge_click, rect, frame_size, true, false)
+        else {
+            panic!("right-edge Browser click should forward into the page");
+        };
+        assert!(
+            pos.x >= frame_size[0] as f32 - 1.0,
+            "visible right edge must map to the helper frame edge, got {pos:?} of {frame_size:?}"
+        );
+    }
+
+    #[test]
+    fn vertical_tabs_page_body_stays_bounded_and_uses_remaining_workspace() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.set_vertical_tabs(true);
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let rect = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("vertical Browser body should paint the page texture");
+
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 960.5,
+            "vertical Browser body must remain inside the visible width: {rect:?}"
+        );
+        assert!(
+            rect.width() > 700.0,
+            "vertical Browser body should use the workspace to the right of the tab rail: {rect:?}"
+        );
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= 640.5 && rect.height() > 560.0,
+            "vertical Browser body must use the visible height below compact chrome: {rect:?}"
         );
     }
 

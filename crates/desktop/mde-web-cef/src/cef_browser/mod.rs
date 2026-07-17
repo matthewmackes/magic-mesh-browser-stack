@@ -887,12 +887,14 @@ const CEF_WEBRTC_BLOCK_ENV: &str = "MDE_CEF_WEBRTC_BLOCKED";
 ///
 /// While awaiting the first paint or within [`PUMP_IDLE_AFTER`] of the last
 /// paint/frame/navigation the tab is "active" and pumped at [`PUMP_ACTIVE`];
-/// sustained quiet backs the pump off to [`PUMP_IDLE`] so an idle tab stops
-/// spinning at 125 Hz. Input latency is preserved because the loop waits on the
-/// session fd with `poll()`, which returns immediately when a control frame lands
-/// regardless of the interval.
-fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
-    if awaiting_first_paint || idle_for < PUMP_IDLE_AFTER {
+/// active HTML media also stays on the active pump so offscreen Chromium keeps
+/// advancing video while the pointer is still. Sustained quiet with no active
+/// media backs off to [`PUMP_IDLE`] so an idle tab stops spinning at 125 Hz.
+/// Input latency is preserved because the loop waits on the session fd with
+/// `poll()`, which returns immediately when a control frame lands regardless of
+/// the interval.
+fn pump_interval(idle_for: Duration, awaiting_first_paint: bool, active_media: bool) -> Duration {
+    if awaiting_first_paint || active_media || idle_for < PUMP_IDLE_AFTER {
         PUMP_ACTIVE
     } else {
         PUMP_IDLE
@@ -1108,7 +1110,10 @@ pub fn run_windowless_tab(
             });
         }
 
-        wait_for_readable(fd, pump_interval(idle_for, awaiting_first_paint));
+        wait_for_readable(
+            fd,
+            pump_interval(idle_for, awaiting_first_paint, callbacks.state.active_media()),
+        );
     }
 
     let probe = first_paint.unwrap_or(CefBrowserProbe {
@@ -2124,6 +2129,11 @@ struct CefBrowserState {
     /// document is patched immediately, and the navigation shim injector reapplies
     /// the block to fresh documents while this is true.
     autoplay_blocked: AtomicBool,
+    /// CEF audio callback says the page is currently audible.
+    audio_active: AtomicBool,
+    /// Media Session / HTMLMediaElement probe says at least one media element is
+    /// playing. This is metadata only; no samples or frames leave CEF.
+    media_session_playing: AtomicBool,
     /// Optional legacy WebRTC API remover. Default is false so CEF can satisfy
     /// browser-page WebRTC compatibility; deployments can set
     /// [`CEF_WEBRTC_BLOCK_ENV`] to restore the old WebRTC-off posture.
@@ -2195,6 +2205,8 @@ impl CefBrowserState {
             download_seq: AtomicU64::new(1),
             user_agent_override: Mutex::new(String::new()),
             autoplay_blocked: AtomicBool::new(false),
+            audio_active: AtomicBool::new(false),
+            media_session_playing: AtomicBool::new(false),
             webrtc_blocked: AtomicBool::new(cef_webrtc_blocked_from_env()),
         })
     }
@@ -2265,6 +2277,7 @@ impl CefBrowserState {
     /// shell, which shows/hides the 🔊 "playing audio" indicator on the tab. We
     /// carry only the audible bit — never any audio samples.
     fn publish_audio_state(&self, audible: bool) {
+        self.audio_active.store(audible, Ordering::SeqCst);
         let event = EventMsg::AudioState { audible };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
@@ -2275,6 +2288,8 @@ impl CefBrowserState {
 
     /// Forward bounded page/media-session now-playing metadata to the shell.
     fn publish_media_metadata(&self, body: String) {
+        self.media_session_playing
+            .store(media_metadata_reports_playing(&body), Ordering::SeqCst);
         let event = EventMsg::MediaMetadata {
             body: clamp_utf8(&body, CEF_MEDIA_METADATA_BEACON_MAX_BYTES),
         };
@@ -2343,12 +2358,19 @@ impl CefBrowserState {
     /// Record that a fresh document context is being loaded (browser-8). Called
     /// from the resource handler when CEF flags a request as a navigation.
     fn record_navigation(&self) {
+        self.audio_active.store(false, Ordering::SeqCst);
+        self.media_session_playing.store(false, Ordering::SeqCst);
         self.nav_seq.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Current navigation generation observed by the pump loop.
     fn navigations(&self) -> u64 {
         self.nav_seq.load(Ordering::SeqCst)
+    }
+
+    fn active_media(&self) -> bool {
+        self.audio_active.load(Ordering::SeqCst)
+            || self.media_session_playing.load(Ordering::SeqCst)
     }
 
     fn update_pointer(&self, x: f32, y: f32) -> (i32, i32) {
@@ -5356,6 +5378,24 @@ fn decode_media_metadata_beacon(url: &str) -> Option<String> {
         return Some(body);
     }
     body.trim_start().starts_with('{').then_some(body)
+}
+
+fn media_metadata_reports_playing(body: &str) -> bool {
+    let mut rest = body;
+    while let Some(idx) = rest.find("\"paused\"") {
+        rest = &rest[idx + "\"paused\"".len()..];
+        let value = rest.trim_start().strip_prefix(':').map(str::trim_start);
+        match value {
+            Some(v) if v.starts_with("false") => return true,
+            Some(v) if v.starts_with("true") => return false,
+            _ => {}
+        }
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[1..];
+    }
+    false
 }
 
 /// Decode a login-capture beacon URL into `(origin, body)`. Returns `None` for

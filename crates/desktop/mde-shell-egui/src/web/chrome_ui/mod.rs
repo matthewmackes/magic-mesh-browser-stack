@@ -34,8 +34,8 @@ use super::{
     BrowserVoiceCommandStatus, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
     ManagedPolicyBlock, PendingPasskeyConsent, PixelRegion, Tab, UserAgentOverride, WebState,
     CHROME_BUTTON, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE,
-    CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_W, MAX_CHANNEL_DIM,
-    PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
+    CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_RAIL_W, CHROME_TAB_W,
+    MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
 };
 use accessibility::install_browser_page_accessibility;
 use drawers::{
@@ -3909,7 +3909,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
         .fill(CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
-            ui.set_width(152.0);
+            ui.set_width((CHROME_TAB_RAIL_W - 8.0).max(CHROME_NEW_TAB_W));
             egui::ScrollArea::vertical()
                 .id_salt("browser-vertical-tabs")
                 .max_height(ui.available_height().max(CHROME_TAB_H * 3.0))
@@ -6894,11 +6894,10 @@ fn cursor_icon_for(kind: CursorKind) -> egui::CursorIcon {
 /// Paint the active tab's decoded frame to fill the body and forward this frame's
 /// egui input to the session.
 pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize) {
-    let Some((tex_id, texture_size, frame_size)) = state.tabs.get(active).and_then(|tab| {
+    let Some((tex_id, frame_size)) = state.tabs.get(active).and_then(|tab| {
         let texture = tab.texture.as_ref()?;
         Some((
             texture.id(),
-            texture.size_vec2(),
             tab.last_frame.as_ref().map_or([0, 0], |frame| frame.size),
         ))
     }) else {
@@ -6909,7 +6908,7 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
         return;
     }
     let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-    let image_rect = fit_rect_preserving_aspect(rect, texture_size);
+    let image_rect = rect;
     ui.painter().rect_filled(rect, 0.0, page_backdrop_fill());
     egui::Image::new(egui::load::SizedTexture::new(tex_id, image_rect.size()))
         .paint_at(ui, image_rect);
