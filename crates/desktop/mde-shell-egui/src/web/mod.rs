@@ -2617,12 +2617,14 @@ impl WebState {
         if tab.session.media_metadata().is_some() || tab.session.audible() {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
-        if tab.session.nav().loading
-            && tab
+        if tab.session.nav().loading {
+            if tab
                 .loading_fast_repaint_until
                 .is_some_and(|deadline| now <= deadline)
-        {
-            return Some(LIVE_PAGE_REPAINT_INTERVAL);
+            {
+                return Some(LIVE_PAGE_REPAINT_INTERVAL);
+            }
+            return Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL);
         }
         if tab.texture.is_some() || tab.last_frame.is_some() {
             return Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL);
@@ -14523,6 +14525,59 @@ mod tests {
             state.active_live_page_repaint_interval_at(deadline + Duration::from_millis(1)),
             Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
             "a non-media page that keeps loading must not pin the DRM shell at 60 Hz"
+        );
+    }
+
+    #[test]
+    fn long_loading_page_without_first_frame_keeps_low_rate_heartbeat() {
+        let (session, helper) = raw_session_pair();
+        let mut state = WebState::default();
+        state.push_session(session);
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: true,
+                url: "https://www.google.com/".to_owned(),
+            },
+        );
+        let _events = state.poll_tabs_for_panel();
+        assert!(
+            state.tabs[0].session.nav().loading,
+            "regression setup must leave the page in a Chromium loading state"
+        );
+        assert!(
+            state.tabs[0].texture.is_none() && state.tabs[0].last_frame.is_none(),
+            "regression setup must cover a loading page before first paint"
+        );
+        let deadline = state.tabs[0]
+            .loading_fast_repaint_until
+            .expect("loading page should receive a short fast-repaint budget");
+
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(deadline - Duration::from_millis(1)),
+            Some(LIVE_PAGE_REPAINT_INTERVAL),
+            "fresh loading pages keep the fast first-paint cadence"
+        );
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(deadline + Duration::from_millis(1)),
+            Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
+            "a still-loading page with no first frame must keep the Browser helper heartbeat"
+        );
+
+        state.tabs[0].loading_fast_repaint_until = Some(Instant::now() - Duration::from_millis(1));
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = run_panel_output(&ctx, &mut state, body_input());
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        assert!(
+            repaint_delay <= LIVE_PAGE_IDLE_REPAINT_INTERVAL,
+            "pre-paint Browser loads must keep polling frames without mouse input at a bounded low rate (delay {repaint_delay:?})"
         );
     }
 
