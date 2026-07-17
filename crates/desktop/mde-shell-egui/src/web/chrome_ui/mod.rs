@@ -28,14 +28,16 @@ use mde_web_preview_client::{
 mod accessibility;
 mod body;
 mod drawers;
+#[cfg(test)]
+use super::BrowserSecurityUpdateStatus;
 use super::{
     browser_capture_dir, ellipsize, is_new_tab_url, media_metadata_chip_label, BrowserEngine,
-    BrowserOfflineCacheResult, BrowserReadAloudStatus, BrowserSecurityUpdateStatus,
-    BrowserVoiceCommandStatus, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
-    ManagedPolicyBlock, PendingPasskeyConsent, PixelRegion, Tab, UserAgentOverride, WebState,
-    CHROME_BUTTON, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE,
-    CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_RAIL_W, CHROME_TAB_W,
-    MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
+    BrowserOfflineCacheResult, BrowserReadAloudStatus, BrowserVoiceCommandStatus, ContainerProfile,
+    DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock, PendingPasskeyConsent,
+    PixelRegion, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
+    CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
+    CHROME_TAB_PINNED_W, CHROME_TAB_RAIL_W, CHROME_TAB_W, MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER,
+    RESIZE_DEBOUNCE,
 };
 use accessibility::install_browser_page_accessibility;
 use drawers::{
@@ -285,6 +287,7 @@ pub(super) const fn engine_display_name(engine: BrowserEngine) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(super) const fn engine_marker(engine: BrowserEngine) -> &'static str {
     match engine {
         BrowserEngine::Cef => "CEF",
@@ -463,6 +466,53 @@ pub(super) const REQUIRED_BROWSER_ICONS: &[ChromeIcon] = &[
     ChromeIcon::VolumeOff,
     ChromeIcon::VolumeUp,
     ChromeIcon::PictureInPicture,
+];
+
+#[cfg(test)]
+const ALL_BROWSER_ICONS: &[ChromeIcon] = &[
+    ChromeIcon::Back,
+    ChromeIcon::Forward,
+    ChromeIcon::Reload,
+    ChromeIcon::Stop,
+    ChromeIcon::Options,
+    ChromeIcon::Downloads,
+    ChromeIcon::Capture,
+    ChromeIcon::Bookmark,
+    ChromeIcon::Security,
+    ChromeIcon::Warning,
+    ChromeIcon::Search,
+    ChromeIcon::Close,
+    ChromeIcon::ZoomIn,
+    ChromeIcon::ZoomOut,
+    ChromeIcon::Print,
+    ChromeIcon::Privacy,
+    ChromeIcon::History,
+    ChromeIcon::Tabs,
+    ChromeIcon::Engine,
+    ChromeIcon::NewTab,
+    ChromeIcon::Up,
+    ChromeIcon::Down,
+    ChromeIcon::Check,
+    ChromeIcon::Page,
+    ChromeIcon::Edit,
+    ChromeIcon::View,
+    ChromeIcon::Power,
+    ChromeIcon::Share,
+    ChromeIcon::Find,
+    ChromeIcon::Audio,
+    ChromeIcon::Play,
+    ChromeIcon::Pause,
+    ChromeIcon::MediaStop,
+    ChromeIcon::Previous,
+    ChromeIcon::Next,
+    ChromeIcon::Minus,
+    ChromeIcon::Plus,
+    ChromeIcon::VolumeDown,
+    ChromeIcon::VolumeOff,
+    ChromeIcon::VolumeUp,
+    ChromeIcon::PictureInPicture,
+    ChromeIcon::DarkMode,
+    ChromeIcon::Lock,
 ];
 
 #[cfg(test)]
@@ -9011,16 +9061,18 @@ mod tests {
 
     #[test]
     fn required_browser_icons_have_non_empty_painters() {
+        for icon in ALL_BROWSER_ICONS {
+            assert!(
+                chrome_icon_painted_shape_count(*icon) > 0,
+                "Browser-local icon {icon:?} must paint at least one shape"
+            );
+        }
         for icon in REQUIRED_BROWSER_ICONS {
             assert!(
                 chrome_icon_painted_shape_count(*icon) > 0,
                 "required Browser icon {icon:?} must paint at least one shape"
             );
         }
-        assert!(
-            chrome_icon_painted_shape_count(ChromeIcon::Lock) > 0,
-            "disabled command lock affordance must also be painted locally"
-        );
         assert_eq!(
             chrome_icon_painted_shape_count(ChromeIcon::Minus),
             1,
