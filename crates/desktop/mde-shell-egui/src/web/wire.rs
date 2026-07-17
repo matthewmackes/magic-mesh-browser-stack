@@ -1144,6 +1144,10 @@ pub(super) fn browser_custom_filter_rules_source_topic(host: &str) -> String {
     format!("{STATE_BROWSER_CUSTOM_FILTER_RULES_SOURCE_PREFIX}{host}")
 }
 
+pub(super) fn browser_filter_list_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_FILTER_LIST_SOURCE_PREFIX}{host}")
+}
+
 pub(super) fn cache_url_keys(url: &str) -> Vec<String> {
     let url = url.trim();
     if url.is_empty() {

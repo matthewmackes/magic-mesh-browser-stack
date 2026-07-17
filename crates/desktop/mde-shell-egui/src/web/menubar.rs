@@ -278,6 +278,8 @@ struct Snapshot {
     current_site_permissions: Option<String>,
     /// Whether the native blocker is enabled for the current first-party host.
     site_blocking_enabled: bool,
+    /// Mesh-synced filter-list source status.
+    filter_lists: String,
     /// Operator custom filter-rule source status.
     custom_filters: String,
     /// Safe-browsing mesh blocklist status.
@@ -338,6 +340,7 @@ fn snapshot(state: &WebState) -> Snapshot {
                 current_site: state.active_first_party(),
                 current_site_permissions: state.active_site_permission_summary(),
                 site_blocking_enabled: state.active_site_blocking_enabled(),
+                filter_lists: state.filter_list_summary(),
                 custom_filters: state.custom_filter_rules_summary(),
                 safe_browsing: state.safe_browsing_summary(),
                 managed_policy: state.managed_policy_summary(),
@@ -407,6 +410,7 @@ fn snapshot(state: &WebState) -> Snapshot {
         .is_some_and(|saved| pdf_file_looks_readable(&saved.path));
     snap.active_downloads = active_downloads;
     snap.total_downloads = total_downloads;
+    snap.filter_lists = state.filter_list_summary();
     snap.custom_filters = state.custom_filter_rules_summary();
     snap.safe_browsing = state.safe_browsing_summary();
     snap.managed_policy = state.managed_policy_summary();
@@ -753,7 +757,6 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Caption("Third-party cookies: blocked (no cookie store)".to_owned()),
                 Entry::Caption("Session data: cleared on tab close".to_owned()),
                 Entry::Caption(s.site_data.clone()),
-                Entry::Caption("Filter lists: bundled seed + synced/custom rules".to_owned()),
                 Entry::Caption(
                     "Extensions: native blocker, passkeys, reader mode, userscripts, and site styles active"
                         .to_owned(),
@@ -785,9 +788,12 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ClearAllBrowsingData, "Clear All Browsing Data")
-                        .enabled(s.has_tab && !s.crashed),
+                    .enabled(s.has_tab && !s.crashed),
                 ),
             ];
+            if !s.filter_lists.trim().is_empty() {
+                entries.insert(4, Entry::Caption(s.filter_lists.clone()));
+            }
             if !s.custom_filters.trim().is_empty() {
                 entries.insert(5, Entry::Caption(s.custom_filters.clone()));
             }
@@ -1427,6 +1433,7 @@ mod tests {
                 "example.com: all sensitive prompts denied by default".to_owned(),
             ),
             site_blocking_enabled: true,
+            filter_lists: "Filter lists: 3 filter sources loaded".to_owned(),
             custom_filters: "Custom filters: 2 custom rules loaded".to_owned(),
             safe_browsing: "Safe browsing: 2 unsafe site rules loaded".to_owned(),
             managed_policy: "Managed policy: 3 URL block rules loaded".to_owned(),
@@ -2492,7 +2499,7 @@ mod tests {
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Filter lists: bundled seed + synced/custom rules")),
+                .any(|c| c.contains("Filter lists: 3 filter sources loaded")),
             "the filter-list policy source is visible"
         );
         assert!(

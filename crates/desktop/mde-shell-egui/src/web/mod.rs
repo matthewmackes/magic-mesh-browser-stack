@@ -1225,6 +1225,7 @@ impl BrowserEngine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserPolicySourceKind {
+    FilterLists,
     SafeBrowsing,
     ManagedUrl,
     CustomFilterRules,
@@ -1233,6 +1234,7 @@ enum BrowserPolicySourceKind {
 impl BrowserPolicySourceKind {
     const fn policy(self) -> &'static str {
         match self {
+            Self::FilterLists => "filter_lists",
             Self::SafeBrowsing => "safe_browsing",
             Self::ManagedUrl => "managed_url",
             Self::CustomFilterRules => "custom_filter_rules",
@@ -1241,6 +1243,7 @@ impl BrowserPolicySourceKind {
 
     const fn op(self) -> &'static str {
         match self {
+            Self::FilterLists => "browser_filter_list_source_status",
             Self::SafeBrowsing => "browser_safe_browsing_source_status",
             Self::ManagedUrl => "browser_managed_url_policy_source_status",
             Self::CustomFilterRules => "browser_custom_filter_rules_source_status",
@@ -1249,6 +1252,7 @@ impl BrowserPolicySourceKind {
 
     const fn label(self) -> &'static str {
         match self {
+            Self::FilterLists => "Filter lists",
             Self::SafeBrowsing => "Safe browsing",
             Self::ManagedUrl => "Managed policy",
             Self::CustomFilterRules => "Custom filters",
@@ -1257,6 +1261,7 @@ impl BrowserPolicySourceKind {
 
     const fn item_label(self) -> &'static str {
         match self {
+            Self::FilterLists => "filter source",
             Self::SafeBrowsing => "unsafe site rule",
             Self::ManagedUrl => "URL block rule",
             Self::CustomFilterRules => "custom rule",
@@ -1265,6 +1270,7 @@ impl BrowserPolicySourceKind {
 
     fn topic(self, host: &str) -> String {
         match self {
+            Self::FilterLists => browser_filter_list_source_topic(host),
             Self::SafeBrowsing => browser_safe_browsing_source_topic(host),
             Self::ManagedUrl => browser_managed_policy_source_topic(host),
             Self::CustomFilterRules => browser_custom_filter_rules_source_topic(host),
@@ -1521,6 +1527,8 @@ pub(crate) struct WebState {
     /// toggles mutate this store, then every open tab receives a freshly compiled
     /// [`RequestFilter`].
     adfilter_store: FilterListStore,
+    /// Current read posture for the mesh-synced compiled filter-list store.
+    filter_list_source_status: BrowserPolicySourceStatus,
     /// Current read posture for the operator-managed custom filter rules file.
     custom_filter_rules_source_status: BrowserPolicySourceStatus,
     /// Mesh-hosted safe-browsing host blocklists. The worker/file-sync half can
@@ -1744,6 +1752,8 @@ pub(crate) struct WebState {
     bookmarks_collection_cursor: Option<String>,
     /// Throttle for the relaxed bookmark-collection re-read.
     bookmarks_collection_last_poll: Option<Instant>,
+    /// Throttle for the mesh-synced compiled filter-list store re-read.
+    filter_lists_last_poll: Option<Instant>,
     /// Throttle for the operator-managed custom filter rules re-read.
     custom_filter_rules_last_poll: Option<Instant>,
     /// Throttle for the operator-curated safe-browsing blocklist re-read.
@@ -1811,6 +1821,10 @@ impl Default for WebState {
             pending_translate_requests: BTreeMap::new(),
             pending_offline_cache_requests: BTreeMap::new(),
             adfilter_store: FilterListStore::with_bundled(),
+            filter_list_source_status: BrowserPolicySourceStatus::unknown(
+                BrowserPolicySourceKind::FilterLists,
+                default_workgroup_root().join(ADFILTER_COMPILED_STORE_PATH),
+            ),
             custom_filter_rules_source_status: BrowserPolicySourceStatus::unknown(
                 BrowserPolicySourceKind::CustomFilterRules,
                 default_workgroup_root().join(CUSTOM_FILTER_RULES_PATH),
@@ -1903,6 +1917,7 @@ impl Default for WebState {
             site_style_host_draft: String::new(),
             site_style_css_draft: String::new(),
             bookmarks_collection_cursor: None,
+            filter_lists_last_poll: None,
             custom_filter_rules_last_poll: None,
             safe_browsing_last_poll: None,
             managed_policy_last_poll: None,
@@ -2279,6 +2294,7 @@ impl WebState {
         self.poll_offline_cache_results();
         self.poll_security_update_status();
         self.poll_bookmarks_collection();
+        self.poll_filter_lists();
         self.poll_custom_filter_rules();
         self.poll_safe_browsing_hosts();
         self.poll_managed_url_policy();
@@ -5938,6 +5954,10 @@ impl WebState {
             .is_some_and(|host| !self.adfilter_store.allowlist().is_allowed(&host))
     }
 
+    fn filter_list_summary(&self) -> String {
+        self.filter_list_source_status.summary()
+    }
+
     fn custom_filter_rules_summary(&self) -> String {
         self.custom_filter_rules_source_status.summary()
     }
@@ -6027,6 +6047,21 @@ impl WebState {
         self.adfilter_store
             .source(CUSTOM_FILTER_SOURCE_NAME)
             .map_or(0, |source| custom_filter_rule_count(&source.raw))
+    }
+
+    fn current_filter_source_count(&self) -> usize {
+        self.adfilter_store.enabled_sources().count()
+    }
+
+    fn set_synced_filter_store(&mut self, store: FilterListStore) {
+        let mut merged = store;
+        // Preserve immediate local Browser edits (site allow/block toggles and the
+        // local custom-rule source) while still letting newer synced sources win.
+        merged.merge(&self.adfilter_store);
+        if merged != self.adfilter_store {
+            self.adfilter_store = merged;
+            self.apply_adfilter_to_open_tabs();
+        }
     }
 
     fn set_custom_filter_rules(&mut self, raw: &str, source_path: &Path) {
@@ -6436,6 +6471,61 @@ impl WebState {
         self.publish_policy_source_status(&self.safe_browsing_source_status);
     }
 
+    /// Populate the Browser blocker from the mackesd adfilter worker's converged
+    /// store (`adfilter/compiled/engine.json` under the workgroup root). The local
+    /// custom-rule file is polled immediately after this so operator-local rules
+    /// remain layered on top.
+    fn poll_filter_lists(&mut self) {
+        if self
+            .filter_lists_last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.filter_lists_last_poll = Some(Instant::now());
+        let path = default_workgroup_root().join(ADFILTER_COMPILED_STORE_PATH);
+        let checked_ms = unix_ms();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match FilterListStore::from_json(&text) {
+                Ok(store) => {
+                    let source_count = store.enabled_sources().count();
+                    let status = BrowserPolicySourceStatus::loaded(
+                        BrowserPolicySourceKind::FilterLists,
+                        path,
+                        source_count,
+                        checked_ms,
+                    );
+                    self.set_synced_filter_store(store);
+                    self.filter_list_source_status = status;
+                }
+                Err(err) => {
+                    self.filter_list_source_status = self.filter_list_source_status.error(
+                        path,
+                        checked_ms,
+                        self.current_filter_source_count(),
+                        err.to_string(),
+                    );
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.filter_list_source_status = self.filter_list_source_status.missing(
+                    path,
+                    checked_ms,
+                    self.current_filter_source_count(),
+                );
+            }
+            Err(err) => {
+                self.filter_list_source_status = self.filter_list_source_status.error(
+                    path,
+                    checked_ms,
+                    self.current_filter_source_count(),
+                    err.to_string(),
+                );
+            }
+        }
+        self.publish_policy_source_status(&self.filter_list_source_status);
+    }
+
     /// Populate operator custom EasyList-format rules from
     /// `browser/custom-filter-rules.txt` under the workgroup root. A loaded empty
     /// file clears the custom source; missing/error keeps the last-good source.
@@ -6528,6 +6618,8 @@ impl WebState {
 
 /// The operator-curated safe-browsing blocklist path, relative to the workgroup root.
 const SAFE_BROWSING_HOSTS_PATH: &str = "browser/safe-browsing-hosts.txt";
+/// The mackesd adfilter worker's converged store path, relative to the workgroup root.
+const ADFILTER_COMPILED_STORE_PATH: &str = "adfilter/compiled/engine.json";
 /// The operator-managed custom filter rules path, relative to the workgroup root.
 const CUSTOM_FILTER_RULES_PATH: &str = "browser/custom-filter-rules.txt";
 /// The stable source name used inside the Browser filter-list store.
@@ -7138,6 +7230,9 @@ const STATE_BROWSER_MANAGED_POLICY_SOURCE_PREFIX: &str = "state/browser-managed-
 /// Browser custom filter rules source-read status prefix.
 const STATE_BROWSER_CUSTOM_FILTER_RULES_SOURCE_PREFIX: &str =
     "state/browser-custom-filter-rules-source/";
+
+/// Browser synced filter-list source-read status prefix.
+const STATE_BROWSER_FILTER_LIST_SOURCE_PREFIX: &str = "state/browser-filter-list-source/";
 
 /// Browser managed-policy block audit event. Operators/admin tooling can consume
 /// this without scraping UI notices.
@@ -16098,6 +16193,99 @@ mod tests {
     }
 
     #[test]
+    fn synced_filter_store_file_compiles_into_open_tabs_and_publishes_status() {
+        use mde_web_preview_client::{ControlMsg, EventMsg, ResourceType};
+
+        let _env = browser_env_lock();
+        let _workgroup = EnvRestore::capture("MDE_WORKGROUP_ROOT");
+        let workgroup = tempfile::tempdir().expect("temp workgroup");
+        let compiled_dir = workgroup.path().join("adfilter").join("compiled");
+        std::fs::create_dir_all(&compiled_dir).expect("compiled adfilter dir");
+        let source_path = compiled_dir.join("engine.json");
+        let mut synced = FilterListStore::new();
+        synced.add_source(FilterListSource::custom(
+            "Synced mirror",
+            Some("file:///mesh/adfilter/mirror/Synced_mirror.txt".to_owned()),
+            "||ads.synced.test^\n",
+            100,
+        ));
+        std::fs::write(
+            &source_path,
+            synced.to_json().expect("serialize synced filter store"),
+        )
+        .expect("compiled filter store");
+        std::env::set_var("MDE_WORKGROUP_ROOT", workgroup.path());
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(WebSession::from_stream(shell, None).expect("session"));
+        state.add_custom_filter_rules(CUSTOM_FILTER_SOURCE_NAME, "||ads.local.test^\n", None);
+        state.poll_filter_lists();
+
+        assert_eq!(
+            state.filter_list_source_status.state,
+            BrowserPolicySourceState::Loaded
+        );
+        assert_eq!(
+            state.filter_list_source_status.summary(),
+            "Filter lists: 1 filter source loaded"
+        );
+        assert!(
+            state.adfilter_store.source("Synced mirror").is_some(),
+            "the worker-compiled filter source is now part of the Browser matcher"
+        );
+        assert!(
+            state
+                .adfilter_store
+                .source(CUSTOM_FILTER_SOURCE_NAME)
+                .is_some(),
+            "loading the synced store must preserve the local operator custom source"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let topic = browser_filter_list_source_topic(&local_hostname());
+        let msgs = persist
+            .list_since(&topic, None)
+            .expect("list filter-list source status");
+        assert_eq!(msgs.len(), 1);
+        let loaded: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("loaded body"))
+                .expect("valid loaded JSON");
+        assert_eq!(loaded["op"], "browser_filter_list_source_status");
+        assert_eq!(loaded["policy"], "filter_lists");
+        assert_eq!(loaded["state"], "loaded");
+        assert_eq!(loaded["item_count"], 1);
+        assert_eq!(loaded["effective_count"], 1);
+        let expected_source_path = source_path.to_string_lossy().into_owned();
+        assert_eq!(loaded["source_path"], expected_source_path.as_str());
+
+        let mut peer: &UnixStream = &helper;
+        for (id, url) in [
+            (51, "https://ads.synced.test/banner.js"),
+            (52, "https://ads.local.test/banner.js"),
+        ] {
+            peer.write_all(&wire::frame(
+                &EventMsg::ResourceRequest {
+                    id,
+                    url: url.to_owned(),
+                    resource: mde_web_preview_client::resource_to_wire(ResourceType::Script),
+                }
+                .encode(),
+            ))
+            .expect("resource request");
+            state.tabs[0].session.poll();
+            assert!(
+                drain_control_messages(&helper)
+                    .into_iter()
+                    .any(|m| matches!(m, ControlMsg::ResourceVerdict { id: got, allow: false } if got == id)),
+                "synced and preserved local filter rules must both block real resource verdicts"
+            );
+        }
+    }
+
+    #[test]
     fn custom_filter_rules_file_compiles_into_open_tabs_and_publishes_status() {
         use mde_web_preview_client::{ControlMsg, EventMsg, ResourceType};
 
@@ -16936,6 +17124,10 @@ mod tests {
             browser_custom_filter_rules_source_topic("node-a"),
             "state/browser-custom-filter-rules-source/node-a"
         );
+        assert_eq!(
+            browser_filter_list_source_topic("node-a"),
+            "state/browser-filter-list-source/node-a"
+        );
 
         let source = Path::new("/mesh/browser/safe-browsing-hosts.txt");
         let body = browser_policy_source_status_body(
@@ -17001,6 +17193,25 @@ mod tests {
         assert_eq!(v["item_count"], 2);
         assert_eq!(v["effective_count"], 2);
         assert_eq!(v["loaded_ms"], 780);
+
+        let body = browser_policy_source_status_body(
+            BrowserPolicySourceKind::FilterLists.op(),
+            BrowserPolicySourceKind::FilterLists.policy(),
+            Path::new("/mesh/adfilter/compiled/engine.json"),
+            BrowserPolicySourceState::Loaded.wire(),
+            3,
+            3,
+            990,
+            Some(990),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["op"], "browser_filter_list_source_status");
+        assert_eq!(v["policy"], "filter_lists");
+        assert_eq!(v["state"], "loaded");
+        assert_eq!(v["source_path"], "/mesh/adfilter/compiled/engine.json");
+        assert_eq!(v["item_count"], 3);
+        assert_eq!(v["effective_count"], 3);
     }
 
     #[test]
