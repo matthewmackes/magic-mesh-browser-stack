@@ -2721,7 +2721,8 @@ impl WebState {
             Ok(target) => match self.download_opener.open_path(&target.open) {
                 Ok(()) => {
                     self.download_notice = None;
-                    self.capture_notice = Some(format!("Opening {}", target.open.display()));
+                    self.capture_notice =
+                        Some(format!("Opening {}", browser_output_label(&target.open)));
                 }
                 Err(err) => self.download_notice = Some(format!("Open failed: {err}")),
             },
@@ -2740,7 +2741,8 @@ impl WebState {
             Ok(target) => match self.download_opener.reveal_path(&target.reveal) {
                 Ok(()) => {
                     self.download_notice = None;
-                    self.capture_notice = Some(format!("Showing {}", target.reveal.display()));
+                    self.capture_notice =
+                        Some(format!("Showing {}", browser_output_label(&target.reveal)));
                 }
                 Err(err) => self.download_notice = Some(format!("Show failed: {err}")),
             },
@@ -4663,7 +4665,7 @@ impl WebState {
     }
 
     fn record_capture_success(&mut self, label: &str, path: &Path) {
-        let notice = format!("{label} {}", path.display());
+        let notice = format!("{label}: {}", browser_output_label(path));
         self.capture_notice = Some(notice.clone());
         let body = browser_notify_body(Severity::Info, &notice, Some(&path.to_string_lossy()));
         publish_to_bus(self.bus_root.as_deref(), EVENT_NOTIFY_BROWSER, &body);
@@ -4923,11 +4925,16 @@ impl WebState {
                     title,
                 }
             });
+            let notice = format!("PDF saved: {}", browser_output_label(&saved.path));
             self.last_saved_pdf = Some(saved);
-            format!("PDF saved {path}")
+            notice
         } else {
-            self.pending_saved_pdfs.remove(&path);
-            format!("PDF failed {path}")
+            let saved_path = self
+                .pending_saved_pdfs
+                .remove(&path)
+                .map(|saved| saved.path)
+                .unwrap_or_else(|| PathBuf::from(&path));
+            format!("PDF save failed: {}", browser_output_label(&saved_path))
         }
     }
 
@@ -4949,7 +4956,7 @@ impl WebState {
         };
         let path = &saved.path;
         if !pdf_file_looks_readable(path) {
-            return Err(format!("{} is not a readable PDF", path.display()));
+            return Err("saved PDF is not readable".to_owned());
         }
         file_url_for_path(path)
     }
@@ -4957,10 +4964,13 @@ impl WebState {
     fn save_active_page_pdf(&mut self) {
         match self.save_active_page_pdf_to_dir(browser_pdf_dir()) {
             Ok(path) => {
-                self.capture_notice = Some(format!("PDF requested {}", path.display()));
+                self.capture_notice = Some(format!(
+                    "PDF save requested: {}",
+                    browser_output_label(&path)
+                ));
             }
             Err(err) => {
-                self.capture_notice = Some(format!("PDF failed: {err}"));
+                self.capture_notice = Some(pdf_save_failed_notice(&err));
             }
         }
     }
@@ -7192,6 +7202,28 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
     let mut out = s.chars().take(max_chars - 3).collect::<String>();
     out.push_str("...");
     out
+}
+
+fn browser_output_label(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let label = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("saved file");
+    ellipsize(label, 48)
+}
+
+fn pdf_save_failed_notice(err: &str) -> String {
+    match err {
+        "no live page" => "PDF failed: no live page".to_owned(),
+        "no active tab" => "PDF failed: no active tab".to_owned(),
+        _ if err.starts_with("could not create ") => {
+            "PDF failed: could not prepare the PDF folder".to_owned()
+        }
+        _ => "PDF failed: could not save the page".to_owned(),
+    }
 }
 
 fn media_metadata_chip_label(body: &str) -> Option<String> {
@@ -10074,7 +10106,15 @@ mod tests {
         run_panel(&mut state);
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("PDF saved /tmp/mde-page.pdf")
+            Some("PDF saved: mde-page.pdf")
+        );
+        assert!(
+            !state
+                .capture_notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/tmp/"),
+            "saved-PDF notice should not expose an absolute path"
         );
 
         write_helper_event(
@@ -10087,7 +10127,15 @@ mod tests {
         run_panel(&mut state);
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("PDF failed /tmp/mde-page.pdf")
+            Some("PDF save failed: mde-page.pdf")
+        );
+        assert!(
+            !state
+                .capture_notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("/tmp/"),
+            "failed-PDF notice should not expose an absolute path"
         );
     }
 
@@ -10101,7 +10149,7 @@ mod tests {
 
         assert_eq!(
             state.handle_pdf_event(path_text.clone(), true),
-            format!("PDF saved {path_text}")
+            "PDF saved: report one.pdf"
         );
         state.open_last_saved_pdf();
 
@@ -10133,12 +10181,17 @@ mod tests {
         state.open_last_saved_pdf();
 
         assert_eq!(state.take_open_request(), None);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("PDF viewer failed: saved PDF is not readable")
+        );
         assert!(
-            state
+            !state
                 .capture_notice
                 .as_deref()
-                .is_some_and(|notice| notice.starts_with("PDF viewer failed:")),
-            "viewer should explain the refused file: {:?}",
+                .unwrap_or_default()
+                .contains(path.to_string_lossy().as_ref()),
+            "viewer notice should not expose the refused path: {:?}",
             state.capture_notice
         );
     }
@@ -11943,6 +11996,25 @@ mod tests {
         );
         assert_eq!(media_metadata_chip_label(r#"{"title":"   "}"#), None);
         assert_eq!(media_metadata_chip_label("not-json"), None);
+    }
+
+    #[test]
+    fn browser_output_label_hides_parent_paths() {
+        assert_eq!(
+            browser_output_label(Path::new("/tmp/quazar/report.pdf")),
+            "report.pdf"
+        );
+        assert_eq!(
+            browser_output_label(Path::new(r"C:\Users\Alice\capture.png")),
+            "capture.png"
+        );
+        assert_eq!(browser_output_label(Path::new("/")), "saved file");
+
+        let long = Path::new("/tmp/quazar/abcdefghijklmnopqrstuvwxyz0123456789-output.pdf");
+        let label = browser_output_label(long);
+        assert!(label.ends_with("..."));
+        assert!(label.chars().count() <= 48);
+        assert!(!label.contains("/tmp/"));
     }
 
     #[test]
@@ -21351,7 +21423,7 @@ mod tests {
         assert_eq!(v["source"], "browser");
         assert_eq!(
             v["summary"],
-            "Captured web archive /tmp/mde-browser-capture.png"
+            "Captured web archive: mde-browser-capture.png"
         );
         assert!(
             !v["summary"]
@@ -22954,11 +23026,88 @@ mod tests {
         assert_eq!(opener.opened(), vec![dest.join("report.pdf")]);
         assert_eq!(opener.revealed(), vec![dest.clone()]);
         assert_eq!(state.download_notice, None);
-        let expected_notice = format!("Showing {}", dest.display());
+        assert_eq!(state.capture_notice.as_deref(), Some("Showing downloads"));
+        assert!(
+            !state
+                .capture_notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains(tmp.path().to_string_lossy().as_ref()),
+            "download reveal notice should not expose an absolute path"
+        );
+    }
+
+    #[test]
+    fn browser_output_notices_hide_absolute_paths() {
+        let mut state = WebState::default();
+        let pdf_path = "/tmp/quazar-output/report.pdf".to_owned();
+        assert_eq!(
+            state.handle_pdf_event(pdf_path.clone(), true),
+            "PDF saved: report.pdf"
+        );
+        assert!(
+            !state.handle_pdf_event(pdf_path, false).contains("/tmp/"),
+            "PDF completion notices should use a filename label"
+        );
+        state.last_saved_pdf = Some(SavedPdf {
+            path: PathBuf::from("/tmp/quazar-output/not-pdf.pdf"),
+            url: "https://example.test/".to_owned(),
+            title: "Example".to_owned(),
+        });
+        state.open_last_saved_pdf();
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some(expected_notice.as_str())
+            Some("PDF viewer failed: saved PDF is not readable")
         );
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut capture_state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        capture_state.record_capture_success(
+            "Captured web archive",
+            Path::new("/tmp/quazar-output/capture.mhtml"),
+        );
+        assert_eq!(
+            capture_state.capture_notice.as_deref(),
+            Some("Captured web archive: capture.mhtml")
+        );
+
+        let tmp = tempfile::tempdir().expect("download tempdir");
+        let dest = tmp.path().join("downloads");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let manifest = write_browser_download_manifest(
+            tmp.path(),
+            "https://files.example.test/report.pdf",
+            "report.pdf",
+            None,
+        );
+        let job = browser_download_fixture("browser-done", &manifest, &dest, TransferState::Done);
+        let opener = RecordingDownloadOpener::default();
+        let mut download_state = WebState::default()
+            .with_transfers(Box::new(RecordingTransfers::with_jobs(vec![job])))
+            .with_download_opener(Box::new(opener));
+        download_state.open_download("browser-done");
+        assert_eq!(
+            download_state.capture_notice.as_deref(),
+            Some("Opening report.pdf")
+        );
+        download_state.reveal_download("browser-done");
+        assert_eq!(
+            download_state.capture_notice.as_deref(),
+            Some("Showing downloads")
+        );
+        for notice in [
+            state.capture_notice.as_deref(),
+            capture_state.capture_notice.as_deref(),
+            download_state.capture_notice.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !notice.contains("/tmp/"),
+                "visible output notice leaked an absolute path: {notice}"
+            );
+        }
     }
 
     #[test]
