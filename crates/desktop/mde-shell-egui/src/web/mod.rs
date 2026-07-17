@@ -121,7 +121,7 @@ const CEF_ICU_DATA: &str = "icudtl.dat";
 const CEF_RESOURCES_PAK: &str = "resources.pak";
 
 /// The native new-tab URL. A real helper session still loads this, while the shell
-/// overlays the Quasar dashboard chrome for it.
+/// overlays the Quazar dashboard chrome for it.
 const NEW_TAB_URL: &str = "about:blank";
 
 /// The first page a freshly spawned live tab loads.
@@ -1463,7 +1463,7 @@ pub(crate) struct WebState {
     /// Destination for the pending HTTPS prompt: active-tab load or a new-tab
     /// open intent that must not bypass the same transport decision.
     insecure_prompt_target: InsecureNavigationTarget,
-    /// Quasar new-tab dashboard search draft. This is chrome state, not page
+    /// Quazar new-tab dashboard search draft. This is chrome state, not page
     /// content; submitted searches load the mesh SearXNG URL into the active tab.
     dashboard_query: String,
     /// New-tab speed-dial shortcuts. These start with mesh-local defaults but are

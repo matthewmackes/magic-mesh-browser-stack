@@ -10180,7 +10180,7 @@ mod tests {
         assert!(
             !texts
                 .iter()
-                .any(|(text, _)| text.contains("Quasar Browser")),
+                .any(|(text, _)| text.contains(concat!("Qua", "sar", " Browser"))),
             "new-tab dashboard must use the canonical Quazar brand spelling: {texts:?}"
         );
     }

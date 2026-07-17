@@ -647,7 +647,7 @@ impl Engine {
         self.evaluate_page_script(clear_find_script());
     }
 
-    /// Apply or remove Quasar forced-dark styling in the Servo tab.
+    /// Apply or remove Quazar forced-dark styling in the Servo tab.
     pub fn set_force_dark(&self, enabled: bool) {
         self.evaluate_page_script(&force_dark_script(enabled));
     }

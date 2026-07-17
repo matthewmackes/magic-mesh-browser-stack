@@ -26,7 +26,7 @@ policy_module(mde_web_cef, 1.0.0)
 # permissive stub.
 #
 # NOTE (platform standard): the operator sets SELinux DISABLED platform-wide
-# (2026-06-20); Quasar-cloud nodes target Enforcing (QC-22). Where SELinux is
+# (2026-06-20); Quazar-cloud nodes target Enforcing (QC-22). Where SELinux is
 # disabled the kernel never enforces this module and the loader
 # (setup-selinux-web-cef.sh) self-skips — the OS sandbox above remains the
 # operative confinement. This module ships + loads so that any node running
