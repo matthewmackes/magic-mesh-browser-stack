@@ -1047,7 +1047,7 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new(result.request_id.chars().take(12).collect::<String>())
+                    RichText::new("Ready")
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -1081,9 +1081,9 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                 );
                 ui.label(
                     RichText::new(format!(
-                        "{} modules from {}",
+                        "QR code {}x{}",
                         result.modules.len(),
-                        result.host
+                        result.modules.first().map_or(0, Vec::len)
                     ))
                     .size(Style::SMALL)
                     .color(super::CHROME_TEXT_DIM),
@@ -1139,7 +1139,7 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new(format!("{} > {}", result.source_lang, result.target_lang))
+                    RichText::new(format!("{} to {}", result.source_lang, result.target_lang))
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -1173,14 +1173,9 @@ pub(super) fn translation_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.label(
-                    RichText::new(format!(
-                        "{} chars from tab {} / {}",
-                        result.translation.chars().count(),
-                        result.tab_index,
-                        result.engine.label()
-                    ))
-                    .size(Style::SMALL)
-                    .color(super::CHROME_TEXT_DIM),
+                    RichText::new(format!("Text {} chars", result.translation.chars().count()))
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
                 );
             });
             egui::ScrollArea::vertical()

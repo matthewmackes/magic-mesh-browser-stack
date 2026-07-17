@@ -8684,6 +8684,37 @@ mod tests {
         )
     }
 
+    fn render_translation_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_translation = Some(super::super::BrowserTranslationResult {
+            host: "translation-worker".to_owned(),
+            tab_index: 3,
+            engine: BrowserEngine::Cef,
+            url: "https://example.test/translate".to_owned(),
+            title: "Example Translation".to_owned(),
+            source_lang: "en".to_owned(),
+            target_lang: "fr".to_owned(),
+            translation: "Bonjour monde".to_owned(),
+        });
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 260.0),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    scope(ui, |ui| {
+                        drawers::translation_drawer(ui, &mut state);
+                    });
+                });
+            },
+        )
+    }
+
     fn offline_cache_result_fixture() -> BrowserOfflineCacheResult {
         BrowserOfflineCacheResult {
             host: "browser-helper".to_owned(),
@@ -10358,11 +10389,20 @@ mod tests {
         let texts = painted_text(&out.shapes);
 
         assert_painted_text_color(&texts, "QR share", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Ready", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Example QR", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "QR code 5x5", CHROME_TEXT_DIM);
         assert!(
             !texts.iter().any(|(text, color)| text == "QR share"
                 && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
             "QR share drawer heading leaked shared shell text color: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("01hqr") && !lower.contains("phone") && !lower.contains("module")
+            }),
+            "QR share drawer must not expose routing or matrix internals: {texts:?}"
         );
 
         let fills = painted_rect_fills(&out.shapes);
@@ -10379,6 +10419,31 @@ mod tests {
         assert!(
             !fills.contains(&egui::Color32::BLACK),
             "QR share matrix must not paint raw black fills inside Browser chrome: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn browser_translation_drawer_uses_user_facing_metadata() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_translation_drawer_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Translation", CHROME_TEXT);
+        assert_painted_text_color(&texts, "en to fr", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Example Translation", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Text 13 chars", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Bonjour monde", CHROME_TEXT);
+        assert!(
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("translation-worker")
+                    && !lower.contains("tab ")
+                    && !lower.contains("cef")
+                    && !lower.contains("servo")
+                    && !lower.contains("chars from")
+            }),
+            "translation drawer must not expose routing/session metadata: {texts:?}"
         );
     }
 
