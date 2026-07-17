@@ -188,6 +188,12 @@ const ENGINE_TOOLBAR_BADGE: f32 = 14.0;
 const CHROME_SEPARATOR_H: f32 = 9.0;
 const OPTION_ROW_H: f32 = 30.0;
 const OPTION_ICON_SIZE: f32 = 18.0;
+const OPTION_ROW_MAX_W: f32 = 760.0;
+const OPTIONS_RAIL_W: f32 = 154.0;
+const OPTIONS_WIDE_GAP: f32 = 10.0;
+const OPTIONS_CONTENT_MIN_W: f32 = 420.0;
+const OPTIONS_COMPACT_BREAKPOINT: f32 =
+    OPTIONS_RAIL_W + OPTIONS_WIDE_GAP + OPTIONS_CONTENT_MIN_W + 36.0;
 const MEDIA_CLUSTER_LABEL_W: f32 = 132.0;
 const MEDIA_PIP_W: f32 = 272.0;
 const MEDIA_PIP_VIDEO_H: f32 = 150.0;
@@ -3028,11 +3034,24 @@ fn action_icon(action: super::menubar::MenuAction) -> ChromeIcon {
     }
 }
 
+fn option_row_width(available_width: f32) -> f32 {
+    available_width.max(0.0).min(OPTION_ROW_MAX_W)
+}
+
+fn bounded_available_width(ui: &egui::Ui) -> f32 {
+    let clip_remaining = (ui.clip_rect().right() - ui.next_widget_position().x).max(0.0);
+    ui.available_width().max(0.0).min(clip_remaining)
+}
+
+fn options_compact_layout(available_width: f32) -> bool {
+    available_width < OPTIONS_COMPACT_BREAKPOINT
+}
+
 fn option_row(
     ui: &mut egui::Ui,
     item: &mde_egui::menubar::Item<super::menubar::MenuAction>,
 ) -> Option<super::menubar::MenuAction> {
-    let width = ui.available_width().clamp(320.0, 760.0);
+    let width = option_row_width(bounded_available_width(ui));
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width, OPTION_ROW_H),
         if item.enabled {
@@ -3082,7 +3101,25 @@ fn option_row(
         );
         paint_chrome_icon(ui.painter(), lock_rect, ChromeIcon::Lock, CHROME_TEXT_DIM);
     }
-    ui.painter().text(
+    let trailing_reserved = if selected || !item.enabled {
+        34.0
+    } else {
+        12.0
+    };
+    let label_left = rect.left() + 34.0;
+    let label_right = (rect.right()
+        - if item.shortcut.is_some() {
+            116.0
+        } else {
+            trailing_reserved
+        })
+    .max(label_left);
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(label_left, rect.top()),
+        egui::pos2(label_right, rect.bottom()),
+    )
+    .intersect(rect);
+    ui.painter().with_clip_rect(label_clip).text(
         egui::pos2(rect.left() + 34.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         item.label.as_str(),
@@ -3090,7 +3127,14 @@ fn option_row(
         text_color,
     );
     if let Some(shortcut) = &item.shortcut {
-        ui.painter().text(
+        let shortcut_right = rect.right() - trailing_reserved;
+        let shortcut_left = (shortcut_right - 104.0).max(label_left + 8.0);
+        let shortcut_clip = egui::Rect::from_min_max(
+            egui::pos2(shortcut_left.min(shortcut_right), rect.top()),
+            egui::pos2(shortcut_right, rect.bottom()),
+        )
+        .intersect(rect);
+        ui.painter().with_clip_rect(shortcut_clip).text(
             egui::pos2(
                 rect.right() - if selected { 34.0 } else { 12.0 },
                 rect.center().y,
@@ -3146,104 +3190,180 @@ fn render_options_entries(
     }
 }
 
+fn render_options_category_index(
+    ui: &mut egui::Ui,
+    menus: &[mde_egui::menubar::Menu<super::menubar::MenuAction>],
+    compact: bool,
+) {
+    if compact {
+        let width = bounded_available_width(ui);
+        ui.set_width(width);
+        ui.set_max_width(width);
+    }
+    egui::Frame::NONE
+        .fill(CHROME_SURFACE_CONTAINER)
+        .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            if !compact {
+                ui.set_width(OPTIONS_RAIL_W);
+            }
+            ui.label(
+                RichText::new("Runtime")
+                    .size(CHROME_FONT + 3.0)
+                    .color(CHROME_TEXT),
+            );
+            ui.label(
+                RichText::new(super::BROWSER_OPTIONS_URL)
+                    .size(CHROME_FONT)
+                    .color(CHROME_TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            if compact {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
+                    for menu in menus {
+                        ui.horizontal(|ui| {
+                            let rect = egui::Rect::from_center_size(
+                                ui.next_widget_position() + egui::vec2(8.0, 8.0),
+                                egui::vec2(OPTION_ICON_SIZE - 2.0, OPTION_ICON_SIZE - 2.0),
+                            );
+                            ui.allocate_space(egui::vec2(20.0, 18.0));
+                            paint_chrome_icon(
+                                ui.painter(),
+                                rect,
+                                menu_icon(&menu.title),
+                                CHROME_TEXT_DIM,
+                            );
+                            ui.label(
+                                RichText::new(technical_menu_label(&menu.title))
+                                    .size(CHROME_FONT)
+                                    .color(CHROME_TEXT),
+                            );
+                        });
+                    }
+                });
+            } else {
+                for menu in menus {
+                    ui.horizontal(|ui| {
+                        let rect = egui::Rect::from_center_size(
+                            ui.next_widget_position() + egui::vec2(8.0, 8.0),
+                            egui::vec2(OPTION_ICON_SIZE - 2.0, OPTION_ICON_SIZE - 2.0),
+                        );
+                        ui.allocate_space(egui::vec2(20.0, 18.0));
+                        paint_chrome_icon(
+                            ui.painter(),
+                            rect,
+                            menu_icon(&menu.title),
+                            CHROME_TEXT_DIM,
+                        );
+                        ui.label(
+                            RichText::new(technical_menu_label(&menu.title))
+                                .size(CHROME_FONT)
+                                .color(CHROME_TEXT),
+                        );
+                    });
+                    ui.add_space(3.0);
+                }
+            }
+        });
+}
+
+fn render_options_command_page(
+    ui: &mut egui::Ui,
+    menus: &[mde_egui::menubar::Menu<super::menubar::MenuAction>],
+    picked: &mut Option<super::menubar::MenuAction>,
+    compact: bool,
+) {
+    if compact {
+        let width = bounded_available_width(ui);
+        ui.set_width(width);
+        ui.set_max_width(width);
+    } else {
+        ui.set_min_width(ui.available_width().max(0.0).min(OPTIONS_CONTENT_MIN_W));
+    }
+    ui.label(
+        RichText::new("Browser Options")
+            .size(CHROME_FONT + 8.0)
+            .color(CHROME_TEXT),
+    );
+    ui.label(
+        RichText::new("Command and runtime controls")
+            .size(CHROME_FONT)
+            .color(CHROME_TEXT_DIM),
+    );
+    ui.add_space(10.0);
+    for menu in menus {
+        if compact {
+            let width = bounded_available_width(ui);
+            ui.set_width(width);
+            ui.set_max_width(width);
+        }
+        egui::Frame::NONE
+            .fill(CHROME_SURFACE_CONTAINER)
+            .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(8, 7))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let rect = egui::Rect::from_center_size(
+                        ui.next_widget_position() + egui::vec2(9.0, 9.0),
+                        egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
+                    );
+                    ui.allocate_space(egui::vec2(22.0, 20.0));
+                    paint_chrome_icon(ui.painter(), rect, menu_icon(&menu.title), CHROME_PRIMARY);
+                    ui.label(
+                        RichText::new(technical_menu_label(&menu.title))
+                            .size(CHROME_FONT + 4.0)
+                            .color(CHROME_TEXT),
+                    );
+                });
+                ui.add_space(5.0);
+                render_options_entries(ui, &menu.entries, picked);
+            });
+        ui.add_space(10.0);
+    }
+}
+
 pub(super) fn options_page(ui: &mut egui::Ui, state: &mut WebState) {
     let menus = super::menubar::chrome_menus(state);
     let mut picked = None;
+    let compact = options_compact_layout(bounded_available_width(ui));
     egui::Frame::NONE
         .fill(CHROME_SURFACE)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.set_height(ui.available_height());
-                egui::Frame::NONE
-                    .fill(CHROME_SURFACE_CONTAINER)
-                    .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
-                    .corner_radius(8.0)
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.set_width(154.0);
-                        ui.label(
-                            RichText::new("Runtime")
-                                .size(CHROME_FONT + 3.0)
-                                .color(CHROME_TEXT),
-                        );
-                        ui.label(
-                            RichText::new(super::BROWSER_OPTIONS_URL)
-                                .size(CHROME_FONT)
-                                .color(CHROME_TEXT_DIM),
-                        );
-                        ui.add_space(8.0);
-                        for menu in &menus {
-                            ui.horizontal(|ui| {
-                                let rect = egui::Rect::from_center_size(
-                                    ui.next_widget_position() + egui::vec2(8.0, 8.0),
-                                    egui::vec2(OPTION_ICON_SIZE - 2.0, OPTION_ICON_SIZE - 2.0),
-                                );
-                                ui.allocate_space(egui::vec2(20.0, 18.0));
-                                paint_chrome_icon(
-                                    ui.painter(),
-                                    rect,
-                                    menu_icon(&menu.title),
-                                    CHROME_TEXT_DIM,
-                                );
-                                ui.label(
-                                    RichText::new(technical_menu_label(&menu.title))
-                                        .size(CHROME_FONT)
-                                        .color(CHROME_TEXT),
-                                );
-                            });
-                            ui.add_space(3.0);
-                        }
-                    });
-                ui.add_space(10.0);
+            if compact {
+                let page_width = bounded_available_width(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("browser-options-page")
+                    .max_width(page_width)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_min_width(420.0);
-                        ui.label(
-                            RichText::new("Browser Options")
-                                .size(CHROME_FONT + 8.0)
-                                .color(CHROME_TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Command and runtime controls")
-                                .size(CHROME_FONT)
-                                .color(CHROME_TEXT_DIM),
-                        );
+                        ui.set_width(page_width);
+                        ui.set_max_width(page_width);
+                        render_options_category_index(ui, &menus, true);
                         ui.add_space(10.0);
-                        for menu in &menus {
-                            egui::Frame::NONE
-                                .fill(CHROME_SURFACE_CONTAINER)
-                                .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
-                                .corner_radius(8.0)
-                                .inner_margin(egui::Margin::symmetric(8, 7))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let rect = egui::Rect::from_center_size(
-                                            ui.next_widget_position() + egui::vec2(9.0, 9.0),
-                                            egui::vec2(OPTION_ICON_SIZE, OPTION_ICON_SIZE),
-                                        );
-                                        ui.allocate_space(egui::vec2(22.0, 20.0));
-                                        paint_chrome_icon(
-                                            ui.painter(),
-                                            rect,
-                                            menu_icon(&menu.title),
-                                            CHROME_PRIMARY,
-                                        );
-                                        ui.label(
-                                            RichText::new(technical_menu_label(&menu.title))
-                                                .size(CHROME_FONT + 4.0)
-                                                .color(CHROME_TEXT),
-                                        );
-                                    });
-                                    ui.add_space(5.0);
-                                    render_options_entries(ui, &menu.entries, &mut picked);
-                                });
-                            ui.add_space(10.0);
-                        }
+                        render_options_command_page(ui, &menus, &mut picked, true);
                     });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.set_height(ui.available_height());
+                    render_options_category_index(ui, &menus, false);
+                    ui.add_space(OPTIONS_WIDE_GAP);
+                    let page_width = bounded_available_width(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("browser-options-page")
+                        .max_width(page_width)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(page_width);
+                            ui.set_max_width(page_width);
+                            render_options_command_page(ui, &menus, &mut picked, false);
+                        });
+                });
+            }
         });
     if let Some(action) = picked {
         super::menubar::apply(ui.ctx(), state, action);
@@ -7562,6 +7682,31 @@ mod tests {
         out
     }
 
+    fn painted_rect_bounds(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, clip_rect: egui::Rect, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    let visible = rect.rect.intersect(clip_rect);
+                    if visible.is_positive() {
+                        out.push(visible);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, clip_rect, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, clipped.clip_rect, &mut out);
+        }
+        out
+    }
+
     fn render_chrome_separator_frame(ctx: &egui::Context) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
@@ -7580,6 +7725,35 @@ mod tests {
                         page_context_separator(ui);
                     });
                 });
+            },
+        )
+    }
+
+    fn render_options_page_frame(ctx: &egui::Context, size: egui::Vec2) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.power_mode = true;
+        state.open_options_tab();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.set_width(size.x);
+                            ui.set_max_width(size.x);
+                            ui.set_min_height(size.y);
+                            ui.set_clip_rect(rect);
+                            scope(ui, |ui| {
+                                options_page(ui, &mut state);
+                            });
+                        });
+                    });
             },
         )
     }
@@ -8729,6 +8903,64 @@ mod tests {
                 .any(|stroke| stroke.color == CHROME_OUTLINE && (stroke.width - 1.0).abs() < 0.01),
             "{surface} text field must paint Browser outline strokes: {strokes:?}"
         );
+    }
+
+    fn assert_rects_inside_viewport(out: &egui::FullOutput, width: f32, surface: &str) {
+        let rects = painted_rect_bounds(&out.shapes);
+        assert!(
+            rects
+                .iter()
+                .filter(|rect| !(rect.left() <= 0.5 && rect.right() > width + 0.5))
+                .all(|rect| rect.left() >= -0.5 && rect.right() <= width + 0.5),
+            "{surface} painted rects must stay inside {width}px viewport: {rects:?}"
+        );
+    }
+
+    #[test]
+    fn browser_option_rows_never_force_wider_than_the_available_column() {
+        assert_eq!(option_row_width(-20.0), 0.0);
+        assert_eq!(option_row_width(0.0), 0.0);
+        assert_eq!(option_row_width(180.0), 180.0);
+        assert_eq!(option_row_width(OPTION_ROW_MAX_W + 200.0), OPTION_ROW_MAX_W);
+    }
+
+    #[test]
+    fn browser_options_page_uses_compact_single_column_layout_when_narrow() {
+        assert!(options_compact_layout(390.0));
+        assert!(!options_compact_layout(900.0));
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_options_page_frame(&ctx, egui::vec2(390.0, 640.0));
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Browser Options", CHROME_TEXT);
+        assert_painted_text_color(&texts, super::super::BROWSER_OPTIONS_URL, CHROME_TEXT_DIM);
+        for label in [
+            "Navigation",
+            "Runtime",
+            "Input",
+            "Rendering",
+            "Instrumentation",
+        ] {
+            assert_painted_text_color(&texts, label, CHROME_TEXT);
+        }
+        assert_rects_inside_viewport(&out, 390.0, "narrow Browser Options page");
+    }
+
+    #[test]
+    fn browser_options_page_keeps_category_rail_when_wide() {
+        assert!(!options_compact_layout(900.0));
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_options_page_frame(&ctx, egui::vec2(900.0, 640.0));
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Runtime", CHROME_TEXT);
+        assert_painted_text_color(&texts, super::super::BROWSER_OPTIONS_URL, CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Browser Options", CHROME_TEXT);
+        assert_rects_inside_viewport(&out, 900.0, "wide Browser Options page");
     }
 
     #[test]
