@@ -42,6 +42,8 @@ use sha2::{Digest as _, Sha256};
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned WebAuthn/passkey ceremony handoff topic.
 pub const ACTION_TOPIC: &str = "action/browser/passkey";
 
@@ -246,6 +248,7 @@ pub struct BrowserPasskeysWorker {
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
     status: PasskeyStatus,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserPasskeysWorker {
@@ -290,6 +293,7 @@ impl BrowserPasskeysWorker {
                 hardware_probe_ms: updated_ms,
                 updated_ms,
             },
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -569,28 +573,46 @@ impl BrowserPasskeysWorker {
         self.publish_status(persist);
     }
 
-    fn status_with_hardware(&self) -> PasskeyStatus {
-        let mut status = self.status.clone();
+    fn refresh_hardware_status(&mut self) {
         let hardware = probe_hardware_key_status(Path::new("/sys/class/hidraw"), Path::new("/dev"));
-        status.hardware_state = hardware.state;
-        status.hardware_key_count = hardware.key_count;
-        status.hardware_readable_count = hardware.readable_count;
-        status.hardware_ctaphid_state = hardware.ctaphid_state;
-        status.hardware_ctaphid_init_frame_count = hardware.ctaphid_init_frame_count;
-        status.hardware_ctaphid_live_state = hardware.ctaphid_live_state;
-        status.hardware_ctaphid_live_channel_id = hardware.ctaphid_live_channel_id;
-        status.hardware_ctaphid_live_protocol_version = hardware.ctaphid_live_protocol_version;
-        status.hardware_ctaphid_live_device_version = hardware.ctaphid_live_device_version;
-        status.hardware_ctaphid_live_capabilities = hardware.ctaphid_live_capabilities;
-        status.hardware_ctaphid_live_error = hardware.ctaphid_live_error;
-        status.hardware_probe_ms = self.now_ms();
-        status
+        let changed = self.status.hardware_state != hardware.state
+            || self.status.hardware_key_count != hardware.key_count
+            || self.status.hardware_readable_count != hardware.readable_count
+            || self.status.hardware_ctaphid_state != hardware.ctaphid_state
+            || self.status.hardware_ctaphid_init_frame_count != hardware.ctaphid_init_frame_count
+            || self.status.hardware_ctaphid_live_state != hardware.ctaphid_live_state
+            || self.status.hardware_ctaphid_live_channel_id != hardware.ctaphid_live_channel_id
+            || self.status.hardware_ctaphid_live_protocol_version
+                != hardware.ctaphid_live_protocol_version
+            || self.status.hardware_ctaphid_live_device_version
+                != hardware.ctaphid_live_device_version
+            || self.status.hardware_ctaphid_live_capabilities != hardware.ctaphid_live_capabilities
+            || self.status.hardware_ctaphid_live_error != hardware.ctaphid_live_error;
+        if !changed {
+            return;
+        }
+        self.status.hardware_state = hardware.state;
+        self.status.hardware_key_count = hardware.key_count;
+        self.status.hardware_readable_count = hardware.readable_count;
+        self.status.hardware_ctaphid_state = hardware.ctaphid_state;
+        self.status.hardware_ctaphid_init_frame_count = hardware.ctaphid_init_frame_count;
+        self.status.hardware_ctaphid_live_state = hardware.ctaphid_live_state;
+        self.status.hardware_ctaphid_live_channel_id = hardware.ctaphid_live_channel_id;
+        self.status.hardware_ctaphid_live_protocol_version = hardware.ctaphid_live_protocol_version;
+        self.status.hardware_ctaphid_live_device_version = hardware.ctaphid_live_device_version;
+        self.status.hardware_ctaphid_live_capabilities = hardware.ctaphid_live_capabilities;
+        self.status.hardware_ctaphid_live_error = hardware.ctaphid_live_error;
+        let now = self.now_ms();
+        self.status.hardware_probe_ms = now;
+        self.status.updated_ms = now;
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
+        self.refresh_hardware_status();
         let topic = format!("{STATE_PREFIX}{}", self.node);
-        if let Ok(body) = serde_json::to_string(&self.status_with_hardware()) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+        if let Ok(body) = serde_json::to_string(&self.status) {
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 

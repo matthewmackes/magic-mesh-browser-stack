@@ -14,6 +14,75 @@
 
 #![forbid(unsafe_code)]
 
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
+
+#[derive(Debug, Default)]
+pub(crate) struct RetainedStatusPublisher {
+    last_body: Option<String>,
+}
+
+impl RetainedStatusPublisher {
+    pub(crate) const fn new() -> Self {
+        Self { last_body: None }
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        persist: &Persist,
+        topic: &str,
+        priority: Priority,
+        body: String,
+    ) {
+        if self.last_body.as_deref() == Some(body.as_str()) {
+            return;
+        }
+        if persist.write(topic, priority, None, Some(&body)).is_ok() {
+            self.last_body = Some(body);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_status_publisher_skips_unchanged_bodies() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let mut publisher = RetainedStatusPublisher::new();
+
+        publisher.publish(
+            &persist,
+            "state/browser-test/node-a",
+            Priority::Min,
+            r#"{"state":"idle"}"#.to_owned(),
+        );
+        publisher.publish(
+            &persist,
+            "state/browser-test/node-a",
+            Priority::Min,
+            r#"{"state":"idle"}"#.to_owned(),
+        );
+        publisher.publish(
+            &persist,
+            "state/browser-test/node-a",
+            Priority::Min,
+            r#"{"state":"busy"}"#.to_owned(),
+        );
+
+        let msgs = persist
+            .list_since("state/browser-test/node-a", None)
+            .expect("list retained status");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "unchanged retained Browser status must not append every tick"
+        );
+    }
+}
+
 // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
 // action/browser/passkey handoffs, persists pending challenges locally, mirrors
 // them into the Syncthing-backed workgroup root, owns the software platform-

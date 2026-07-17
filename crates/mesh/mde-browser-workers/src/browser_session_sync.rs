@@ -22,6 +22,8 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned session snapshot action topic.
 pub const ACTION_TOPIC: &str = "action/browser/session-sync";
 
@@ -81,6 +83,7 @@ pub struct BrowserSessionSyncWorker {
     now_fn: NowFn,
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserSessionSyncWorker {
@@ -101,6 +104,7 @@ impl BrowserSessionSyncWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -223,17 +227,22 @@ impl BrowserSessionSyncWorker {
             return;
         };
         let dst = latest_path(&self.share_root, &host);
-        if let Err(e) = write_atomic(&dst, &body) {
-            tracing::debug!(
-                target: "mackesd::browser_session_sync",
-                path = %dst.display(),
-                error = %e,
-                "browser session snapshot mirror skipped"
-            );
-            return;
+        match write_atomic_if_changed(&dst, &body) {
+            Ok(changed) => {
+                self.pending_local = false;
+                if changed {
+                    self.last_mirror_ms = Some(self.now_ms());
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "mackesd::browser_session_sync",
+                    path = %dst.display(),
+                    error = %e,
+                    "browser session snapshot mirror skipped"
+                );
+            }
         }
-        self.pending_local = false;
-        self.last_mirror_ms = Some(self.now_ms());
     }
 
     fn apply_send_tab(&mut self, handoff: BrowserSendTabHandoff, persist: &Persist) {
@@ -301,7 +310,7 @@ impl BrowserSessionSyncWorker {
         }
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
         let status = SessionSyncStatus {
             node: self.node.clone(),
             syncing: self.share_writable() && !self.pending_local,
@@ -312,7 +321,8 @@ impl BrowserSessionSyncWorker {
         };
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&status) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 }
@@ -560,6 +570,14 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
+}
+
+fn write_atomic_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
+    if matches!(std::fs::read_to_string(path), Ok(current) if current == body) {
+        return Ok(false);
+    }
+    write_atomic(path, body)?;
+    Ok(true)
 }
 
 /// Resolve the local durable session-sync root for this host.

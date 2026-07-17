@@ -17,6 +17,8 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned platform-share handoff topic.
 pub const ACTION_TOPIC: &str = "action/browser/share";
 
@@ -96,6 +98,7 @@ pub struct BrowserShareWorker {
     now_fn: NowFn,
     bus_root_override: Option<std::path::PathBuf>,
     status: ShareStatus,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserShareWorker {
@@ -125,6 +128,7 @@ impl BrowserShareWorker {
                 last_routed_ms: None,
                 updated_ms,
             },
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -195,10 +199,11 @@ impl BrowserShareWorker {
         self.publish_status(persist);
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&self.status) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 

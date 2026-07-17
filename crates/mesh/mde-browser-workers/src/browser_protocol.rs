@@ -18,6 +18,8 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned external protocol handoff topic.
 pub const ACTION_TOPIC: &str = "action/browser/protocol";
 
@@ -87,6 +89,7 @@ pub struct BrowserProtocolWorker {
     now_fn: NowFn,
     bus_root_override: Option<std::path::PathBuf>,
     status: ProtocolStatus,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserProtocolWorker {
@@ -115,6 +118,7 @@ impl BrowserProtocolWorker {
                 last_routed_ms: None,
                 updated_ms,
             },
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -183,10 +187,11 @@ impl BrowserProtocolWorker {
         self.publish_status(persist);
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&self.status) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 
