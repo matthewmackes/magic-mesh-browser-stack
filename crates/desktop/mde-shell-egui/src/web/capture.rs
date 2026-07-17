@@ -548,7 +548,7 @@ pub(super) fn active_page_scrape_documents(
 fn browser_engine_export_label(engine: BrowserEngine) -> &'static str {
     match engine {
         BrowserEngine::Cef => "Chromium",
-        BrowserEngine::Servo => "Servo",
+        BrowserEngine::Servo => "Lightweight",
     }
 }
 

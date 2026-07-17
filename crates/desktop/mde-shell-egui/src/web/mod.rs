@@ -21647,7 +21647,8 @@ mod tests {
                 "stub",
                 "helper",
                 "handoff",
-                "CEF"
+                "CEF",
+                "Servo"
             ]
             .iter()
             .all(|term| !md.contains(term)),
@@ -21875,7 +21876,8 @@ mod tests {
                 "stub",
                 "helper",
                 "handoff",
-                "CEF"
+                "CEF",
+                "Servo"
             ]
             .iter()
             .all(|term| !md.contains(term)),
@@ -21935,6 +21937,30 @@ mod tests {
                 "scrape markdown leaked internal copy {forbidden:?}: {md}"
             );
         }
+
+        let lightweight_docs = active_page_scrape_documents(
+            "https://example.test/empty",
+            "Empty Page",
+            BrowserEngine::Servo,
+            1234,
+            &[],
+            Some(""),
+            Some(""),
+        )
+        .expect("empty lightweight scrape documents");
+        let lightweight_md = lightweight_docs
+            .iter()
+            .find(|(ext, _)| *ext == "md")
+            .map(|(_, body)| String::from_utf8(body.clone()).expect("markdown is utf8"))
+            .expect("markdown export");
+        assert!(
+            lightweight_md.contains("- Engine: `Lightweight`"),
+            "lightweight scrape markdown must use user-facing engine copy: {lightweight_md}"
+        );
+        assert!(
+            !lightweight_md.contains("Servo"),
+            "lightweight scrape markdown leaked raw engine copy: {lightweight_md}"
+        );
     }
 
     #[test]
