@@ -4708,12 +4708,21 @@ fn resolve_tab_favicon_textures(
         .collect()
 }
 
+fn browser_dashboard_title() -> String {
+    let codename = mde_theme::brand::build::info().codename;
+    if codename.is_empty() {
+        format!("{} Browser", mde_theme::brand::logo::PRODUCT_NAME)
+    } else {
+        format!("{codename} Browser")
+    }
+}
+
 pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {
     let mut submit_search = false;
     let mut open_service: Option<String> = None;
     centered(ui, |ui| {
         ui.label(
-            egui::RichText::new("Quasar Browser")
+            egui::RichText::new(browser_dashboard_title())
                 .size(Style::HEADING)
                 .color(CHROME_TEXT),
         );
@@ -10155,6 +10164,25 @@ mod tests {
 
         let password = render_password_menu_contents_frame(&ctx, "example.test", false);
         assert_browser_text_field_paint(&password, "operator", "password menu");
+    }
+
+    #[test]
+    fn browser_new_tab_dashboard_uses_canonical_brand_identity() {
+        assert_eq!(mde_theme::brand::logo::PRODUCT_NAME, "MDE Quazar");
+        assert_eq!(browser_dashboard_title(), "Quazar Browser");
+
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let out = render_new_tab_dashboard_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Quazar Browser", CHROME_TEXT);
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains("Quasar Browser")),
+            "new-tab dashboard must use the canonical Quazar brand spelling: {texts:?}"
+        );
     }
 
     #[test]
