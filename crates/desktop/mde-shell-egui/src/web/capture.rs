@@ -31,7 +31,7 @@ pub(super) fn browser_capture_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Magic Mesh Browser Captures")
+        .join(format!("{} Captures", browser_product_label()))
 }
 
 pub(super) fn browser_pdf_dir() -> PathBuf {
@@ -39,7 +39,7 @@ pub(super) fn browser_pdf_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Documents")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Magic Mesh Browser PDFs")
+        .join(format!("{} PDFs", browser_product_label()))
 }
 
 pub(super) fn browser_print_spool_dir() -> PathBuf {
@@ -1211,7 +1211,8 @@ pub(super) fn mhtml_capture_document(url: &str, title: &str, unix_ms: u64, png: 
         "Content-Type: multipart/related; type=\"text/html\"; boundary=\"{BOUNDARY}\"\r\n"
     ));
     out.push_str(&format!(
-        "Subject: Magic Mesh Browser Capture - {}\r\n\r\n",
+        "Subject: {} Capture - {}\r\n\r\n",
+        browser_product_label(),
         mhtml_header_value(&html_escape(&label))
     ));
     out.push_str(&format!("--{BOUNDARY}\r\n"));
@@ -1280,7 +1281,8 @@ pub(super) fn offline_cache_mhtml_document(
         "Content-Type: multipart/related; type=\"text/html\"; boundary=\"{BOUNDARY}\"\r\n"
     ));
     out.push_str(&format!(
-        "Subject: Magic Mesh Browser Offline Copy - {}\r\n\r\n",
+        "Subject: {} Offline Copy - {}\r\n\r\n",
+        browser_product_label(),
         mhtml_header_value(&html_escape(&label))
     ));
     out.push_str(&format!("--{BOUNDARY}\r\n"));

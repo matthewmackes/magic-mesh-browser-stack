@@ -31,13 +31,13 @@ mod drawers;
 #[cfg(test)]
 use super::BrowserSecurityUpdateStatus;
 use super::{
-    browser_capture_dir, ellipsize, is_new_tab_url, media_metadata_chip_label, BrowserEngine,
-    BrowserOfflineCacheResult, BrowserReadAloudStatus, BrowserVoiceCommandStatus, ContainerProfile,
-    DeviceProfile, DisplayTarget, FaviconCache, ManagedPolicyBlock, PendingPasskeyConsent,
-    PixelRegion, Tab, UserAgentOverride, WebState, CHROME_BUTTON, CHROME_FONT, CHROME_GAP,
-    CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE, CHROME_TAB_H, CHROME_TAB_MIN_W,
-    CHROME_TAB_PINNED_W, CHROME_TAB_RAIL_W, CHROME_TAB_W, MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER,
-    RESIZE_DEBOUNCE,
+    browser_capture_dir, browser_product_label, ellipsize, is_new_tab_url,
+    media_metadata_chip_label, BrowserEngine, BrowserOfflineCacheResult, BrowserReadAloudStatus,
+    BrowserVoiceCommandStatus, ContainerProfile, DeviceProfile, DisplayTarget, FaviconCache,
+    ManagedPolicyBlock, PendingPasskeyConsent, PixelRegion, Tab, UserAgentOverride, WebState,
+    CHROME_BUTTON, CHROME_FONT, CHROME_GAP, CHROME_NEW_TAB_W, CHROME_OMNIBOX_H, CHROME_TAB_CLOSE,
+    CHROME_TAB_H, CHROME_TAB_MIN_W, CHROME_TAB_PINNED_W, CHROME_TAB_RAIL_W, CHROME_TAB_W,
+    MAX_CHANNEL_DIM, PRIVATE_MODE_EXPLAINER, RESIZE_DEBOUNCE,
 };
 use accessibility::install_browser_page_accessibility;
 use drawers::{
@@ -4709,12 +4709,7 @@ fn resolve_tab_favicon_textures(
 }
 
 fn browser_dashboard_title() -> String {
-    let codename = mde_theme::brand::build::info().codename;
-    if codename.is_empty() {
-        format!("{} Browser", mde_theme::brand::logo::PRODUCT_NAME)
-    } else {
-        format!("{codename} Browser")
-    }
+    browser_product_label()
 }
 
 pub(super) fn new_tab_dashboard(ui: &mut egui::Ui, state: &mut WebState) {

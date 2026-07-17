@@ -133,9 +133,9 @@ pub(super) fn cups_job_title(url: &str, title: &str, unix_ms: u64) -> String {
     }
     let out = out.trim();
     if out.is_empty() {
-        format!("Magic Mesh Browser {unix_ms}")
+        format!("{} {unix_ms}", browser_product_label())
     } else {
-        format!("Magic Mesh Browser - {out}")
+        format!("{} - {out}", browser_product_label())
     }
 }
 

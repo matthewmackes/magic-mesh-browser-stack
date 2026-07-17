@@ -92,6 +92,15 @@ const CEF_DEVTOOLS_URL: &str = "http://127.0.0.1:9222/";
 const CEF_DEVTOOLS_LIST_URL: &str = "http://127.0.0.1:9222/json/list";
 const CEF_DEVTOOLS_TIMEOUT: Duration = Duration::from_millis(450);
 
+pub(super) fn browser_product_label() -> String {
+    let codename = mde_theme::brand::build::info().codename;
+    if codename.is_empty() {
+        format!("{} Browser", mde_theme::brand::logo::PRODUCT_NAME)
+    } else {
+        format!("{codename} Browser")
+    }
+}
+
 /// Environment variable pointing at a pinned CEF bundle root (mirrors
 /// `mde-web-cef`; duplicated here so the shell can gate honestly without
 /// depending on the excluded helper crate).
@@ -8996,6 +9005,47 @@ mod tests {
     }
 
     #[test]
+    fn browser_artifacts_use_canonical_quazar_browser_identity() {
+        assert_eq!(browser_product_label(), "Quazar Browser");
+        assert_eq!(
+            browser_capture_dir()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("Quazar Browser Captures")
+        );
+        assert_eq!(
+            browser_pdf_dir().file_name().and_then(|name| name.to_str()),
+            Some("Quazar Browser PDFs")
+        );
+        assert_eq!(cups_job_title("", "", 42), "Quazar Browser - Browser page");
+        assert_eq!(
+            cups_job_title("https://example.test/", "Example", 42),
+            "Quazar Browser - Example"
+        );
+
+        let capture = String::from_utf8(mhtml_capture_document(
+            "https://example.test/",
+            "Example",
+            42,
+            b"png",
+        ))
+        .expect("capture mhtml utf8");
+        assert!(capture.contains("Subject: Quazar Browser Capture - Example"));
+        assert!(!capture.contains("Magic Mesh Browser"));
+
+        let offline = String::from_utf8(offline_cache_mhtml_document(
+            "https://example.test/",
+            "Example",
+            42,
+            "cached text",
+            None,
+        ))
+        .expect("offline mhtml utf8");
+        assert!(offline.contains("Subject: Quazar Browser Offline Copy - Example"));
+        assert!(!offline.contains("Magic Mesh Browser"));
+    }
+
+    #[test]
     fn browser_annotated_capture_writes_captioned_png() {
         let (session, _helper, _writer) = live_page_session();
         let mut state = WebState::default();
@@ -10371,10 +10421,11 @@ mod tests {
         std::fs::write(&path, b"%PDF-1.7\n").expect("pdf fixture");
         let mut seen_program = String::new();
         let mut seen_args = Vec::new();
+        let title = format!("{} - Example", browser_product_label());
 
         let job = submit_pdf_to_cups_with_runner(
             &path,
-            "Magic Mesh Browser - Example",
+            &title,
             &CupsPrintSettings::default(),
             |program, args, timeout| {
                 seen_program = program.to_owned();
@@ -10393,11 +10444,7 @@ mod tests {
         assert_eq!(seen_program, "lp");
         assert_eq!(
             seen_args,
-            vec![
-                "-t".to_owned(),
-                "Magic Mesh Browser - Example".to_owned(),
-                path.to_string_lossy().into_owned(),
-            ]
+            vec!["-t".to_owned(), title, path.to_string_lossy().into_owned(),]
         );
     }
 
