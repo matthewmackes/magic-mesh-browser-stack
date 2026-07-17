@@ -518,7 +518,7 @@ pub(super) fn active_page_scrape_documents(
         },
     };
     let md = format!(
-        "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest handoff\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 handoff targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nRecursive network fetching remains a follow-up scraper hook.\n",
+        "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 same-origin targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nThis export records bounded same-origin crawl targets and does not recursively fetch them.\n",
         markdown_heading_text(&label),
         url.replace('`', "\\`"),
         engine.label(),

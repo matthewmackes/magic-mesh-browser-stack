@@ -20766,6 +20766,15 @@ mod tests {
         assert!(md.contains("## Crawl Manifest"));
         assert!(md.contains("source=telemetry"));
         assert!(md.contains("https://example.test/assets/app.js"));
+        assert!(md.contains(
+            "This export records bounded same-origin crawl targets and does not recursively fetch them."
+        ));
+        assert!(
+            ["follow-up", "hook", "placeholder", "stub"]
+                .iter()
+                .all(|term| !md.contains(term)),
+            "scrape markdown must stay user-facing: {md}"
+        );
 
         let verbs = transfers.verbs();
         assert_eq!(verbs.len(), 3);
@@ -20977,6 +20986,15 @@ mod tests {
         assert!(md.contains("[Related Article](https://example.test/article/related.html)"));
         assert!(md.contains("## DOM Headings"));
         assert!(md.contains("h1 Story Headline"));
+        assert!(md.contains(
+            "This export records bounded same-origin crawl targets and does not recursively fetch them."
+        ));
+        assert!(
+            ["follow-up", "hook", "placeholder", "stub"]
+                .iter()
+                .all(|term| !md.contains(term)),
+            "scrape markdown must stay user-facing: {md}"
+        );
 
         let verbs = transfers.verbs();
         assert_eq!(verbs.len(), 3);
