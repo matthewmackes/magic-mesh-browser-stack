@@ -624,6 +624,20 @@ impl PendingPasskeyConsent {
     }
 }
 
+fn passkey_page_request_notice(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    let reason = if lower.contains("unsupported ceremony") {
+        "this passkey action is not supported"
+    } else if lower.contains("json") {
+        "the passkey request could not be read"
+    } else if lower.contains("missing") {
+        "the passkey request was incomplete"
+    } else {
+        "the passkey request could not be verified"
+    };
+    format!("Passkey: {reason}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessOutput {
     success: bool,
@@ -5292,7 +5306,7 @@ impl WebState {
             Ok(handoff_body) => {
                 let Some(client_request_id) = passkey_client_request_id(body) else {
                     self.capture_notice =
-                        Some("Passkey: ignored page request (missing request id)".to_owned());
+                        Some(passkey_page_request_notice("missing client request id"));
                     return;
                 };
                 if self.pending_passkey_consent.is_some() {
@@ -5301,9 +5315,8 @@ impl WebState {
                         &client_request_id,
                         "Another passkey ceremony is already waiting for approval",
                     );
-                    self.capture_notice = Some(
-                        "Passkey: blocked duplicate ceremony while approval is pending".to_owned(),
-                    );
+                    self.capture_notice =
+                        Some("Passkey: another approval is already pending".to_owned());
                     return;
                 }
                 match PendingPasskeyConsent::from_handoff(
@@ -5318,13 +5331,12 @@ impl WebState {
                         self.capture_notice = Some(notice);
                     }
                     Err(err) => {
-                        self.capture_notice =
-                            Some(format!("Passkey: ignored page request ({err})"));
+                        self.capture_notice = Some(passkey_page_request_notice(&err));
                     }
                 }
             }
             Err(err) => {
-                self.capture_notice = Some(format!("Passkey: ignored page request ({err})"));
+                self.capture_notice = Some(passkey_page_request_notice(&err));
             }
         }
     }
@@ -5364,16 +5376,15 @@ impl WebState {
                 );
                 self.pending_passkey_requests
                     .insert(pending.client_request_id.clone(), pending.tab_id);
-                self.capture_notice =
-                    Some(format!("Passkey: approved ceremony for {}", pending.rp_id));
+                self.capture_notice = Some(format!("Passkey: approved for {}", pending.rp_id));
             }
-            Err(err) => {
+            Err(_err) => {
                 self.complete_passkey_denial(
                     pending.tab_id,
                     &pending.client_request_id,
                     "Passkey ceremony could not be approved",
                 );
-                self.capture_notice = Some(format!("Passkey: approval failed ({err})"));
+                self.capture_notice = Some("Passkey: approval could not be completed".to_owned());
             }
         }
     }
@@ -5387,7 +5398,7 @@ impl WebState {
             &pending.client_request_id,
             "Passkey ceremony denied by user",
         );
-        self.capture_notice = Some(format!("Passkey: denied ceremony for {}", pending.rp_id));
+        self.capture_notice = Some(format!("Passkey: denied for {}", pending.rp_id));
     }
 
     fn handle_js_dialog_event(&mut self, tab_index: usize, dialog: &JsDialog) {
@@ -20483,7 +20494,7 @@ mod tests {
         state.approve_pending_passkey();
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Passkey: approved ceremony for login.example")
+            Some("Passkey: approved for login.example")
         );
         let msgs = persist
             .list_since(ACTION_BROWSER_PASSKEY, None)
@@ -20528,12 +20539,26 @@ mod tests {
 
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Passkey: ignored page request (missing request id)")
+            Some("Passkey: the passkey request was incomplete")
         );
         let notice = state.capture_notice.as_deref().unwrap_or_default();
-        assert!(
-            !notice.contains("helper"),
-            "malformed passkey notice leaked helper wording: {notice}"
+        for forbidden in ["helper", "handoff", "request id", "ceremony", "JSON"] {
+            assert!(
+                !notice.contains(forbidden),
+                "malformed passkey notice leaked implementation copy {forbidden:?}: {notice}"
+            );
+        }
+
+        state.handle_passkey_event(1, BrowserEngine::Cef, r#"{"ceremony":"delete"}"#);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: this passkey action is not supported")
+        );
+
+        state.handle_passkey_event(1, BrowserEngine::Cef, r#"{"#);
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: the passkey request could not be read")
         );
     }
 
@@ -20647,6 +20672,10 @@ mod tests {
         );
         run_until_texture(&mut state);
         state.deny_pending_passkey();
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Passkey: denied for login.example")
+        );
 
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
         assert!(
@@ -20704,7 +20733,7 @@ mod tests {
 
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Passkey: blocked duplicate ceremony while approval is pending")
+            Some("Passkey: another approval is already pending")
         );
         let pending = state
             .pending_passkey_consent
