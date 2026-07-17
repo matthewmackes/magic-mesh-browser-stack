@@ -3754,19 +3754,94 @@ fn tab_search_results(ui: &mut egui::Ui, state: &WebState) -> Option<usize> {
     select
 }
 
+fn tab_search_clear_button_id() -> egui::Id {
+    egui::Id::new("mde_web_tab_search_clear")
+}
+
+fn tab_search_field(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
+    let outer = egui::Frame::NONE
+        .fill(CHROME_SURFACE)
+        .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
+        .corner_radius(ICON_BUTTON_RADIUS)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let icon_edge = OPTION_ICON_SIZE - 2.0;
+                let (icon_slot, _) = ui.allocate_exact_size(
+                    egui::vec2(icon_edge + 3.0, CHROME_OMNIBOX_H - 6.0),
+                    egui::Sense::hover(),
+                );
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::pos2(icon_slot.left() + icon_edge / 2.0, icon_slot.center().y),
+                    egui::vec2(icon_edge, icon_edge),
+                );
+                paint_chrome_icon(ui.painter(), icon_rect, ChromeIcon::Search, CHROME_TEXT_DIM);
+
+                let clear_w = if query.is_empty() { 0.0 } else { CHROME_BUTTON };
+                let width = (ui.available_width() - clear_w).max(180.0);
+                let edit = egui::TextEdit::singleline(query)
+                    .desired_width(width)
+                    .hint_text(
+                        RichText::new("Search tabs")
+                            .size(Style::SMALL)
+                            .color(CHROME_TEXT_DIM),
+                    )
+                    .text_color(CHROME_TEXT)
+                    .font(font_id(Style::SMALL))
+                    .background_color(CHROME_SURFACE)
+                    .margin(egui::Margin::symmetric(0, 0))
+                    .frame(false)
+                    .min_size(egui::vec2(width, CHROME_OMNIBOX_H - 6.0));
+                let response = chrome_hover_text(ui.add(edit), "Search tabs");
+
+                if !query.is_empty() {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(CHROME_BUTTON, CHROME_BUTTON),
+                        egui::Sense::hover(),
+                    );
+                    let clear_resp =
+                        ui.interact(rect, tab_search_clear_button_id(), egui::Sense::click());
+                    clear_resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            ui.is_enabled(),
+                            "Clear tab search",
+                        )
+                    });
+                    paint_transparent_icon_button_state(
+                        ui,
+                        &clear_resp,
+                        rect,
+                        ICON_BUTTON_RADIUS,
+                        CHROME_TEXT,
+                        true,
+                    );
+                    let tint = if clear_resp.hovered() || clear_resp.has_focus() {
+                        CHROME_TEXT
+                    } else {
+                        CHROME_TEXT_DIM
+                    };
+                    paint_chrome_icon(ui.painter(), rect, ChromeIcon::Close, tint);
+                    mde_egui::focus::paint_focus_ring(ui.painter(), rect, clear_resp.has_focus());
+                    let clear_resp =
+                        clear_resp.on_hover_ui(|ui| chrome_tooltip(ui, "Clear tab search"));
+                    if clear_resp.clicked() || menu_anchor_keyboard_toggle(ui, &clear_resp) {
+                        query.clear();
+                        response.request_focus();
+                    }
+                }
+
+                response
+            })
+            .inner
+        });
+    mde_egui::focus::paint_focus_ring(ui.painter(), outer.response.rect, outer.inner.has_focus());
+    outer.inner
+}
+
 fn tab_search_menu_contents(ui: &mut egui::Ui, state: &mut WebState) -> Option<usize> {
     ui.set_min_width(300.0);
-    let resp = chrome_text_field(
-        ui,
-        true,
-        &mut state.tab_search_query,
-        "Search tabs",
-        f32::INFINITY,
-        220.0,
-        false,
-        "Search tabs",
-        None,
-    );
+    let resp = tab_search_field(ui, &mut state.tab_search_query);
     state.chrome_edit_focus |= resp.has_focus();
     tab_search_results(ui, state)
 }
@@ -9086,6 +9161,14 @@ mod tests {
         let mut state = WebState::default();
         state.open_options_tab();
         state.tab_search_query = "options".to_owned();
+        drive_tab_search_menu_contents_frame(ctx, &mut state, Vec::new())
+    }
+
+    fn drive_tab_search_menu_contents_frame(
+        ctx: &egui::Context,
+        state: &mut WebState,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -9093,16 +9176,26 @@ mod tests {
                     egui::vec2(420.0, 320.0),
                 )),
                 time: Some(0.0),
+                events,
                 ..Default::default()
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     scope(ui, |ui| {
-                        let _ = tab_search_menu_contents(ui, &mut state);
+                        let _ = tab_search_menu_contents(ui, state);
                     });
                 });
             },
         )
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
     }
 
     fn render_tab_search_menu_button_frame(ctx: &egui::Context) -> egui::FullOutput {
@@ -10331,6 +10424,47 @@ mod tests {
 
         let password = render_password_menu_contents_frame(&ctx, "example.test", false);
         assert_browser_text_field_paint(&password, "operator", "password menu");
+    }
+
+    #[test]
+    fn tab_search_field_exposes_icon_clear_button() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let mut state = WebState::default();
+        state.open_options_tab();
+        state.tab_search_query = "options".to_owned();
+
+        let out = drive_tab_search_menu_contents_frame(&ctx, &mut state, Vec::new());
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "options", CHROME_TEXT);
+        let clear_rect = ctx
+            .read_response(tab_search_clear_button_id())
+            .expect("live tab search query exposes a clear icon button")
+            .rect;
+        let active_before = state.active;
+
+        drive_tab_search_menu_contents_frame(
+            &ctx,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(clear_rect.center()),
+                pointer_button(clear_rect.center(), true),
+            ],
+        );
+        drive_tab_search_menu_contents_frame(
+            &ctx,
+            &mut state,
+            vec![pointer_button(clear_rect.center(), false)],
+        );
+
+        assert!(
+            state.tab_search_query.is_empty(),
+            "clicking the tab-search clear icon clears the query"
+        );
+        assert_eq!(
+            state.active, active_before,
+            "clearing tab search must not select a different tab"
+        );
     }
 
     #[test]
