@@ -5040,7 +5040,7 @@ impl WebState {
             ACTION_BROWSER_VOICE_COMMAND,
             &body,
         );
-        self.capture_notice = Some(format!("{}: sent STT request", mode.label()));
+        self.capture_notice = Some(format!("{}: sent voice input request", mode.label()));
     }
 
     fn handle_page_text_event(&mut self, id: u64, text: String) {
@@ -5060,7 +5060,8 @@ impl WebState {
             }
             let body = browser_read_aloud_body(&request, &text);
             publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_READ_ALOUD, &body);
-            self.capture_notice = Some("Read aloud: sent page text to TTS".to_owned());
+            self.capture_notice =
+                Some("Read aloud: sent page text to the speech service".to_owned());
             return;
         }
         if let Some(request) = self.pending_translate_requests.remove(&id) {
@@ -7239,7 +7240,20 @@ impl BrowserReadAloudStatus {
     }
 
     fn chip_label(&self) -> String {
-        format!("TTS {}", self.state)
+        match self.state.as_str() {
+            "idle" => "Read aloud idle".to_owned(),
+            "speaking" => "Reading aloud".to_owned(),
+            "spoken" => "Read aloud complete".to_owned(),
+            "unavailable" => "Read aloud unavailable".to_owned(),
+            "error" => "Read aloud error".to_owned(),
+            other => format!("Read aloud {}", sentence_case_ascii(other)),
+        }
+    }
+
+    fn user_facing_error(&self) -> Option<String> {
+        self.last_error
+            .as_deref()
+            .and_then(speech_status_error_label)
     }
 }
 
@@ -7278,11 +7292,45 @@ impl BrowserVoiceCommandStatus {
     }
 
     fn chip_label(&self) -> String {
-        match self.last_mode.as_deref() {
-            Some("dictation") => format!("Dictation {}", self.state),
-            _ => format!("Voice {}", self.state),
+        let prefix = match self.last_mode.as_deref() {
+            Some("dictation") => "Dictation",
+            _ => "Voice",
+        };
+        match self.state.as_str() {
+            "idle" => format!("{prefix} idle"),
+            "listening" => format!("{prefix} listening"),
+            "transcribed" => format!("{prefix} captured"),
+            "unavailable" => format!("{prefix} unavailable"),
+            "error" => format!("{prefix} error"),
+            other => format!("{prefix} {}", sentence_case_ascii(other)),
         }
     }
+
+    fn user_facing_error(&self) -> Option<String> {
+        self.last_error
+            .as_deref()
+            .and_then(speech_status_error_label)
+    }
+}
+
+fn speech_status_error_label(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("stt runtime") && lower.contains("not configured") {
+        return Some("Voice input is not configured".to_owned());
+    }
+    if lower.contains("tts runtime") && lower.contains("not configured") {
+        return Some("Read aloud is not configured".to_owned());
+    }
+    if lower.contains("runtime") && lower.contains("not configured") {
+        return Some("Speech service is not configured".to_owned());
+    }
+
+    Some(sentence_case_ascii(trimmed))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18570,7 +18618,7 @@ mod tests {
         state.handle_page_text_event(1, "  Hello from the page.  ".to_owned());
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Read aloud: sent page text to TTS")
+            Some("Read aloud: sent page text to the speech service")
         );
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
         let msgs = persist
@@ -19172,7 +19220,7 @@ mod tests {
         assert_eq!(read_status.accepted, 2);
         assert!(read_status.is_visible());
         assert!(read_status.is_actionable());
-        assert_eq!(read_status.chip_label(), "TTS unavailable");
+        assert_eq!(read_status.chip_label(), "Read aloud unavailable");
         assert!(parse_read_aloud_status(r#"{"node":"n","state":"pretend"}"#).is_err());
 
         let voice_body = serde_json::json!({
@@ -19348,7 +19396,7 @@ mod tests {
             .as_ref()
             .expect("read-aloud status");
         assert_eq!(read_status.state, "speaking");
-        assert_eq!(read_status.chip_label(), "TTS speaking");
+        assert_eq!(read_status.chip_label(), "Reading aloud");
         let voice_status = state
             .latest_voice_command_status
             .as_ref()
@@ -19512,7 +19560,7 @@ mod tests {
         assert_eq!(pending.rp_id, "login.example");
         assert_eq!(
             chrome_ui::passkey_consent_prompt_text(pending, Some(tab_id)),
-            "login.example wants to use a passkey on login.example via CEF"
+            "login.example wants to use a passkey on login.example via Chromium"
         );
         let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
         assert!(
@@ -20169,7 +20217,7 @@ mod tests {
         assert_eq!(modes, ["command", "dictation"]);
         assert_eq!(
             state.capture_notice.as_deref(),
-            Some("Dictation: sent STT request")
+            Some("Dictation: sent voice input request")
         );
     }
 

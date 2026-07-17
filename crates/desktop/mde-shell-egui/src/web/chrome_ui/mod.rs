@@ -6882,7 +6882,7 @@ pub(super) fn passkey_consent_prompt_text(
         pending.verb(),
         account,
         pending.rp_id,
-        pending.engine.label()
+        engine_display_name(pending.engine)
     )
 }
 
@@ -10513,7 +10513,7 @@ mod tests {
         assert_painted_text_color(&texts, "Target Chromium 149.0.7827.201", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Installed Chromium old", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Stable channel", CHROME_TEXT_DIM);
-        assert_painted_text_color(&texts, "TTS speaking", CHROME_PRIMARY);
+        assert_painted_text_color(&texts, "Reading aloud", CHROME_PRIMARY);
         assert_painted_text_color(&texts, "Voice unavailable", CHROME_WARN);
         assert_painted_text_color(&texts, "Example", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "https://example.test/", CHROME_TEXT_DIM);
@@ -10523,9 +10523,12 @@ mod tests {
             CHROME_WARN,
         );
         assert_painted_text_color(&texts, "Installer unavailable", CHROME_WARN);
-        assert_painted_text_color(&texts, "STT runtime is not configured", CHROME_WARN);
+        assert_painted_text_color(&texts, "Voice input is not configured", CHROME_WARN);
         for forbidden in [
             "CEF",
+            "TTS",
+            "STT",
+            "runtime",
             "/opt/mde/cef",
             "packaged manifest",
             "updater failed",
@@ -10797,7 +10800,7 @@ mod tests {
         let texts = painted_text(&out.shapes);
 
         for label in [
-            "login.example wants to use a passkey on login.example via CEF",
+            "login.example wants to use a passkey on login.example via Chromium",
             "https://camera.example wants to use your camera",
             "Save login for docs.example.com (mm)?",
         ] {

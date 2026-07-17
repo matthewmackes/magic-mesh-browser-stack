@@ -1590,8 +1590,8 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                     );
                 });
-                if let Some(error) = status.last_error.as_deref() {
-                    drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
+                if let Some(error) = status.user_facing_error() {
+                    drawer_status_row(ui, ChromeIcon::Warning, &error, super::CHROME_WARN);
                 }
             }
 
@@ -1627,8 +1627,8 @@ pub(super) fn speech_status_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                     );
                 });
-                if let Some(error) = status.last_error.as_deref() {
-                    drawer_status_row(ui, ChromeIcon::Warning, error, super::CHROME_WARN);
+                if let Some(error) = status.user_facing_error() {
+                    drawer_status_row(ui, ChromeIcon::Warning, &error, super::CHROME_WARN);
                 }
             }
         });

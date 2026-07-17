@@ -2110,7 +2110,9 @@ mod tests {
             ..https_page()
         };
         assert!(
-            !build_status(&idle).iter().any(|c| c.text == "TTS idle"),
+            !build_status(&idle)
+                .iter()
+                .any(|c| c.text == "Read aloud idle"),
             "idle workers do not crowd the status cluster"
         );
 
@@ -2145,7 +2147,7 @@ mod tests {
         let chips = build_status(&active);
         assert!(chips
             .iter()
-            .any(|c| { c.text == "TTS speaking" && c.tone == ChipTone::Info }));
+            .any(|c| { c.text == "Reading aloud" && c.tone == ChipTone::Info }));
         assert!(chips
             .iter()
             .any(|c| { c.text == "Dictation unavailable" && c.tone == ChipTone::Warn }));
