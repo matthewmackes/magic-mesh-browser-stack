@@ -1334,7 +1334,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
+                    RichText::new("Ready")
                         .size(Style::SMALL)
                         .color(super::CHROME_TEXT_DIM),
                 );
@@ -1390,30 +1390,22 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .color(super::CHROME_TEXT_DIM),
                 );
                 ui.label(
-                    RichText::new(format!(
-                        "{} chars from tab {} / {}",
-                        result.text.chars().count(),
-                        result.tab_index,
-                        result.engine.label()
-                    ))
-                    .size(Style::SMALL)
-                    .color(super::CHROME_TEXT_DIM),
+                    RichText::new(format!("Text {} chars", result.text.chars().count()))
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
                 );
-                if let Some(cached_ms) = result.cached_ms {
+                if result.cached_ms.is_some() {
                     ui.label(
-                        RichText::new(format!("cached {cached_ms}"))
+                        RichText::new("Saved now")
                             .size(Style::SMALL)
                             .color(super::CHROME_TEXT_DIM),
                     );
                 }
                 if let Some(viewport) = &result.viewport {
                     ui.label(
-                        RichText::new(format!(
-                            "viewport PNG {}x{}",
-                            viewport.width, viewport.height
-                        ))
-                        .size(Style::SMALL)
-                        .color(super::CHROME_TEXT_DIM),
+                        RichText::new(format!("Preview {}x{}", viewport.width, viewport.height))
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
                     );
                 }
                 if let Some(archive) = &result.archive_mhtml {
@@ -1431,7 +1423,7 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         .count();
                     ui.label(
                         RichText::new(format!(
-                            "resources {} / {} blocked",
+                            "Resources {}, blocked {}",
                             result.resources.len(),
                             blocked
                         ))

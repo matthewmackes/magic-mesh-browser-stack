@@ -7118,7 +7118,7 @@ pub(super) fn cached_offline_body(
                         .color(CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new(result.cache_id.chars().take(12).collect::<String>())
+                    RichText::new("Ready")
                         .size(Style::SMALL)
                         .color(CHROME_TEXT_DIM),
                 );
@@ -7157,14 +7157,24 @@ pub(super) fn cached_offline_body(
                         .color(CHROME_TEXT_DIM),
                 );
                 ui.label(
-                    RichText::new(format!(
-                        "{} chars from {}",
-                        result.text.chars().count(),
-                        result.engine.label()
-                    ))
-                    .size(Style::SMALL)
-                    .color(CHROME_TEXT_DIM),
+                    RichText::new(format!("Text {} chars", result.text.chars().count()))
+                        .size(Style::SMALL)
+                        .color(CHROME_TEXT_DIM),
                 );
+                if result.cached_ms.is_some() {
+                    ui.label(
+                        RichText::new("Saved now")
+                            .size(Style::SMALL)
+                            .color(CHROME_TEXT_DIM),
+                    );
+                }
+                if let Some(viewport) = &result.viewport {
+                    ui.label(
+                        RichText::new(format!("Preview {}x{}", viewport.width, viewport.height))
+                            .size(Style::SMALL)
+                            .color(CHROME_TEXT_DIM),
+                    );
+                }
             });
             ui.add_space(Style::SP_S);
             egui::ScrollArea::vertical()
@@ -8674,18 +8684,27 @@ mod tests {
         )
     }
 
-    fn render_offline_cache_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
-        let mut state = WebState::default();
-        state.latest_offline_cache = Some(BrowserOfflineCacheResult {
+    fn offline_cache_result_fixture() -> BrowserOfflineCacheResult {
+        BrowserOfflineCacheResult {
             host: "browser-helper".to_owned(),
             cache_id: "01HARchivecopy-test".to_owned(),
             tab_index: 0,
             engine: BrowserEngine::Cef,
             url: "https://example.test/archive".to_owned(),
             title: "Example archive".to_owned(),
-            text: "Cached page text".to_owned(),
-            viewport: None,
-            resources: Vec::new(),
+            text: "Saved page text".to_owned(),
+            viewport: Some(super::super::OfflineCacheViewportImage {
+                mime: "image/png".to_owned(),
+                width: 320,
+                height: 180,
+                data_base64: "bm90LXBuZw==".to_owned(),
+            }),
+            resources: vec![super::super::OfflineCacheResource {
+                url: "https://cdn.example.test/tracker.js".to_owned(),
+                resource: "script".to_owned(),
+                allowed: false,
+                blocked_by: Some("Tracking protection".to_owned()),
+            }],
             archive_mhtml: Some(super::super::OfflineCacheArchive {
                 mime: "multipart/related".to_owned(),
                 filename: "mde-browser-example.mhtml".to_owned(),
@@ -8694,7 +8713,12 @@ mod tests {
             }),
             pdf_snapshot: None,
             cached_ms: Some(123),
-        });
+        }
+    }
+
+    fn render_offline_cache_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.latest_offline_cache = Some(offline_cache_result_fixture());
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -10366,13 +10390,57 @@ mod tests {
         let texts = painted_text(&out.shapes);
 
         assert_painted_text_color(&texts, "Offline copy", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Ready", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Archive", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Text 15 chars", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Saved now", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Preview 320x180", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Web archive 4096 bytes", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Resources 1, blocked 1", CHROME_TEXT_DIM);
         assert!(
-            texts
-                .iter()
-                .all(|(text, _)| !text.to_ascii_lowercase().contains("mhtml")),
-            "offline copy drawer must not expose archive file-format terminology: {texts:?}"
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("mhtml")
+                    && !lower.contains("01harchivecopy")
+                    && !lower.contains("cached ")
+                    && !lower.contains("tab ")
+                    && !lower.contains("cef")
+                    && !lower.contains("servo")
+                    && !lower.contains("png")
+            }),
+            "offline copy drawer must not expose implementation metadata: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn browser_cached_offline_body_uses_user_facing_metadata() {
+        let ctx = egui::Context::default();
+        mde_egui::fonts::install(&ctx);
+        let result = offline_cache_result_fixture();
+        let out = render_body_frame(&ctx, |ui| {
+            cached_offline_body(ui, &result, None);
+        });
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Offline copy", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Ready", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Example archive", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Text 15 chars", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Saved now", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Preview 320x180", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Saved page text", CHROME_TEXT);
+        assert!(
+            texts.iter().all(|(text, _)| {
+                let lower = text.to_ascii_lowercase();
+                !lower.contains("mhtml")
+                    && !lower.contains("01harchivecopy")
+                    && !lower.contains("cached ")
+                    && !lower.contains("tab ")
+                    && !lower.contains("cef")
+                    && !lower.contains("servo")
+                    && !lower.contains("png")
+            }),
+            "cached offline body must not expose implementation metadata: {texts:?}"
         );
     }
 
