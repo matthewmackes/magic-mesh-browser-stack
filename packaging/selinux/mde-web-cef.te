@@ -63,6 +63,7 @@ gen_require(`
 	type device_t;
 	type random_device_t;
 	type proc_t;
+	type proc_psi_t;
 	type sysctl_fs_t;
 	type node_t;
 	type unreserved_port_t;
@@ -105,6 +106,8 @@ allow mde_web_cef_t tmpfs_t:filesystem { mount remount };
 allow mde_web_cef_t fs_t:filesystem { getattr remount unmount };
 allow mde_web_cef_t device_t:filesystem remount;
 allow mde_web_cef_t proc_t:filesystem mount;
+allow mde_web_cef_t proc_psi_t:dir { getattr open read search };
+allow mde_web_cef_t proc_psi_t:file { getattr open read };
 allow mde_web_cef_t random_device_t:chr_file getattr;
 allow mde_web_cef_t self:fifo_file rw_fifo_file_perms;
 allow mde_web_cef_t self:unix_stream_socket create_stream_socket_perms;
