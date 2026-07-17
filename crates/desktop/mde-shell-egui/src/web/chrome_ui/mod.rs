@@ -3504,42 +3504,75 @@ fn render_options_command_page(
 pub(super) fn options_page(ui: &mut egui::Ui, state: &mut WebState) {
     let menus = super::menubar::chrome_menus(state);
     let mut picked = None;
-    let compact = options_compact_layout(bounded_available_width(ui));
-    egui::Frame::NONE
-        .fill(CHROME_SURFACE)
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            if compact {
-                let page_width = bounded_available_width(ui);
-                egui::ScrollArea::vertical()
-                    .id_salt("browser-options-page")
-                    .max_width(page_width)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(page_width);
-                        ui.set_max_width(page_width);
-                        render_options_category_index(ui, &menus, true);
-                        ui.add_space(10.0);
-                        render_options_command_page(ui, &menus, &mut picked, true);
-                    });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.set_height(ui.available_height());
+    let page_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    if !page_rect.is_positive() {
+        return;
+    }
+    ui.allocate_rect(page_rect, egui::Sense::hover());
+    ui.painter().rect_filled(page_rect, 0.0, CHROME_SURFACE);
+
+    let inner_rect = page_rect.shrink2(egui::vec2(10.0, 8.0));
+    if !inner_rect.is_positive() {
+        return;
+    }
+    let mut page_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    page_ui.set_clip_rect(page_rect);
+
+    let compact = options_compact_layout(bounded_available_width(&page_ui));
+    if compact {
+        let page_width = bounded_available_width(&page_ui);
+        let page_height = page_ui.available_height().max(0.0);
+        egui::ScrollArea::vertical()
+            .id_salt("browser-options-page")
+            .max_width(page_width)
+            .max_height(page_height)
+            .auto_shrink([false, false])
+            .show(&mut page_ui, |ui| {
+                ui.set_width(page_width);
+                ui.set_max_width(page_width);
+                render_options_category_index(ui, &menus, true);
+                ui.add_space(10.0);
+                render_options_command_page(ui, &menus, &mut picked, true);
+            });
+    } else {
+        let page_height = page_ui.available_height().max(0.0);
+        page_ui.horizontal(|ui| {
+            ui.set_height(page_height);
+            ui.allocate_ui_with_layout(
+                egui::vec2(OPTIONS_RAIL_W, page_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(OPTIONS_RAIL_W);
+                    ui.set_max_width(OPTIONS_RAIL_W);
                     render_options_category_index(ui, &menus, false);
-                    ui.add_space(OPTIONS_WIDE_GAP);
-                    let page_width = bounded_available_width(ui);
+                },
+            );
+            ui.add_space(OPTIONS_WIDE_GAP);
+            let page_width = bounded_available_width(ui);
+            ui.allocate_ui_with_layout(
+                egui::vec2(page_width, page_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(page_width);
+                    ui.set_max_width(page_width);
                     egui::ScrollArea::vertical()
                         .id_salt("browser-options-page")
                         .max_width(page_width)
+                        .max_height(page_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_width(page_width);
                             ui.set_max_width(page_width);
                             render_options_command_page(ui, &menus, &mut picked, false);
                         });
-                });
-            }
+                },
+            );
         });
+    }
     if let Some(action) = picked {
         super::menubar::apply(ui.ctx(), state, action);
     }
@@ -9432,6 +9465,9 @@ mod tests {
         assert_painted_text_color(&texts, "Controls", CHROME_TEXT);
         assert_painted_text_color(&texts, super::super::BROWSER_OPTIONS_URL, CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Browser Options", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Use Chromium for New Tabs", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Open Typed Address", CHROME_TEXT);
+        assert_painted_text_color(&texts, "Reload", CHROME_TEXT);
         assert_rects_inside_viewport(&out, 900.0, "wide Browser Options page");
     }
 

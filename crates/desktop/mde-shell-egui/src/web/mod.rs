@@ -9473,6 +9473,79 @@ mod tests {
         )
     }
 
+    fn capture_browser_screenshot(
+        name: &str,
+        state: &mut WebState,
+        size: egui::Vec2,
+    ) -> crate::screenshot::Canvas {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let mut cap = crate::screenshot::Capture::new();
+        let _settle = cap.frame(&ctx, input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
+        });
+        let canvas = cap.frame(&ctx, input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| web_panel(ui, state));
+        });
+
+        assert_eq!(
+            (canvas.width(), canvas.height()),
+            (size.x.round() as usize, size.y.round() as usize),
+            "Browser screenshot canvas must match the driven viewport"
+        );
+        assert!(!canvas.is_blank(), "Browser screenshot must not be blank");
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("screenshots")
+            .join(name);
+        canvas
+            .write_png(&path)
+            .expect("write the Browser visual-audit screenshot");
+        println!(
+            "Browser visual-audit screenshot written to {}",
+            path.display()
+        );
+        canvas
+    }
+
+    #[test]
+    fn browser_visual_audit_screenshots_cover_tab_modes_and_viewports() {
+        let mut options = WebState::default();
+        options.set_vertical_tabs(true);
+        options.open_options_tab();
+        let wide = capture_browser_screenshot(
+            "browser-wide-vertical-options.png",
+            &mut options,
+            vec2(1280.0, 800.0),
+        );
+        let clear_pixels = wide.count_exact_color(Style::CAPTURE_CLEAR);
+        let total_pixels = wide.width() * wide.height();
+        assert!(
+            clear_pixels < total_pixels / 20,
+            "Browser Options screenshot must paint the full body; clear pixels: {clear_pixels}/{total_pixels}"
+        );
+
+        let (session, _helper, _writer) = live_page_session();
+        let mut page = WebState::default();
+        page.set_vertical_tabs(false);
+        page.push_session_with_engine(session, BrowserEngine::Cef);
+        let compact = capture_browser_screenshot(
+            "browser-compact-horizontal-page.png",
+            &mut page,
+            vec2(540.0, 720.0),
+        );
+        assert!(
+            page.tabs[page.active].texture.is_some(),
+            "compact horizontal Browser screenshot must include the live page texture"
+        );
+        assert_eq!((compact.width(), compact.height()), (540, 720));
+    }
+
     fn drain_control_messages(stream: &UnixStream) -> Vec<mde_web_preview_client::ControlMsg> {
         let mut rbuf = Vec::new();
         let mut out = Vec::new();
