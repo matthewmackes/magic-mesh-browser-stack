@@ -195,6 +195,7 @@ const OPTIONS_CONTENT_MIN_W: f32 = 420.0;
 const OPTIONS_COMPACT_BREAKPOINT: f32 =
     OPTIONS_RAIL_W + OPTIONS_WIDE_GAP + OPTIONS_CONTENT_MIN_W + 36.0;
 const MEDIA_CLUSTER_LABEL_W: f32 = 132.0;
+const MEDIA_CLUSTER_COMPACT_LABEL_W: f32 = 84.0;
 const MEDIA_PIP_W: f32 = 272.0;
 const MEDIA_PIP_VIDEO_H: f32 = 150.0;
 const MEDIA_PIP_MARGIN: f32 = 14.0;
@@ -2580,6 +2581,71 @@ pub(super) const fn media_toolbar_play_action(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MediaToolbarDensity {
+    Full,
+    Compact,
+    IconOnly,
+    Hidden,
+}
+
+fn media_toolbar_trailing_nav_min_width() -> f32 {
+    CHROME_BUTTON + CHROME_GAP + 160.0 + (CHROME_BUTTON * 2.0) + Style::SP_XL
+}
+
+pub(super) fn media_toolbar_estimated_width(density: MediaToolbarDensity) -> f32 {
+    match density {
+        MediaToolbarDensity::Full => {
+            CHROME_GAP + 6.0 + MEDIA_CLUSTER_LABEL_W + (CHROME_BUTTON * 6.0) + (CHROME_GAP * 6.0)
+        }
+        MediaToolbarDensity::Compact => {
+            CHROME_GAP
+                + 6.0
+                + MEDIA_CLUSTER_COMPACT_LABEL_W
+                + (CHROME_BUTTON * 3.0)
+                + (CHROME_GAP * 3.0)
+        }
+        MediaToolbarDensity::IconOnly => CHROME_GAP + CHROME_BUTTON,
+        MediaToolbarDensity::Hidden => 0.0,
+    }
+}
+
+pub(super) fn media_toolbar_density(available_width: f32) -> MediaToolbarDensity {
+    if available_width.is_infinite() && available_width.is_sign_positive() {
+        return MediaToolbarDensity::Full;
+    }
+    if !available_width.is_finite() {
+        return MediaToolbarDensity::Hidden;
+    }
+    let media_budget = available_width - media_toolbar_trailing_nav_min_width();
+    if media_budget >= media_toolbar_estimated_width(MediaToolbarDensity::Full) {
+        MediaToolbarDensity::Full
+    } else if media_budget >= media_toolbar_estimated_width(MediaToolbarDensity::Compact) {
+        MediaToolbarDensity::Compact
+    } else if media_budget >= media_toolbar_estimated_width(MediaToolbarDensity::IconOnly) {
+        MediaToolbarDensity::IconOnly
+    } else {
+        MediaToolbarDensity::Hidden
+    }
+}
+
+fn media_toolbar_label_width(density: MediaToolbarDensity) -> f32 {
+    match density {
+        MediaToolbarDensity::Full => MEDIA_CLUSTER_LABEL_W,
+        MediaToolbarDensity::Compact => MEDIA_CLUSTER_COMPACT_LABEL_W,
+        MediaToolbarDensity::IconOnly | MediaToolbarDensity::Hidden => 0.0,
+    }
+}
+
+fn media_toolbar_label_text(label: &str, density: MediaToolbarDensity) -> String {
+    let limit = match density {
+        MediaToolbarDensity::Full => 32,
+        MediaToolbarDensity::Compact => 18,
+        MediaToolbarDensity::IconOnly | MediaToolbarDensity::Hidden => 0,
+    };
+    format!("    {}", ellipsize(label, limit))
+}
+
 fn media_toolbar_icon_button(
     ui: &mut egui::Ui,
     icon: ChromeIcon,
@@ -2617,8 +2683,21 @@ fn browser_media_toolbar(ui: &mut egui::Ui, state: &mut WebState) {
         return;
     };
     let (play_icon, play_tip, play_action) = media_toolbar_play_action(model.paused);
+    let density = media_toolbar_density(ui.available_width());
+    if density == MediaToolbarDensity::Hidden {
+        return;
+    }
     let mut picked = None;
     ui.add_space(CHROME_GAP);
+    if density == MediaToolbarDensity::IconOnly {
+        if let Some(action) = media_toolbar_icon_button(ui, play_icon, play_tip, play_action) {
+            picked = Some(action);
+        }
+        if let Some(action) = picked {
+            state.selected_media_transport(action);
+        }
+        return;
+    }
     egui::Frame::NONE
         .fill(CHROME_SURFACE_CONTAINER)
         .stroke(egui::Stroke::new(1.0, CHROME_OUTLINE))
@@ -2627,6 +2706,7 @@ fn browser_media_toolbar(ui: &mut egui::Ui, state: &mut WebState) {
         .show(ui, |ui| {
             ui.set_height(CHROME_BUTTON);
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = CHROME_GAP;
                 let tone = if model.background {
                     CHROME_PRIMARY
                 } else if model.muted {
@@ -2634,10 +2714,10 @@ fn browser_media_toolbar(ui: &mut egui::Ui, state: &mut WebState) {
                 } else {
                     CHROME_TEXT
                 };
-                let label_text = format!("    {}", model.label);
+                let label_text = media_toolbar_label_text(&model.label, density);
                 let label = chrome_hover_text(
                     ui.add_sized(
-                        egui::vec2(MEDIA_CLUSTER_LABEL_W, CHROME_BUTTON),
+                        egui::vec2(media_toolbar_label_width(density), CHROME_BUTTON),
                         egui::Label::new(RichText::new(label_text).size(CHROME_FONT).color(tone)),
                     ),
                     if model.background {
@@ -2666,29 +2746,31 @@ fn browser_media_toolbar(ui: &mut egui::Ui, state: &mut WebState) {
                 {
                     picked = Some(action);
                 }
-                if let Some(action) = media_toolbar_icon_button(
-                    ui,
-                    ChromeIcon::MediaStop,
-                    "Stop browser media",
-                    MediaTransportAction::Stop,
-                ) {
-                    picked = Some(action);
-                }
-                if let Some(action) = media_toolbar_icon_button(
-                    ui,
-                    ChromeIcon::VolumeDown,
-                    "Lower browser media volume",
-                    MediaTransportAction::VolumeDown,
-                ) {
-                    picked = Some(action);
-                }
-                if let Some(action) = media_toolbar_icon_button(
-                    ui,
-                    ChromeIcon::VolumeUp,
-                    "Raise browser media volume",
-                    MediaTransportAction::VolumeUp,
-                ) {
-                    picked = Some(action);
+                if density == MediaToolbarDensity::Full {
+                    if let Some(action) = media_toolbar_icon_button(
+                        ui,
+                        ChromeIcon::MediaStop,
+                        "Stop browser media",
+                        MediaTransportAction::Stop,
+                    ) {
+                        picked = Some(action);
+                    }
+                    if let Some(action) = media_toolbar_icon_button(
+                        ui,
+                        ChromeIcon::VolumeDown,
+                        "Lower browser media volume",
+                        MediaTransportAction::VolumeDown,
+                    ) {
+                        picked = Some(action);
+                    }
+                    if let Some(action) = media_toolbar_icon_button(
+                        ui,
+                        ChromeIcon::VolumeUp,
+                        "Raise browser media volume",
+                        MediaTransportAction::VolumeUp,
+                    ) {
+                        picked = Some(action);
+                    }
                 }
                 if let Some(action) = media_toolbar_icon_button(
                     ui,
@@ -9338,6 +9420,58 @@ mod tests {
         assert!(
             loading_globe_painted_shape_count() > 0,
             "the parked globe still paints a real non-text loading status"
+        );
+    }
+
+    #[test]
+    fn browser_media_toolbar_density_preserves_omnibox_budget() {
+        let reserve = media_toolbar_trailing_nav_min_width();
+        let full = media_toolbar_estimated_width(MediaToolbarDensity::Full);
+        let compact = media_toolbar_estimated_width(MediaToolbarDensity::Compact);
+        let icon_only = media_toolbar_estimated_width(MediaToolbarDensity::IconOnly);
+
+        assert!(full > compact);
+        assert!(compact > icon_only);
+        assert_eq!(
+            media_toolbar_density(reserve + full),
+            MediaToolbarDensity::Full
+        );
+        assert_eq!(
+            media_toolbar_density(reserve + full - 1.0),
+            MediaToolbarDensity::Compact
+        );
+        assert_eq!(
+            media_toolbar_density(reserve + compact),
+            MediaToolbarDensity::Compact
+        );
+        assert_eq!(
+            media_toolbar_density(reserve + compact - 1.0),
+            MediaToolbarDensity::IconOnly
+        );
+        assert_eq!(
+            media_toolbar_density(reserve + icon_only),
+            MediaToolbarDensity::IconOnly
+        );
+        assert_eq!(
+            media_toolbar_density(reserve + icon_only - 1.0),
+            MediaToolbarDensity::Hidden
+        );
+        assert_eq!(media_toolbar_density(f32::NAN), MediaToolbarDensity::Hidden);
+    }
+
+    #[test]
+    fn compact_media_toolbar_label_elides_before_paint() {
+        let label = "Now: A very long media title - An equally long artist";
+        let compact = media_toolbar_label_text(label, MediaToolbarDensity::Compact);
+        let full = media_toolbar_label_text(label, MediaToolbarDensity::Full);
+
+        assert!(compact.starts_with("    Now:"));
+        assert!(compact.contains("..."));
+        assert!(compact.chars().count() <= 22);
+        assert!(full.chars().count() <= 36);
+        assert!(
+            full.chars().count() > compact.chars().count(),
+            "full toolbar keeps more metadata than the compact rail"
         );
     }
 
