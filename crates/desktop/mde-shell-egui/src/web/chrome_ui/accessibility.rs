@@ -97,7 +97,7 @@ fn tab_accessibility_summary(tab: &Tab) -> String {
     };
     format!(
         "{} page, {title}, {url}, {}, {}, container {}, display target {}, {}",
-        tab.engine.label(),
+        engine_display_name(tab.engine),
         tab_accessibility_state(tab),
         security,
         tab.container.label(),

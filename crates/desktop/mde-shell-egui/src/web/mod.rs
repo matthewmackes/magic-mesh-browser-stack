@@ -1200,13 +1200,6 @@ enum BrowserEngine {
 }
 
 impl BrowserEngine {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Servo => "Servo",
-            Self::Cef => "CEF",
-        }
-    }
-
     const fn wire(self) -> &'static str {
         match self {
             Self::Servo => "servo",
@@ -14121,8 +14114,8 @@ mod tests {
             "Servo tabs should carry a readable Servo badge marker"
         );
         assert!(
-            chrome_ui::tab_hover(&state.tabs[1]).contains("Engine: Servo"),
-            "Servo hover card should name the engine"
+            chrome_ui::tab_hover(&state.tabs[1]).contains("Engine: Lightweight"),
+            "Servo-backed hover card should use the user-facing engine label"
         );
         assert!(
             !chrome_ui::tab_label(&state.tabs[0]).contains("CEF"),

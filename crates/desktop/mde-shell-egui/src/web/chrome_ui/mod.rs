@@ -293,7 +293,7 @@ pub(super) const fn tone_color(tone: ChipTone) -> Color32 {
 pub(super) const fn engine_display_name(engine: BrowserEngine) -> &'static str {
     match engine {
         BrowserEngine::Cef => "Chromium",
-        BrowserEngine::Servo => "Servo",
+        BrowserEngine::Servo => "Lightweight",
     }
 }
 
@@ -9783,7 +9783,7 @@ mod tests {
         assert_eq!(engine_display_name(BrowserEngine::Cef), "Chromium");
         assert_eq!(engine_marker(BrowserEngine::Cef), "CEF");
         assert_eq!(engine_glyph(BrowserEngine::Cef), "C");
-        assert_eq!(engine_display_name(BrowserEngine::Servo), "Servo");
+        assert_eq!(engine_display_name(BrowserEngine::Servo), "Lightweight");
         assert_eq!(engine_marker(BrowserEngine::Servo), "Servo");
         assert_eq!(engine_glyph(BrowserEngine::Servo), "S");
         assert_eq!(engine_accent(BrowserEngine::Cef), CHROME_PRIMARY);

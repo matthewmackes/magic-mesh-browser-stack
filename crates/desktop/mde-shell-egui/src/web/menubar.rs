@@ -484,7 +484,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 Entry::Item(
                     Item::new(
                         MenuAction::SelectEngine(BrowserEngine::Servo),
-                        "Use Servo for New Tabs",
+                        "Use Lightweight for New Tabs",
                     )
                     .checked(s.future_engine == BrowserEngine::Servo),
                 ),
@@ -753,7 +753,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
         ),
         Menu::new("Privacy", {
             let mut entries = vec![
-                Entry::Caption("Cookies: blocked by the sandboxed engine".to_owned()),
+                Entry::Caption("Cookies: blocked for this session".to_owned()),
                 Entry::Caption("Third-party cookies: blocked (no cookie store)".to_owned()),
                 Entry::Caption("Session data: cleared on tab close".to_owned()),
                 Entry::Caption(s.site_data.clone()),
@@ -993,6 +993,14 @@ fn truncate_url(url: &str) -> String {
     super::ellipsize(url, URL_MAX)
 }
 
+#[cfg(test)]
+fn engine_chrome_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Lightweight",
+    }
+}
+
 /// Build the live status cluster: the active engine (only while a tab is
 /// actually running a page engine, §7), the committed URL, the lifecycle state,
 /// the http/https security state, and the blocked-request count (a `0` count
@@ -1001,7 +1009,7 @@ fn truncate_url(url: &str) -> String {
 fn build_status(s: &Snapshot) -> Vec<StatusChip> {
     let mut chips = Vec::new();
     if let Some(engine) = s.active_engine {
-        chips.push(StatusChip::new(engine.label(), ChipTone::Info));
+        chips.push(StatusChip::new(engine_chrome_label(engine), ChipTone::Info));
     }
     if s.has_tab && !s.url.trim().is_empty() {
         chips.push(StatusChip::new(truncate_url(&s.url), ChipTone::Neutral));
@@ -1492,9 +1500,10 @@ mod tests {
                 Entry::Item(i) if i.id == MenuAction::SelectEngine(BrowserEngine::Servo) => Some(i),
                 _ => None,
             })
-            .expect("Servo engine row present");
+            .expect("Lightweight engine row present");
         assert_eq!(cef.label, "Use Chromium for New Tabs");
         assert_eq!(cef.checked, Some(false));
+        assert_eq!(servo.label, "Use Lightweight for New Tabs");
         assert_eq!(servo.checked, Some(true));
 
         let ctx = egui::Context::default();
@@ -2092,12 +2101,15 @@ mod tests {
         // A tab with a live page engine shows an engine chip; with no session
         // there is no engine to claim (§7).
         let chips = build_status(&https_page());
-        assert_eq!(chips[0].text, "Servo", "the engine chip leads the cluster");
+        assert_eq!(
+            chips[0].text, "Lightweight",
+            "the engine chip leads the cluster"
+        );
         assert_eq!(chips[0].tone, ChipTone::Info);
         assert!(
             !build_status(&Snapshot::default())
                 .iter()
-                .any(|c| c.text == "Servo"),
+                .any(|c| c.text == "Lightweight"),
             "no tab ⇒ no engine chip"
         );
     }
@@ -2111,7 +2123,7 @@ mod tests {
         };
         let chips = build_status(&snap);
         assert_eq!(
-            chips[0].text, "Servo",
+            chips[0].text, "Lightweight",
             "the status chip reads the actual active tab engine"
         );
         let engine = build_menus(&snap)
@@ -2411,7 +2423,7 @@ mod tests {
                         matches!(
                             item.label.as_str(),
                             "Use Chromium for New Tabs"
-                                | "Use Servo for New Tabs"
+                                | "Use Lightweight for New Tabs"
                                 | "Vertical Tabs"
                                 | "Show Downloads"
                                 | "Show History"
@@ -2642,7 +2654,7 @@ mod tests {
         let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
         // Engine / URL / Live / https / blocked count, left-to-right (MENU-3 leads
         // with the active engine).
-        assert_eq!(texts[0], "Servo");
+        assert_eq!(texts[0], "Lightweight");
         assert_eq!(texts[1], "https://example.com/path");
         assert!(texts.contains(&"Live"), "the lifecycle chip is present");
         assert!(texts.contains(&"https"), "the security chip is present");
