@@ -285,6 +285,11 @@ struct Tab {
     device_profile: DeviceProfile,
     /// Last operator/page activity seen by the shell for idle-suspend accounting.
     last_activity: Instant,
+    /// Deadline for the short fast-repaint window granted to a loading page. Some
+    /// sites keep Chromium's loading bit alive after first paint; once this expires
+    /// a non-media page falls back to the static-page heartbeat so input stays
+    /// responsive on the DRM seat.
+    loading_fast_repaint_until: Option<Instant>,
     /// Whether this inactive tab has been shell-suspended after the idle timeout.
     idle_suspended: bool,
     /// Whether the painted page canvas owns keyboard/text input. This is tracked
@@ -331,6 +336,32 @@ struct FaviconCache {
     texture: Option<TextureHandle>,
 }
 
+fn loading_fast_repaint_deadline(now: Instant) -> Instant {
+    now + LIVE_PAGE_LOADING_FAST_REPAINT_GRACE
+}
+
+fn initial_loading_fast_repaint_deadline(session: &WebSession, now: Instant) -> Option<Instant> {
+    session
+        .nav()
+        .loading
+        .then(|| loading_fast_repaint_deadline(now))
+}
+
+fn start_tab_load(tab: &mut Tab, url: String) {
+    tab.session.load(url);
+    tab.loading_fast_repaint_until = Some(loading_fast_repaint_deadline(Instant::now()));
+}
+
+fn sync_tab_loading_repaint_budget(tab: &mut Tab, now: Instant) {
+    if tab.session.nav().loading {
+        if tab.loading_fast_repaint_until.is_none() {
+            tab.loading_fast_repaint_until = Some(loading_fast_repaint_deadline(now));
+        }
+    } else {
+        tab.loading_fast_repaint_until = None;
+    }
+}
+
 /// How long a new panel device size must hold steady before it is committed to the
 /// helper as a `session.resize` — long enough that a drag-resize sends ONE settled
 /// resize instead of one per frame, short enough to feel immediate.
@@ -341,6 +372,9 @@ const LIVE_PAGE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// Static Browser pages still need a light heartbeat so helper events are drained
 /// without pointer input, but they must not pin the bare DRM shell at 60 Hz.
 const LIVE_PAGE_IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+/// Loading pages get a short fast repaint burst for first paint and obvious page
+/// progress, then non-media pages fall back to the low-rate helper heartbeat.
+const LIVE_PAGE_LOADING_FAST_REPAINT_GRACE: Duration = Duration::from_secs(2);
 
 /// Debounces browser-panel viewport-size changes (browser-1, item 2).
 ///
@@ -2049,6 +2083,7 @@ impl WebState {
         tab.favicon_cache = None;
         tab.resizer = ViewportResizer::default();
         tab.last_activity = Instant::now();
+        tab.loading_fast_repaint_until = None;
         tab.idle_suspended = false;
         self.address = url.to_owned();
         self.last_engine_url = None;
@@ -2396,6 +2431,7 @@ impl WebState {
     /// others. UI-visible side effects are applied after the mutable tab pass.
     fn poll_tabs_for_panel(&mut self) -> BrowserTabPollEvents {
         let mut events = BrowserTabPollEvents::default();
+        let now = Instant::now();
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.internal_page.is_some() {
                 continue;
@@ -2404,6 +2440,7 @@ impl WebState {
                 continue;
             }
             tab.session.poll();
+            sync_tab_loading_repaint_budget(tab, now);
             if let Some(error) = tab.session.cert_error().cloned() {
                 if tab.last_audited_cert_error.as_ref() != Some(&error) {
                     events.certificate_errors.push(CertificateErrorAudit {
@@ -2572,14 +2609,18 @@ impl WebState {
         }
     }
 
-    fn active_live_page_repaint_interval(&self) -> Option<Duration> {
+    fn active_live_page_repaint_interval_at(&self, now: Instant) -> Option<Duration> {
         let tab = self.tabs.get(self.active)?;
         if tab.internal_page.is_some() || tab.idle_suspended || tab.session.is_crashed() {
             return None;
         }
+        if tab.session.media_metadata().is_some() || tab.session.audible() {
+            return Some(LIVE_PAGE_REPAINT_INTERVAL);
+        }
         if tab.session.nav().loading
-            || tab.session.media_metadata().is_some()
-            || tab.session.audible()
+            && tab
+                .loading_fast_repaint_until
+                .is_some_and(|deadline| now <= deadline)
         {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
@@ -2587,6 +2628,10 @@ impl WebState {
             return Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL);
         }
         None
+    }
+
+    fn active_live_page_repaint_interval(&self) -> Option<Duration> {
+        self.active_live_page_repaint_interval_at(Instant::now())
     }
 
     fn media_pip_needs_repaint(&self) -> bool {
@@ -2605,10 +2650,11 @@ impl WebState {
     }
 
     fn request_browser_frame_repaint(&self, ctx: &egui::Context) {
+        let now = Instant::now();
         let delay = if self.media_pip_needs_repaint() {
             Some(LIVE_PAGE_REPAINT_INTERVAL)
         } else {
-            self.active_live_page_repaint_interval()
+            self.active_live_page_repaint_interval_at(now)
         };
         if let Some(delay) = delay {
             ctx.request_repaint_after(delay);
@@ -2643,6 +2689,7 @@ impl WebState {
                 continue;
             }
             tab.session.stop();
+            tab.loading_fast_repaint_until = None;
             tab.idle_suspended = true;
             suspended.push((
                 idx,
@@ -2781,6 +2828,8 @@ impl WebState {
         session.set_autoplay_blocked(DEFAULT_AUTOPLAY_BLOCKED);
         let id = self.next_tab_id;
         self.next_tab_id = self.next_tab_id.saturating_add(1);
+        let now = Instant::now();
+        let loading_fast_repaint_until = initial_loading_fast_repaint_deadline(&session, now);
         self.tabs.push(Tab {
             id,
             session,
@@ -2798,7 +2847,8 @@ impl WebState {
             user_scripts: false,
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
-            last_activity: Instant::now(),
+            last_activity: now,
+            loading_fast_repaint_until,
             idle_suspended: false,
             page_focused: false,
             texture: None,
@@ -2835,6 +2885,7 @@ impl WebState {
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
+            loading_fast_repaint_until: None,
             idle_suspended: false,
             page_focused: false,
             texture: None,
@@ -3934,7 +3985,7 @@ impl WebState {
         self.managed_policy_block = None;
         self.mark_active_tab_activity();
         if let Some(tab) = self.active_tab() {
-            tab.session.load(url);
+            start_tab_load(tab, url);
         }
     }
 
@@ -4038,7 +4089,7 @@ impl WebState {
                 self.address = url.clone();
                 self.mark_active_tab_activity();
                 if let Some(tab) = self.active_tab() {
-                    tab.session.load(url);
+                    start_tab_load(tab, url);
                 }
             }
             InsecureNavigationTarget::NewTab(engine) => {
@@ -4194,7 +4245,7 @@ impl WebState {
             tab.user_scripts = false;
             tab.user_agent = UserAgentOverride::Default;
             tab.device_profile = DeviceProfile::Default;
-            tab.session.load(NEW_TAB_URL);
+            start_tab_load(tab, NEW_TAB_URL.to_owned());
             tab.session.set_zoom(self.page_zoom_percent);
             tab.session.clear_find();
             tab.session.set_audio_muted(false);
@@ -5647,6 +5698,8 @@ impl WebState {
         let mut session = session;
         let url = session.nav().url.clone();
         session.set_filter(self.compiled_request_filter_for_url(&url));
+        let now = Instant::now();
+        let loading_fast_repaint_until = initial_loading_fast_repaint_deadline(&session, now);
         let autoplay_blocked = self
             .tabs
             .get(self.active)
@@ -5659,7 +5712,8 @@ impl WebState {
             tab.last_frame = None;
             tab.last_audited_resource_seq = 0;
             tab.last_audited_cert_error = None;
-            tab.last_activity = Instant::now();
+            tab.last_activity = now;
+            tab.loading_fast_repaint_until = loading_fast_repaint_until;
             tab.idle_suspended = false;
             // A fresh helper re-negotiates its viewport from scratch.
             tab.resizer = ViewportResizer::default();
@@ -5682,6 +5736,8 @@ impl WebState {
         let url = session.nav().url.clone();
         session.set_filter(self.compiled_request_filter_for_url(&url));
         session.set_autoplay_blocked(DEFAULT_AUTOPLAY_BLOCKED);
+        let now = Instant::now();
+        let loading_fast_repaint_until = initial_loading_fast_repaint_deadline(&session, now);
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.session = session;
             tab.engine = engine;
@@ -5700,7 +5756,8 @@ impl WebState {
             tab.last_frame = None;
             tab.last_audited_resource_seq = 0;
             tab.last_audited_cert_error = None;
-            tab.last_activity = Instant::now();
+            tab.last_activity = now;
+            tab.loading_fast_repaint_until = loading_fast_repaint_until;
             tab.idle_suspended = false;
             tab.page_focused = false;
             tab.resizer = ViewportResizer::default();
@@ -14433,6 +14490,43 @@ mod tests {
     }
 
     #[test]
+    fn long_loading_static_browser_page_drops_to_low_rate_heartbeat() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: true,
+                url: "https://www.google.com/".to_owned(),
+            },
+        );
+        let _events = state.poll_tabs_for_panel();
+        assert!(
+            state.tabs[0].session.nav().loading,
+            "regression setup must leave the page in a Chromium loading state"
+        );
+        let deadline = state.tabs[0]
+            .loading_fast_repaint_until
+            .expect("loading page should receive a short fast-repaint budget");
+
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(deadline - Duration::from_millis(1)),
+            Some(LIVE_PAGE_REPAINT_INTERVAL),
+            "fresh loading pages keep the fast first-paint cadence"
+        );
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(deadline + Duration::from_millis(1)),
+            Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
+            "a non-media page that keeps loading must not pin the DRM shell at 60 Hz"
+        );
+    }
+
+    #[test]
     fn active_browser_media_page_keeps_fast_repaint_heartbeat() {
         let (session, helper, _writer) = live_page_session();
         let mut state = WebState::default();
@@ -16168,6 +16262,7 @@ mod tests {
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
+            loading_fast_repaint_until: None,
             idle_suspended: false,
             page_focused: false,
             texture: None,
