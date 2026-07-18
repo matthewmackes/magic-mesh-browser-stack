@@ -9,13 +9,16 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-browser-verify-engines [--engine cef|servo|all] [--budget SECONDS] [--timeout DURATION] [--idle-media]
+browser-verify-engines [--engine cef|servo|all] [--budget SECONDS] [--timeout DURATION] [--idle-media] [--link-navigation]
 
 Default:
   browser-verify-engines --engine all
 
 Idle media proof:
   browser-verify-engines --engine cef --idle-media --budget 70 --timeout 90s
+
+Click-navigation proof:
+  browser-verify-engines --engine cef --link-navigation --budget 30 --timeout 45s
 
 Environment overrides:
   MDE_BROWSER_VERIFY_VERIFIER=/usr/libexec/mackesd/cef-verify
@@ -28,6 +31,7 @@ Environment overrides:
   MDE_BROWSER_VERIFY_KEEP_LOGS=1
   MDE_BROWSER_VERIFY_SKIP_PROCESS_CHECK=1
   MDE_BROWSER_VERIFY_IDLE_MEDIA=1
+  MDE_BROWSER_VERIFY_LINK_NAVIGATION=1
   MDE_BROWSER_VERIFY_IDLE_MIN_SECONDS=60
   MDE_BROWSER_VERIFY_IDLE_MIN_FRAMES=4
 
@@ -52,6 +56,7 @@ BUDGET="${MDE_BROWSER_VERIFY_BUDGET:-}"
 RUN_TIMEOUT="${MDE_BROWSER_VERIFY_TIMEOUT:-45s}"
 ENGINE="all"
 IDLE_MEDIA="${MDE_BROWSER_VERIFY_IDLE_MEDIA:-0}"
+LINK_NAVIGATION="${MDE_BROWSER_VERIFY_LINK_NAVIGATION:-${MDE_BROWSER_VERIFY_LINK_NAV:-0}}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -72,6 +77,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --idle-media)
       IDLE_MEDIA=1
+      shift
+      ;;
+    --link-navigation|--link-nav)
+      LINK_NAVIGATION=1
       shift
       ;;
     --help|-h)
@@ -100,6 +109,20 @@ case "${IDLE_MEDIA}" in
     die "MDE_BROWSER_VERIFY_IDLE_MEDIA/--idle-media must be boolean"
     ;;
 esac
+case "${LINK_NAVIGATION}" in
+  1|true|TRUE|yes|YES|on|ON)
+    LINK_NAVIGATION=1
+    ;;
+  0|false|FALSE|no|NO|off|OFF|'')
+    LINK_NAVIGATION=0
+    ;;
+  *)
+    die "MDE_BROWSER_VERIFY_LINK_NAVIGATION/--link-navigation must be boolean"
+    ;;
+esac
+if [ "$IDLE_MEDIA" = "1" ] && [ "$LINK_NAVIGATION" = "1" ]; then
+  die "--idle-media and --link-navigation are separate verifier modes"
+fi
 if [ "$IDLE_MEDIA" = "1" ]; then
   if [ "$ENGINE" = "servo" ]; then
     die "--idle-media is CEF-only; use --engine cef"
@@ -177,6 +200,8 @@ run_engine() {
   local env_args=()
   if [ "$IDLE_MEDIA" = "1" ]; then
     env_args+=("MDE_BROWSER_VERIFY_IDLE_MEDIA=1")
+  elif [ "$LINK_NAVIGATION" = "1" ]; then
+    env_args+=("MDE_BROWSER_VERIFY_LINK_NAVIGATION=1")
   else
     env_args+=("MDE_BROWSER_VERIFY_INPUT=1")
   fi
@@ -197,6 +222,12 @@ run_engine() {
         if grep -q 'idle media advanced without pointer input' "$log_file" \
             && grep -q 'VERIFY media_metadata .* playing=true' "$log_file"; then
           log "$engine idle-media verifier passed"
+          return 0
+        fi
+      elif [ "$LINK_NAVIGATION" = "1" ]; then
+        if grep -q 'click-driven link navigation observed over the wire' "$log_file" \
+            && grep -q 'mde-browser-link-clicked' "$log_file"; then
+          log "$engine link-navigation verifier passed"
           return 0
         fi
       elif grep -Eq 'mde-browser-verify-p1-k1-tm|P:1 K:1 T:m' "$log_file"; then

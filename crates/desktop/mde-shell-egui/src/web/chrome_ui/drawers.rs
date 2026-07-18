@@ -389,52 +389,53 @@ fn drawer_multiline_text_field(
 
 fn drawer_stepper(ui: &mut egui::Ui, value: &mut u16, min: u16, max: u16, tip: &str) {
     *value = (*value).clamp(min, max);
-    ui.horizontal(|ui| {
-        if drawer_icon_button_enabled(
-            ui,
-            *value > min,
-            ChromeIcon::Minus,
-            BrowserActionRole::Quiet,
-            "Decrease",
-        )
-        .clicked()
-        {
-            *value = (*value).saturating_sub(1).max(min);
-        }
+    let row_response = ui
+        .horizontal(|ui| {
+            if drawer_icon_button_enabled(
+                ui,
+                *value > min,
+                ChromeIcon::Minus,
+                BrowserActionRole::Quiet,
+                "Decrease",
+            )
+            .clicked()
+            {
+                *value = (*value).saturating_sub(1).max(min);
+            }
 
-        let text = (*value).to_string();
-        egui::Frame::NONE
-            .fill(super::CHROME_SURFACE)
-            .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(8, 2))
-            .show(ui, |ui| {
-                ui.set_min_width(22.0);
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(text)
-                            .size(Style::SMALL)
-                            .color(super::CHROME_TEXT),
-                    );
-                });
-            })
-            .response
-            .on_hover_ui(|ui| chrome_tooltip(ui, tip));
+            let text = (*value).to_string();
+            let value_response = egui::Frame::NONE
+                .fill(super::CHROME_SURFACE)
+                .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(8, 2))
+                .show(ui, |ui| {
+                    ui.set_min_width(22.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(text)
+                                .size(Style::SMALL)
+                                .color(super::CHROME_TEXT),
+                        );
+                    });
+                })
+                .response;
+            let _ = chrome_hover_text(value_response, tip);
 
-        if drawer_icon_button_enabled(
-            ui,
-            *value < max,
-            ChromeIcon::Plus,
-            BrowserActionRole::Quiet,
-            "Increase",
-        )
-        .clicked()
-        {
-            *value = (*value).saturating_add(1).min(max);
-        }
-    })
-    .response
-    .on_hover_ui(|ui| chrome_tooltip(ui, tip));
+            if drawer_icon_button_enabled(
+                ui,
+                *value < max,
+                ChromeIcon::Plus,
+                BrowserActionRole::Quiet,
+                "Increase",
+            )
+            .clicked()
+            {
+                *value = (*value).saturating_add(1).min(max);
+            }
+        })
+        .response;
+    let _ = chrome_hover_text(row_response, tip);
 }
 
 pub(super) fn drawer_progress_width(available_width: f32) -> f32 {
@@ -1640,11 +1641,11 @@ pub(super) fn offline_cache_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                     offline_cache_viewport_texture(ui.ctx(), &result.cache_id, viewport)
                 {
                     let size = offline_cache_viewport_display_size(ui, viewport);
-                    ui.add(
+                    let response = ui.add(
                         egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
                             .sense(Sense::hover()),
-                    )
-                    .on_hover_ui(|ui| chrome_tooltip(ui, "Cached viewport image"));
+                    );
+                    let _ = chrome_hover_text(response, "Cached viewport image");
                 }
             }
             egui::ScrollArea::vertical()

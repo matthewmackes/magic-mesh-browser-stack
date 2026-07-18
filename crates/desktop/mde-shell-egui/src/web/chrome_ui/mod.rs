@@ -10502,6 +10502,14 @@ mod tests {
     }
 
     fn render_print_settings_drawer_frame(ctx: &egui::Context) -> egui::FullOutput {
+        render_print_settings_drawer_frame_with_input(ctx, Vec::new(), 0.0)
+    }
+
+    fn render_print_settings_drawer_frame_with_input(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> egui::FullOutput {
         let mut state = WebState::default();
         state.print_settings_open = true;
         state.cups_settings.copies = 12;
@@ -10514,7 +10522,8 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(760.0, 360.0),
                 )),
-                time: Some(0.0),
+                time: Some(time),
+                events,
                 ..Default::default()
             },
             |ctx| {
@@ -13967,6 +13976,38 @@ mod tests {
             "print drawer copy stepper must paint Browser plus/minus icons: lines={:?} image_meshes={}",
             painted_line_strokes(&out.shapes),
             painted_image_mesh_count(&out.shapes)
+        );
+    }
+
+    #[test]
+    fn browser_print_drawer_stepper_hover_uses_browser_tooltip_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        mde_egui::fonts::install(&ctx);
+
+        let first = render_print_settings_drawer_frame(&ctx);
+        let copy_value_rect = painted_text_rects(&first.shapes)
+            .into_iter()
+            .find_map(|(text, rect)| (text == "12").then_some(rect))
+            .expect("print drawer renders the copy-stepper value");
+        let _ = render_print_settings_drawer_frame_with_input(
+            &ctx,
+            vec![egui::Event::PointerMoved(copy_value_rect.center())],
+            1.0,
+        );
+        let out = render_print_settings_drawer_frame_with_input(&ctx, Vec::new(), 1.6);
+        let texts = painted_text(&out.shapes);
+        assert_painted_text_color(&texts, "Number of copies", CHROME_TEXT);
+        assert!(
+            !texts.iter().any(|(text, color)| text == "Number of copies"
+                && matches!(*color, Style::TEXT | Style::TEXT_DIM | Style::TEXT_STRONG)),
+            "print drawer stepper hover leaked shared shell text color: {texts:?}"
+        );
+
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.contains(&CHROME_SURFACE),
+            "print drawer stepper hover should paint the Browser tooltip surface: {fills:?}"
         );
     }
 
