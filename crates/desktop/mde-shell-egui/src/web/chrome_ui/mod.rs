@@ -206,6 +206,9 @@ const DASHBOARD_TILE_MAX_W: f32 = 156.0;
 const DASHBOARD_TILE_ICON: f32 = 32.0;
 const CHROME_TOOLTIP_W: f32 = 260.0;
 const PAGE_ACTIONS_MENU_W: f32 = 260.0;
+const BOOKMARK_OVERFLOW_MENU_W: f32 = 240.0;
+const PASSWORD_MENU_W: f32 = 280.0;
+const PASSWORD_FIELD_MIN_W: f32 = 160.0;
 const OMNIBOX_SECURITY_SLOT_W: f32 = 30.0;
 const OMNIBOX_TEXT_TINY_MIN: f32 = 36.0;
 const TOOLBAR_COUNT_BADGE_W: f32 = 28.0;
@@ -7641,7 +7644,7 @@ fn bookmark_overflow_rows(
     let mut chosen = None;
     for link in links {
         let label = ellipsize(&link.title, 40);
-        let width = ui.available_width().max(180.0);
+        let width = bounded_available_width(ui).max(1.0);
         let resp =
             bookmark_bar_button(ui, &label, &link.title, &link.url, width, link.url.as_str());
         if resp.clicked() {
@@ -7653,6 +7656,10 @@ fn bookmark_overflow_rows(
         }
     }
     chosen
+}
+
+fn bookmark_overflow_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_bookmark_overflow_popup")
 }
 
 /// Single-row bookmarks bar below the nav chrome.
@@ -7698,7 +7705,7 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                     }
                 }
                 if visible < links.len() {
-                    let popup_id = egui::Id::new("mde_web_bookmark_overflow_popup");
+                    let popup_id = bookmark_overflow_popup_id();
                     let response = toolbar_icon_menu_anchor(
                         ui,
                         popup_id,
@@ -7717,7 +7724,8 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                         &response,
                         egui::PopupCloseBehavior::CloseOnClickOutside,
                         |ui| {
-                            apply_visuals(ui);
+                            ui.set_min_width(BOOKMARK_OVERFLOW_MENU_W);
+                            ui.set_width(BOOKMARK_OVERFLOW_MENU_W);
                             if motion.active {
                                 ui.ctx().request_repaint();
                             }
@@ -7725,10 +7733,13 @@ pub(super) fn bookmarks_bar(ui: &mut egui::Ui, state: &mut WebState) {
                             if motion.anchor_offset > 0.0 {
                                 ui.add_space(motion.anchor_offset);
                             }
-                            if let Some(choice) = bookmark_overflow_rows(ui, &links[visible..]) {
-                                chosen = Some(choice);
-                                ui.memory_mut(|mem| mem.close_popup());
-                            }
+                            chrome_popup_frame(ui, BOOKMARK_OVERFLOW_MENU_W, |ui| {
+                                if let Some(choice) = bookmark_overflow_rows(ui, &links[visible..])
+                                {
+                                    chosen = Some(choice);
+                                    ui.memory_mut(|mem| mem.close_popup());
+                                }
+                            });
                         },
                     );
                 }
@@ -7841,7 +7852,9 @@ fn password_menu_contents(
     has_page: bool,
     can_fill: bool,
 ) -> PasswordMenuOutcome {
-    ui.set_min_width(260.0);
+    let width = chrome_popup_width(ui, PASSWORD_MENU_W);
+    ui.set_min_width(width);
+    ui.set_width(width);
     if host.is_empty() {
         browser_muted_note(ui, "No site loaded");
         return PasswordMenuOutcome::default();
@@ -7855,14 +7868,18 @@ fn password_menu_contents(
             .color(CHROME_TEXT),
     );
     if matches.is_empty() {
-        browser_muted_note(ui, &format!("None saved for {host}"));
+        browser_muted_note(ui, &format!("None saved for {}", ellipsize(host, 42)));
     } else {
         for (idx, username, password) in matches {
             ui.horizontal(|ui| {
+                let label = format!("Fill {}", ellipsize(username, 30));
+                let fill_width =
+                    (bounded_available_width(ui) - CHROME_BUTTON - CHROME_GAP).max(72.0);
                 if ui
                     .add_enabled(
                         has_page && can_fill,
-                        action_button(format!("Fill {username}"), BrowserActionRole::Primary),
+                        action_button(label, BrowserActionRole::Primary)
+                            .min_size(egui::vec2(fill_width, CHROME_BUTTON)),
                     )
                     .clicked()
                 {
@@ -7886,17 +7903,19 @@ fn password_menu_contents(
     }
     chrome_separator(ui);
     ui.label(
-        RichText::new(format!("Save a login for {host}"))
+        RichText::new(format!("Save a login for {}", ellipsize(host, 42)))
             .size(CHROME_FONT)
             .color(CHROME_TEXT),
     );
+    let field_width = bounded_available_width(ui).max(1.0);
+    let field_min_width = PASSWORD_FIELD_MIN_W.min(field_width);
     let user_resp = chrome_text_field(
         ui,
         true,
         &mut state.login_user_draft,
         "username",
-        f32::INFINITY,
-        160.0,
+        field_width,
+        field_min_width,
         false,
         "Username",
         None,
@@ -7907,8 +7926,8 @@ fn password_menu_contents(
         true,
         &mut state.login_pass_draft,
         "password",
-        f32::INFINITY,
-        160.0,
+        field_width,
+        field_min_width,
         true,
         "Password",
         None,
@@ -7924,6 +7943,10 @@ fn password_menu_contents(
     outcome
 }
 
+fn password_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_password_menu_popup")
+}
+
 fn password_menu(
     ui: &mut egui::Ui,
     state: &mut WebState,
@@ -7936,7 +7959,7 @@ fn password_menu(
     let mut remove: Option<usize> = None;
     let mut save = false;
     let matches = password_menu_matches(state, &host);
-    let popup_id = egui::Id::new("mde_web_password_menu_popup");
+    let popup_id = password_popup_id();
     let response = toolbar_icon_menu_anchor(
         ui,
         popup_id,
@@ -7959,7 +7982,8 @@ fn password_menu(
         &response,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            apply_visuals(ui);
+            ui.set_min_width(PASSWORD_MENU_W);
+            ui.set_width(PASSWORD_MENU_W);
             if motion.active {
                 ui.ctx().request_repaint();
             }
@@ -7967,14 +7991,18 @@ fn password_menu(
             if motion.anchor_offset > 0.0 {
                 ui.add_space(motion.anchor_offset);
             }
-            let outcome = password_menu_contents(ui, state, &host, &matches, has_page, can_fill);
-            let close_popup = outcome.fill.is_some() || outcome.remove.is_some() || outcome.save;
-            fill = outcome.fill;
-            remove = outcome.remove;
-            save = outcome.save;
-            if close_popup {
-                ui.memory_mut(|mem| mem.close_popup());
-            }
+            chrome_popup_frame(ui, PASSWORD_MENU_W, |ui| {
+                let outcome =
+                    password_menu_contents(ui, state, &host, &matches, has_page, can_fill);
+                let close_popup =
+                    outcome.fill.is_some() || outcome.remove.is_some() || outcome.save;
+                fill = outcome.fill;
+                remove = outcome.remove;
+                save = outcome.save;
+                if close_popup {
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            });
         },
     );
     if let Some((user, pass)) = fill {
@@ -9540,6 +9568,45 @@ mod tests {
         )
     }
 
+    fn render_open_password_menu_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        let host = "very-long-subdomain-for-passwords.example.test";
+        state.save_login(
+            host,
+            "operator-with-a-long-username@example.test",
+            "hunter2",
+        );
+        let page_url = format!("https://{host}/login");
+        let mut render = |open: bool, time: f64| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(340.0, 260.0),
+                    )),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        scope(ui, |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                if open {
+                                    ui.memory_mut(|mem| mem.open_popup(password_popup_id()));
+                                }
+                                password_menu(ui, &mut state, &page_url, true, true);
+                            });
+                        });
+                    });
+                },
+            )
+        };
+
+        let _ = render(true, 0.0);
+        let _ = render(false, 0.016);
+        render(false, 1.0)
+    }
+
     fn render_capture_notice_frame(ctx: &egui::Context, notice: &str) -> egui::FullOutput {
         let mut state = WebState::default();
         state.capture_notice = Some(notice.to_owned());
@@ -9812,6 +9879,47 @@ mod tests {
                 });
             },
         )
+    }
+
+    fn render_open_bookmark_overflow_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
+        let mut state = WebState::default();
+        state.bookmarks_bar_visible = true;
+        state.bookmark_bar_links = (0..5)
+            .map(|idx| super::super::BookmarkBarLink {
+                title: format!("Bookmark {idx}"),
+                url: format!("https://bookmark-{idx}.example/"),
+            })
+            .collect();
+        let mut render = |open: bool, time: f64| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 180.0),
+                    )),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        scope(ui, |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                if open {
+                                    ui.memory_mut(|mem| {
+                                        mem.open_popup(bookmark_overflow_popup_id())
+                                    });
+                                }
+                                bookmarks_bar(ui, &mut state);
+                            });
+                        });
+                    });
+                },
+            )
+        };
+
+        let _ = render(true, 0.0);
+        let _ = render(false, 0.016);
+        render(false, 1.0)
     }
 
     fn render_bookmark_overflow_rows_frame(ctx: &egui::Context) -> egui::FullOutput {
@@ -12150,6 +12258,36 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_overflow_toolbar_popup_keeps_full_browser_menu_width() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_open_bookmark_overflow_popup_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Bookmark 2", CHROME_TEXT);
+        let nodes = accesskit_nodes(&out);
+        let bookmark_row = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Open bookmark Bookmark 2")
+                    && node.bounds().is_some())
+                .then(|| accesskit_bounds_rect(node))
+            })
+            .expect("open bookmarks overflow popup exposes a bookmark row");
+        assert!(
+            bookmark_row.width() >= BOOKMARK_OVERFLOW_MENU_W - 24.0,
+            "bookmarks overflow popup row must not collapse into a thin wedge: {bookmark_row:?}"
+        );
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.iter().any(|fill| *fill == CHROME_SURFACE),
+            "bookmarks overflow popup should paint a Browser popup surface: {fills:?}"
+        );
+    }
+
+    #[test]
     fn browser_body_interstitials_use_painted_warning_icons_not_glyph_text() {
         let ctx = egui::Context::default();
         mde_egui::fonts::install(&ctx);
@@ -13362,13 +13500,55 @@ mod tests {
             "password toolbar anchor must not paint the legacy key emoji as text: {texts:?}"
         );
 
-        let lines = painted_line_strokes(&out.shapes);
+        assert_browser_icon_painted(&out.shapes, CHROME_TEXT, "password toolbar anchor");
+    }
+
+    #[test]
+    fn password_toolbar_popup_keeps_full_browser_menu_width_and_bounds_text() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+        let out = render_open_password_menu_popup_frame(&ctx);
+        let texts = painted_text(&out.shapes);
+
+        assert_painted_text_color(&texts, "Saved logins (this session)", CHROME_TEXT);
         assert!(
-            lines
-                .iter()
-                .any(|stroke| stroke.color == CHROME_TEXT && (stroke.width - 1.7).abs() < 0.01),
-            "password toolbar anchor must paint a Browser line icon: {lines:?}"
+            texts.iter().any(|(text, color)| {
+                text.starts_with("Fill operator-with-a-long") && *color == CHROME_TOOLBAR
+            }),
+            "password popup should paint a bounded fill action for the long user: {texts:?}"
         );
+        let nodes = accesskit_nodes(&out);
+        let fill_row = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Fill operator-with-a-long"))
+                    && node.bounds().is_some())
+                .then(|| accesskit_bounds_rect(node))
+            })
+            .expect("open password popup exposes a fill row");
+        assert!(
+            fill_row.width() >= PASSWORD_FIELD_MIN_W,
+            "password popup fill row must not collapse into a thin wedge: {fill_row:?}"
+        );
+        let fills = painted_rect_fills(&out.shapes);
+        assert!(
+            fills.iter().any(|fill| *fill == CHROME_SURFACE),
+            "password popup should paint a Browser surface behind rows: {fills:?}"
+        );
+        let text_rects = painted_text_rects(&out.shapes);
+        for (text, rect) in text_rects
+            .iter()
+            .filter(|(text, _)| text.contains("very-long-subdomain") || text.starts_with("Fill "))
+        {
+            assert!(
+                rect.width() <= PASSWORD_MENU_W,
+                "password popup text should stay bounded by the menu width: {text:?} {rect:?}"
+            );
+        }
     }
 
     #[test]
