@@ -401,6 +401,8 @@ pub const CEF_FRAME_SIZE: usize = 248;
 pub const CEF_FRAME_LOAD_URL_OFFSET: usize = 144;
 /// `offsetof(cef_frame_t, execute_java_script)`.
 pub const CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET: usize = 152;
+/// `offsetof(cef_frame_t, is_main)` — logical top-level frame test.
+pub const CEF_FRAME_IS_MAIN_OFFSET: usize = 160;
 /// `sizeof(cef_request_t)` for pinned Linux CEF 149.
 pub const CEF_REQUEST_SIZE: usize = 216;
 /// `offsetof(cef_request_t, get_url)`.
@@ -5632,9 +5634,19 @@ fn main_frame(browser: *mut c_void) -> Option<*mut c_void> {
 }
 
 fn frame_is_main(browser: *mut c_void, frame: *mut c_void) -> bool {
-    !browser.is_null()
-        && !frame.is_null()
-        && main_frame(browser).is_some_and(|main| std::ptr::eq(main, frame))
+    if browser.is_null() || frame.is_null() {
+        return false;
+    }
+    if let Some(is_main) = read_fn(frame, CEF_FRAME_IS_MAIN_OFFSET) {
+        // SAFETY: `is_main` is read from `cef_frame_t::is_main`, whose pinned C
+        // signature is `int (*)(cef_frame_t*)`. Prefer CEF's logical frame test
+        // over wrapper pointer equality because live callbacks can hand us a
+        // different wrapper pointer than a fresh `browser.get_main_frame()` call.
+        let is_main: unsafe extern "C" fn(*mut c_void) -> c_int =
+            unsafe { std::mem::transmute(is_main) };
+        return unsafe { is_main(frame) } != 0;
+    }
+    main_frame(browser).is_some_and(|main| std::ptr::eq(main, frame))
 }
 
 fn request_url(

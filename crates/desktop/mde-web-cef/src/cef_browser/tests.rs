@@ -362,6 +362,7 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_FRAME_SIZE, 248);
     assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 144);
     assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 152);
+    assert_eq!(CEF_FRAME_IS_MAIN_OFFSET, 160);
     assert_eq!(CEF_REQUEST_SIZE, 216);
     assert_eq!(CEF_REQUEST_GET_URL_OFFSET, 48);
     // set_header_by_name is index 13 of the fn-ptr block after the 40-byte base;
@@ -506,6 +507,14 @@ unsafe extern "C" fn test_main_frame(_browser: *mut c_void) -> *mut c_void {
     TEST_MAIN_FRAME_PTR.load(AtomicOrdering::SeqCst) as *mut c_void
 }
 
+unsafe extern "C" fn test_frame_is_main(_frame: *mut c_void) -> c_int {
+    1
+}
+
+unsafe extern "C" fn test_frame_is_subframe(_frame: *mut c_void) -> c_int {
+    0
+}
+
 unsafe extern "C" fn record_focus(_host: *mut c_void, focused: c_int) {
     FOCUS_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     FOCUS_LAST.store(focused, AtomicOrdering::SeqCst);
@@ -526,9 +535,14 @@ fn cef_address_changes_only_update_top_level_url_from_the_main_frame() {
     browser
         [CEF_BROWSER_GET_MAIN_FRAME_OFFSET..CEF_BROWSER_GET_MAIN_FRAME_OFFSET + size_of::<usize>()]
         .copy_from_slice(&(test_main_frame as *const () as usize).to_ne_bytes());
+    let mut main_wrapper = vec![0u8; CEF_FRAME_SIZE];
     let mut main = vec![0u8; CEF_FRAME_SIZE];
     let mut subframe = vec![0u8; CEF_FRAME_SIZE];
-    TEST_MAIN_FRAME_PTR.store(main.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+    main[CEF_FRAME_IS_MAIN_OFFSET..CEF_FRAME_IS_MAIN_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_frame_is_main as *const () as usize).to_ne_bytes());
+    subframe[CEF_FRAME_IS_MAIN_OFFSET..CEF_FRAME_IS_MAIN_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_frame_is_subframe as *const () as usize).to_ne_bytes());
+    TEST_MAIN_FRAME_PTR.store(main_wrapper.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
 
     let display = callbacks.state.display_ptr();
     let browser = browser.as_mut_ptr().cast();
@@ -1431,7 +1445,8 @@ fn download_handler_offsets_reconcile_and_size_is_unique() {
 fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     // cef_frame_t: 40-byte base then 8-byte fn ptrs. is_valid=0(40), undo=1(48),
     // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104),
-    // get_source=10(120), get_text=11(128), load_url=13(144), execute_js=14(152).
+    // get_source=10(120), get_text=11(128), load_url=13(144), execute_js=14(152),
+    // is_main=15(160).
     assert_eq!(CEF_FRAME_UNDO_OFFSET, 40 + 1 * 8);
     assert_eq!(CEF_FRAME_REDO_OFFSET, 40 + 2 * 8);
     assert_eq!(CEF_FRAME_CUT_OFFSET, 40 + 3 * 8);
@@ -1442,9 +1457,11 @@ fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     assert_eq!(CEF_FRAME_GET_TEXT_OFFSET, 40 + 11 * 8);
     assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 40 + 13 * 8);
     assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 40 + 14 * 8);
+    assert_eq!(CEF_FRAME_IS_MAIN_OFFSET, 40 + 15 * 8);
     // Reconcile with the frame's execute_java_script slot — edit commands sit
     // before the page-tool extraction/navigation slots.
     assert!(CEF_FRAME_SELECT_ALL_OFFSET < CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET);
+    assert!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET < CEF_FRAME_IS_MAIN_OFFSET);
 }
 
 #[test]
