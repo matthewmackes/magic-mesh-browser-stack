@@ -10023,34 +10023,42 @@ mod tests {
     }
 
     fn render_open_page_actions_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
-        ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(320.0, 260.0),
-                )),
-                time: Some(0.0),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    scope(ui, |ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            ui.memory_mut(|mem| mem.open_popup(page_actions_popup_id()));
-                            page_actions_button(
-                                ui,
-                                true,
-                                false,
-                                None,
-                                Some(BrowserEngine::Cef),
-                                "https://example.test/",
-                                "Example",
-                            );
+        let render = |ctx: &egui::Context, open: bool, time: f64| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 260.0),
+                    )),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        scope(ui, |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                if open {
+                                    ui.memory_mut(|mem| mem.open_popup(page_actions_popup_id()));
+                                }
+                                page_actions_button(
+                                    ui,
+                                    true,
+                                    false,
+                                    None,
+                                    Some(BrowserEngine::Cef),
+                                    "https://example.test/",
+                                    "Example",
+                                );
+                            });
                         });
                     });
-                });
-            },
-        )
+                },
+            )
+        };
+
+        let _ = render(ctx, true, 0.0);
+        let _ = render(ctx, false, 0.016);
+        render(ctx, false, 1.0)
     }
 
     fn render_body_frame(
@@ -12052,7 +12060,7 @@ mod tests {
                 (node.role() == egui::accesskit::Role::Button
                     && node.label() == Some("Add bookmark")
                     && node.bounds().is_some())
-                .then_some(accesskit_bounds_rect(node))
+                .then(|| accesskit_bounds_rect(node))
             })
             .expect("collapsed context path exposes Add bookmark row");
         assert!(
@@ -12118,7 +12126,7 @@ mod tests {
                 (node.role() == egui::accesskit::Role::Button
                     && node.label() == Some("Add bookmark")
                     && node.bounds().is_some())
-                .then_some(accesskit_bounds_rect(node))
+                .then(|| accesskit_bounds_rect(node))
             })
             .expect("open page-actions popup exposes Add bookmark row");
         assert!(
