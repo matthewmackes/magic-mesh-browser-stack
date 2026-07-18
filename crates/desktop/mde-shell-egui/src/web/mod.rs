@@ -2189,7 +2189,7 @@ impl WebState {
     }
 
     #[cfg(test)]
-    fn with_transfers(mut self, transfers: Box<dyn TransfersClient>) -> Self {
+    pub(crate) fn with_transfers(mut self, transfers: Box<dyn TransfersClient>) -> Self {
         self.transfers = transfers;
         self.refresh_downloads();
         self
@@ -2400,6 +2400,19 @@ impl WebState {
             return;
         }
         self.refresh_downloads();
+    }
+
+    /// Keep the shell's bottom navigation progress cell current even when the
+    /// Browser workspace is not the active surface. The same cadenced local ledger
+    /// read backs the downloads drawer, so the taskbar does not own a second model.
+    pub(crate) fn pump_downloads_for_shell_chrome(&mut self) {
+        self.poll_downloads();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_downloads_poll_due_for_test(&mut self) {
+        self.downloads_last_poll =
+            Some(Instant::now() - DOWNLOADS_POLL_INTERVAL - Duration::from_millis(1));
     }
 
     fn poll_browser_services_before_tabs(&mut self) {
