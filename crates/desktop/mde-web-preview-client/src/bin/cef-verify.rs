@@ -14,11 +14,14 @@
 //! the same AF_UNIX wire the shell consumes, with NO shell and NO reboot. The
 //! binary name is historical (`cef-verify`) because the first live use was CEF
 //! display/load verification, but the harness also works against `mde-web-preview`
-//! (Servo) and can prove mouse+keyboard response with `MDE_BROWSER_VERIFY_INPUT=1`.
+//! (Servo), can prove mouse+keyboard response with `MDE_BROWSER_VERIFY_INPUT=1`,
+//! and can prove click-driven link navigation with
+//! `MDE_BROWSER_VERIFY_LINK_NAV=1`.
 //!
 //! Usage: `cef-verify <helper_bin> <url> [seconds]`
 //!   e.g. `cef-verify /usr/bin/mde-web-cef https://example.com/ 20`
 //!   e.g. `MDE_BROWSER_VERIFY_INPUT=1 cef-verify /usr/bin/mde-web-preview`
+//!   e.g. `MDE_BROWSER_VERIFY_LINK_NAV=1 cef-verify /usr/bin/mde-web-cef`
 //!   e.g. `MDE_BROWSER_VERIFY_IDLE_MEDIA=1 cef-verify /usr/bin/mde-web-cef "" 70`
 
 use std::collections::BTreeSet;
@@ -61,12 +64,14 @@ fn main() {
     let mut nav_events = 0u32;
     let mut title_events = 0u32;
     let mut frame_events = 0u32;
+    let input_probe = mode == VerifyMode::Input;
+    let link_nav_probe = mode == VerifyMode::LinkNavigation;
+    let idle_media_probe = mode == VerifyMode::IdleMedia;
     // Servo's minimal helper currently does not publish dynamic title changes,
     // so page-text polling is the cross-engine observable for input response.
-    let input_probe = mode == VerifyMode::Input;
-    let idle_media_probe = mode == VerifyMode::IdleMedia;
     let page_text_input_probe = input_probe || env_flag("MDE_BROWSER_VERIFY_PAGE_TEXT_INPUT");
     let mut input_probe_state = InputProbeState::new(page_text_input_probe);
+    let mut link_nav_probe_state = LinkNavigationProbeState::new(args.url.clone());
     let mut idle_probe_state = IdleMediaProbeState::new(
         idle_media_min_seconds(args.secs),
         idle_media_min_signatures(),
@@ -129,6 +134,9 @@ fn main() {
         if input_probe {
             drive_input_probe(&mut sess, frame_events, &mut input_probe_state);
         }
+        if link_nav_probe {
+            drive_link_navigation_probe(&mut sess, frame_events, &mut link_nav_probe_state);
+        }
         if input_probe
             && nav_events > 0
             && frame_events > 0
@@ -137,6 +145,13 @@ fn main() {
             break;
         }
         if idle_media_probe && nav_events > 0 && idle_probe_state.is_complete(started.elapsed()) {
+            break;
+        }
+        if link_nav_probe
+            && nav_events > 0
+            && frame_events > 0
+            && link_nav_probe_state.is_complete(&sess.nav().url)
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -148,10 +163,16 @@ fn main() {
         sess.title(),
     );
     let input_ok = !input_probe || input_probe_state.is_complete(sess.title());
+    let link_nav_ok = !link_nav_probe || link_nav_probe_state.is_complete(&sess.nav().url);
     let idle_media_ok = !idle_media_probe || idle_probe_state.is_complete(started.elapsed());
-    if nav_events > 0 && frame_events > 0 && input_ok && idle_media_ok {
+    if nav_events > 0 && frame_events > 0 && input_ok && link_nav_ok && idle_media_ok {
         if input_probe {
             println!("VERIFY RESULT=PASS display/load/input response observed over the wire");
+        } else if link_nav_probe {
+            println!(
+                "VERIFY RESULT=PASS click-driven link navigation observed over the wire ({})",
+                link_nav_probe_state.summary(&sess.nav().url)
+            );
         } else if idle_media_probe {
             println!(
                 "VERIFY RESULT=PASS idle media advanced without pointer input ({})",
@@ -163,7 +184,12 @@ fn main() {
             );
         }
     } else {
-        if idle_media_probe {
+        if link_nav_probe {
+            println!(
+                "VERIFY RESULT=FAIL missing NavState, frame, or click-driven link navigation ({})",
+                link_nav_probe_state.summary(&sess.nav().url)
+            );
+        } else if idle_media_probe {
             println!(
                 "VERIFY RESULT=FAIL missing NavState, frame, or no-input idle media progress ({})",
                 idle_probe_state.summary()
@@ -181,6 +207,7 @@ fn main() {
 enum VerifyMode {
     Display,
     Input,
+    LinkNavigation,
     IdleMedia,
 }
 
@@ -188,6 +215,10 @@ impl VerifyMode {
     fn from_env() -> Self {
         if env_flag("MDE_BROWSER_VERIFY_IDLE_MEDIA") {
             Self::IdleMedia
+        } else if env_flag("MDE_BROWSER_VERIFY_LINK_NAV")
+            || env_flag("MDE_BROWSER_VERIFY_LINK_NAVIGATION")
+        {
+            Self::LinkNavigation
         } else if env_flag("MDE_CEF_VERIFY_INPUT") || env_flag("MDE_BROWSER_VERIFY_INPUT") {
             Self::Input
         } else {
@@ -199,13 +230,14 @@ impl VerifyMode {
         match self {
             Self::Display => "display",
             Self::Input => "input",
+            Self::LinkNavigation => "link-navigation",
             Self::IdleMedia => "idle-media",
         }
     }
 
     const fn default_budget_secs(self) -> u64 {
         match self {
-            Self::Display | Self::Input => 20,
+            Self::Display | Self::Input | Self::LinkNavigation => 20,
             Self::IdleMedia => 70,
         }
     }
@@ -241,6 +273,7 @@ fn default_verify_url(mode: VerifyMode) -> String {
     match mode {
         VerifyMode::Display => "about:blank".to_string(),
         VerifyMode::Input => input_probe_url(),
+        VerifyMode::LinkNavigation => link_navigation_probe_url(),
         VerifyMode::IdleMedia => idle_media_probe_url(),
     }
 }
@@ -351,6 +384,49 @@ fn drive_input_probe(sess: &mut WebSession, frame_events: u32, state: &mut Input
         }
         _ => {}
     }
+}
+
+#[derive(Debug)]
+struct LinkNavigationProbeState {
+    source_url: String,
+    sent_click: bool,
+}
+
+impl LinkNavigationProbeState {
+    fn new(source_url: String) -> Self {
+        Self {
+            source_url,
+            sent_click: false,
+        }
+    }
+
+    fn is_complete(&self, current_url: &str) -> bool {
+        self.sent_click
+            && current_url != self.source_url
+            && current_url.contains(LINK_NAVIGATION_TARGET_MARKER)
+    }
+
+    fn summary(&self, current_url: &str) -> String {
+        format!(
+            "click_sent={} source_unchanged={} final_has_marker={} final_url={}",
+            self.sent_click,
+            current_url == self.source_url,
+            current_url.contains(LINK_NAVIGATION_TARGET_MARKER),
+            current_url,
+        )
+    }
+}
+
+fn drive_link_navigation_probe(
+    sess: &mut WebSession,
+    frame_events: u32,
+    state: &mut LinkNavigationProbeState,
+) {
+    if state.sent_click || frame_events == 0 {
+        return;
+    }
+    send_link_navigation_probe(sess);
+    state.sent_click = true;
 }
 
 fn compact_text(text: &str) -> String {
@@ -540,6 +616,31 @@ fn send_pointer_probe(sess: &mut WebSession) {
     println!("VERIFY input_probe_sent pointer=true");
 }
 
+fn send_link_navigation_probe(sess: &mut WebSession) {
+    let pos = pos2(96.0, 84.0);
+    let modifiers = egui::Modifiers::default();
+    sess.send_input(&egui::Event::PointerMoved(pos), 1.0);
+    sess.send_input(
+        &egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers,
+        },
+        1.0,
+    );
+    sess.send_input(
+        &egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        },
+        1.0,
+    );
+    println!("VERIFY link_navigation_probe_sent pointer=true");
+}
+
 fn send_key_probe(sess: &mut WebSession) {
     let modifiers = egui::Modifiers::default();
     sess.send_input(
@@ -578,6 +679,10 @@ fn send_text_probe(sess: &mut WebSession) {
 
 fn input_probe_url() -> String {
     data_url(INPUT_PROBE_HTML)
+}
+
+fn link_navigation_probe_url() -> String {
+    data_url(LINK_NAVIGATION_PROBE_HTML)
 }
 
 fn idle_media_probe_url() -> String {
@@ -646,6 +751,21 @@ html,body{margin:0;padding:0;background:#101418;color:#f4f4f4;font:16px sans-ser
 </script>
 "#;
 
+const LINK_NAVIGATION_TARGET_MARKER: &str = "mde-browser-link-clicked";
+const LINK_NAVIGATION_TARGET_URL: &str = "about:blank#mde-browser-link-clicked";
+
+const LINK_NAVIGATION_PROBE_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>mde-browser-link-source</title>
+<style>
+html,body{margin:0;padding:0;background:#fff;color:#202124;font:16px sans-serif}
+a{position:absolute;left:40px;top:52px;width:360px;height:64px;display:flex;align-items:center;justify-content:center;border:2px solid #1a73e8;border-radius:8px;color:#1a73e8;text-decoration:none;font-weight:700}
+#status{position:absolute;left:40px;top:136px;color:#5f6368}
+</style>
+<a id="target" href="about:blank#mde-browser-link-clicked">Open navigation target</a>
+<div id="status">Ready for click navigation proof</div>
+"#;
+
 const IDLE_MEDIA_PROBE_HTML: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <title>mde-browser-idle-media-f0</title>
@@ -685,7 +805,9 @@ video{position:absolute;right:8px;bottom:8px;width:1px;height:1px;opacity:.01}
 mod tests {
     use super::{
         animated_frame_signature, data_url, idle_media_probe_url, input_probe_url,
-        media_metadata_reports_playing, sample_positions, VerifyArgs, VerifyMode,
+        link_navigation_probe_url, media_metadata_reports_playing, sample_positions,
+        LinkNavigationProbeState, VerifyArgs, VerifyMode, LINK_NAVIGATION_TARGET_MARKER,
+        LINK_NAVIGATION_TARGET_URL,
     };
     use mde_web_preview_client::egui::{Color32, ColorImage};
 
@@ -706,6 +828,42 @@ mod tests {
             data_url("<title>x y</title>"),
             "data:text/html;charset=utf-8,%3Ctitle%3Ex%20y%3C%2Ftitle%3E"
         );
+    }
+
+    #[test]
+    fn link_navigation_probe_url_has_a_fixed_offline_click_target() {
+        let url = link_navigation_probe_url();
+        assert!(url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(url.contains("mde-browser-link-source"));
+        assert!(url.contains("Open%20navigation%20target"));
+        assert!(url.contains("href%3D%22about%3Ablank%23mde-browser-link-clicked%22"));
+    }
+
+    #[test]
+    fn args_default_to_link_navigation_probe_page_when_link_mode_has_no_url() {
+        let args = VerifyArgs::parse(
+            vec!["/usr/bin/mde-web-cef".to_owned()],
+            VerifyMode::LinkNavigation,
+        );
+
+        assert_eq!(args.helper, "/usr/bin/mde-web-cef");
+        assert!(args.url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(args.url.contains("mde-browser-link-source"));
+        assert_eq!(args.secs, 20);
+    }
+
+    #[test]
+    fn link_navigation_probe_requires_a_click_and_a_changed_target_url() {
+        let mut state = LinkNavigationProbeState::new(link_navigation_probe_url());
+
+        assert!(!state.is_complete(LINK_NAVIGATION_TARGET_URL));
+        state.sent_click = true;
+        assert!(!state.is_complete(&state.source_url));
+        assert!(!state.is_complete("about:blank#wrong-target"));
+        assert!(state.is_complete(LINK_NAVIGATION_TARGET_URL));
+        assert!(state
+            .summary(LINK_NAVIGATION_TARGET_URL)
+            .contains(LINK_NAVIGATION_TARGET_MARKER));
     }
 
     #[test]

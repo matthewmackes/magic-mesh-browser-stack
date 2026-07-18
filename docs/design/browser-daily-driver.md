@@ -2,7 +2,7 @@
 
 Turn the platform's browser (`mde-web-preview` / the BOOKMARKS-5/6 helper) from an
 experimental Servo preview into a **daily-driver browser matching current browsers** —
-while staying mesh-native, privacy-forward, and Quazar-styled. Locked via a 100-question
+while staying mesh-native, privacy-forward, and Construct-styled. Locked via a 100-question
 `/plan` survey. This is a large multi-phase epic; the survey is the durable spec.
 
 ## The pivotal decision: a DUAL-engine browser
@@ -47,7 +47,7 @@ blocklists (no Google phone-home) · full per-site data manager + "forget this s
 Full **uBlock-class ad/tracker blocking** (mesh-synced subscribable lists + custom rules,
 Q83) · reader mode (+ TTS) · **no** built-in password manager (external/OS store) → instead
 **WebAuthn/passkeys + hardware keys + phone-as-authenticator** (Q77) · no form autofill ·
-force-dark on light sites (Quazar-tuned) (Q54).
+force-dark on light sites (Construct-tuned) (Q54).
 
 ### Extensions (v1 decision, Q97–99 revised 2026-07-14)
 V1 skips WebExtensions in production. Native ad/tracker blocking, reader mode, userscripts,
@@ -58,7 +58,7 @@ CEF build can prove extension execution and permission semantics. No general ext
 ### Search & address bar (Q17–20)
 Unified URL+search omnibox · live suggestions · default **mesh-hosted SearXNG** + a
 user-configurable engine list incl. privacy engines + keyword shortcuts · new-tab =
-**Quazar-dark dashboard** (SearXNG box + mesh-service quick links, Q91).
+**Construct-dark dashboard** (SearXNG box + mesh-service quick links, Q91).
 
 ### Media & real-time (Q33–36, 46, 60, 69)
 Full codecs incl. **H.264/H.265** · **full WebRTC** · fullscreen + **picture-in-picture** +
@@ -103,7 +103,7 @@ notifications → the mesh notify feed (Q43).
 **Container tabs** (per-tab isolated identity) · single browser surface (no per-site app
 pin) · F11 + present-to-node · full multi-display · English-first (multi-lang later) ·
 minimal onboarding · import bookmarks · startup restores the synced follow-me session ·
-rich bookmarks (folders + tags + search + dead-link check, mesh-synced) · fixed Quazar
+rich bookmarks (folders + tags + search + dead-link check, mesh-synced) · fixed Construct
 toolbar.
 
 ### Phase 1 MVP (Q100 — the operator marked ALL of these for the first cut)

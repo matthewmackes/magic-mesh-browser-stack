@@ -3541,8 +3541,8 @@ unsafe extern "C" fn get_print_handler(self_: *mut c_void) -> *mut c_void {
 
 unsafe extern "C" fn get_resource_request_handler(
     self_: *mut c_void,
-    _browser: *mut c_void,
-    _frame: *mut c_void,
+    browser: *mut c_void,
+    frame: *mut c_void,
     _request: *mut c_void,
     is_navigation: c_int,
     _is_download: c_int,
@@ -3556,7 +3556,7 @@ unsafe extern "C" fn get_resource_request_handler(
         }
     }
     with_state(self_, |state| {
-        if is_navigation != 0 {
+        if is_navigation != 0 && frame_is_main(browser, frame) {
             // browser-8: a real navigation opens a fresh JS context that needs
             // the WebRTC/passkey shims re-injected. Signal the pump loop instead
             // of re-running the shims on a blind 250 ms timer.
@@ -4189,10 +4189,13 @@ unsafe extern "C" fn on_find_result(
 /// CEF `on_address_change(self, browser, frame, url)` — the committed URL changed.
 unsafe extern "C" fn on_address_change(
     self_: *mut c_void,
-    _browser: *mut c_void,
-    _frame: *mut c_void,
+    browser: *mut c_void,
+    frame: *mut c_void,
     url: *const CefString,
 ) {
+    if !frame_is_main(browser, frame) {
+        return;
+    }
     let url = cef_string_to_string(url);
     // Off-by-default live diagnostic: proves the display handler is actually being
     // dispatched by CEF on the real vtable (the class of bug fixed in the
@@ -5626,6 +5629,12 @@ fn main_frame(browser: *mut c_void) -> Option<*mut c_void> {
     // SAFETY: CEF returned `browser` from `cef_browser_host_create_browser_sync`.
     let frame = unsafe { get_main_frame(browser) };
     (!frame.is_null()).then_some(frame)
+}
+
+fn frame_is_main(browser: *mut c_void, frame: *mut c_void) -> bool {
+    !browser.is_null()
+        && !frame.is_null()
+        && main_frame(browser).is_some_and(|main| std::ptr::eq(main, frame))
 }
 
 fn request_url(

@@ -29,7 +29,9 @@ use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
 use mde_editor_egui::spell::{self, SpellMiss};
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
-use mde_egui::{ChipTone, Style};
+use mde_egui::ChipTone;
+#[cfg(test)]
+use mde_egui::Style;
 use mde_files_egui::model::FileSearchTarget;
 use mde_files_egui::transfers::{
     FileTransfers, Method as TransferMethod, TransferJob, TransferPolicy, TransferState,
@@ -94,12 +96,7 @@ const CEF_DEVTOOLS_LIST_URL: &str = "http://127.0.0.1:9222/json/list";
 const CEF_DEVTOOLS_TIMEOUT: Duration = Duration::from_millis(450);
 
 pub(super) fn browser_product_label() -> String {
-    let codename = mde_theme::brand::build::info().codename;
-    if codename.is_empty() {
-        format!("{} Browser", mde_theme::brand::logo::PRODUCT_NAME)
-    } else {
-        format!("{codename} Browser")
-    }
+    format!("{} Browser", mde_theme::brand::logo::PRODUCT_NAME)
 }
 
 /// Environment variable pointing at a pinned CEF bundle root (mirrors
@@ -131,7 +128,7 @@ const CEF_ICU_DATA: &str = "icudtl.dat";
 const CEF_RESOURCES_PAK: &str = "resources.pak";
 
 /// The native new-tab URL. A real helper session still loads this, while the shell
-/// overlays the Quazar dashboard chrome for it.
+/// overlays the Construct dashboard chrome for it.
 const NEW_TAB_URL: &str = "about:blank";
 
 /// The first page a freshly spawned live tab loads.
@@ -171,23 +168,23 @@ const INIT_H: u32 = 800;
 /// click-correct via [`map_pointer_to_frame`], just gently upscaled.
 const MAX_CHANNEL_DIM: u32 = 4096;
 
-const CHROME_FONT: f32 = 10.0;
-const CHROME_BUTTON: f32 = 20.0;
-const CHROME_TAB_H: f32 = 22.0;
-const CHROME_TAB_W: f32 = 132.0;
-const CHROME_TAB_RAIL_W: f32 = 160.0;
+const CHROME_FONT: f32 = 11.0;
+const CHROME_BUTTON: f32 = 22.0;
+const CHROME_TAB_H: f32 = 24.0;
+const CHROME_TAB_W: f32 = 140.0;
+const CHROME_TAB_RAIL_W: f32 = 172.0;
 /// The floor a horizontal tab pill shrinks to once the strip is crowded. Below
 /// this the strip stops shrinking and scrolls horizontally instead of wrapping
 /// onto a second row (the standard desktop-browser overflow behaviour).
-const CHROME_TAB_MIN_W: f32 = 54.0;
+const CHROME_TAB_MIN_W: f32 = 60.0;
 /// The fixed, compact width of a pinned tab's pill (favicon only, no title, no ×) —
 /// Chrome's pinned tabs collapse to an icon. Constant so pinned tabs never shrink
 /// under the crowded-strip overflow the way unpinned pills do.
-const CHROME_TAB_PINNED_W: f32 = 24.0;
-const CHROME_TAB_CLOSE: f32 = 18.0;
-const CHROME_NEW_TAB_W: f32 = 58.0;
-const CHROME_OMNIBOX_H: f32 = 22.0;
-const CHROME_GAP: f32 = 2.0;
+const CHROME_TAB_PINNED_W: f32 = 28.0;
+const CHROME_TAB_CLOSE: f32 = 20.0;
+const CHROME_NEW_TAB_W: f32 = 62.0;
+const CHROME_OMNIBOX_H: f32 = 24.0;
+const CHROME_GAP: f32 = 3.0;
 const DEFAULT_VERTICAL_TABS: bool = true;
 const DEFAULT_DENIED_PERMISSIONS: &str = "location, camera, microphone, notifications, clipboard";
 const PAGE_ZOOM_MIN: u16 = 50;
@@ -1590,7 +1587,7 @@ pub(crate) struct WebState {
     /// Destination for the pending HTTPS prompt: active-tab load or a new-tab
     /// open intent that must not bypass the same transport decision.
     insecure_prompt_target: InsecureNavigationTarget,
-    /// Quazar new-tab dashboard search draft. This is chrome state, not page
+    /// Construct new-tab dashboard search draft. This is chrome state, not page
     /// content; submitted searches load the mesh SearXNG URL into the active tab.
     dashboard_query: String,
     /// New-tab speed-dial shortcuts. These start with mesh-local defaults but are
@@ -2614,7 +2611,7 @@ impl WebState {
         if tab.internal_page.is_some() || tab.idle_suspended || tab.session.is_crashed() {
             return None;
         }
-        if tab.session.media_metadata().is_some() || tab.session.audible() {
+        if active_tab_media_needs_fast_repaint(tab) {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
         if tab.session.nav().loading {
@@ -7187,11 +7184,15 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         let panel_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         if panel_rect.is_positive() {
             ui.allocate_rect(panel_rect, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(panel_rect, 0.0, chrome_ui::CHROME_SURFACE);
             let rail_right = (panel_rect.left() + CHROME_TAB_RAIL_W).min(panel_rect.right());
             let rail_rect = egui::Rect::from_min_max(
                 panel_rect.min,
                 egui::pos2(rail_right, panel_rect.bottom()),
             );
+            ui.painter()
+                .rect_filled(rail_rect, 0.0, chrome_ui::CHROME_SURFACE_CONTAINER);
             let content_left = (rail_right + CHROME_GAP).min(panel_rect.right());
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(content_left, panel_rect.top()),
@@ -7232,6 +7233,8 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         let panel_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         if panel_rect.is_positive() {
             ui.allocate_rect(panel_rect, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(panel_rect, 0.0, chrome_ui::CHROME_SURFACE);
             let mut panel_ui = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(panel_rect)
@@ -7332,6 +7335,19 @@ fn tab_media_is_playing(tab: &Tab) -> bool {
         .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata.body).ok())
         .and_then(|value| value.get("paused").and_then(serde_json::Value::as_bool))
         .is_some_and(|paused| !paused)
+}
+
+fn active_tab_media_needs_fast_repaint(tab: &Tab) -> bool {
+    if tab.session.audible() {
+        return true;
+    }
+    let Some(metadata) = tab.session.media_metadata() else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&metadata.body)
+        .ok()
+        .and_then(|value| value.get("paused").and_then(serde_json::Value::as_bool))
+        .map_or(true, |paused| !paused)
 }
 
 /// The crash reason string for a session, or empty if it has not crashed.
@@ -8539,14 +8555,14 @@ const NEW_TAB_SERVICES: [MeshServiceShortcut; 4] = [
         hint: "Open the active-active Navidrome mesh service",
     },
     MeshServiceShortcut {
-        label: "Horizon",
-        url: "https://horizon.mesh/",
-        hint: "Open the optional OpenStack dashboard when enabled",
+        label: "Docs",
+        url: "https://docs.mesh/browser",
+        hint: "Open the installed mesh documentation service",
     },
     MeshServiceShortcut {
-        label: "Keystone",
-        url: "http://keystone.mesh:5000/v3",
-        hint: "Open the OpenStack identity API endpoint",
+        label: "Status",
+        url: "https://status.mesh/browser",
+        hint: "Open the installed mesh status service",
     },
 ];
 
@@ -9627,6 +9643,44 @@ mod tests {
         canvas
     }
 
+    fn rect_pixels(rect: Rect, canvas: &crate::screenshot::Canvas) -> usize {
+        let x0 = rect.left().floor().max(0.0) as usize;
+        let y0 = rect.top().floor().max(0.0) as usize;
+        let x1 = rect.right().ceil().min(canvas.width() as f32) as usize;
+        let y1 = rect.bottom().ceil().min(canvas.height() as f32) as usize;
+        x1.saturating_sub(x0) * y1.saturating_sub(y0)
+    }
+
+    fn count_chrome_light_pixels(canvas: &crate::screenshot::Canvas, rect: Rect) -> usize {
+        [
+            chrome_ui::CHROME_SURFACE,
+            chrome_ui::CHROME_SURFACE_CONTAINER,
+            chrome_ui::CHROME_SURFACE_CONTAINER_HIGH,
+            chrome_ui::CHROME_TOOLBAR,
+        ]
+        .into_iter()
+        .map(|color| canvas.count_near_color_in_rect(rect, color, 10))
+        .sum()
+    }
+
+    fn assert_chrome_light_surface(
+        canvas: &crate::screenshot::Canvas,
+        rect: Rect,
+        surface: &str,
+        min_ratio: f32,
+    ) {
+        let light_pixels = count_chrome_light_pixels(canvas, rect);
+        let total_pixels = rect_pixels(rect, canvas);
+        assert!(
+            total_pixels > 0,
+            "{surface} visual-audit rect must cover pixels"
+        );
+        assert!(
+            (light_pixels as f32) >= (total_pixels as f32 * min_ratio),
+            "{surface} must stay on the official light Chrome palette; got {light_pixels}/{total_pixels} light pixels"
+        );
+    }
+
     #[test]
     fn browser_visual_audit_screenshots_cover_tab_modes_and_viewports() {
         let mut options = WebState::default();
@@ -9643,6 +9697,18 @@ mod tests {
             clear_pixels < total_pixels / 20,
             "Browser Options screenshot must paint the full body; clear pixels: {clear_pixels}/{total_pixels}"
         );
+        assert_chrome_light_surface(
+            &wide,
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 72.0)),
+            "wide Browser toolbar",
+            0.60,
+        );
+        assert_chrome_light_surface(
+            &wide,
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(CHROME_TAB_RAIL_W, 800.0)),
+            "wide Browser vertical tab rail",
+            0.60,
+        );
 
         let (session, _helper, _writer) = live_page_session();
         let mut page = WebState::default();
@@ -9652,6 +9718,13 @@ mod tests {
             "browser-compact-horizontal-page.png",
             &mut page,
             vec2(540.0, 720.0),
+        );
+        let compact_toolbar = Rect::from_min_size(pos2(0.0, 0.0), vec2(540.0, 72.0));
+        assert_chrome_light_surface(
+            &compact,
+            compact_toolbar,
+            "compact horizontal Browser toolbar",
+            0.50,
         );
         assert!(
             page.tabs[page.active].texture.is_some(),
@@ -9851,22 +9924,25 @@ mod tests {
     }
 
     #[test]
-    fn browser_artifacts_use_canonical_quazar_browser_identity() {
-        assert_eq!(browser_product_label(), "Quazar Browser");
+    fn browser_artifacts_use_canonical_construct_browser_identity() {
+        assert_eq!(browser_product_label(), "Construct Browser");
         assert_eq!(
             browser_capture_dir()
                 .file_name()
                 .and_then(|name| name.to_str()),
-            Some("Quazar Browser Captures")
+            Some("Construct Browser Captures")
         );
         assert_eq!(
             browser_pdf_dir().file_name().and_then(|name| name.to_str()),
-            Some("Quazar Browser PDFs")
+            Some("Construct Browser PDFs")
         );
-        assert_eq!(cups_job_title("", "", 42), "Quazar Browser - Browser page");
+        assert_eq!(
+            cups_job_title("", "", 42),
+            "Construct Browser - Browser page"
+        );
         assert_eq!(
             cups_job_title("https://example.test/", "Example", 42),
-            "Quazar Browser - Example"
+            "Construct Browser - Example"
         );
 
         let capture = String::from_utf8(mhtml_capture_document(
@@ -9876,8 +9952,8 @@ mod tests {
             b"png",
         ))
         .expect("capture mhtml utf8");
-        assert!(capture.contains("Subject: Quazar Browser Capture - Example"));
-        assert!(!capture.contains("Magic Mesh Browser"));
+        assert!(capture.contains("Subject: Construct Browser Capture - Example"));
+        assert!(!capture.contains(concat!("Magic", " Mesh Browser")));
 
         let offline = String::from_utf8(offline_cache_mhtml_document(
             "https://example.test/",
@@ -9887,8 +9963,8 @@ mod tests {
             None,
         ))
         .expect("offline mhtml utf8");
-        assert!(offline.contains("Subject: Quazar Browser Offline Copy - Example"));
-        assert!(!offline.contains("Magic Mesh Browser"));
+        assert!(offline.contains("Subject: Construct Browser Offline Copy - Example"));
+        assert!(!offline.contains(concat!("Magic", " Mesh Browser")));
     }
 
     #[test]
@@ -9926,8 +10002,8 @@ mod tests {
         assert!(
             image.pixels[frame_pixels..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT),
-            "caption band should contain rendered annotation text"
+                .any(|pixel| *pixel == chrome_ui::CHROME_TEXT),
+            "caption band should contain rendered Browser Chrome annotation text"
         );
     }
 
@@ -9966,8 +10042,8 @@ mod tests {
         assert!(
             image.pixels[frame_pixels..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT_STRONG),
-            "callout capture should render a callout label into the caption band"
+                .any(|pixel| *pixel == chrome_ui::CHROME_TEXT),
+            "callout capture should render a Chrome-colored callout label into the caption band"
         );
     }
 
@@ -10006,8 +10082,8 @@ mod tests {
         assert!(
             image.pixels[frame_pixels..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT_STRONG),
-            "freehand capture should render a freehand label into the caption band"
+                .any(|pixel| *pixel == chrome_ui::CHROME_PRIMARY),
+            "freehand capture should render a Chrome primary freehand label into the caption band"
         );
     }
 
@@ -10024,8 +10100,14 @@ mod tests {
         assert!(
             annotated.pixels[img.pixels.len()..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT),
-            "caption text should be painted into the appended band"
+                .any(|pixel| *pixel == chrome_ui::CHROME_TEXT),
+            "Chrome caption text should be painted into the appended band"
+        );
+        assert!(
+            annotated.pixels[img.pixels.len()..]
+                .iter()
+                .any(|pixel| *pixel == chrome_ui::CHROME_SURFACE_CONTAINER),
+            "caption band should use the Browser Chrome surface container"
         );
     }
 
@@ -10045,14 +10127,14 @@ mod tests {
         assert!(
             annotated.pixels[..(64 * 48)]
                 .iter()
-                .any(|pixel| *pixel == Style::ACCENT),
-            "callout overlay should paint an accent rectangle or leader line"
+                .any(|pixel| *pixel == chrome_ui::CHROME_PRIMARY),
+            "callout overlay should paint a Chrome primary rectangle or leader line"
         );
         assert!(
             annotated.pixels[(64 * 48)..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT_STRONG),
-            "callout label should be painted into the appended band"
+                .any(|pixel| *pixel == chrome_ui::CHROME_TEXT),
+            "callout label should use Chrome text in the appended band"
         );
     }
 
@@ -10072,14 +10154,14 @@ mod tests {
         assert!(
             annotated.pixels[..(64 * 48)]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT_STRONG),
-            "freehand overlay should paint a visible white stroke"
+                .any(|pixel| *pixel == chrome_ui::CHROME_PRIMARY),
+            "freehand overlay should paint a visible Chrome primary stroke"
         );
         assert!(
             annotated.pixels[(64 * 48)..]
                 .iter()
-                .any(|pixel| *pixel == Style::TEXT_STRONG),
-            "freehand label should be painted into the appended band"
+                .any(|pixel| *pixel == chrome_ui::CHROME_PRIMARY),
+            "freehand label should use Chrome primary in the appended band"
         );
     }
 
@@ -10413,6 +10495,41 @@ mod tests {
                 false
             ),
             Some(egui::Event::PointerGone)
+        );
+    }
+
+    #[test]
+    fn focused_browser_page_does_not_turn_outside_presses_into_page_edge_clicks() {
+        let rect = Rect::from_min_size(pos2(100.0, 40.0), vec2(800.0, 600.0));
+        let frame = [1600usize, 1200usize];
+        let outside = pos2(1000.0, 700.0);
+        let press = egui::Event::PointerButton {
+            pos: outside,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        assert_eq!(
+            browser_input_event(&press, rect, frame, true, false),
+            None,
+            "a focused page must not reinterpret chrome/outside presses as clamped page-edge clicks"
+        );
+
+        let release = egui::Event::PointerButton {
+            pos: outside,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        assert_eq!(
+            browser_input_event(&release, rect, frame, true, true),
+            Some(egui::Event::PointerButton {
+                pos: pos2(1600.0, 1200.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }),
+            "a drag-stop release still reaches the helper so page buttons cannot stay latched"
         );
     }
 
@@ -11366,7 +11483,7 @@ mod tests {
     #[test]
     fn browser_print_pdf_events_use_user_facing_notices() {
         let mut state = WebState::default();
-        let path = "/tmp/quazar-print-missing.pdf".to_owned();
+        let path = "/tmp/construct-print-missing.pdf".to_owned();
         state.pending_cups_prints.insert(
             path.clone(),
             CupsPrintRequest {
@@ -12072,7 +12189,7 @@ mod tests {
     #[test]
     fn browser_output_label_hides_parent_paths() {
         assert_eq!(
-            browser_output_label(Path::new("/tmp/quazar/report.pdf")),
+            browser_output_label(Path::new("/tmp/construct/report.pdf")),
             "report.pdf"
         );
         assert_eq!(
@@ -12081,7 +12198,7 @@ mod tests {
         );
         assert_eq!(browser_output_label(Path::new("/")), "saved file");
 
-        let long = Path::new("/tmp/quazar/abcdefghijklmnopqrstuvwxyz0123456789-output.pdf");
+        let long = Path::new("/tmp/construct/abcdefghijklmnopqrstuvwxyz0123456789-output.pdf");
         let label = browser_output_label(long);
         assert!(label.ends_with("..."));
         assert!(label.chars().count() <= 48);
@@ -14603,6 +14720,48 @@ mod tests {
     }
 
     #[test]
+    fn paused_active_browser_media_page_uses_low_rate_heartbeat() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Paused video","paused":true}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            state.active_live_page_repaint_interval(),
+            Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
+            "paused active media should not pin the DRM seat to a 16 ms repaint loop"
+        );
+    }
+
+    #[test]
+    fn active_browser_media_with_unknown_play_state_keeps_fast_heartbeat() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Live video"}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+
+        assert_eq!(
+            state.active_live_page_repaint_interval(),
+            Some(LIVE_PAGE_REPAINT_INTERVAL),
+            "unknown media play state keeps the safer fast cadence for live video"
+        );
+    }
+
+    #[test]
     fn closing_the_last_tab_returns_to_the_honest_empty_state() {
         let (session, _helper) = testkit::connect().expect("connect");
         let mut state = WebState::default();
@@ -14672,6 +14831,85 @@ mod tests {
         assert!(
             chrome_ui::chrome_icon_painted_shape_count(chrome_ui::ChromeIcon::NewTab) > 0,
             "new-tab toolbar control is a painted icon button"
+        );
+    }
+
+    #[test]
+    fn browser_toolbar_order_model_keeps_only_page_navigation_left_of_location() {
+        use chrome_ui::NavToolbarSlot::{
+            Back, BlockedRequests, Capture, DownloadBadge, Downloads, Forward, Go, LoadingStatus,
+            MediaToolbar, NewTabType, Options, PageActions, Passwords, RefreshStop,
+        };
+
+        let full = chrome_ui::nav_toolbar_model(false, 3, 7, true, true);
+        assert_eq!(
+            full.left_of_location,
+            vec![NewTabType, Back, RefreshStop, Forward],
+            "only New Tab/type, Back, Refresh/Stop, and Forward stay left of Location"
+        );
+        assert_eq!(
+            full.right_of_location,
+            vec![
+                Go,
+                PageActions,
+                Passwords,
+                Capture,
+                Downloads,
+                DownloadBadge,
+                BlockedRequests,
+                LoadingStatus,
+                MediaToolbar,
+                Options,
+            ],
+            "page and tool actions move to the right of Location before Options"
+        );
+
+        let options_idx = full
+            .right_of_location
+            .iter()
+            .position(|slot| *slot == Options)
+            .expect("Options stays in the far-right toolbar slot");
+        for moved in [
+            Go,
+            PageActions,
+            Passwords,
+            Capture,
+            Downloads,
+            DownloadBadge,
+            BlockedRequests,
+            LoadingStatus,
+            MediaToolbar,
+        ] {
+            assert!(
+                !full.left_of_location.contains(&moved),
+                "{moved:?} must not be left of Location"
+            );
+            assert!(
+                full.right_of_location
+                    .iter()
+                    .position(|slot| *slot == moved)
+                    .is_some_and(|idx| idx < options_idx),
+                "{moved:?} must sit right of Location before Options"
+            );
+        }
+
+        let compact = chrome_ui::nav_toolbar_model(true, 3, 7, true, true);
+        assert_eq!(
+            compact.right_of_location,
+            vec![Go, Downloads, DownloadBadge, Options],
+            "compact Browser chrome sheds optional right-side tools before squeezing Location"
+        );
+
+        let settled = chrome_ui::nav_toolbar_model(false, 0, 0, false, false);
+        let loading = chrome_ui::nav_toolbar_model(false, 0, 0, true, false);
+        assert_eq!(
+            loading.trailing_reserve - settled.trailing_reserve,
+            CHROME_BUTTON + CHROME_GAP,
+            "the budget model reserves the full toolbar loading status before Location is measured"
+        );
+        assert!(
+            full.trailing_reserve > compact.trailing_reserve,
+            "full toolbar budget must account for the moved right-side controls"
         );
     }
 
@@ -15247,6 +15485,7 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut state = WebState::default();
+        state.dashboard_query = "mesh docs".to_owned();
 
         let out = ctx.run(body_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -15257,8 +15496,14 @@ mod tests {
         assert!(
             texts
                 .iter()
+                .any(|(text, color)| text == "mesh docs" && *color == chrome_ui::CHROME_TEXT),
+            "dashboard search field must use Browser text: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
                 .any(|(text, color)| text == "Search" && *color == chrome_ui::CHROME_TOOLBAR),
-            "dashboard submit must use Browser primary-on text: {texts:?}"
+            "dashboard submit must use a Browser icon button, not a text Search button: {texts:?}"
         );
         assert!(
             texts
@@ -15293,6 +15538,24 @@ mod tests {
             wait_for_fresh_frame(&mut state),
             "dashboard search reached the helper"
         );
+    }
+
+    #[test]
+    fn new_tab_default_shortcuts_use_installed_services_not_retired_openstack_endpoints() {
+        let labels: Vec<_> = NEW_TAB_SERVICES
+            .iter()
+            .map(|service| service.label)
+            .collect();
+        assert_eq!(labels, vec!["Search", "Music", "Docs", "Status"]);
+        let urls: Vec<_> = NEW_TAB_SERVICES.iter().map(|service| service.url).collect();
+        assert!(
+            !urls
+                .iter()
+                .any(|url| url.contains("horizon.mesh") || url.contains("keystone.mesh")),
+            "new-tab defaults must not point at retired OpenStack web endpoints: {urls:?}"
+        );
+        assert!(urls.contains(&"https://docs.mesh/browser"));
+        assert!(urls.contains(&"https://status.mesh/browser"));
     }
 
     #[test]
@@ -23228,7 +23491,7 @@ mod tests {
     #[test]
     fn browser_output_notices_hide_absolute_paths() {
         let mut state = WebState::default();
-        let pdf_path = "/tmp/quazar-output/report.pdf".to_owned();
+        let pdf_path = "/tmp/construct-output/report.pdf".to_owned();
         assert_eq!(
             state.handle_pdf_event(pdf_path.clone(), true),
             "PDF saved: report.pdf"
@@ -23238,7 +23501,7 @@ mod tests {
             "PDF completion notices should use a filename label"
         );
         state.last_saved_pdf = Some(SavedPdf {
-            path: PathBuf::from("/tmp/quazar-output/not-pdf.pdf"),
+            path: PathBuf::from("/tmp/construct-output/not-pdf.pdf"),
             url: "https://example.test/".to_owned(),
             title: "Example".to_owned(),
         });
@@ -23252,7 +23515,7 @@ mod tests {
         let mut capture_state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
         capture_state.record_capture_success(
             "Captured web archive",
-            Path::new("/tmp/quazar-output/capture.mhtml"),
+            Path::new("/tmp/construct-output/capture.mhtml"),
         );
         assert_eq!(
             capture_state.capture_notice.as_deref(),

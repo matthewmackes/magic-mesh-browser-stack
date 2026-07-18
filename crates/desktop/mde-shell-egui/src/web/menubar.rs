@@ -1131,10 +1131,8 @@ pub(super) fn show(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
     let menus = build_menus(&snap);
     let status = build_status(&snap);
     let model = MenuBarModel {
-        // The dock groups Browser under **Terminals** (teal), so the title
-        // wears that categorical accent (lock 2).
         title: "Browser",
-        accent: Style::ACCENT_TERMINALS,
+        accent: Style::ACCENT_WEB,
         menus: &menus,
         status: &status,
     };

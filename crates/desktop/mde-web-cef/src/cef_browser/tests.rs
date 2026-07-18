@@ -496,14 +496,141 @@ static STOP_LOAD_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_LAST: AtomicI32 = AtomicI32::new(0);
 static TEST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
+static TEST_MAIN_FRAME_PTR: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn test_browser_host(_browser: *mut c_void) -> *mut c_void {
     TEST_HOST_PTR.load(AtomicOrdering::SeqCst) as *mut c_void
 }
 
+unsafe extern "C" fn test_main_frame(_browser: *mut c_void) -> *mut c_void {
+    TEST_MAIN_FRAME_PTR.load(AtomicOrdering::SeqCst) as *mut c_void
+}
+
 unsafe extern "C" fn record_focus(_host: *mut c_void, focused: c_int) {
     FOCUS_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     FOCUS_LAST.store(focused, AtomicOrdering::SeqCst);
+}
+
+#[test]
+fn cef_address_changes_only_update_top_level_url_from_the_main_frame() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser
+        [CEF_BROWSER_GET_MAIN_FRAME_OFFSET..CEF_BROWSER_GET_MAIN_FRAME_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_main_frame as *const () as usize).to_ne_bytes());
+    let mut main = vec![0u8; CEF_FRAME_SIZE];
+    let mut subframe = vec![0u8; CEF_FRAME_SIZE];
+    TEST_MAIN_FRAME_PTR.store(main.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+
+    let display = callbacks.state.display_ptr();
+    let browser = browser.as_mut_ptr().cast();
+    let main_url = CefStringOwned::new("https://news.example/article").expect("main url");
+    let subframe_url = CefStringOwned::new("https://ads.example/frame").expect("subframe url");
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            subframe_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "",
+        "a subframe address event must not claim top-level browser chrome"
+    );
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            main.as_mut_ptr().cast(),
+            main_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "https://news.example/article"
+    );
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            subframe_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "https://news.example/article",
+        "a later iframe navigation must not overwrite the committed page URL"
+    );
+}
+
+#[test]
+fn cef_navigation_generation_ignores_subframe_navigation_callbacks() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser
+        [CEF_BROWSER_GET_MAIN_FRAME_OFFSET..CEF_BROWSER_GET_MAIN_FRAME_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_main_frame as *const () as usize).to_ne_bytes());
+    let mut main = vec![0u8; CEF_FRAME_SIZE];
+    let mut subframe = vec![0u8; CEF_FRAME_SIZE];
+    TEST_MAIN_FRAME_PTR.store(main.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+    let request = callbacks.state.request_ptr();
+    let mut disable_default_handling = -1;
+    let browser = browser.as_mut_ptr().cast();
+
+    unsafe {
+        get_resource_request_handler(
+            request,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            1,
+            0,
+            ptr::null(),
+            &mut disable_default_handling,
+        );
+    }
+    assert_eq!(
+        callbacks.state.navigations(),
+        0,
+        "subframe navigations should not trigger top-level reinjection cadence"
+    );
+    assert_eq!(disable_default_handling, 0);
+
+    unsafe {
+        get_resource_request_handler(
+            request,
+            browser,
+            main.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            1,
+            0,
+            ptr::null(),
+            &mut disable_default_handling,
+        );
+    }
+    assert_eq!(callbacks.state.navigations(), 1);
 }
 
 unsafe extern "C" fn record_key_event(_host: *mut c_void, event: *const c_void) {

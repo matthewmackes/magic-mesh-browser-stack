@@ -13,7 +13,7 @@ use super::super::{
 };
 use super::*;
 use mde_egui::egui::{RichText, Sense};
-use mde_files_egui::transfers::{TransferState, TransferVerb};
+use mde_files_egui::transfers::{TransferJob, TransferState, TransferVerb};
 
 const DRAWER_ICON_BUTTON_W: f32 = 28.0;
 const DRAWER_ICON_BUTTON_H: f32 = 24.0;
@@ -21,6 +21,10 @@ const DRAWER_CONTROL_RADIUS: f32 = 6.0;
 pub(super) const QR_MATRIX_LIGHT: egui::Color32 = super::CHROME_TOOLBAR;
 pub(super) const QR_MATRIX_DARK: egui::Color32 = super::CHROME_TEXT;
 pub(super) const PRINT_PAGE_RANGE_HELP: &str = "Page range, e.g. 1-5,8: empty prints all pages";
+
+fn drawer_available_width(ui: &egui::Ui) -> f32 {
+    super::bounded_available_width(ui).max(0.0)
+}
 
 pub(super) fn download_drawer_subtitle(
     worker_present: bool,
@@ -81,6 +85,110 @@ fn install_download_row_accessibility(
             node.set_max_numeric_value(100.0);
         }
     });
+}
+
+#[derive(Default)]
+struct DownloadRowCommand {
+    action: Option<TransferVerb>,
+    removed: bool,
+    open: bool,
+    reveal: bool,
+    copy_link: bool,
+}
+
+fn download_job_summary(ui: &mut egui::Ui, job: &TransferJob) {
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(short_transfer_name(job))
+                    .size(Style::SMALL)
+                    .color(super::CHROME_TEXT),
+            );
+            ui.label(
+                RichText::new(job.state.label())
+                    .size(Style::SMALL)
+                    .color(download_state_color(job.state)),
+            );
+            if job.policy.verify {
+                ui.label(
+                    RichText::new("verify")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+            }
+        });
+        ui.label(
+            RichText::new(job.route())
+                .size(Style::SMALL)
+                .color(super::CHROME_TEXT_DIM),
+        );
+        if let Some(progress) = job.progress {
+            drawer_progress_bar(ui, progress);
+        }
+        if let Some(err) = &job.error {
+            drawer_status_row(ui, ChromeIcon::Warning, err, super::CHROME_ERROR);
+        }
+    });
+}
+
+fn download_job_action_buttons(
+    ui: &mut egui::Ui,
+    job: &TransferJob,
+    has_source_url: bool,
+) -> DownloadRowCommand {
+    let mut command = DownloadRowCommand::default();
+    if drawer_button(ui, "Remove", BrowserActionRole::Quiet, "Remove from list").clicked() {
+        command.removed = true;
+    }
+    if has_source_url
+        && drawer_button(
+            ui,
+            "Copy link",
+            BrowserActionRole::Secondary,
+            "Copy the download's source URL",
+        )
+        .clicked()
+    {
+        command.copy_link = true;
+    }
+    if job.state == TransferState::Done {
+        if drawer_button(
+            ui,
+            "Show",
+            BrowserActionRole::Secondary,
+            "Show the completed download in its folder",
+        )
+        .clicked()
+        {
+            command.reveal = true;
+        }
+        if drawer_button(
+            ui,
+            "Open",
+            BrowserActionRole::Secondary,
+            "Open the completed download",
+        )
+        .clicked()
+        {
+            command.open = true;
+        }
+    }
+    if !job.state.is_terminal()
+        && drawer_button(ui, "Cancel", BrowserActionRole::Quiet, "Cancel").clicked()
+    {
+        command.action = Some(TransferVerb::Cancel(job.id.clone()));
+    }
+    if job.state.can_resume()
+        && drawer_button(ui, "Resume", BrowserActionRole::Secondary, "Resume").clicked()
+    {
+        command.action = Some(TransferVerb::Resume(job.id.clone()));
+    }
+    if job.state.can_pause()
+        && drawer_button(ui, "Pause", BrowserActionRole::Secondary, "Pause").clicked()
+    {
+        command.action = Some(TransferVerb::Pause(job.id.clone()));
+    }
+    command
 }
 
 fn history_row_accesskit_id(index: usize, url: &str) -> egui::Id {
@@ -218,6 +326,7 @@ fn drawer_text_field(
     width: f32,
     tip: &str,
 ) -> egui::Response {
+    let width = width.min(drawer_available_width(ui)).max(1.0);
     let inner = egui::Frame::NONE
         .fill(super::CHROME_SURFACE)
         .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
@@ -251,6 +360,7 @@ fn drawer_multiline_text_field(
     rows: usize,
     tip: &str,
 ) -> egui::Response {
+    let width = width.min(drawer_available_width(ui)).max(1.0);
     let inner = egui::Frame::NONE
         .fill(super::CHROME_SURFACE)
         .stroke(egui::Stroke::new(1.0, super::CHROME_OUTLINE))
@@ -327,10 +437,19 @@ fn drawer_stepper(ui: &mut egui::Ui, value: &mut u16, min: u16, max: u16, tip: &
     .on_hover_ui(|ui| chrome_tooltip(ui, tip));
 }
 
+pub(super) fn drawer_progress_width(available_width: f32) -> f32 {
+    let available_width = available_width.max(0.0);
+    let preferred = (available_width * 0.55).max(120.0);
+    preferred.min(available_width)
+}
+
 fn drawer_progress_bar(ui: &mut egui::Ui, progress: u8) {
     let progress = progress.min(100);
     let fraction = f32::from(progress) / 100.0;
-    let width = (ui.available_width() * 0.55).max(120.0);
+    let width = drawer_progress_width(drawer_available_width(ui));
+    if width <= 0.0 {
+        return;
+    }
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 16.0), Sense::hover());
     let label = format!("{progress}%");
     let font = font_id(Style::SMALL);
@@ -374,6 +493,14 @@ fn drawer_button_enabled(
     chrome_hover_text(response, tip)
 }
 
+pub(super) const fn drawer_toggle_state_layer(checked: bool) -> egui::Color32 {
+    if checked {
+        super::CHROME_TOOLBAR
+    } else {
+        super::CHROME_TEXT
+    }
+}
+
 fn drawer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
     let font = font_id(Style::SMALL);
     let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, super::CHROME_TEXT));
@@ -388,7 +515,13 @@ fn drawer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Re
     } else {
         super::CHROME_TOOLBAR
     };
-    let fill = animated_response_fill(ui, &response, hover_fill, super::CHROME_TEXT, true);
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        hover_fill,
+        drawer_toggle_state_layer(*checked),
+        true,
+    );
     let box_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 6.0, rect.center().y - 7.0),
         egui::vec2(14.0, 14.0),
@@ -434,6 +567,14 @@ fn drawer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Re
     response
 }
 
+pub(super) const fn drawer_choice_chip_state_layer(selected: bool) -> egui::Color32 {
+    if selected {
+        super::CHROME_ON_PRIMARY_CONTAINER
+    } else {
+        super::CHROME_TEXT
+    }
+}
+
 fn drawer_choice_chip(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str) -> egui::Response {
     let font = font_id(Style::SMALL);
     let text_color = super::selected_text(selected);
@@ -445,7 +586,13 @@ fn drawer_choice_chip(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str)
     } else {
         super::CHROME_SURFACE
     };
-    let fill = animated_response_fill(ui, &response, base, super::CHROME_TEXT, true);
+    let fill = animated_response_fill(
+        ui,
+        &response,
+        base,
+        drawer_choice_chip_state_layer(selected),
+        true,
+    );
     let stroke = if selected {
         super::CHROME_PRIMARY
     } else {
@@ -471,7 +618,7 @@ fn drawer_choice_chip(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str)
 }
 
 fn drawer_separator(ui: &mut egui::Ui) {
-    let width = ui.available_width().max(1.0);
+    let width = drawer_available_width(ui).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 9.0), Sense::hover());
     let y = rect.center().y;
     ui.painter().line_segment(
@@ -873,18 +1020,19 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         .fill(super::CHROME_SURFACE_CONTAINER)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Downloads")
-                        .size(CHROME_FONT)
-                        .color(super::CHROME_TEXT),
-                );
-                ui.label(
-                    RichText::new(subtitle)
-                        .size(Style::SMALL)
-                        .color(super::CHROME_TEXT_DIM),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let compact_header = drawer_available_width(ui) < 220.0;
+            if compact_header {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Downloads")
+                            .size(CHROME_FONT)
+                            .color(super::CHROME_TEXT),
+                    );
+                    ui.label(
+                        RichText::new(&subtitle)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
+                    );
                     if drawer_close_button(ui, "Close downloads").clicked() {
                         state.downloads_open = false;
                     }
@@ -910,7 +1058,46 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
                         clear_all = true;
                     }
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Downloads")
+                            .size(CHROME_FONT)
+                            .color(super::CHROME_TEXT),
+                    );
+                    ui.label(
+                        RichText::new(&subtitle)
+                            .size(Style::SMALL)
+                            .color(super::CHROME_TEXT_DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if drawer_close_button(ui, "Close downloads").clicked() {
+                            state.downloads_open = false;
+                        }
+                        if drawer_icon_button(
+                            ui,
+                            ChromeIcon::Reload,
+                            BrowserActionRole::Quiet,
+                            "Refresh downloads",
+                        )
+                        .clicked()
+                        {
+                            state.refresh_downloads();
+                        }
+                        if !jobs.is_empty()
+                            && drawer_button(
+                                ui,
+                                "Clear all",
+                                BrowserActionRole::Quiet,
+                                "Remove every download from this list",
+                            )
+                            .clicked()
+                        {
+                            clear_all = true;
+                        }
+                    });
+                });
+            }
 
             if let Some(notice) = &state.download_notice {
                 drawer_status_row(ui, ChromeIcon::Warning, notice, super::CHROME_ERROR);
@@ -970,101 +1157,48 @@ pub(super) fn downloads_drawer(ui: &mut egui::Ui, state: &mut WebState) {
 
             for job in jobs.iter().take(6) {
                 drawer_separator(ui);
-                let row = ui.horizontal(|ui| {
+                let source_url = state.download_source_urls.get(&job.id).cloned();
+                let has_source_url = source_url.is_some();
+                let compact_row = drawer_available_width(ui) < 240.0;
+                let mut row_command = DownloadRowCommand::default();
+                let row = if compact_row {
                     ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(short_transfer_name(job))
-                                    .size(Style::SMALL)
-                                    .color(super::CHROME_TEXT),
-                            );
-                            ui.label(
-                                RichText::new(job.state.label())
-                                    .size(Style::SMALL)
-                                    .color(download_state_color(job.state)),
-                            );
-                            if job.policy.verify {
-                                ui.label(
-                                    RichText::new("verify")
-                                        .size(Style::SMALL)
-                                        .color(super::CHROME_TEXT_DIM),
-                                );
-                            }
-                        });
-                        ui.label(
-                            RichText::new(job.route())
-                                .size(Style::SMALL)
-                                .color(super::CHROME_TEXT_DIM),
-                        );
-                        if let Some(progress) = job.progress {
-                            drawer_progress_bar(ui, progress);
-                        }
-                        if let Some(err) = &job.error {
-                            drawer_status_row(ui, ChromeIcon::Warning, err, super::CHROME_ERROR);
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if drawer_button(ui, "Remove", BrowserActionRole::Quiet, "Remove from list")
-                            .clicked()
-                        {
-                            removed = Some(job.id.clone());
-                        }
-                        if let Some(url) = state.download_source_urls.get(&job.id) {
-                            if drawer_button(
-                                ui,
-                                "Copy link",
-                                BrowserActionRole::Secondary,
-                                "Copy the download's source URL",
-                            )
-                            .clicked()
-                            {
-                                ui.ctx().copy_text(url.clone());
-                                state.capture_notice = Some("Download link copied".to_owned());
-                            }
-                        }
-                        if job.state == TransferState::Done {
-                            if drawer_button(
-                                ui,
-                                "Show",
-                                BrowserActionRole::Secondary,
-                                "Show the completed download in its folder",
-                            )
-                            .clicked()
-                            {
-                                reveal_download = Some(job.id.clone());
-                            }
-                            if drawer_button(
-                                ui,
-                                "Open",
-                                BrowserActionRole::Secondary,
-                                "Open the completed download",
-                            )
-                            .clicked()
-                            {
-                                open_download = Some(job.id.clone());
-                            }
-                        }
-                        if !job.state.is_terminal()
-                            && drawer_button(ui, "Cancel", BrowserActionRole::Quiet, "Cancel")
-                                .clicked()
-                        {
-                            action = Some(TransferVerb::Cancel(job.id.clone()));
-                        }
-                        if job.state.can_resume()
-                            && drawer_button(ui, "Resume", BrowserActionRole::Secondary, "Resume")
-                                .clicked()
-                        {
-                            action = Some(TransferVerb::Resume(job.id.clone()));
-                        }
-                        if job.state.can_pause()
-                            && drawer_button(ui, "Pause", BrowserActionRole::Secondary, "Pause")
-                                .clicked()
-                        {
-                            action = Some(TransferVerb::Pause(job.id.clone()));
-                        }
-                    });
-                });
+                        download_job_summary(ui, job);
+                        row_command = ui
+                            .horizontal_wrapped(|ui| {
+                                download_job_action_buttons(ui, job, has_source_url)
+                            })
+                            .inner;
+                    })
+                } else {
+                    ui.horizontal(|ui| {
+                        download_job_summary(ui, job);
+                        row_command = ui
+                            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                download_job_action_buttons(ui, job, has_source_url)
+                            })
+                            .inner;
+                    })
+                };
                 install_download_row_accessibility(ui.ctx(), row.response.rect, job);
+                if let Some(verb) = row_command.action {
+                    action = Some(verb);
+                }
+                if row_command.removed {
+                    removed = Some(job.id.clone());
+                }
+                if row_command.copy_link {
+                    if let Some(url) = source_url {
+                        ui.ctx().copy_text(url);
+                        state.capture_notice = Some("Download link copied".to_owned());
+                    }
+                }
+                if row_command.reveal {
+                    reveal_download = Some(job.id.clone());
+                }
+                if row_command.open {
+                    open_download = Some(job.id.clone());
+                }
             }
 
             let hidden = jobs.len().saturating_sub(6);
@@ -1161,12 +1295,19 @@ pub(super) fn qr_share_drawer(ui: &mut egui::Ui, state: &mut WebState) {
         });
 }
 
+pub(super) fn qr_matrix_side(available_width: f32) -> f32 {
+    available_width.max(0.0).min(168.0)
+}
+
 fn paint_qr_matrix(ui: &mut egui::Ui, modules: &[Vec<bool>]) {
     let width = modules.len();
     if width == 0 {
         return;
     }
-    let side = 168.0_f32.min(ui.available_width().max(96.0));
+    let side = qr_matrix_side(drawer_available_width(ui));
+    if side <= 0.0 {
+        return;
+    }
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, QR_MATRIX_LIGHT);

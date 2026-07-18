@@ -1440,14 +1440,14 @@ pub(super) fn annotate_capture_image(
             img.pixels.len()
         ));
     }
-    let mut out = egui::ColorImage::new([w, out_h], Style::BG);
+    let mut out = egui::ColorImage::new([w, out_h], super::chrome_ui::CHROME_SURFACE);
     out.pixels[..expected].copy_from_slice(&img.pixels);
     for y in h..out_h {
         for x in 0..w {
             out.pixels[y * w + x] = if y == h {
-                Style::ACCENT
+                super::chrome_ui::CHROME_PRIMARY
             } else {
-                Style::SURFACE
+                super::chrome_ui::CHROME_SURFACE_CONTAINER
             };
         }
     }
@@ -1456,7 +1456,7 @@ pub(super) fn annotate_capture_image(
         6,
         h + 6,
         &caption.to_ascii_uppercase(),
-        Style::TEXT,
+        super::chrome_ui::CHROME_TEXT,
     );
     Ok(out)
 }
@@ -1468,7 +1468,7 @@ pub(super) fn annotate_callout_capture_image(
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
     if w < 16 || h < 12 {
-        draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
+        draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", super::chrome_ui::CHROME_TEXT);
         return Ok(out);
     }
 
@@ -1476,7 +1476,7 @@ pub(super) fn annotate_callout_capture_image(
     let box_h = (h / 3).clamp(8, 96);
     let x = (w.saturating_sub(box_w)) / 2;
     let y = (h.saturating_sub(box_h)) / 2;
-    let accent = Style::ACCENT;
+    let accent = super::chrome_ui::CHROME_PRIMARY;
     draw_rect_outline(&mut out, x, y, box_w, box_h, accent);
 
     let leader_start_x = x.saturating_add(box_w);
@@ -1504,9 +1504,9 @@ pub(super) fn annotate_callout_capture_image(
         leader_end_x.saturating_sub(8),
         leader_end_y.saturating_add(1),
         "1",
-        Style::TEXT_STRONG,
+        super::chrome_ui::CHROME_PRIMARY,
     );
-    draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
+    draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", super::chrome_ui::CHROME_TEXT);
     Ok(out)
 }
 
@@ -1516,7 +1516,7 @@ pub(super) fn annotate_freehand_capture_image(
 ) -> Result<egui::ColorImage, String> {
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
-    let stroke = Style::TEXT_STRONG;
+    let stroke = super::chrome_ui::CHROME_PRIMARY;
     if w < 16 || h < 12 {
         draw_tiny_text(&mut out, 6, h + 6, "FREEHAND", stroke);
         return Ok(out);

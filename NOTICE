@@ -10,6 +10,9 @@ following third-party components, each under its own license:
 - The broad Rust crate ecosystem (tokio, serde, rusqlite, rustls, image, tar,
   flate2, symphonia, cpal, etc.) — predominantly MIT / Apache-2.0 / BSD / Zlib /
   Unicode-DFS, all GPL-3.0-compatible.
+- YAMIS / Yet Another Monochrome Icon Set, bundled as the default platform icon
+  theme under `/usr/share/icons/YAMIS` and embedded for native shell glyphs —
+  GPL-3.0-compatible; see `assets/icons/YAMIS/YAMIS/LICENSE`.
 
 Bundled upstream release binaries (BIRTHRIGHT-2 — shipped in the RPM under
 /usr/share/magic-mesh/vendor/ for air-gapped first-boot provisioning; fetched +
