@@ -356,6 +356,14 @@ pub const CEF_BROWSER_HOST_FIND_OFFSET: usize = 208;
 pub const CEF_BROWSER_HOST_STOP_FINDING_OFFSET: usize = 216;
 /// `offsetof(cef_browser_host_t, was_resized)`.
 pub const CEF_BROWSER_HOST_WAS_RESIZED_OFFSET: usize = 304;
+/// `offsetof(cef_browser_host_t, was_hidden)` — field 34 of the pinned CEF 149
+/// `cef_browser_host_t` vtable (base `40 + 34*8 = 312`). It sits immediately after
+/// `was_resized` (field 33 = 304) and two slots before `invalidate`
+/// (field 36 = 328), which bracket it — so 312 is high-confidence even without the
+/// header. Signature `void(self, int hidden)`. Cross-check against the on-seat
+/// header `/opt/mde/cef/include/capi/cef_browser_capi.h` before shipping (assert
+/// the `40 + 34*8` field-index form, not the constant against itself).
+pub const CEF_BROWSER_HOST_WAS_HIDDEN_OFFSET: usize = 312;
 /// `offsetof(cef_browser_host_t, invalidate)`.
 pub const CEF_BROWSER_HOST_INVALIDATE_OFFSET: usize = 328;
 /// `offsetof(cef_browser_host_t, send_key_event)`.
@@ -1246,6 +1254,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::ClearFind => clear_find_in_page(browser),
         ControlMsg::EditCommand { command } => apply_edit_command(browser, *command),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
+        ControlMsg::SetHidden { hidden } => was_hidden(browser, *hidden),
         ControlMsg::ToggleMediaPlayback => apply_media_playback_toggle(browser),
         ControlMsg::MediaTransport { action } => apply_media_transport(browser, *action),
         ControlMsg::SetAutoplayBlocked { blocked } => {
@@ -4609,6 +4618,28 @@ fn set_audio_muted(browser: *mut c_void, muted: bool) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF and the mute flag is the CEF boolean int.
     unsafe { callback(host, if muted { 1 } else { 0 }) };
+}
+
+/// Tell the windowless browser it is hidden (`true`) or visible (`false`) via
+/// `cef_browser_host_t::was_hidden`. When hidden, CEF stops offscreen paint and
+/// composite for this browser, so a backgrounded tab no longer drives the
+/// `on_paint` → shm readback → shell convert/upload pipeline — the single biggest
+/// lever for many background media tabs. Media playback and audio keep running
+/// (this mirrors native `document.hidden`); only rendering stops. On `false` CEF
+/// resumes and schedules a fresh paint, so no explicit invalidate is needed.
+fn was_hidden(browser: *mut c_void, hidden: bool) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_WAS_HIDDEN_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is read from `cef_browser_host_t::was_hidden`, whose
+    // pinned C signature is `(cef_browser_host_t*, int)`.
+    let callback: unsafe extern "C" fn(*mut c_void, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF and the hidden flag is the CEF boolean int.
+    unsafe { callback(host, if hidden { 1 } else { 0 }) };
 }
 
 /// Push an IME preedit into the windowless browser via
