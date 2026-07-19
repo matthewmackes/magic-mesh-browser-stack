@@ -1037,6 +1037,13 @@ impl WebSession {
         self.send(&ControlMsg::SetAudioMuted { muted });
     }
 
+    /// Tell the helper whether this tab is hidden (backgrounded/occluded). A
+    /// hidden tab drives CEF `WasHidden(true)`, which stops its offscreen paint
+    /// and shm readback so an unseen tab no longer burns decode/copy work.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.send(&ControlMsg::SetHidden { hidden });
+    }
+
     /// Ask the helper to toggle media playback on the active page.
     pub fn toggle_media_playback(&mut self) {
         self.send(&ControlMsg::ToggleMediaPlayback);

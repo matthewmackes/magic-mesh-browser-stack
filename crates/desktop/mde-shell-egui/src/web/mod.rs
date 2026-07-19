@@ -268,6 +268,12 @@ struct Tab {
     pinned: bool,
     /// Per-tab audio mute state mirrored to the helper.
     muted: bool,
+    /// Last CEF visibility state sent to this tab's helper via
+    /// [`mde_web_preview_client::ControlMsg::SetHidden`]: `Some(true)` = told
+    /// hidden, `Some(false)` = told visible, `None` = never sent. Edge-triggers
+    /// the engine `WasHidden()` occlusion signal so a backgrounded tab stops its
+    /// offscreen paint + shm readback pipeline instead of painting ~30fps unseen.
+    hidden_sent: Option<bool>,
     /// Per-tab autoplay-block state mirrored to the helper.
     autoplay_blocked: bool,
     /// Per-tab forced dark rendering state mirrored to the helper.
@@ -2622,6 +2628,55 @@ impl WebState {
         self.sync_address_on_engine_nav();
         self.publish_media_status_if_changed();
         self.poll_session_snapshot();
+        self.reconcile_tab_visibility();
+    }
+
+    /// Whether tab `idx` should be hidden from its engine, given the active tab
+    /// and the optional picture-in-picture tab. A tab paints only when it is the
+    /// active tab or the PiP tab; every other live tab is hidden. Pure (takes no
+    /// `self`) so the decision is unit-tested directly.
+    fn tab_should_be_hidden(idx: usize, active: usize, pip_index: Option<usize>) -> bool {
+        idx != active && pip_index != Some(idx)
+    }
+
+    /// Whether a `SetHidden` message must actually be sent, given the last state
+    /// sent to this tab's helper and the newly-desired one. A fresh CEF browser is
+    /// visible by default, so a never-hidden visible tab needs no message; every
+    /// other case sends only on a real change. Suppressing the initial visible
+    /// send keeps a foreground tab's control stream clean (a background tab that
+    /// starts hidden still gets its `WasHidden(true)`). Pure, so it is unit-tested
+    /// directly.
+    fn should_send_hidden(prev: Option<bool>, hidden: bool) -> bool {
+        match prev {
+            Some(previous) => previous != hidden,
+            None => hidden,
+        }
+    }
+
+    /// Reconcile each live tab's engine visibility with its foreground state,
+    /// sending [`WebSession::set_hidden`] only on a real change (edge-triggered, so
+    /// it is cheap to call every browser frame). The active tab and the PiP tab
+    /// keep painting; every other live tab is told `WasHidden(true)` so it stops
+    /// the offscreen paint + shm readback pipeline — the fix for many background
+    /// media tabs pinning the CPU while the user sees only one. Internal pages have
+    /// no CEF session and are skipped.
+    fn reconcile_tab_visibility(&mut self) {
+        let active = self.active;
+        let pip_index = if self.media_pip_open {
+            browser_media_status_tab_index(self)
+        } else {
+            None
+        };
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.internal_page.is_some() {
+                continue;
+            }
+            let hidden = Self::tab_should_be_hidden(idx, active, pip_index);
+            if Self::should_send_hidden(tab.hidden_sent, hidden) {
+                tab.session.set_hidden(hidden);
+                tab.hidden_sent = Some(hidden);
+            }
+        }
     }
 
     /// Upload one tab's pending frame only when one is present, so an idle page
@@ -2908,6 +2963,7 @@ impl WebState {
             id,
             session,
             engine,
+            hidden_sent: None,
             internal_page: None,
             internal_peer: None,
             container: ContainerProfile::None,
@@ -2947,6 +3003,7 @@ impl WebState {
             id,
             session,
             engine: self.engine,
+            hidden_sent: None,
             internal_page: Some(page),
             internal_peer: Some(peer),
             container: ContainerProfile::None,
@@ -9398,6 +9455,41 @@ mod tests {
                 "missing userscript payload: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn tab_visibility_hides_all_but_active_and_pip() {
+        // Five tabs, active = 1, PiP = tab 3: only tabs 1 and 3 stay visible.
+        assert!(WebState::tab_should_be_hidden(0, 1, Some(3)));
+        assert!(
+            !WebState::tab_should_be_hidden(1, 1, Some(3)),
+            "active paints"
+        );
+        assert!(WebState::tab_should_be_hidden(2, 1, Some(3)));
+        assert!(!WebState::tab_should_be_hidden(3, 1, Some(3)), "PiP paints");
+        assert!(WebState::tab_should_be_hidden(4, 1, Some(3)));
+        // No PiP: only the active tab paints.
+        assert!(!WebState::tab_should_be_hidden(1, 1, None));
+        assert!(WebState::tab_should_be_hidden(0, 1, None));
+        // A tab that is both the active tab and the PiP index stays visible.
+        assert!(!WebState::tab_should_be_hidden(2, 2, Some(2)));
+
+        // Edge-send: a never-hidden visible tab stays silent (CEF starts visible),
+        // a new background tab is hidden, and un-hide/no-change behave as expected.
+        assert!(
+            !WebState::should_send_hidden(None, false),
+            "default-visible tab needs no message"
+        );
+        assert!(
+            WebState::should_send_hidden(None, true),
+            "a tab that opens in the background is hidden"
+        );
+        assert!(
+            WebState::should_send_hidden(Some(true), false),
+            "returning to the foreground un-hides"
+        );
+        assert!(!WebState::should_send_hidden(Some(false), false));
+        assert!(!WebState::should_send_hidden(Some(true), true));
     }
 
     #[test]
@@ -17097,6 +17189,7 @@ mod tests {
             id: 1,
             session,
             engine: BrowserEngine::Servo,
+            hidden_sent: None,
             internal_page: None,
             internal_peer: None,
             container: ContainerProfile::None,
