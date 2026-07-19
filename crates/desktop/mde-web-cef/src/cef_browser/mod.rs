@@ -3975,16 +3975,37 @@ unsafe extern "C" fn on_dismiss_permission_prompt(
     let _ = with_state(self_, |state| state.discard_permission_prompt(prompt_id));
 }
 
+/// Whether page audio should play through CEF's own pipeline to the OS
+/// (`MDE_CEF_NATIVE_AUDIO` set) instead of being diverted into our audio stream
+/// handler. Off by default, so the shipped audible-pip behavior is unchanged
+/// until the sandbox `/dev/snd` ALSA path is confirmed to carry CEF output on a
+/// live seat — this flag exists to A/B that on hardware without a rebuild.
+///
+/// NOTE (CEF 149, on-seat verified 2026-07-19): `cef_display_handler_t` has NO
+/// `on_audio_state_changed` on this build, so the audio STREAM handler is the only
+/// engine source of the audible bit — and opting into it is exactly what silences
+/// the OS output. In native-audio mode the shell therefore drives the 🔊 pip from
+/// page media metadata instead (see `web/mod.rs`).
+fn wants_native_audio() -> bool {
+    std::env::var_os("MDE_CEF_NATIVE_AUDIO").is_some()
+}
+
 /// CEF `get_audio_parameters(self, browser, params) -> int` — CEF asks whether we
 /// want the page's audio stream and, if so, in what format. Returning 0 makes CEF
-/// skip audio delivery entirely (the started/stopped callbacks never fire), so we
-/// return 1 (true) and fill a sane STEREO / 48 kHz / 1024-frame default. We never
-/// consume the samples — this only unlocks the audible-state signalling.
+/// skip our handler and play the audio itself (to the OS); returning 1 diverts the
+/// stream to our (no-op) handler, which unlocks the `on_audio_stream_*` audible
+/// signalling at the cost of silencing OS output. Default = 1 (indicator);
+/// `MDE_CEF_NATIVE_AUDIO` = 0 (native OS playback) — see [`wants_native_audio`].
 unsafe extern "C" fn get_audio_parameters(
     _self: *mut c_void,
     _browser: *mut c_void,
     params: *mut CefAudioParameters,
 ) -> c_int {
+    if wants_native_audio() {
+        // Decline the stream so CEF routes page audio to the OS through its own
+        // pipeline (native A/V sync). The stream callbacks never fire in this mode.
+        return 0;
+    }
     if !params.is_null() {
         // SAFETY: CEF supplied a non-null, writable `cef_audio_parameters_t`.
         // `size` leads the struct; keeping it correct pins channel_layout to
