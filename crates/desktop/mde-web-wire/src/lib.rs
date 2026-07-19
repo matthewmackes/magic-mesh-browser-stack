@@ -656,6 +656,17 @@ pub enum ControlMsg {
         /// `true` to mute audio, `false` to unmute.
         muted: bool,
     },
+    /// Tell the helper whether this tab is currently hidden — i.e. neither the
+    /// foreground tab nor picture-in-picture. A hidden tab calls CEF
+    /// `WasHidden(true)`, which stops offscreen paint/composite for that browser.
+    /// This is the single biggest lever for running many background media tabs
+    /// without the engine and the shm readback path burning CPU on frames the
+    /// user cannot see. The shell sends `hidden = false` the instant the tab
+    /// returns to the foreground so it resumes painting immediately.
+    SetHidden {
+        /// `true` when the tab is backgrounded/occluded; `false` when foreground.
+        hidden: bool,
+    },
     /// Toggle playback on the active page's HTML media elements.
     ToggleMediaPlayback,
     /// Run one page media transport action on HTML media elements.
@@ -870,6 +881,9 @@ impl std::fmt::Debug for ControlMsg {
                 .debug_struct("SetAudioMuted")
                 .field("muted", muted)
                 .finish(),
+            Self::SetHidden { hidden } => {
+                f.debug_struct("SetHidden").field("hidden", hidden).finish()
+            }
             Self::ToggleMediaPlayback => f.write_str("ToggleMediaPlayback"),
             Self::MediaTransport { action } => f
                 .debug_struct("MediaTransport")
@@ -1050,6 +1064,10 @@ impl ControlMsg {
                 out.push(12);
                 out.push(u8::from(*muted));
             }
+            Self::SetHidden { hidden } => {
+                out.push(38);
+                out.push(u8::from(*hidden));
+            }
             Self::ToggleMediaPlayback => out.push(36),
             Self::MediaTransport { action } => {
                 out.push(37);
@@ -1208,6 +1226,7 @@ impl ControlMsg {
             },
             11 => Self::ClearFind,
             12 => Self::SetAudioMuted { muted: c.bool()? },
+            38 => Self::SetHidden { hidden: c.bool()? },
             36 => Self::ToggleMediaPlayback,
             37 => Self::MediaTransport {
                 action: MediaTransportAction::from_u8(c.u8()?).ok_or(WireError::BadTag(37))?,
@@ -2144,6 +2163,8 @@ mod tests {
         round_control(&ControlMsg::ClearFind);
         round_control(&ControlMsg::SetAudioMuted { muted: true });
         round_control(&ControlMsg::SetAudioMuted { muted: false });
+        round_control(&ControlMsg::SetHidden { hidden: true });
+        round_control(&ControlMsg::SetHidden { hidden: false });
         round_control(&ControlMsg::ToggleMediaPlayback);
         for action in [
             MediaTransportAction::PlayPause,
