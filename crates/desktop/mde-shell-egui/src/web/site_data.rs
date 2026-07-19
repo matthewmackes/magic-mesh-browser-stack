@@ -19,14 +19,14 @@ pub(super) struct SiteDataManager {
 }
 
 impl SiteDataManager {
-    pub(super) fn observe_open_tabs<'a>(
-        &mut self,
-        hosts: impl IntoIterator<Item = &'a str>,
-        now_ms: u64,
-    ) {
+    pub(super) fn observe_open_tabs<I, S>(&mut self, hosts: I, now_ms: u64)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut counts = BTreeMap::<String, u32>::new();
         for host in hosts {
-            let host = host.trim().to_ascii_lowercase();
+            let host = host.as_ref().trim().to_ascii_lowercase();
             if !host.is_empty() {
                 *counts.entry(host).or_insert(0) += 1;
             }

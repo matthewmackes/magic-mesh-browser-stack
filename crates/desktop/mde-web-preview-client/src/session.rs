@@ -775,6 +775,33 @@ impl WebSession {
         self.recent_resource_requests.iter().cloned().collect()
     }
 
+    /// Whether the recent-resource window contains rows newer than `seq`.
+    ///
+    /// Resource sequence numbers are monotonically appended, so hot poll paths can
+    /// check the newest row before deciding whether to scan or clone the bounded
+    /// request history.
+    #[must_use]
+    pub fn has_recent_resource_requests_after(&self, seq: u64) -> bool {
+        self.recent_resource_requests
+            .back()
+            .is_some_and(|resource| resource.seq > seq)
+    }
+
+    /// Recent subresource requests observed after `seq`.
+    ///
+    /// The full recent list backs operator-facing site-info summaries. Hot shell
+    /// poll paths that only need newly observed rows should use this sequence
+    /// window so an unchanged active tab does not clone the full bounded history
+    /// every frame.
+    #[must_use]
+    pub fn recent_resource_requests_after(&self, seq: u64) -> Vec<ResourceRequestStatus> {
+        self.recent_resource_requests
+            .iter()
+            .filter(|resource| resource.seq > seq)
+            .cloned()
+            .collect()
+    }
+
     /// The session's live status.
     #[must_use]
     pub const fn state(&self) -> &SessionState {
@@ -1376,6 +1403,59 @@ mod tests {
                 .is_some_and(|rule| rule.contains("google")),
             "tracker block should retain the matched rule: {:?}",
             recent[0].blocked_by
+        );
+    }
+
+    #[test]
+    fn recent_resource_requests_after_returns_only_newer_rows() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        let _cosmetic = read_control_after_poll(&mut session, &mut peer);
+
+        for id in 1..=3 {
+            send_event(
+                &peer,
+                &EventMsg::ResourceRequest {
+                    id,
+                    url: format!("https://cdn.example.com/{id}.js"),
+                    resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                },
+            );
+            let _verdict = read_control_after_poll(&mut session, &mut peer);
+        }
+
+        let all = session.recent_resource_requests();
+        assert_eq!(all.len(), 3);
+        assert!(
+            session.has_recent_resource_requests_after(2),
+            "the newest resource sequence should expose a cheap hot-path signal"
+        );
+        assert_eq!(
+            session.recent_resource_requests_after(2),
+            vec![ResourceRequestStatus {
+                seq: 3,
+                url: "https://cdn.example.com/3.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                allowed: true,
+                blocked_by: None,
+            }],
+            "hot poll paths should clone only requests beyond their sequence watermark"
+        );
+        assert!(
+            !session.has_recent_resource_requests_after(3),
+            "an unchanged watermark should avoid scanning or cloning the resource window"
+        );
+        assert!(
+            session.recent_resource_requests_after(3).is_empty(),
+            "an unchanged active tab should not clone its full recent-resource history"
         );
     }
 

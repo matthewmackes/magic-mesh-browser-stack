@@ -169,8 +169,8 @@ const INIT_H: u32 = 800;
 const MAX_CHANNEL_DIM: u32 = 4096;
 
 const CHROME_FONT: f32 = 11.0;
-const CHROME_BUTTON: f32 = 22.0;
-const CHROME_TAB_H: f32 = 24.0;
+const CHROME_BUTTON: f32 = 21.0;
+const CHROME_TAB_H: f32 = 22.0;
 const CHROME_TAB_W: f32 = 140.0;
 const CHROME_TAB_RAIL_W: f32 = 172.0;
 /// The floor a horizontal tab pill shrinks to once the strip is crowded. Below
@@ -183,7 +183,7 @@ const CHROME_TAB_MIN_W: f32 = 60.0;
 const CHROME_TAB_PINNED_W: f32 = 28.0;
 const CHROME_TAB_CLOSE: f32 = 20.0;
 const CHROME_NEW_TAB_W: f32 = 62.0;
-const CHROME_OMNIBOX_H: f32 = 24.0;
+const CHROME_OMNIBOX_H: f32 = 32.0;
 const CHROME_GAP: f32 = 3.0;
 const DEFAULT_VERTICAL_TABS: bool = true;
 const DEFAULT_DENIED_PERMISSIONS: &str = "location, camera, microphone, notifications, clipboard";
@@ -282,6 +282,10 @@ struct Tab {
     device_profile: DeviceProfile,
     /// Last operator/page activity seen by the shell for idle-suspend accounting.
     last_activity: Instant,
+    /// Last time an inactive live tab drained its helper IPC. Active tabs poll every
+    /// panel frame; background tabs use a bounded cadence so extra tabs do not
+    /// multiply Browser-frame work on the DRM seat.
+    last_background_poll: Option<Instant>,
     /// Deadline for the short fast-repaint window granted to a loading page. Some
     /// sites keep Chromium's loading bit alive after first paint; once this expires
     /// a non-media page falls back to the static-page heartbeat so input stays
@@ -303,6 +307,10 @@ struct Tab {
     /// full-resolution pixel deep copy, on every decoded frame (the same `Arc`
     /// is handed to the texture upload — `egui::ImageData` stores `Arc<ColorImage>`).
     last_frame: Option<std::sync::Arc<egui::ColorImage>>,
+    /// Last time the shell uploaded a fresh helper frame. This keeps animated
+    /// pages/video on a short fast-repaint window even before audio/media metadata
+    /// arrives; static pages decay back to the low-rate helper heartbeat.
+    last_frame_uploaded_at: Option<Instant>,
     /// Last shell-local resource-request sequence audited from this tab's session.
     /// `recent_resource_requests()` is a bounded snapshot, so this watermark keeps
     /// pre-network resource-block audit events one-shot without changing helper wire.
@@ -347,6 +355,7 @@ fn initial_loading_fast_repaint_deadline(session: &WebSession, now: Instant) -> 
 fn start_tab_load(tab: &mut Tab, url: String) {
     tab.session.load(url);
     tab.loading_fast_repaint_until = Some(loading_fast_repaint_deadline(Instant::now()));
+    tab.last_frame_uploaded_at = None;
 }
 
 fn sync_tab_loading_repaint_budget(tab: &mut Tab, now: Instant) {
@@ -359,6 +368,17 @@ fn sync_tab_loading_repaint_budget(tab: &mut Tab, now: Instant) {
     }
 }
 
+fn background_tab_poll_due(tab: &Tab, now: Instant) -> bool {
+    tab.last_background_poll
+        .is_none_or(|last| now.saturating_duration_since(last) >= BACKGROUND_TAB_POLL_INTERVAL)
+}
+
+fn tab_recent_frame_needs_fast_repaint(tab: &Tab, now: Instant) -> bool {
+    tab.last_frame_uploaded_at.is_some_and(|last| {
+        now.saturating_duration_since(last) <= LIVE_PAGE_RECENT_FRAME_FAST_REPAINT_WINDOW
+    })
+}
+
 /// How long a new panel device size must hold steady before it is committed to the
 /// helper as a `session.resize` — long enough that a drag-resize sends ONE settled
 /// resize instead of one per frame, short enough to feel immediate.
@@ -369,6 +389,10 @@ const LIVE_PAGE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// Static Browser pages still need a light heartbeat so helper events are drained
 /// without pointer input, but they must not pin the bare DRM shell at 60 Hz.
 const LIVE_PAGE_IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+/// Fresh helper frames usually mean video/canvas/animation is active even before
+/// media metadata has caught up. Keep a short fast repaint window after each
+/// uploaded frame, then fall back to the static-page heartbeat.
+const LIVE_PAGE_RECENT_FRAME_FAST_REPAINT_WINDOW: Duration = Duration::from_millis(250);
 /// Loading pages get a short fast repaint burst for first paint and obvious page
 /// progress, then non-media pages fall back to the low-rate helper heartbeat.
 const LIVE_PAGE_LOADING_FAST_REPAINT_GRACE: Duration = Duration::from_secs(2);
@@ -712,6 +736,8 @@ const PASSKEY_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PASSKEY_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SECURITY_UPDATE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BACKGROUND_TAB_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_QUIET_BACKGROUND_TAB_POLLS_PER_PANEL: usize = 2;
 const IDLE_TAB_SUSPEND_AFTER: Duration = Duration::from_secs(30 * 60);
 const CURATED_USERSCRIPT_COUNT: usize = 100;
 
@@ -2077,9 +2103,11 @@ impl WebState {
         tab.internal_peer = None;
         tab.texture = None;
         tab.last_frame = None;
+        tab.last_frame_uploaded_at = None;
         tab.favicon_cache = None;
         tab.resizer = ViewportResizer::default();
         tab.last_activity = Instant::now();
+        tab.last_background_poll = None;
         tab.loading_fast_repaint_until = None;
         tab.idle_suspended = false;
         self.address = url.to_owned();
@@ -2310,6 +2338,7 @@ impl WebState {
         }
         tab.session.media_transport(request.action);
         tab.last_activity = Instant::now();
+        tab.last_background_poll = None;
         true
     }
 
@@ -2442,6 +2471,11 @@ impl WebState {
     fn poll_tabs_for_panel(&mut self) -> BrowserTabPollEvents {
         let mut events = BrowserTabPollEvents::default();
         let now = Instant::now();
+        let mut quiet_background_polls = 0usize;
+        let media_pip_tab_index = self
+            .media_pip_open
+            .then(|| browser_media_status_tab_index(self))
+            .flatten();
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.internal_page.is_some() {
                 continue;
@@ -2449,7 +2483,25 @@ impl WebState {
             if tab.idle_suspended && idx != self.active {
                 continue;
             }
+            let active = idx == self.active;
+            let background_media = !active && tab_media_is_playing(tab);
+            let background_pip = background_media && media_pip_tab_index == Some(idx);
+            if !active && !background_pip && !background_tab_poll_due(tab, now) {
+                continue;
+            }
+            if !active
+                && !background_media
+                && quiet_background_polls >= MAX_QUIET_BACKGROUND_TAB_POLLS_PER_PANEL
+            {
+                continue;
+            }
             tab.session.poll();
+            if !active {
+                tab.last_background_poll = Some(now);
+                if !background_media {
+                    quiet_background_polls += 1;
+                }
+            }
             sync_tab_loading_repaint_budget(tab, now);
             if let Some(error) = tab.session.cert_error().cloned() {
                 if tab.last_audited_cert_error.as_ref() != Some(&error) {
@@ -2464,24 +2516,28 @@ impl WebState {
                 tab.last_audited_cert_error = None;
             }
 
-            let resources = tab.session.recent_resource_requests();
-            let mut max_resource_seq = tab.last_audited_resource_seq;
-            for resource in resources
-                .iter()
-                .filter(|resource| resource.seq > tab.last_audited_resource_seq)
+            if tab
+                .session
+                .has_recent_resource_requests_after(tab.last_audited_resource_seq)
             {
-                max_resource_seq = max_resource_seq.max(resource.seq);
-                if resource.blocked_by.as_deref() == Some("mixed-content:http") {
-                    events.mixed_content_blocks.push(MixedContentBlockAudit {
-                        engine: tab.engine,
-                        page_url: tab.session.nav().url.clone(),
-                        title: tab.session.title().to_owned(),
-                        url: resource.url.clone(),
-                        resource: resource.resource,
-                    });
+                let resources = tab
+                    .session
+                    .recent_resource_requests_after(tab.last_audited_resource_seq);
+                let mut max_resource_seq = tab.last_audited_resource_seq;
+                for resource in &resources {
+                    max_resource_seq = max_resource_seq.max(resource.seq);
+                    if resource.blocked_by.as_deref() == Some("mixed-content:http") {
+                        events.mixed_content_blocks.push(MixedContentBlockAudit {
+                            engine: tab.engine,
+                            page_url: tab.session.nav().url.clone(),
+                            title: tab.session.title().to_owned(),
+                            url: resource.url.clone(),
+                            resource: resource.resource,
+                        });
+                    }
                 }
+                tab.last_audited_resource_seq = max_resource_seq;
             }
-            tab.last_audited_resource_seq = max_resource_seq;
 
             for event in tab.session.drain_pdf_events() {
                 events.pdf_events.push((event.path, event.ok));
@@ -2581,11 +2637,13 @@ impl WebState {
             return;
         }
         if let Some(img) = tab.session.take_frame() {
+            let uploaded_at = Instant::now();
             // Share one Arc<ColorImage> between the retained CPU frame and the
             // GPU upload instead of deep-copying full-resolution pixels on
             // every decoded frame.
             let img = std::sync::Arc::new(img);
             tab.last_frame = Some(img.clone());
+            tab.last_frame_uploaded_at = Some(uploaded_at);
             match tab.texture.as_mut() {
                 Some(handle) => handle.set(img, BROWSER_TEX),
                 None => {
@@ -2625,6 +2683,9 @@ impl WebState {
             return None;
         }
         if active_tab_media_needs_fast_repaint(tab) {
+            return Some(LIVE_PAGE_REPAINT_INTERVAL);
+        }
+        if tab_recent_frame_needs_fast_repaint(tab, now) {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
         if tab.session.nav().loading {
@@ -2676,6 +2737,7 @@ impl WebState {
     fn mark_tab_active(&mut self, index: usize) {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.last_activity = Instant::now();
+            tab.last_background_poll = None;
             tab.idle_suspended = false;
         }
     }
@@ -2860,11 +2922,13 @@ impl WebState {
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
             last_activity: now,
+            last_background_poll: None,
             loading_fast_repaint_until,
             idle_suspended: false,
             page_focused: false,
             texture: None,
             last_frame: None,
+            last_frame_uploaded_at: None,
             last_audited_resource_seq: 0,
             last_audited_cert_error: None,
             resizer: ViewportResizer::default(),
@@ -2897,11 +2961,13 @@ impl WebState {
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
+            last_background_poll: None,
             loading_fast_repaint_until: None,
             idle_suspended: false,
             page_focused: false,
             texture: None,
             last_frame: None,
+            last_frame_uploaded_at: None,
             last_audited_resource_seq: 0,
             last_audited_cert_error: None,
             resizer: ViewportResizer::default(),
@@ -3627,6 +3693,7 @@ impl WebState {
         let event = egui::Event::Text(result.transcript.clone());
         tab.session.send_input(&event, 1.0);
         tab.last_activity = Instant::now();
+        tab.last_background_poll = None;
         self.capture_notice = Some(format!(
             "Dictation inserted {} character{}",
             result.transcript.chars().count(),
@@ -4250,6 +4317,7 @@ impl WebState {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.texture = None;
             tab.last_frame = None;
+            tab.last_frame_uploaded_at = None;
             tab.muted = false;
             tab.autoplay_blocked = DEFAULT_AUTOPLAY_BLOCKED;
             tab.force_dark = false;
@@ -5722,6 +5790,7 @@ impl WebState {
             tab.engine = engine;
             tab.texture = None;
             tab.last_frame = None;
+            tab.last_frame_uploaded_at = None;
             tab.last_audited_resource_seq = 0;
             tab.last_audited_cert_error = None;
             tab.last_activity = now;
@@ -5766,6 +5835,7 @@ impl WebState {
             tab.device_profile = DeviceProfile::Default;
             tab.texture = None;
             tab.last_frame = None;
+            tab.last_frame_uploaded_at = None;
             tab.last_audited_resource_seq = 0;
             tab.last_audited_cert_error = None;
             tab.last_activity = now;
@@ -6209,14 +6279,13 @@ impl WebState {
     }
 
     fn update_site_data_from_tabs(&mut self) {
-        let hosts = self
-            .tabs
-            .iter()
-            .filter(|tab| tab.internal_page.is_none())
-            .filter_map(|tab| host_of(tab.session.nav().url.trim()))
-            .collect::<Vec<_>>();
-        self.site_data
-            .observe_open_tabs(hosts.iter().map(String::as_str), unix_ms());
+        self.site_data.observe_open_tabs(
+            self.tabs
+                .iter()
+                .filter(|tab| tab.internal_page.is_none())
+                .filter_map(|tab| host_of(tab.session.nav().url.trim())),
+            unix_ms(),
+        );
     }
 
     /// Record the ACTIVE tab's committed navigation into the session-only history
@@ -7345,9 +7414,7 @@ fn tab_media_is_playing(tab: &Tab) -> bool {
     }
     tab.session
         .media_metadata()
-        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata.body).ok())
-        .and_then(|value| value.get("paused").and_then(serde_json::Value::as_bool))
-        .is_some_and(|paused| !paused)
+        .is_some_and(|metadata| media_metadata_needs_fast_repaint(&metadata.body))
 }
 
 fn active_tab_media_needs_fast_repaint(tab: &Tab) -> bool {
@@ -7357,7 +7424,11 @@ fn active_tab_media_needs_fast_repaint(tab: &Tab) -> bool {
     let Some(metadata) = tab.session.media_metadata() else {
         return false;
     };
-    serde_json::from_str::<serde_json::Value>(&metadata.body)
+    media_metadata_needs_fast_repaint(&metadata.body)
+}
+
+fn media_metadata_needs_fast_repaint(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value.get("paused").and_then(serde_json::Value::as_bool))
         .map_or(true, |paused| !paused)
@@ -12024,14 +12095,13 @@ mod tests {
     }
 
     #[test]
-    fn frame_upload_uses_arc_capture_retention_without_cpu_clone() {
+    fn browser_hot_path_frame_upload_uses_arc_capture_retention_without_cpu_clone() {
         let (session, _helper) = testkit::connect().expect("connect");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
         let mut state = WebState::default();
         state.push_session(session);
-        assert!(
-            run_until_texture(&mut state),
-            "no frame uploaded to a texture"
-        );
+        let out = run_panel_output(&ctx, &mut state, body_input());
         let tab = &state.tabs[state.active];
         assert!(tab.texture.is_some(), "paint-ready frame did not upload");
         let frame = tab
@@ -12042,6 +12112,18 @@ mod tests {
             !frame.pixels.is_empty(),
             "retained capture frame must keep the decoded pixels"
         );
+        assert!(
+            out.textures_delta.set.iter().any(|(_, delta)| {
+                matches!(
+                    &delta.image,
+                    egui::ImageData::Color(uploaded)
+                        if uploaded.size == frame.size
+                            && std::sync::Arc::ptr_eq(uploaded, frame)
+                )
+            }),
+            "Browser should hand the retained ColorImage Arc to the texture upload instead of cloning pixels"
+        );
+        drop(out);
         assert_eq!(
             std::sync::Arc::strong_count(frame),
             1,
@@ -12469,6 +12551,43 @@ mod tests {
         assert!(
             repaint_delay <= LIVE_PAGE_REPAINT_INTERVAL,
             "background Browser PiP media must schedule frame polling without mouse input (delay {repaint_delay:?})"
+        );
+    }
+
+    #[test]
+    fn browser_media_pip_polls_background_tab_without_waiting_for_quiet_cadence() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let (media_session, media_helper, _media_writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session_with_engine(media_session, BrowserEngine::Servo);
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::MediaMetadata {
+                body: r#"{"title":"Background PiP","paused":false}"#.to_owned(),
+            },
+        );
+        state.tabs[0].session.poll();
+        assert!(run_until_texture(&mut state));
+
+        state.open_options_tab();
+        state.media_pip_open = true;
+        state.tabs[0].last_background_poll = Some(Instant::now());
+        write_helper_event(
+            &media_helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://background-pip.example/".to_owned(),
+            },
+        );
+
+        let _out = run_panel_output(&ctx, &mut state, body_input());
+        assert_eq!(
+            state.tabs[0].session.nav().url,
+            "https://background-pip.example/",
+            "visible background PiP media must poll immediately, not wait for the quiet-tab cadence"
         );
     }
 
@@ -14601,6 +14720,9 @@ mod tests {
         let mut state = WebState::default();
         state.push_session(session);
         assert!(run_until_texture(&mut state));
+        state.tabs[0].last_frame_uploaded_at = Some(
+            Instant::now() - LIVE_PAGE_RECENT_FRAME_FAST_REPAINT_WINDOW - Duration::from_millis(1),
+        );
         assert_eq!(
             state.active_live_page_repaint_interval(),
             Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
@@ -14618,6 +14740,247 @@ mod tests {
         assert!(
             repaint_delay <= LIVE_PAGE_IDLE_REPAINT_INTERVAL,
             "settled Browser pages must keep polling frames without mouse input at a bounded low rate (delay {repaint_delay:?})"
+        );
+    }
+
+    #[test]
+    fn fresh_active_browser_frame_keeps_fast_repaint_briefly_without_media_metadata() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+        assert!(
+            state.tabs[0].session.media_metadata().is_none(),
+            "regression setup should prove the fresh-frame path does not depend on media metadata"
+        );
+        let uploaded_at = state.tabs[0]
+            .last_frame_uploaded_at
+            .expect("texture upload records the fresh-frame time");
+
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(
+                uploaded_at + LIVE_PAGE_RECENT_FRAME_FAST_REPAINT_WINDOW - Duration::from_millis(1),
+            ),
+            Some(LIVE_PAGE_REPAINT_INTERVAL),
+            "fresh helper frames should keep the Browser helper waking at video-safe cadence"
+        );
+        assert_eq!(
+            state.active_live_page_repaint_interval_at(
+                uploaded_at + LIVE_PAGE_RECENT_FRAME_FAST_REPAINT_WINDOW + Duration::from_millis(1),
+            ),
+            Some(LIVE_PAGE_IDLE_REPAINT_INTERVAL),
+            "a static page decays back to the bounded low-rate heartbeat after the fresh-frame window"
+        );
+    }
+
+    #[test]
+    fn inactive_browser_tabs_poll_on_background_cadence_not_every_panel_frame() {
+        let (first, first_helper) = raw_session_pair();
+        let (second, second_helper) = raw_session_pair();
+        let mut state = WebState::default();
+        state.push_session(first);
+        state.push_session(second);
+        assert_eq!(state.active, 1);
+
+        let now = Instant::now();
+        state.tabs[0].last_background_poll = Some(now);
+        write_helper_event(
+            &first_helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://background.example/".to_owned(),
+            },
+        );
+        write_helper_event(
+            &second_helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: true,
+                loading: false,
+                url: "https://active.example/".to_owned(),
+            },
+        );
+
+        let _events = state.poll_tabs_for_panel();
+        assert_ne!(
+            state.tabs[0].session.nav().url,
+            "https://background.example/",
+            "background tabs must not drain helper IPC every Browser frame"
+        );
+        assert_eq!(
+            state.tabs[1].session.nav().url,
+            "https://active.example/",
+            "the active tab must keep immediate helper polling"
+        );
+
+        state.tabs[0].last_background_poll =
+            Some(Instant::now() - BACKGROUND_TAB_POLL_INTERVAL - Duration::from_millis(1));
+        let _events = state.poll_tabs_for_panel();
+        assert_eq!(
+            state.tabs[0].session.nav().url,
+            "https://background.example/",
+            "background tabs still drain events once their bounded cadence is due"
+        );
+    }
+
+    #[test]
+    fn many_due_inactive_browser_tabs_are_staggered_across_panel_frames() {
+        let mut state = WebState::default();
+        let mut helpers = Vec::new();
+        for _ in 0..5 {
+            let (session, helper) = raw_session_pair();
+            state.push_session(session);
+            helpers.push(helper);
+        }
+        assert_eq!(state.active, 4, "the last pushed tab is active");
+
+        let due = Instant::now() - BACKGROUND_TAB_POLL_INTERVAL - Duration::from_millis(1);
+        for (idx, helper) in helpers.iter().take(4).enumerate() {
+            state.tabs[idx].last_background_poll = Some(due);
+            write_helper_event(
+                helper,
+                &mde_web_preview_client::EventMsg::NavState {
+                    can_back: false,
+                    can_forward: false,
+                    loading: false,
+                    url: format!("https://background-{idx}.example/"),
+                },
+            );
+        }
+        write_helper_event(
+            &helpers[4],
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: false,
+                can_forward: true,
+                loading: false,
+                url: "https://active.example/".to_owned(),
+            },
+        );
+
+        let _events = state.poll_tabs_for_panel();
+        let updated_backgrounds = (0..4)
+            .filter(|idx| {
+                state.tabs[*idx].session.nav().url == format!("https://background-{idx}.example/")
+            })
+            .count();
+        assert_eq!(
+            updated_backgrounds, MAX_QUIET_BACKGROUND_TAB_POLLS_PER_PANEL,
+            "quiet inactive tabs should be staggered so many tabs do not all drain helper IPC in one Browser frame"
+        );
+        assert_eq!(
+            state.tabs[4].session.nav().url,
+            "https://active.example/",
+            "the active tab must still poll immediately even when the background cap is full"
+        );
+
+        let _events = state.poll_tabs_for_panel();
+        let updated_backgrounds = (0..4)
+            .filter(|idx| {
+                state.tabs[*idx].session.nav().url == format!("https://background-{idx}.example/")
+            })
+            .count();
+        assert_eq!(
+            updated_backgrounds, 4,
+            "due quiet tabs skipped by the first capped pass must drain on later Browser frames"
+        );
+    }
+
+    #[test]
+    fn known_playing_background_media_tabs_bypass_quiet_poll_cap() {
+        let mut state = WebState::default();
+        let mut helpers = Vec::new();
+        for _ in 0..5 {
+            let (session, helper) = raw_session_pair();
+            state.push_session(session);
+            helpers.push(helper);
+        }
+        assert_eq!(state.active, 4, "the last pushed tab is active");
+
+        let due = Instant::now() - BACKGROUND_TAB_POLL_INTERVAL - Duration::from_millis(1);
+        for (idx, helper) in helpers.iter().take(4).enumerate() {
+            write_helper_event(
+                helper,
+                &mde_web_preview_client::EventMsg::MediaMetadata {
+                    body: format!(r#"{{"title":"Video {idx}","paused":false}}"#),
+                },
+            );
+            state.tabs[idx].session.poll();
+            assert!(
+                tab_media_is_playing(&state.tabs[idx]),
+                "regression setup should mark background tab {idx} as playing media"
+            );
+            state.tabs[idx].last_background_poll = Some(due);
+            write_helper_event(
+                helper,
+                &mde_web_preview_client::EventMsg::NavState {
+                    can_back: false,
+                    can_forward: false,
+                    loading: false,
+                    url: format!("https://media-{idx}.example/"),
+                },
+            );
+        }
+
+        let _events = state.poll_tabs_for_panel();
+        let updated_backgrounds = (0..4)
+            .filter(|idx| {
+                state.tabs[*idx].session.nav().url == format!("https://media-{idx}.example/")
+            })
+            .count();
+        assert_eq!(
+            updated_backgrounds, 4,
+            "known playing media tabs must not be delayed by the quiet-tab poll cap"
+        );
+    }
+
+    #[test]
+    fn background_media_with_unknown_paused_state_bypasses_quiet_poll_cap() {
+        let mut state = WebState::default();
+        let mut helpers = Vec::new();
+        for _ in 0..5 {
+            let (session, helper) = raw_session_pair();
+            state.push_session(session);
+            helpers.push(helper);
+        }
+        assert_eq!(state.active, 4, "the last pushed tab is active");
+
+        let due = Instant::now() - BACKGROUND_TAB_POLL_INTERVAL - Duration::from_millis(1);
+        for (idx, helper) in helpers.iter().take(4).enumerate() {
+            write_helper_event(
+                helper,
+                &mde_web_preview_client::EventMsg::MediaMetadata {
+                    body: format!(r#"{{"title":"Video {idx}"}}"#),
+                },
+            );
+            state.tabs[idx].session.poll();
+            assert!(
+                tab_media_is_playing(&state.tabs[idx]),
+                "background media tab {idx} should stay media-classified when metadata has no paused field"
+            );
+            state.tabs[idx].last_background_poll = Some(due);
+            write_helper_event(
+                helper,
+                &mde_web_preview_client::EventMsg::NavState {
+                    can_back: false,
+                    can_forward: false,
+                    loading: false,
+                    url: format!("https://unknown-media-{idx}.example/"),
+                },
+            );
+        }
+
+        let _events = state.poll_tabs_for_panel();
+        let updated_backgrounds = (0..4)
+            .filter(|idx| {
+                state.tabs[*idx].session.nav().url
+                    == format!("https://unknown-media-{idx}.example/")
+            })
+            .count();
+        assert_eq!(
+            updated_backgrounds, 4,
+            "background media with incomplete play-state metadata must not be delayed by the quiet-tab poll cap"
         );
     }
 
@@ -15040,6 +15403,37 @@ mod tests {
     }
 
     #[test]
+    fn tab_strip_favicon_resolution_is_on_demand_per_tab() {
+        let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
+        img.pixels[0] = egui::Color32::GREEN;
+        let png = encode_color_image_png(&img).expect("encode favicon");
+
+        let mut state = WebState::default();
+        for _ in 0..3 {
+            state.push_session(session_with_favicon(&png));
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        assert!(
+            chrome_ui::tab_favicon_texture_at(&ctx, &mut state.tabs, 1).is_some(),
+            "the requested tab favicon should decode"
+        );
+        assert!(
+            state.tabs[0].favicon_cache.is_none() && state.tabs[2].favicon_cache.is_none(),
+            "resolving one tab's favicon must not pre-resolve every tab in the strip"
+        );
+        assert!(
+            state.tabs[1]
+                .favicon_cache
+                .as_ref()
+                .is_some_and(|cache| cache.texture.is_some()),
+            "the requested tab stores the decoded texture cache"
+        );
+    }
+
+    #[test]
     fn horizontal_tab_strip_renders_a_favicon_without_panicking() {
         let mut img = egui::ColorImage::new([2, 2], egui::Color32::TRANSPARENT);
         img.pixels[0] = egui::Color32::GREEN;
@@ -15421,6 +15815,41 @@ mod tests {
         assert_eq!(
             state.address, "https://example.test/third",
             "engine navigation resumes syncing once the edit ends"
+        );
+    }
+
+    #[test]
+    fn focusing_the_omnibox_clears_the_committed_url_for_new_entry() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(state.address, "https://example.test/");
+
+        ctx.memory_mut(|m| m.request_focus(omnibox_widget_id()));
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "",
+            "entering the location bar should start with an empty field"
+        );
+        assert!(state.omnibox_focused, "omnibox focus should latch");
+
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::NavState {
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                url: "https://example.test/redirected".to_owned(),
+            },
+        );
+        assert!(run_panel_on_ctx(&ctx, &mut state, body_input()));
+        assert_eq!(
+            state.address, "",
+            "engine navigation must not refill the cleared edit field while focused"
         );
     }
 
@@ -16319,6 +16748,95 @@ mod tests {
     }
 
     #[test]
+    fn resource_audit_hot_path_uses_sequence_watermark_for_new_rows() {
+        use mde_web_preview_client::{EventMsg, ResourceType};
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, helper) = raw_session_pair();
+        helper.set_nonblocking(true).expect("helper nonblocking");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+
+        write_helper_event(
+            &helper,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/dashboard".to_owned(),
+            },
+        );
+        write_helper_event(
+            &helper,
+            &EventMsg::ResourceRequest {
+                id: 11,
+                url: "https://portal.example/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Script),
+            },
+        );
+        write_helper_event(
+            &helper,
+            &EventMsg::ResourceRequest {
+                id: 12,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Script),
+            },
+        );
+
+        assert!(
+            run_panel(&mut state),
+            "panel polls initial resource requests"
+        );
+        assert_eq!(
+            state.tabs[0].last_audited_resource_seq, 2,
+            "the audit watermark advances to the newest observed resource"
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_MIXED_CONTENT_BLOCK, None)
+            .expect("list mixed-content events");
+        assert_eq!(msgs.len(), 1, "only the mixed-content row is audited");
+
+        assert!(run_panel(&mut state), "unchanged repaint stays stable");
+        let msgs = persist
+            .list_since(EVENT_BROWSER_MIXED_CONTENT_BLOCK, None)
+            .expect("list mixed-content events after unchanged repaint");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a current sequence watermark leaves the hot poll path quiet"
+        );
+
+        write_helper_event(
+            &helper,
+            &EventMsg::ResourceRequest {
+                id: 13,
+                url: "http://media.example.test/poster.jpg".to_owned(),
+                resource: mde_web_preview_client::resource_to_wire(ResourceType::Image),
+            },
+        );
+        assert!(
+            run_panel(&mut state),
+            "later resource request still drains after the watermark"
+        );
+        assert_eq!(
+            state.tabs[0].last_audited_resource_seq, 3,
+            "the sequence window does not skip later resource requests"
+        );
+        let msgs = persist
+            .list_since(EVENT_BROWSER_MIXED_CONTENT_BLOCK, None)
+            .expect("list mixed-content events after later request");
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            msgs.iter()
+                .filter_map(|msg| msg.body.as_deref())
+                .any(|body| body.contains("http://media.example.test/poster.jpg")),
+            "the later mixed-content request is still audited"
+        );
+    }
+
+    #[test]
     fn a_permission_prompt_is_suppressed_behind_a_cert_interstitial() {
         // Defensive precedence: a tab that has BOTH a blocking cert error and a
         // pending permission must show the cert interstitial with the permission bar
@@ -16593,11 +17111,13 @@ mod tests {
             user_agent: UserAgentOverride::Default,
             device_profile: DeviceProfile::Default,
             last_activity: Instant::now(),
+            last_background_poll: None,
             loading_fast_repaint_until: None,
             idle_suspended: false,
             page_focused: false,
             texture: None,
             last_frame: None,
+            last_frame_uploaded_at: None,
             last_audited_resource_seq: 0,
             last_audited_cert_error: None,
             resizer: ViewportResizer::default(),
@@ -16968,6 +17488,27 @@ mod tests {
         assert!(
             !summary.contains('·'),
             "site-data summary must use ASCII separators: {summary}"
+        );
+    }
+
+    #[test]
+    fn browser_hot_path_site_data_observer_accepts_owned_host_iterator() {
+        let mut site_data = SiteDataManager::default();
+        site_data.observe_open_tabs(
+            [
+                "Alpha.Example".to_owned(),
+                "beta.example".to_owned(),
+                "alpha.example".to_owned(),
+            ],
+            42,
+        );
+
+        let summary = site_data.summary(Some("alpha.example"));
+        assert!(summary.contains("2 tracked sites"), "summary = {summary}");
+        assert!(summary.contains("3 open tabs"), "summary = {summary}");
+        assert!(
+            summary.contains("alpha.example cleared 0 times"),
+            "summary = {summary}"
         );
     }
 
@@ -18399,13 +18940,17 @@ mod tests {
 
         assert_eq!(
             selected.as_deref(),
-            Some("http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/ACTIVE")
+            Some(
+                "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/ACTIVE"
+            )
         );
         let fallback =
             chromium_devtools_frontend_from_list("https://missing.example/", &body).unwrap();
         assert_eq!(
             fallback.as_deref(),
-            Some("http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/OTHER")
+            Some(
+                "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/OTHER"
+            )
         );
     }
 
@@ -21869,6 +22414,53 @@ mod tests {
     }
 
     #[test]
+    fn browser_hot_path_session_snapshot_poll_is_throttled_off_the_frame_path() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let baseline = persist
+            .list_since(ACTION_BROWSER_SESSION_SYNC, None)
+            .expect("list browser session sync baseline")
+            .len();
+
+        state.session_snapshot_last_poll = Some(Instant::now());
+        state.poll_session_snapshot();
+
+        let msgs = persist
+            .list_since(ACTION_BROWSER_SESSION_SYNC, None)
+            .expect("list browser session sync");
+        assert_eq!(
+            msgs.len(),
+            baseline,
+            "a just-polled Browser frame must not rebuild/publish session JSON"
+        );
+
+        state.session_snapshot_last_poll =
+            Some(Instant::now() - SESSION_SNAPSHOT_POLL_INTERVAL - Duration::from_millis(1));
+        state.poll_session_snapshot();
+        let msgs = persist
+            .list_since(ACTION_BROWSER_SESSION_SYNC, None)
+            .expect("list browser session sync after due poll");
+        assert_eq!(
+            msgs.len(),
+            baseline,
+            "the cadence poll rebuilds the snapshot when due, but the unchanged body is still de-duped"
+        );
+
+        state.poll_session_snapshot();
+        let msgs = persist
+            .list_since(ACTION_BROWSER_SESSION_SYNC, None)
+            .expect("list browser session sync after immediate repeat");
+        assert_eq!(
+            msgs.len(),
+            baseline,
+            "an immediate follow-up frame must not publish another unchanged snapshot"
+        );
+    }
+
+    #[test]
     fn browser_capture_success_publishes_notify_feed_event() {
         let bus = tempfile::tempdir().expect("temp bus");
         let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
@@ -22309,8 +22901,7 @@ mod tests {
             "payloads remain the exact values committed by Enter/click"
         );
         assert_eq!(
-            targets[3],
-            "https://search.mesh/search?q=mesh+browser",
+            targets[3], "https://search.mesh/search?q=mesh+browser",
             "web suggestion rows carry their real search target while keeping the typed commit payload"
         );
     }

@@ -16,7 +16,7 @@ use mde_egui::egui::{RichText, Sense};
 use mde_files_egui::transfers::{TransferJob, TransferState, TransferVerb};
 
 const DRAWER_ICON_BUTTON_W: f32 = 28.0;
-const DRAWER_ICON_BUTTON_H: f32 = 24.0;
+pub(super) const DRAWER_ICON_BUTTON_H: f32 = super::CHROME_BUTTON;
 const DRAWER_CONTROL_RADIUS: f32 = 6.0;
 pub(super) const QR_MATRIX_LIGHT: egui::Color32 = super::CHROME_TOOLBAR;
 pub(super) const QR_MATRIX_DARK: egui::Color32 = super::CHROME_TEXT;
@@ -223,7 +223,7 @@ fn drawer_button_widget(
     .fill(action_button_fill(role))
     .stroke(egui::Stroke::new(1.0, action_button_stroke(role)))
     .corner_radius(DRAWER_CONTROL_RADIUS)
-    .min_size(egui::vec2(28.0, 24.0))
+    .min_size(egui::vec2(DRAWER_ICON_BUTTON_W, DRAWER_ICON_BUTTON_H))
 }
 
 fn drawer_button(
@@ -305,7 +305,10 @@ fn drawer_close_button(ui: &mut egui::Ui, tip: &str) -> egui::Response {
 
 fn drawer_status_row(ui: &mut egui::Ui, icon: ChromeIcon, text: &str, color: egui::Color32) {
     ui.horizontal_wrapped(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(DRAWER_ICON_BUTTON_H, DRAWER_ICON_BUTTON_H),
+            Sense::hover(),
+        );
         paint_chrome_icon(ui.painter(), rect, icon, color);
         ui.label(RichText::new(text).size(Style::SMALL).color(color));
     });
@@ -505,7 +508,7 @@ pub(super) const fn drawer_toggle_state_layer(checked: bool) -> egui::Color32 {
 fn drawer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
     let font = font_id(Style::SMALL);
     let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, super::CHROME_TEXT));
-    let target_size = egui::vec2((galley.size().x + 36.0).max(82.0), 24.0);
+    let target_size = egui::vec2((galley.size().x + 36.0).max(82.0), DRAWER_ICON_BUTTON_H);
     let (rect, response) = ui.allocate_exact_size(target_size, Sense::click());
     if response.clicked() {
         *checked = !*checked;
@@ -580,7 +583,7 @@ fn drawer_choice_chip(ui: &mut egui::Ui, label: &str, selected: bool, tip: &str)
     let font = font_id(Style::SMALL);
     let text_color = super::selected_text(selected);
     let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, text_color));
-    let target_size = egui::vec2((galley.size().x + 18.0).max(44.0), 24.0);
+    let target_size = egui::vec2((galley.size().x + 18.0).max(44.0), DRAWER_ICON_BUTTON_H);
     let (rect, response) = ui.allocate_exact_size(target_size, Sense::click());
     let base = if selected {
         super::CHROME_PRIMARY_CONTAINER
@@ -632,7 +635,7 @@ fn drawer_separator(ui: &mut egui::Ui) {
 }
 
 fn drawer_inline_separator(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 24.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, DRAWER_ICON_BUTTON_H), Sense::hover());
     let x = rect.center().x;
     ui.painter().line_segment(
         [
