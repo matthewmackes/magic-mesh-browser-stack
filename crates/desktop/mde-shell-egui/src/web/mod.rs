@@ -1907,6 +1907,11 @@ pub(crate) struct WebState {
     /// Env-gated (`MDE_WEB_PERF`) published-frame-rate sampler. `None` unless the
     /// env var is set, so it is a zero-cost no-op in normal operation and tests.
     perf_sampler: Option<PerfSampler>,
+    /// Whether the Browser is currently the foreground shell surface. Only one
+    /// surface renders per frame, so a backgrounded Browser's per-tab reconciler
+    /// never runs; this drives surface-level occlusion (see
+    /// [`Self::note_surface_foreground`]). Starts `true`.
+    surface_foreground: bool,
     /// An honest gated notice shown in place of the `EmptyState` when a `live-helper`
     /// open couldn't proceed (no seat · helper binary absent · spawn failed). `None`
     /// = the default gated caption. Only ever set on the live path — a named reason,
@@ -2037,6 +2042,7 @@ impl Default for WebState {
             transfers: Box::new(FileTransfers::from_env()),
             download_opener: Box::<XdgDownloadOpener>::default(),
             perf_sampler: PerfSampler::from_env(),
+            surface_foreground: true,
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
             power_mode: false,
@@ -2704,6 +2710,31 @@ impl WebState {
         match prev {
             Some(previous) => previous != hidden,
             None => hidden,
+        }
+    }
+
+    /// Record whether the Browser is the foreground shell surface. Only one
+    /// surface renders per frame, so [`Self::reconcile_tab_visibility`] never runs
+    /// while another app is shown — a backgrounded Browser would otherwise keep
+    /// painting its active tab. Going background therefore hides EVERY live tab
+    /// right here (edge-triggered, and idempotent via `Tab::hidden_sent`); coming
+    /// foreground just clears the flag, and the next reconcile restores normal
+    /// per-tab visibility (the active tab un-hides, the rest stay hidden).
+    pub(crate) fn note_surface_foreground(&mut self, foreground: bool) {
+        if self.surface_foreground == foreground {
+            return;
+        }
+        self.surface_foreground = foreground;
+        if !foreground {
+            for tab in &mut self.tabs {
+                if tab.internal_page.is_some() {
+                    continue;
+                }
+                if Self::should_send_hidden(tab.hidden_sent, true) {
+                    tab.session.set_hidden(true);
+                    tab.hidden_sent = Some(true);
+                }
+            }
         }
     }
 
@@ -9605,6 +9636,31 @@ mod tests {
         assert!(
             w3[0].contains("0.0 published fps") && w3[0].contains("bg"),
             "{w3:?}"
+        );
+    }
+
+    #[test]
+    fn backgrounding_the_browser_surface_hides_every_tab() {
+        let (session, helper) = raw_session_pair();
+        helper.set_nonblocking(true).expect("nonblocking helper");
+        let mut state = WebState::default();
+        state.push_session(session);
+        let _ = drain_control_messages(&helper); // drop tab-setup control frames
+                                                 // Foreground -> background hides the tab via SetHidden { hidden: true }.
+        state.note_surface_foreground(false);
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().any(|m| matches!(
+                m,
+                mde_web_preview_client::ControlMsg::SetHidden { hidden: true }
+            )),
+            "backgrounding the browser surface hides the tab: {controls:?}"
+        );
+        // Idempotent: staying backgrounded sends nothing more.
+        state.note_surface_foreground(false);
+        assert!(
+            drain_control_messages(&helper).is_empty(),
+            "a repeat background is a no-op"
         );
     }
 
