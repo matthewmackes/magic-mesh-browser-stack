@@ -1904,6 +1904,9 @@ pub(crate) struct WebState {
     capture_region_start: Option<egui::Pos2>,
     /// Region-capture current drag point in helper-frame pixel coordinates.
     capture_region_current: Option<egui::Pos2>,
+    /// Env-gated (`MDE_WEB_PERF`) published-frame-rate sampler. `None` unless the
+    /// env var is set, so it is a zero-cost no-op in normal operation and tests.
+    perf_sampler: Option<PerfSampler>,
     /// An honest gated notice shown in place of the `EmptyState` when a `live-helper`
     /// open couldn't proceed (no seat · helper binary absent · spawn failed). `None`
     /// = the default gated caption. Only ever set on the live path — a named reason,
@@ -1921,6 +1924,55 @@ pub(crate) struct WebState {
     /// the `(INIT_W, INIT_H)` fallback until a real seat is seen.
     #[cfg(feature = "live-helper")]
     seat_px: (u32, u32),
+}
+
+/// Env-gated (`MDE_WEB_PERF=1`) sampler of the browser's real published frame
+/// rate. Once per second it reads each live tab's published shm sequence, turns
+/// the delta into frames-per-second (the seqlock advances by two per engine
+/// paint), and logs one `tracing` line per tab tagged foreground/background — so
+/// frame rate can be measured against native and a hidden tab is confirmed to
+/// drop to ~0 fps (WL-PERF-003). The window math is pure (`flush_due` takes an
+/// explicit `now` + samples), so it is unit-tested without a clock or a helper.
+struct PerfSampler {
+    window_start: Instant,
+    last_seq: BTreeMap<u64, u64>,
+}
+
+impl PerfSampler {
+    /// Build the sampler iff `MDE_WEB_PERF` is set in the environment.
+    fn from_env() -> Option<Self> {
+        std::env::var_os("MDE_WEB_PERF").map(|_| Self {
+            window_start: Instant::now(),
+            last_seq: BTreeMap::new(),
+        })
+    }
+
+    /// If at least a second has elapsed, emit one summary line per sample from the
+    /// published-sequence delta and reset the window; otherwise return nothing.
+    /// `samples` is `(tab_id, is_foreground, published_seq)` for each live tab.
+    fn flush_due(&mut self, now: Instant, samples: &[(u64, bool, u64)]) -> Vec<String> {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < Duration::from_secs(1) {
+            return Vec::new();
+        }
+        let secs = elapsed.as_secs_f64();
+        let mut next = BTreeMap::new();
+        let mut lines = Vec::with_capacity(samples.len());
+        for &(id, foreground, seq) in samples {
+            let prev = self.last_seq.get(&id).copied().unwrap_or(seq);
+            // The seqlock bumps the sequence twice per published frame.
+            let frames = seq.saturating_sub(prev) / 2;
+            let fps = frames as f64 / secs;
+            lines.push(format!(
+                "tab {id} {} {fps:.1} published fps ({frames} frames)",
+                if foreground { "FG" } else { "bg" }
+            ));
+            next.insert(id, seq);
+        }
+        self.last_seq = next;
+        self.window_start = now;
+        lines
+    }
 }
 
 impl Default for WebState {
@@ -1984,6 +2036,7 @@ impl Default for WebState {
             history_open: false,
             transfers: Box::new(FileTransfers::from_env()),
             download_opener: Box::<XdgDownloadOpener>::default(),
+            perf_sampler: PerfSampler::from_env(),
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
             power_mode: false,
@@ -2629,6 +2682,7 @@ impl WebState {
         self.publish_media_status_if_changed();
         self.poll_session_snapshot();
         self.reconcile_tab_visibility();
+        self.flush_perf_metrics();
     }
 
     /// Whether tab `idx` should be hidden from its engine, given the active tab
@@ -2677,6 +2731,33 @@ impl WebState {
                 tab.hidden_sent = Some(hidden);
             }
         }
+    }
+
+    /// Emit per-tab published frame-rate metrics once per second when
+    /// `MDE_WEB_PERF` is set (see [`PerfSampler`]) — a cheap no-op otherwise. The
+    /// sampler is `take`n out first so reading each tab's published sequence does
+    /// not conflict with the field borrow it lives behind.
+    fn flush_perf_metrics(&mut self) {
+        let Some(mut sampler) = self.perf_sampler.take() else {
+            return;
+        };
+        let samples: Vec<(u64, bool, u64)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.internal_page.is_none())
+            .map(|(idx, tab)| {
+                (
+                    tab.id,
+                    idx == self.active,
+                    tab.session.published_frame_seq(),
+                )
+            })
+            .collect();
+        for line in sampler.flush_due(Instant::now(), &samples) {
+            tracing::info!(target: "web::perf", "{line}");
+        }
+        self.perf_sampler = Some(sampler);
     }
 
     /// Upload one tab's pending frame only when one is present, so an idle page
@@ -9496,6 +9577,35 @@ mod tests {
         );
         assert!(!WebState::should_send_hidden(Some(false), false));
         assert!(!WebState::should_send_hidden(Some(true), true));
+    }
+
+    #[test]
+    fn perf_sampler_reports_published_fps_and_zero_for_hidden() {
+        let t0 = Instant::now();
+        let mut sampler = PerfSampler {
+            window_start: t0,
+            last_seq: BTreeMap::new(),
+        };
+        // Under a second: nothing is emitted yet.
+        assert!(sampler
+            .flush_due(t0 + Duration::from_millis(500), &[(1, true, 200)])
+            .is_empty());
+        // First full window seeds the baseline (an unseen tab has a zero delta).
+        let w1 = sampler.flush_due(t0 + Duration::from_secs(1), &[(1, true, 200)]);
+        assert_eq!(w1.len(), 1);
+        assert!(w1[0].contains("0.0 published fps"));
+        // Next window: +120 sequence over 1s = 60 published frames = 60 fps.
+        let w2 = sampler.flush_due(t0 + Duration::from_secs(2), &[(1, true, 320)]);
+        assert!(
+            w2[0].contains("60.0 published fps") && w2[0].contains("FG"),
+            "{w2:?}"
+        );
+        // A hidden tab whose sequence stops advancing reports ~0 fps.
+        let w3 = sampler.flush_due(t0 + Duration::from_secs(3), &[(1, false, 320)]);
+        assert!(
+            w3[0].contains("0.0 published fps") && w3[0].contains("bg"),
+            "{w3:?}"
+        );
     }
 
     #[test]

@@ -1044,6 +1044,16 @@ impl WebSession {
         self.send(&ControlMsg::SetHidden { hidden });
     }
 
+    /// The current published frame sequence for this tab — the shm seqlock
+    /// counter, which the engine advances by two on every `OnPaint` publish.
+    /// Sampling it over time yields the engine's real published frame rate, the
+    /// honest signal that a hidden tab has stopped painting. `0` before the first
+    /// frame or when no frame region is mapped.
+    #[must_use]
+    pub fn published_frame_seq(&self) -> u64 {
+        self.reader.as_ref().map_or(0, |reader| reader.sequence())
+    }
+
     /// Ask the helper to toggle media playback on the active page.
     pub fn toggle_media_playback(&mut self) {
         self.send(&ControlMsg::ToggleMediaPlayback);
