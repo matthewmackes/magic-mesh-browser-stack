@@ -2740,7 +2740,13 @@ impl WebState {
         if active_tab_media_needs_fast_repaint(tab) {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
-        if tab_recent_frame_needs_fast_repaint(tab, now) {
+        // The recent-frame heuristic stands in for "probably still animating"
+        // ONLY until the page reports its media play state. Once metadata exists,
+        // trust it: a paused video must not be pinned to a 16 ms (60 Hz) repaint
+        // loop just because it painted a frame moments ago. Playing/unknown media
+        // is already handled by the media check above; without any metadata this
+        // still keeps a freshly-painting page responsive.
+        if tab.session.media_metadata().is_none() && tab_recent_frame_needs_fast_repaint(tab, now) {
             return Some(LIVE_PAGE_REPAINT_INTERVAL);
         }
         if tab.session.nav().loading {
