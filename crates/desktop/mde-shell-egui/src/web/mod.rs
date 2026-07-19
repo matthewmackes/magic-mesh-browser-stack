@@ -1789,6 +1789,24 @@ pub(crate) struct WebState {
     security_update_last_poll: Option<Instant>,
     /// Whether the compact download manager drawer is visible.
     downloads_open: bool,
+    /// Whether the vertical-rail notifications panel is visible.
+    notifications_open: bool,
+    /// Whether the vertical-rail recommendations panel is visible.
+    recommendations_open: bool,
+    /// Session-only ring buffer of Browser notices shown in the notifications
+    /// panel, mirrored once per frame from the transient capture/download notice
+    /// seams (see [`WebState::absorb_browser_notices`]) so the panel keeps a
+    /// short history without every notice set-site having to feed it directly.
+    browser_notices: VecDeque<BrowserNotice>,
+    /// Notices seen since the notifications panel was last opened; cleared on open.
+    notifications_unread: usize,
+    /// Monotonic logical clock backing [`BrowserNotice::ts`].
+    notice_seq: u64,
+    /// Last capture notice absorbed into `browser_notices`, so the per-frame
+    /// mirror only pushes a genuinely new notice.
+    last_absorbed_capture_notice: Option<String>,
+    /// Last download notice absorbed into `browser_notices`.
+    last_absorbed_download_notice: Option<String>,
     /// Last time the browser refreshed its ledger view.
     downloads_last_poll: Option<Instant>,
     /// Last time the per-frame catch-all rebuilt + published the session
@@ -2080,6 +2098,13 @@ impl Default for WebState {
             latest_security_update: None,
             security_update_last_poll: None,
             downloads_open: false,
+            notifications_open: false,
+            recommendations_open: false,
+            browser_notices: VecDeque::new(),
+            notifications_unread: 0,
+            notice_seq: 0,
+            last_absorbed_capture_notice: None,
+            last_absorbed_download_notice: None,
             downloads_last_poll: None,
             session_snapshot_last_poll: None,
             download_notice: None,
@@ -4147,6 +4172,56 @@ impl WebState {
 
     fn toggle_vertical_tabs(&mut self) {
         self.set_vertical_tabs(!self.vertical_tabs);
+    }
+
+    /// Mirror the transient capture/download notices into the session-only
+    /// notifications ring buffer, once per frame. A genuinely new notice (deduped
+    /// against the last absorbed text) pushes a copy and bumps the unread count so
+    /// the vertical rail's bell can badge it. This absorb keeps the dozens of
+    /// existing notice set-sites untouched.
+    fn absorb_browser_notices(&mut self) {
+        if self.capture_notice != self.last_absorbed_capture_notice {
+            if let Some(text) = self.capture_notice.clone() {
+                let severity = if browser_notice_is_failure(&text) {
+                    BrowserNoticeSeverity::Error
+                } else {
+                    BrowserNoticeSeverity::Info
+                };
+                self.push_browser_notice(severity, text);
+            }
+            self.last_absorbed_capture_notice = self.capture_notice.clone();
+        }
+        if self.download_notice != self.last_absorbed_download_notice {
+            if let Some(text) = self.download_notice.clone() {
+                self.push_browser_notice(BrowserNoticeSeverity::Error, text);
+            }
+            self.last_absorbed_download_notice = self.download_notice.clone();
+        }
+    }
+
+    fn push_browser_notice(&mut self, severity: BrowserNoticeSeverity, text: String) {
+        self.notice_seq = self.notice_seq.saturating_add(1);
+        self.browser_notices.push_back(BrowserNotice {
+            severity,
+            text,
+            ts: self.notice_seq,
+        });
+        while self.browser_notices.len() > BROWSER_NOTICE_CAP {
+            self.browser_notices.pop_front();
+        }
+        self.notifications_unread = self.notifications_unread.saturating_add(1);
+    }
+
+    /// Toggle the notifications panel; opening it clears the unread count.
+    fn toggle_notifications(&mut self) {
+        self.notifications_open = !self.notifications_open;
+        if self.notifications_open {
+            self.notifications_unread = 0;
+        }
+    }
+
+    fn toggle_recommendations(&mut self) {
+        self.recommendations_open = !self.recommendations_open;
     }
 
     fn select_engine(&mut self, engine: BrowserEngine) {
@@ -7412,6 +7487,9 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     let tab_events = state.poll_tabs_for_panel();
     state.apply_tab_poll_events(tab_events);
     state.finish_browser_panel_poll();
+    // Mirror this frame's transient capture/download notices into the
+    // notifications ring buffer before any chrome (incl. the rail bell) renders.
+    state.absorb_browser_notices();
     state.upload_active_frame(ui.ctx());
     state.upload_media_pip_frame(ui.ctx());
     state.request_browser_frame_repaint(ui.ctx());
@@ -7456,14 +7534,34 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 panel_rect.max,
             );
 
+            // The operator's affordances (notifications / downloads / screenshots
+            // / recommendations) live in a fixed band at the bottom of the rail;
+            // the tab strip gets the rail minus that band so its scroll area stops
+            // above the cluster instead of overlapping it.
+            let cluster_h = chrome_ui::vertical_rail_affordances_height();
+            let tabs_bottom = (rail_rect.bottom() - cluster_h).max(rail_rect.top());
+            let rail_tabs_rect =
+                egui::Rect::from_min_max(rail_rect.min, egui::pos2(rail_rect.right(), tabs_bottom));
+            let rail_cluster_rect =
+                egui::Rect::from_min_max(egui::pos2(rail_rect.left(), tabs_bottom), rail_rect.max);
+
             let mut rail_ui = ui.new_child(
                 egui::UiBuilder::new()
-                    .max_rect(rail_rect)
+                    .max_rect(rail_tabs_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             chrome_ui::scope(&mut rail_ui, |ui| {
                 chrome_ui::tab_strip(ui, state);
             });
+
+            if rail_cluster_rect.is_positive() {
+                let mut cluster_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rail_cluster_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                chrome_ui::vertical_rail_affordances(&mut cluster_ui, state);
+            }
 
             if content_rect.is_positive() {
                 let mut content_ui = ui.new_child(
@@ -8790,6 +8888,40 @@ struct SpeedDialEntry {
     label: String,
     url: String,
     hint: String,
+}
+
+/// Severity of a Browser notice mirrored into the notifications ring buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserNoticeSeverity {
+    Info,
+    Error,
+}
+
+/// A single Browser notice retained in the session-only notifications ring
+/// buffer. Fed by the once-per-frame absorb mirror from the transient
+/// capture/download notice seams so the vertical rail's notifications panel has
+/// a short history to show without touching every notice set-site.
+#[derive(Debug, Clone)]
+struct BrowserNotice {
+    severity: BrowserNoticeSeverity,
+    text: String,
+    /// Monotonic logical timestamp (newest = largest) for stable newest-first order.
+    ts: u64,
+}
+
+/// The most notices the notifications panel retains for a session.
+const BROWSER_NOTICE_CAP: usize = 50;
+
+/// Classify a transient Browser notice as a failure so the notifications panel
+/// can tone it. Mirrors the failure-prefix heuristic used by the inline
+/// capture-notice banner.
+fn browser_notice_is_failure(notice: &str) -> bool {
+    notice.starts_with("Capture failed:")
+        || notice.starts_with("PDF failed")
+        || notice.starts_with("PDF viewer failed:")
+        || notice.starts_with("Print failed:")
+        || notice.starts_with("Open failed:")
+        || notice.starts_with("Show failed:")
 }
 
 impl SpeedDialEntry {
@@ -19446,6 +19578,47 @@ mod tests {
             WebState::default().vertical_tabs,
             "Browser defaults to the compact vertical tab rail"
         );
+    }
+
+    #[test]
+    fn browser_notices_mirror_capture_and_download_notices_newest_first() {
+        let mut state = WebState::default();
+        assert!(state.browser_notices.is_empty());
+        assert_eq!(state.notifications_unread, 0);
+
+        state.capture_notice = Some("QR share ready".to_owned());
+        state.absorb_browser_notices();
+        state.capture_notice = Some("Capture failed: no painted page".to_owned());
+        state.absorb_browser_notices();
+        state.download_notice = Some("Open failed: gone".to_owned());
+        state.absorb_browser_notices();
+
+        assert_eq!(state.browser_notices.len(), 3);
+        assert_eq!(state.notifications_unread, 3);
+
+        // Newest notice is at the back of the ring buffer; the drawer walks it
+        // in reverse for a newest-first view.
+        let newest = state.browser_notices.back().expect("newest notice");
+        assert_eq!(newest.text, "Open failed: gone");
+        assert_eq!(newest.severity, BrowserNoticeSeverity::Error);
+        let oldest = state.browser_notices.front().expect("oldest notice");
+        assert_eq!(oldest.text, "QR share ready");
+        assert_eq!(oldest.severity, BrowserNoticeSeverity::Info);
+
+        // A capture failure is toned as an error, an ordinary notice as info.
+        assert_eq!(
+            state.browser_notices[1].severity,
+            BrowserNoticeSeverity::Error
+        );
+
+        // Re-absorbing an unchanged notice does not duplicate it.
+        state.absorb_browser_notices();
+        assert_eq!(state.browser_notices.len(), 3);
+
+        // Opening the notifications panel clears the unread badge.
+        state.toggle_notifications();
+        assert!(state.notifications_open);
+        assert_eq!(state.notifications_unread, 0);
     }
 
     #[test]

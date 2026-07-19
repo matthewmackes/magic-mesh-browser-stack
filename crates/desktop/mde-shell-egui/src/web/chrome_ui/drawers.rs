@@ -9,7 +9,8 @@
 use super::super::{
     offline_cache_viewport_display_size, offline_cache_viewport_texture, plural,
     printer_error_label, short_transfer_name, spellcheck_occurrence_index, spellcheck_results_text,
-    BrowserReadAloudStatus, BrowserVoiceCommandStatus, PaperSize, PrintOrientation,
+    BrowserNoticeSeverity, BrowserReadAloudStatus, BrowserVoiceCommandStatus, PaperSize,
+    PrintOrientation,
 };
 use super::*;
 use mde_egui::egui::{RichText, Sense};
@@ -1000,6 +1001,181 @@ pub(super) fn history_drawer(ui: &mut egui::Ui, state: &mut WebState) {
     if let Some(url) = open_url {
         state.load_target(url);
         state.history_open = false;
+    }
+}
+
+/// The vertical-rail Notifications panel — the session-only ring buffer of
+/// Browser notices, newest-first, with per-item dismiss, Clear-all and an
+/// honest empty state. Modelled on [`history_drawer`].
+pub(super) fn notifications_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.notifications_open {
+        return;
+    }
+    let mut dismiss: Option<usize> = None;
+    let mut clear = false;
+    let mut close = false;
+    egui::Frame::NONE
+        .fill(super::CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Notifications")
+                        .size(CHROME_FONT)
+                        .color(super::CHROME_TEXT),
+                );
+                ui.label(
+                    RichText::new("this session only")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if drawer_close_button(ui, "Close notifications").clicked() {
+                        close = true;
+                    }
+                    if !state.browser_notices.is_empty()
+                        && drawer_button(
+                            ui,
+                            "Clear all",
+                            BrowserActionRole::Quiet,
+                            "Clear this session's notifications",
+                        )
+                        .clicked()
+                    {
+                        clear = true;
+                    }
+                });
+            });
+            if state.browser_notices.is_empty() {
+                ui.label(
+                    RichText::new("No notifications yet")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    // Newest-first by logical timestamp, independent of the ring
+                    // buffer's physical order.
+                    let mut order: Vec<usize> = (0..state.browser_notices.len()).collect();
+                    order.sort_by_key(|&i| std::cmp::Reverse(state.browser_notices[i].ts));
+                    for idx in order {
+                        let notice = &state.browser_notices[idx];
+                        let (icon, tone) = match notice.severity {
+                            BrowserNoticeSeverity::Error => {
+                                (ChromeIcon::Warning, super::CHROME_ERROR)
+                            }
+                            BrowserNoticeSeverity::Info => {
+                                (ChromeIcon::Notifications, super::CHROME_PRIMARY)
+                            }
+                        };
+                        let text = ellipsize(&notice.text, 60);
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(DRAWER_ICON_BUTTON_H, DRAWER_ICON_BUTTON_H),
+                                Sense::hover(),
+                            );
+                            paint_chrome_icon(ui.painter(), icon_rect, icon, tone);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if drawer_icon_button(
+                                        ui,
+                                        ChromeIcon::Close,
+                                        BrowserActionRole::Quiet,
+                                        "Dismiss notification",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = Some(idx);
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(text)
+                                                .size(Style::SMALL)
+                                                .color(super::CHROME_TEXT),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                        });
+                    }
+                });
+        });
+    if close {
+        state.notifications_open = false;
+    }
+    if clear {
+        state.browser_notices.clear();
+    }
+    if let Some(idx) = dismiss {
+        if idx < state.browser_notices.len() {
+            state.browser_notices.remove(idx);
+        }
+    }
+}
+
+/// The vertical-rail Recommendations panel — the operator's speed-dial mesh
+/// services as clickable rows; selecting one loads it on the active tab.
+pub(super) fn recommendations_drawer(ui: &mut egui::Ui, state: &mut WebState) {
+    if !state.recommendations_open {
+        return;
+    }
+    let mut open_url: Option<String> = None;
+    let mut close = false;
+    egui::Frame::NONE
+        .fill(super::CHROME_SURFACE_CONTAINER)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Recommendations")
+                        .size(CHROME_FONT)
+                        .color(super::CHROME_TEXT),
+                );
+                ui.label(
+                    RichText::new("mesh services")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if drawer_close_button(ui, "Close recommendations").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if state.speed_dial.is_empty() {
+                ui.label(
+                    RichText::new("No recommendations")
+                        .size(Style::SMALL)
+                        .color(super::CHROME_TEXT_DIM),
+                );
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for entry in &state.speed_dial {
+                        let label = ellipsize(&entry.label, 40);
+                        let response =
+                            super::chrome_menu_row(ui, &label, ChromeIcon::Recommend, true, "");
+                        if chrome_hover_text(response, entry.hint.clone()).clicked() {
+                            open_url = Some(entry.url.clone());
+                        }
+                    }
+                });
+        });
+    if close {
+        state.recommendations_open = false;
+    }
+    if let Some(url) = open_url {
+        state.load_target(url);
+        state.recommendations_open = false;
     }
 }
 

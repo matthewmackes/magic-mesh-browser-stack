@@ -41,9 +41,9 @@ use super::{
 };
 use accessibility::install_browser_page_accessibility;
 use drawers::{
-    downloads_drawer, history_drawer, offline_cache_drawer, print_settings_drawer, qr_share_drawer,
-    security_update_drawer, site_styles_drawer, speech_status_drawer, spellcheck_drawer,
-    translation_drawer,
+    downloads_drawer, history_drawer, notifications_drawer, offline_cache_drawer,
+    print_settings_drawer, qr_share_drawer, recommendations_drawer, security_update_drawer,
+    site_styles_drawer, speech_status_drawer, spellcheck_drawer, translation_drawer,
 };
 
 pub(super) fn install_browser_accessibility(
@@ -486,6 +486,8 @@ pub(super) enum ChromeIcon {
     PictureInPicture,
     DarkMode,
     Lock,
+    Notifications,
+    Recommend,
 }
 
 #[cfg(test)]
@@ -567,6 +569,8 @@ const ALL_BROWSER_ICONS: &[ChromeIcon] = &[
     ChromeIcon::PictureInPicture,
     ChromeIcon::DarkMode,
     ChromeIcon::Lock,
+    ChromeIcon::Notifications,
+    ChromeIcon::Recommend,
 ];
 
 #[cfg(test)]
@@ -606,6 +610,8 @@ pub(super) const fn chrome_icon_painted_shape_count(icon: ChromeIcon) -> usize {
         | ChromeIcon::VolumeDown
         | ChromeIcon::VolumeUp
         | ChromeIcon::PictureInPicture
+        | ChromeIcon::Notifications
+        | ChromeIcon::Recommend
         | ChromeIcon::DarkMode => 3,
         ChromeIcon::Minus => 1,
         ChromeIcon::Lock | ChromeIcon::MediaStop => 4,
@@ -663,6 +669,9 @@ const fn chrome_icon_yamis_id(icon: ChromeIcon) -> Option<IconId> {
         ChromeIcon::PictureInPicture => Some(IconId::PictureInPicture),
         ChromeIcon::DarkMode => Some(IconId::DarkMode),
         ChromeIcon::Lock => Some(IconId::Lock),
+        ChromeIcon::Notifications => Some(IconId::Notifications),
+        // No YAMIS "recommend" glyph — paints the local hand-vector star fallback.
+        ChromeIcon::Recommend => None,
     }
 }
 
@@ -2114,6 +2123,63 @@ fn paint_chrome_icon(painter: &egui::Painter, rect: egui::Rect, icon: ChromeIcon
             painter.circle_stroke(c, 7.0, stroke);
             painter.circle_filled(egui::pos2(c.x + 3.0, c.y - 2.0), 7.0, CHROME_TOOLBAR);
         }
+        ChromeIcon::Notifications => {
+            // A bell: domed body, its open rim, and the clapper below.
+            let bell = vec![
+                egui::pos2(c.x - 5.0, c.y + 3.0),
+                egui::pos2(c.x - 5.0, c.y),
+                egui::pos2(c.x - 3.5, r.top() + 3.0),
+                egui::pos2(c.x, r.top() + 1.0),
+                egui::pos2(c.x + 3.5, r.top() + 3.0),
+                egui::pos2(c.x + 5.0, c.y),
+                egui::pos2(c.x + 5.0, c.y + 3.0),
+            ];
+            painter.add(egui::Shape::line(bell, stroke));
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 6.0, c.y + 3.0),
+                    egui::pos2(c.x + 6.0, c.y + 3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - 1.6, r.bottom() - 2.0),
+                    egui::pos2(c.x + 1.6, r.bottom() - 2.0),
+                ],
+                stroke,
+            );
+        }
+        ChromeIcon::Recommend => {
+            // A five-point star with two small flanking sparkles.
+            let outer = r.width().min(r.height()) * 0.42;
+            let inner = outer * 0.42;
+            let mut pts = Vec::with_capacity(11);
+            for i in 0..10 {
+                let radius = if i % 2 == 0 { outer } else { inner };
+                let angle = -std::f32::consts::FRAC_PI_2 + (i as f32) * std::f32::consts::PI / 5.0;
+                pts.push(egui::pos2(
+                    c.x + radius * angle.cos(),
+                    c.y + radius * angle.sin(),
+                ));
+            }
+            pts.push(pts[0]);
+            painter.add(egui::Shape::line(pts, stroke));
+            painter.line_segment(
+                [
+                    egui::pos2(r.right() - 2.0, r.top() + 2.0),
+                    egui::pos2(r.right() - 2.0, r.top() + 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 2.0, r.bottom() - 5.0),
+                    egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
+                ],
+                stroke,
+            );
+        }
     }
 }
 
@@ -2349,6 +2415,8 @@ pub(super) fn drawer_stack(ui: &mut egui::Ui, state: &mut WebState) {
         site_styles_drawer(ui, state);
         downloads_drawer(ui, state);
         history_drawer(ui, state);
+        notifications_drawer(ui, state);
+        recommendations_drawer(ui, state);
     });
 }
 
@@ -2376,6 +2444,8 @@ fn drawer_stack_visible(state: &WebState) -> bool {
         || state.site_styles_open
         || state.downloads_open
         || state.history_open
+        || state.notifications_open
+        || state.recommendations_open
 }
 
 fn apply_visuals(ui: &mut egui::Ui) {
@@ -3458,6 +3528,8 @@ fn action_icon(action: super::menubar::MenuAction) -> ChromeIcon {
         MenuAction::SelectEngine(_) => ChromeIcon::Engine,
         MenuAction::ToggleVerticalTabs => ChromeIcon::Tabs,
         MenuAction::ToggleDownloads => ChromeIcon::Downloads,
+        MenuAction::ToggleNotifications => ChromeIcon::Notifications,
+        MenuAction::ToggleRecommendations => ChromeIcon::Recommend,
         MenuAction::ToggleHistory | MenuAction::ReopenClosedTab => ChromeIcon::History,
         MenuAction::ToggleBookmarksBar
         | MenuAction::AddBookmark
@@ -3595,6 +3667,8 @@ fn disabled_option_tip(action: super::menubar::MenuAction) -> &'static str {
         MenuAction::SelectEngine(_)
         | MenuAction::ToggleVerticalTabs
         | MenuAction::ToggleDownloads
+        | MenuAction::ToggleNotifications
+        | MenuAction::ToggleRecommendations
         | MenuAction::ToggleHistory
         | MenuAction::ToggleBookmarksBar
         | MenuAction::OpenBookmarksManager => "Available from Browser Options",
@@ -5238,6 +5312,219 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
     }
 }
 
+/// Height reserved at the bottom of the vertical tab rail for the affordance
+/// cluster (notifications / downloads / screenshots / recommendations).
+const RAIL_CLUSTER_H: f32 = 40.0;
+
+/// Preferred width of the rail Screenshots capture menu popup.
+const RAIL_SCREENSHOTS_MENU_W: f32 = 220.0;
+
+pub(super) fn vertical_rail_affordances_height() -> f32 {
+    RAIL_CLUSTER_H
+}
+
+/// The bottom band of the vertical tab rail. The operator asked to move the
+/// browser's notifications, drop-down (downloads / screenshots) and
+/// recommendations affordances here; in vertical mode they are de-duplicated
+/// from the horizontal toolbar and live as one compact icon row.
+pub(super) fn vertical_rail_affordances(ui: &mut egui::Ui, state: &mut WebState) {
+    scope(ui, |ui| {
+        let band = ui.max_rect();
+        // A 1px separator divides the cluster from the tab strip above it.
+        ui.painter().hline(
+            band.x_range(),
+            band.top(),
+            egui::Stroke::new(1.0, CHROME_OUTLINE),
+        );
+        egui::Frame::NONE
+            .fill(CHROME_SURFACE_CONTAINER)
+            .inner_margin(egui::Margin::same(4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    rail_notifications_button(ui, state);
+                    rail_downloads_button(ui, state);
+                    rail_screenshots_menu(ui, state);
+                    rail_recommendations_button(ui, state);
+                });
+            });
+    });
+}
+
+fn rail_notifications_button(ui: &mut egui::Ui, state: &mut WebState) {
+    let tip = if state.notifications_unread > 0 {
+        format!("Notifications ({} new)", state.notifications_unread)
+    } else {
+        "Notifications".to_owned()
+    };
+    if chrome_icon_button(
+        ui,
+        ChromeIcon::Notifications,
+        &tip,
+        true,
+        state.notifications_open,
+    )
+    .clicked()
+    {
+        state.toggle_notifications();
+    }
+    // Only paints when there is a genuine unread count (0 → nothing).
+    toolbar_count_badge(ui, state.notifications_unread as u64, &tip);
+}
+
+fn rail_downloads_button(ui: &mut egui::Ui, state: &mut WebState) {
+    // The exact toolbar downloads drop-down block, moved onto the rail.
+    let (active_downloads, total_downloads) = state.download_counts();
+    let downloads_tip = downloads_toolbar_tip(active_downloads, total_downloads);
+    if chrome_icon_button(
+        ui,
+        ChromeIcon::Downloads,
+        &downloads_tip,
+        true,
+        state.downloads_open,
+    )
+    .clicked()
+    {
+        state.downloads_open = !state.downloads_open;
+        if state.downloads_open {
+            state.refresh_downloads();
+        }
+    }
+    download_count_badge(ui, active_downloads, &downloads_tip);
+}
+
+fn rail_recommendations_button(ui: &mut egui::Ui, state: &mut WebState) {
+    if chrome_icon_button(
+        ui,
+        ChromeIcon::Recommend,
+        "Recommendations",
+        true,
+        state.recommendations_open,
+    )
+    .clicked()
+    {
+        state.toggle_recommendations();
+    }
+}
+
+/// The 7 capture verbs the rail Screenshots menu exposes — the same seams the
+/// horizontal toolbar's Capture button and the menubar Capture submenu drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailCaptureAction {
+    Viewport,
+    FullPage,
+    Mhtml,
+    Annotated,
+    Callout,
+    Freehand,
+    Region,
+}
+
+const RAIL_CAPTURE_ACTIONS: &[RailCaptureAction] = &[
+    RailCaptureAction::Viewport,
+    RailCaptureAction::FullPage,
+    RailCaptureAction::Mhtml,
+    RailCaptureAction::Annotated,
+    RailCaptureAction::Callout,
+    RailCaptureAction::Freehand,
+    RailCaptureAction::Region,
+];
+
+impl RailCaptureAction {
+    fn label(self, region_mode: bool) -> &'static str {
+        match self {
+            RailCaptureAction::Viewport => "Capture Viewport",
+            RailCaptureAction::FullPage => "Capture Full Page",
+            RailCaptureAction::Mhtml => "Capture Web Archive",
+            RailCaptureAction::Annotated => "Capture with Annotation",
+            RailCaptureAction::Callout => "Capture with Callout",
+            RailCaptureAction::Freehand => "Capture Freehand Markup",
+            RailCaptureAction::Region => {
+                if region_mode {
+                    "Cancel Region Capture"
+                } else {
+                    "Capture Region"
+                }
+            }
+        }
+    }
+
+    fn apply(self, state: &mut WebState) {
+        match self {
+            RailCaptureAction::Viewport => state.capture_active_viewport(),
+            RailCaptureAction::FullPage => state.capture_active_full_page(),
+            RailCaptureAction::Mhtml => state.capture_active_mhtml(),
+            RailCaptureAction::Annotated => state.capture_active_annotated_viewport(),
+            RailCaptureAction::Callout => state.capture_active_callout_viewport(),
+            RailCaptureAction::Freehand => state.capture_active_freehand_viewport(),
+            RailCaptureAction::Region => {
+                if state.capture_region_mode {
+                    state.cancel_region_capture();
+                } else {
+                    state.start_region_capture();
+                }
+            }
+        }
+    }
+}
+
+fn rail_screenshots_popup_id() -> egui::Id {
+    egui::Id::new("mde_web_rail_screenshots_menu_popup")
+}
+
+fn rail_screenshots_menu(ui: &mut egui::Ui, state: &mut WebState) {
+    let can_capture = state.active_tab_has_frame();
+    let region_mode = state.capture_region_mode;
+    let popup_id = rail_screenshots_popup_id();
+    let response = toolbar_icon_menu_anchor(
+        ui,
+        popup_id,
+        ChromeIcon::Capture,
+        CHROME_ICON,
+        "Screenshots",
+    );
+    if response.clicked() || menu_anchor_keyboard_toggle(ui, &response) {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    let popup_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let motion = popover_motion(ui.ctx(), popup_id, popup_open);
+    let mut chosen: Option<RailCaptureAction> = None;
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            reserve_toolbar_popup_width(ui, RAIL_SCREENSHOTS_MENU_W);
+            if motion.active {
+                ui.ctx().request_repaint();
+            }
+            ui.multiply_opacity(motion.opacity.max(0.2));
+            if motion.anchor_offset > 0.0 {
+                ui.add_space(motion.anchor_offset);
+            }
+            chrome_popup_frame(ui, RAIL_SCREENSHOTS_MENU_W, |ui| {
+                for action in RAIL_CAPTURE_ACTIONS {
+                    if chrome_menu_row(
+                        ui,
+                        action.label(region_mode),
+                        ChromeIcon::Capture,
+                        can_capture,
+                        "No painted page to capture",
+                    )
+                    .clicked()
+                    {
+                        chosen = Some(*action);
+                        ui.memory_mut(|mem| mem.close_popup());
+                    }
+                }
+            });
+        },
+    );
+    if let Some(action) = chosen {
+        action.apply(state);
+    }
+}
+
 /// Which way a tab strip runs, so the shared drag-reorder hit-test knows whether
 /// to compare drop points along X (horizontal strip) or Y (vertical strip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -6528,38 +6815,44 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 active_engine == Some(BrowserEngine::Cef),
             );
 
-            if nav_button(
-                ui,
-                ChromeIcon::Capture,
-                if state.capture_region_mode {
-                    "Select capture region"
-                } else {
-                    "Capture viewport"
-                },
-                state.active_tab_has_frame(),
-            ) {
-                if state.capture_region_mode {
-                    state.cancel_region_capture();
-                } else {
-                    state.capture_active_viewport();
+            // Capture + Downloads are de-duplicated in vertical mode: the rail's
+            // bottom affordance cluster owns them, so the toolbar drops them to
+            // avoid two live copies. The View menu / Capture submenu still reach
+            // both in either layout.
+            if !state.vertical_tabs {
+                if nav_button(
+                    ui,
+                    ChromeIcon::Capture,
+                    if state.capture_region_mode {
+                        "Select capture region"
+                    } else {
+                        "Capture viewport"
+                    },
+                    state.active_tab_has_frame(),
+                ) {
+                    if state.capture_region_mode {
+                        state.cancel_region_capture();
+                    } else {
+                        state.capture_active_viewport();
+                    }
                 }
-            }
 
-            if chrome_icon_button(
-                ui,
-                ChromeIcon::Downloads,
-                &downloads_tip,
-                true,
-                state.downloads_open,
-            )
-            .clicked()
-            {
-                state.downloads_open = !state.downloads_open;
-                if state.downloads_open {
-                    state.refresh_downloads();
+                if chrome_icon_button(
+                    ui,
+                    ChromeIcon::Downloads,
+                    &downloads_tip,
+                    true,
+                    state.downloads_open,
+                )
+                .clicked()
+                {
+                    state.downloads_open = !state.downloads_open;
+                    if state.downloads_open {
+                        state.refresh_downloads();
+                    }
                 }
+                download_count_badge(ui, active_downloads, &downloads_tip);
             }
-            download_count_badge(ui, active_downloads, &downloads_tip);
 
             // BOOKMARKS-7 — a compact "N blocked" shield when the ad-filter has dropped
             // requests on this page (honest 0 stays hidden). Reads the session's
@@ -6577,7 +6870,9 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
                 loading_globe(ui, CHROME_BUTTON, "toolbar");
             }
             browser_media_toolbar(ui, state);
-        } else {
+        } else if !state.vertical_tabs {
+            // Compact toolbar keeps Downloads only in horizontal mode; the rail
+            // cluster owns it when the vertical layout is active.
             if chrome_icon_button(
                 ui,
                 ChromeIcon::Downloads,
@@ -9622,6 +9917,11 @@ mod tests {
         address: &str,
     ) -> egui::FullOutput {
         let mut state = WebState::default();
+        // These fixtures assert the horizontal nav toolbar's full affordance set
+        // (Capture + Downloads sit right of the location bar). Those are
+        // de-duplicated onto the rail in the default vertical layout, so render
+        // the toolbar explicitly in horizontal mode here.
+        state.vertical_tabs = false;
         let (shell, _helper) = std::os::unix::net::UnixStream::pair().expect("omnibox socketpair");
         let session =
             mde_web_preview_client::WebSession::from_stream(shell, None).expect("omnibox session");
@@ -11857,6 +12157,7 @@ mod tests {
             (ChromeIcon::PictureInPicture, IconId::PictureInPicture),
             (ChromeIcon::DarkMode, IconId::DarkMode),
             (ChromeIcon::Lock, IconId::Lock),
+            (ChromeIcon::Notifications, IconId::Notifications),
         ];
         for (chrome, yamis) in mapped {
             assert_eq!(
@@ -11865,6 +12166,94 @@ mod tests {
                 "{chrome:?} should resolve through the YAMIS icon catalog"
             );
         }
+        // Recommend has no YAMIS glyph and always paints its local star fallback.
+        assert_eq!(chrome_icon_yamis_id(ChromeIcon::Recommend), None);
+        assert!(
+            chrome_icon_painted_shape_count(ChromeIcon::Recommend) > 0,
+            "Recommend must paint a local fallback since it has no YAMIS asset"
+        );
+    }
+
+    fn sized_input(w: f32, h: f32) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(w, h),
+        ));
+        input
+    }
+
+    #[test]
+    fn vertical_rail_affordance_cluster_paints_its_row() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        let out = ctx.run(sized_input(CHROME_TAB_RAIL_W, 240.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(CHROME_TAB_RAIL_W, RAIL_CLUSTER_H),
+                );
+                let mut cluster = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                vertical_rail_affordances(&mut cluster, &mut state);
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "the rail affordance cluster produced no primitives"
+        );
+    }
+
+    #[test]
+    fn notifications_drawer_paints_absorbed_notices_without_closing() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = WebState::default();
+        state.notifications_open = true;
+        state.capture_notice = Some("QR share ready".to_owned());
+        state.absorb_browser_notices();
+        state.capture_notice = Some("Capture failed: no painted page".to_owned());
+        state.absorb_browser_notices();
+        assert_eq!(state.browser_notices.len(), 2);
+
+        let out = ctx.run(sized_input(360.0, 400.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                scope(ui, |ui| notifications_drawer(ui, &mut state));
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "the notifications drawer painted nothing while open with notices"
+        );
+        assert!(
+            state.notifications_open,
+            "rendering the drawer must not close it"
+        );
+    }
+
+    #[test]
+    fn vertical_mode_drops_the_toolbar_capture_and_downloads_affordances() {
+        fn nav_shapes(vertical: bool) -> usize {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let mut state = WebState::default();
+            state.vertical_tabs = vertical;
+            let out = ctx.run(sized_input(1200.0, 800.0), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| nav_chrome(ui, &mut state));
+            });
+            out.shapes.len()
+        }
+        // The rail cluster owns Downloads + Capture in vertical mode, so the
+        // toolbar paints strictly fewer primitives than the horizontal layout,
+        // which still carries both affordances.
+        assert!(
+            nav_shapes(false) > nav_shapes(true),
+            "vertical toolbar must suppress the Capture + Downloads affordances the rail owns"
+        );
     }
 
     #[test]

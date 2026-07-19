@@ -64,6 +64,10 @@ pub(super) enum MenuAction {
     /// Toggle the browser download manager drawer.
     ToggleDownloads,
     ToggleHistory,
+    /// Toggle the vertical-rail notifications panel.
+    ToggleNotifications,
+    /// Toggle the vertical-rail recommendations panel.
+    ToggleRecommendations,
     /// Toggle the BOOKMARKS-BAR horizontal bookmarks bar below the nav chrome.
     ToggleBookmarksBar,
     /// Toggle BROWSER-DD-8 power mode.
@@ -230,6 +234,10 @@ struct Snapshot {
     /// Download manager drawer is open.
     downloads_open: bool,
     history_open: bool,
+    /// Vertical-rail notifications panel is open.
+    notifications_open: bool,
+    /// Vertical-rail recommendations panel is open.
+    recommendations_open: bool,
     /// The BOOKMARKS-BAR bookmarks bar is shown.
     bookmarks_bar_visible: bool,
     /// Active browser-originated transfer count.
@@ -355,6 +363,8 @@ fn snapshot(state: &WebState) -> Snapshot {
                 find_open: state.find_open,
                 downloads_open: state.downloads_open,
                 history_open: state.history_open,
+                notifications_open: state.notifications_open,
+                recommendations_open: state.recommendations_open,
                 bookmarks_bar_visible: state.bookmarks_bar_visible,
                 active_downloads,
                 total_downloads,
@@ -397,6 +407,8 @@ fn snapshot(state: &WebState) -> Snapshot {
     snap.page_zoom_percent = state.page_zoom_percent;
     snap.find_open = state.find_open;
     snap.downloads_open = state.downloads_open;
+    snap.notifications_open = state.notifications_open;
+    snap.recommendations_open = state.recommendations_open;
     snap.bookmarks_bar_visible = state.bookmarks_bar_visible;
     snap.power_mode = state.power_mode;
     snap.media_pip_available = state.media_pip_available();
@@ -524,6 +536,22 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         "Hide History"
                     } else {
                         "Show History"
+                    },
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ToggleNotifications,
+                    if s.notifications_open {
+                        "Hide Notifications"
+                    } else {
+                        "Show Notifications"
+                    },
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ToggleRecommendations,
+                    if s.recommendations_open {
+                        "Hide Recommendations"
+                    } else {
+                        "Show Recommendations"
                     },
                 )),
                 Entry::Item(Item::new(
@@ -1203,6 +1231,8 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
             }
         }
         MenuAction::ToggleHistory => state.history_open = !state.history_open,
+        MenuAction::ToggleNotifications => state.toggle_notifications(),
+        MenuAction::ToggleRecommendations => state.toggle_recommendations(),
         MenuAction::ToggleBookmarksBar => state.toggle_bookmarks_bar(),
         MenuAction::TogglePowerMode => state.toggle_power_mode(),
         MenuAction::CycleContainer => state.cycle_active_tab_container(),
@@ -1414,6 +1444,8 @@ mod tests {
             find_open: false,
             downloads_open: false,
             history_open: false,
+            notifications_open: false,
+            recommendations_open: false,
             bookmarks_bar_visible: false,
             active_downloads: 0,
             total_downloads: 0,
@@ -1837,6 +1869,8 @@ mod tests {
             find_open: true,
             downloads_open: true,
             history_open: false,
+            notifications_open: false,
+            recommendations_open: false,
             active_downloads: 2,
             total_downloads: 3,
             audio_muted: true,
@@ -2425,6 +2459,8 @@ mod tests {
                                 | "Vertical Tabs"
                                 | "Show Downloads"
                                 | "Show History"
+                                | "Show Notifications"
+                                | "Show Recommendations"
                                 | "Show Bookmarks Bar"
                                 | "Open Bookmarks Manager"
                         ),
@@ -2889,6 +2925,34 @@ mod tests {
         assert!(!state.vertical_tabs);
         apply(&ctx, &mut state, MenuAction::ToggleVerticalTabs);
         assert!(state.vertical_tabs);
+    }
+
+    #[test]
+    fn the_view_menu_toggles_notifications_and_recommendations() {
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+
+        assert!(!state.notifications_open);
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(state.notifications_open);
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(!state.notifications_open);
+
+        assert!(!state.recommendations_open);
+        apply(&ctx, &mut state, MenuAction::ToggleRecommendations);
+        assert!(state.recommendations_open);
+        apply(&ctx, &mut state, MenuAction::ToggleRecommendations);
+        assert!(!state.recommendations_open);
+    }
+
+    #[test]
+    fn opening_notifications_from_the_menu_clears_the_unread_count() {
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+        state.notifications_unread = 3;
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(state.notifications_open);
+        assert_eq!(state.notifications_unread, 0);
     }
 
     #[test]
