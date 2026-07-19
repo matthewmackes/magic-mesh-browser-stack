@@ -883,4 +883,229 @@ mod tests {
         assert_eq!(v["source_host"], "node-a");
         assert_eq!(v["handoff_id"], "01Phone");
     }
+
+    // ----------------------------------------------------------------------
+    // WL-FUNC-003 — deterministic two-store cross-node convergence fixture.
+    //
+    // Per-end round-trips are already covered above. This fixture proves the
+    // remaining verification gap: the cross-node Syncthing hop. Two independent
+    // session-sync stores (two workgroup roots / two node identities) apply
+    // divergent edits to the SAME roaming host key, then a deterministic model
+    // of the Syncthing mirror hop exchanges and re-materializes their snapshots.
+    // Session-state conflicts here are Syncthing last-writer-wins (not CRDT);
+    // the LWW winner is resolved by a fixture-controlled HLC, never a wall clock.
+    // ----------------------------------------------------------------------
+
+    /// Roaming host key edited concurrently on both nodes — the LWW battleground.
+    const SHARED_HOST: &str = "roam-profile";
+    /// Fixture HLC for node-a's mirror write (the earlier writer).
+    const HLC_A: u64 = 7;
+    /// Fixture HLC for node-b's mirror write (the later writer — the LWW winner).
+    const HLC_B: u64 = 9;
+
+    /// Build a Browser session snapshot with an explicit tab set and zoom so the
+    /// two nodes' edits are unambiguously divergent bodies.
+    fn snapshot_tabs(host: &str, zoom: u64, urls: &[&str]) -> String {
+        let tabs: Vec<serde_json::Value> = urls
+            .iter()
+            .enumerate()
+            .map(|(index, url)| serde_json::json!({"index": index, "engine": "cef", "url": url}))
+            .collect();
+        serde_json::json!({
+            "op": "browser_session_sync",
+            "source": "browser",
+            "host": host,
+            "active_index": 0,
+            "settings": {
+                "future_engine": "cef",
+                "vertical_tabs": true,
+                "page_zoom_percent": zoom,
+                "speed_dial": []
+            },
+            "tabs": tabs,
+            "downloads": []
+        })
+        .to_string()
+    }
+
+    /// Drive the REAL mirror path (`apply_snapshot` → `mirror_pending`) for one
+    /// node with an available share, returning its share root plus the backing
+    /// temp dirs to keep alive. The clock is pinned so nothing reads a wall time.
+    fn mirror_node_edits(
+        node: &str,
+        hlc: u64,
+        snapshots: &[String],
+    ) -> (tempfile::TempDir, Vec<tempfile::TempDir>) {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = BrowserSessionSyncWorker::new(
+            node.to_owned(),
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        )
+        .with_share_gate(Arc::new(AtomicBool::new(true)))
+        .with_now_fn(Arc::new(move || hlc));
+        for body in snapshots {
+            let snap = parse_snapshot(body).unwrap();
+            worker.apply_snapshot(snap, &persist);
+        }
+        (share, vec![local, bus])
+    }
+
+    /// Two independent stores that have each mirrored a divergent snapshot for
+    /// `SHARED_HOST`, plus one non-conflicting host apiece.
+    struct DivergentPair {
+        share_a: tempfile::TempDir,
+        share_b: tempfile::TempDir,
+        roam_a_body: String,
+        roam_b_body: String,
+        _keep: Vec<tempfile::TempDir>,
+    }
+
+    /// Materialize the two divergent stores through the production mirror path.
+    fn divergent_pair() -> DivergentPair {
+        let roam_a = snapshot_tabs(SHARED_HOST, 110, &["https://a1.test/", "https://a2.test/"]);
+        let na_only = snapshot_tabs("node-a-only", 100, &["https://na.test/"]);
+        let roam_b = snapshot_tabs(
+            SHARED_HOST,
+            140,
+            &["https://b1.test/", "https://b2.test/", "https://b3.test/"],
+        );
+        let nb_only = snapshot_tabs("node-b-only", 125, &["https://nb.test/"]);
+
+        let (share_a, keep_a) = mirror_node_edits("node-a", HLC_A, &[roam_a, na_only]);
+        let (share_b, keep_b) = mirror_node_edits("node-b", HLC_B, &[roam_b, nb_only]);
+
+        let roam_a_body =
+            std::fs::read_to_string(latest_path(share_a.path(), SHARED_HOST)).unwrap();
+        let roam_b_body =
+            std::fs::read_to_string(latest_path(share_b.path(), SHARED_HOST)).unwrap();
+
+        let mut keep = keep_a;
+        keep.extend(keep_b);
+        DivergentPair {
+            share_a,
+            share_b,
+            roam_a_body,
+            roam_b_body,
+            _keep: keep,
+        }
+    }
+
+    /// Read every mirrored file under a workgroup root into a path->body map.
+    /// `BTreeMap` gives order-independent equality for the convergence assert.
+    fn scan_share_root(root: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+        fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else if let Ok(body) = std::fs::read_to_string(&path) {
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        out.insert(rel.to_path_buf(), body);
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// Deterministic model of one Syncthing mirror hop. Each root's mirrored
+    /// files carry that root's fixture HLC; same-path conflicts resolve
+    /// last-writer-wins on the higher HLC (never a wall clock). The resolved set
+    /// is re-materialized into BOTH roots so they converge byte-for-byte. The
+    /// merge is keyed on the HLC, so the outcome is independent of argument /
+    /// filesystem-traversal order (HLCs are distinct — no ties). Returns the
+    /// resolved snapshot set.
+    fn syncthing_lww_exchange(
+        root_a: &Path,
+        hlc_a: u64,
+        root_b: &Path,
+        hlc_b: u64,
+    ) -> std::collections::BTreeMap<PathBuf, String> {
+        let mut merged: std::collections::BTreeMap<PathBuf, (u64, String)> =
+            std::collections::BTreeMap::new();
+        for (root, hlc) in [(root_a, hlc_a), (root_b, hlc_b)] {
+            for (rel, body) in scan_share_root(root) {
+                match merged.get(&rel) {
+                    Some((current_hlc, _)) if *current_hlc >= hlc => {}
+                    _ => {
+                        merged.insert(rel, (hlc, body));
+                    }
+                }
+            }
+        }
+        let resolved: std::collections::BTreeMap<PathBuf, String> = merged
+            .into_iter()
+            .map(|(rel, (_hlc, body))| (rel, body))
+            .collect();
+        for (rel, body) in &resolved {
+            for root in [root_a, root_b] {
+                write_atomic(&root.join(rel), body).unwrap();
+            }
+        }
+        resolved
+    }
+
+    #[test]
+    fn two_store_session_sync_converges_on_the_deterministic_lww_winner() {
+        let pair = divergent_pair();
+
+        // The divergence is real: each node mirrored a different body for the
+        // shared roaming host, so the two workgroup roots start out disagreeing.
+        assert_ne!(pair.roam_a_body, pair.roam_b_body);
+        assert_ne!(
+            scan_share_root(pair.share_a.path()),
+            scan_share_root(pair.share_b.path())
+        );
+
+        let resolved =
+            syncthing_lww_exchange(pair.share_a.path(), HLC_A, pair.share_b.path(), HLC_B);
+
+        // Both stores converge to one byte-identical resolved snapshot set.
+        let after_a = scan_share_root(pair.share_a.path());
+        let after_b = scan_share_root(pair.share_b.path());
+        assert_eq!(after_a, after_b);
+        assert_eq!(after_a, resolved);
+
+        // Union convergence: every node's non-conflicting host survives on both
+        // sides of the hop, alongside the resolved shared host.
+        let roam_rel = latest_path(Path::new(""), SHARED_HOST);
+        let na_rel = latest_path(Path::new(""), "node-a-only");
+        let nb_rel = latest_path(Path::new(""), "node-b-only");
+        assert_eq!(after_a.len(), 3);
+        assert!(after_a.contains_key(&na_rel));
+        assert!(after_a.contains_key(&nb_rel));
+
+        // The LWW winner for the conflicting host is deterministically the
+        // higher-HLC writer (node-b) — no wall-clock nondeterminism involved.
+        assert_eq!(after_a.get(&roam_rel), Some(&pair.roam_b_body));
+        assert_ne!(after_a.get(&roam_rel), Some(&pair.roam_a_body));
+    }
+
+    #[test]
+    fn two_store_session_sync_lww_exchange_is_order_independent() {
+        // Identical divergent inputs; exchange the roots in opposite argument
+        // order. The later-HLC writer wins either way, and both hops resolve to
+        // the same converged snapshot set — the LWW is driven purely by the HLC.
+        let forward = divergent_pair();
+        let reverse = divergent_pair();
+        let winner = forward.roam_b_body.clone();
+        let roam_rel = latest_path(Path::new(""), SHARED_HOST);
+
+        let resolved_fwd =
+            syncthing_lww_exchange(forward.share_a.path(), HLC_A, forward.share_b.path(), HLC_B);
+        let resolved_rev =
+            syncthing_lww_exchange(reverse.share_b.path(), HLC_B, reverse.share_a.path(), HLC_A);
+
+        assert_eq!(resolved_fwd, resolved_rev);
+        assert_eq!(resolved_fwd.get(&roam_rel), Some(&winner));
+    }
 }
