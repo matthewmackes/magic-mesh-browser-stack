@@ -1552,6 +1552,63 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_document_http_nav_is_allowed_but_a_subresource_is_cancelled() {
+        // The Google-News redirect bug reproduced over the seam: with the request
+        // correctly classified (Document, not the old hardcoded RESOURCE_OTHER), a
+        // top-level https->http navigation is allowed while the SAME http URL as a
+        // subresource is still cancelled as mixed content.
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/".to_owned(),
+            },
+        );
+        session.poll();
+        assert_no_control_pending(&peer);
+
+        // Top-level Document nav -> allow (the shell drives its own prompt).
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 10,
+                url: "http://docs.example.test/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 10,
+                allow: true
+            }
+        );
+        // Same http URL as a Script subresource -> mixed-content cancel.
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 11,
+                url: "http://docs.example.test/x.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 11,
+                allow: false
+            }
+        );
+        // A benign http Document nav must not arm any full-page interstitial.
+        assert!(session.safe_browsing_block().is_none());
+        assert!(session.managed_policy_block().is_none());
+    }
+
+    #[test]
     fn a_mesh_request_is_exempt_over_the_seam() {
         let (mut session, mut peer) = filtered_session();
         send_event(

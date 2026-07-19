@@ -126,6 +126,58 @@ fn certificate_error_offset_sits_inside_the_request_handler_layout() {
 }
 
 #[test]
+fn get_resource_type_offset_sits_inside_the_request_layout() {
+    // cef_request_t (pinned CEF 149, cross-checked on-seat .15): get_resource_type
+    // is index 19 of the fn-ptr block that follows the 40-byte base, so
+    // 40 + 19*8 = 192. Anchored non-tautologically against the two struct-pinning
+    // constants: get_url=48 fixes index 1 (40 + 1*8), and CEF_REQUEST_SIZE=216 =
+    // 40 + 22*8 fixes the method count at 22 (indices 0..21), so index 19 is the
+    // third-from-last fn ptr and must sit inside the struct.
+    assert_eq!(CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET, 40 + 19 * 8);
+    assert_eq!(CEF_REQUEST_GET_URL_OFFSET, 40 + 1 * 8);
+    assert_eq!(CEF_REQUEST_SIZE, 40 + 22 * 8);
+    assert!(
+        CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET < CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET,
+        "set_header_by_name (idx 13) precedes get_resource_type (idx 19)"
+    );
+    assert!(
+        CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET < CEF_REQUEST_SIZE - 8,
+        "get_resource_type fn ptr lies wholly inside cef_request_t"
+    );
+}
+
+#[test]
+fn cef_resource_type_maps_to_the_shell_wire_bytes() {
+    // CEF cef_resource_type_t (on-seat) -> the compact byte resource_from_wire
+    // decodes in mde-web-preview-client filter.rs. The remap is deliberate: CEF's
+    // MEDIA=8/XHR=13/PING=14 are NOT the shell ResourceType discriminants, so a
+    // cast would mis-classify them.
+    assert_eq!(cef_resource_type_to_wire(0), 0, "MAIN_FRAME -> Document");
+    assert_eq!(cef_resource_type_to_wire(1), 1, "SUB_FRAME -> Subdocument");
+    assert_eq!(cef_resource_type_to_wire(2), 2, "STYLESHEET");
+    assert_eq!(cef_resource_type_to_wire(3), 3, "SCRIPT");
+    assert_eq!(cef_resource_type_to_wire(4), 4, "IMAGE");
+    assert_eq!(cef_resource_type_to_wire(5), 5, "FONT_RESOURCE -> Font");
+    assert_eq!(cef_resource_type_to_wire(8), 6, "MEDIA -> Media");
+    assert_eq!(cef_resource_type_to_wire(7), 7, "OBJECT");
+    assert_eq!(cef_resource_type_to_wire(13), 8, "XHR -> XmlHttpRequest");
+    assert_eq!(cef_resource_type_to_wire(14), 9, "PING -> Ping");
+    // The null-vtable sentinel and any unmapped/plugin class fall back to Other,
+    // NOT to the MAIN_FRAME (0) a naive cast of -1 or 6 would risk.
+    assert_eq!(
+        cef_resource_type_to_wire(-1),
+        RESOURCE_OTHER,
+        "null sentinel"
+    );
+    assert_eq!(cef_resource_type_to_wire(6), RESOURCE_OTHER, "SUB_RESOURCE");
+    assert_eq!(
+        cef_resource_type_to_wire(99),
+        RESOURCE_OTHER,
+        "future class"
+    );
+}
+
+#[test]
 fn jsdialog_offsets_reconcile_with_the_pinned_cef_layout() {
     // cef_client_t: get_jsdialog_handler is index 11 (base 40 + 11*8 = 128),
     // sitting between get_permission_handler(120) and get_keyboard_handler(136),
@@ -2613,6 +2665,7 @@ fn resource_verdict_transport_uses_async_cef_callback() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://www.google-analytics.com/collect".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CONTINUE_ASYNC);
@@ -2663,9 +2716,11 @@ fn resource_verdict_pending_callbacks_are_bounded_and_fail_closed() {
         let callback = TestCefCallback::new();
         let id = (idx + 1) as u64;
         let url = format!("https://ads.example/{idx}.js");
-        let rv = callbacks
-            .state
-            .begin_resource_request(url.clone(), callback.as_mut_ptr());
+        let rv = callbacks.state.begin_resource_request(
+            url.clone(),
+            RESOURCE_OTHER,
+            callback.as_mut_ptr(),
+        );
         assert_eq!(rv, RV_CONTINUE_ASYNC);
         assert_eq!(callback.add_refs.load(Ordering::SeqCst), 1);
 
@@ -2693,6 +2748,7 @@ fn resource_verdict_pending_callbacks_are_bounded_and_fail_closed() {
     let overflow = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://ads.example/overflow.js".to_owned(),
+        RESOURCE_OTHER,
         overflow.as_mut_ptr(),
     );
 
@@ -2721,6 +2777,7 @@ fn resource_verdict_pending_callbacks_are_bounded_and_fail_closed() {
     let recovered = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://ads.example/recovered.js".to_owned(),
+        RESOURCE_OTHER,
         recovered.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CONTINUE_ASYNC, "freeing a slot allows new requests");
@@ -2756,6 +2813,7 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "mde-page-text://capture/77?text=hello%20page".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CANCEL);
@@ -2801,6 +2859,7 @@ fn media_metadata_beacon_is_intercepted_and_published_without_adfilter_roundtrip
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://mde-media.invalid/metadata/?body=%7B%22title%22%3A%22Track%22%2C%22artist%22%3A%22Artist%22%7D".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CANCEL);
@@ -2893,6 +2952,7 @@ fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() 
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
             "https://mde-page-scrape.invalid/capture/88?body=%7B%22text%22%3A%22hello%22%2C%22links%22%3A%5B%5D%7D".to_owned(),
+            RESOURCE_OTHER,
             cef_callback.as_mut_ptr(),
         );
     assert_eq!(rv, RV_CANCEL);
@@ -3127,6 +3187,7 @@ fn passkey_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://mde-passkey.invalid/request/?body=%7B%22ceremony%22%3A%22get%22%7D".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CANCEL);

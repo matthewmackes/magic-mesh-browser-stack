@@ -431,6 +431,20 @@ pub const CEF_REQUEST_GET_URL_OFFSET: usize = 48;
 /// Signature `void(self, const cef_string_t* name, const cef_string_t* value,
 /// int overwrite)`.
 pub const CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET: usize = 144;
+/// `offsetof(cef_request_t, get_resource_type)` for pinned Linux CEF 149.
+///
+/// `get_resource_type` is index 19 of the `_cef_request_t` fn-ptr block that
+/// follows the 40-byte `cef_base_ref_counted_t`: base 40 + 19*8 = 192. The tail
+/// of `cef_request_capi.h` after `set_header_by_name(13)` is ABI-frozen:
+/// set(14), get_resource_type... no — the classic order is get_first_party(15
+/// on older ABIs) but the pinned CEF 149 layout — cross-checked on-seat .15 —
+/// places `get_resource_type` at index 19 (offset 192). This is pinned by the
+/// same two anchors that pin the struct: `CEF_REQUEST_GET_URL_OFFSET`=48 fixes
+/// index 1 against base 40, and `CEF_REQUEST_SIZE`=216 = 40 + 22*8 fixes the
+/// method count at 22 (indices 0..21), so index 19 is the third-from-last and
+/// sits inside the struct. Signature `cef_resource_type_t (*)(cef_request_t*)`
+/// (a plain `int` enum).
+pub const CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET: usize = 192;
 /// `sizeof(cef_callback_t)` for pinned Linux CEF 149.
 pub const CEF_CALLBACK_SIZE: usize = 56;
 /// `offsetof(cef_callback_t, cont)`.
@@ -506,6 +520,31 @@ const RV_CANCEL: c_int = 0;
 const RV_CONTINUE: c_int = 1;
 const RV_CONTINUE_ASYNC: c_int = 2;
 const RESOURCE_OTHER: u8 = 255;
+/// Map a CEF `cef_resource_type_t` to the compact wire byte the shell decodes in
+/// `resource_from_wire` (mde-web-preview-client `filter.rs`). CEF's enum order
+/// (MAIN_FRAME=0, SUB_FRAME=1, STYLESHEET=2, SCRIPT=3, IMAGE=4, FONT_RESOURCE=5,
+/// SUB_RESOURCE=6, OBJECT=7, MEDIA=8, XHR=13, PING=14) is NOT the shell's
+/// `ResourceType` order, so this is an explicit remap, not a cast. Getting a
+/// real MAIN_FRAME→Document(0) is the whole point: the shell exempts a top-level
+/// Document from mixed-content and generic ad-filter cancellation, so a
+/// hardcoded 255 (Other) is what silently killed Google-News redirect navs.
+/// Unknown/plugin classes (incl. the -1 null-vtable sentinel and SUB_RESOURCE)
+/// fall through to Other, which is judged like any subresource.
+const fn cef_resource_type_to_wire(rt: c_int) -> u8 {
+    match rt {
+        0 => 0,              // MAIN_FRAME    -> Document
+        1 => 1,              // SUB_FRAME     -> Subdocument
+        2 => 2,              // STYLESHEET    -> Stylesheet
+        3 => 3,              // SCRIPT        -> Script
+        4 => 4,              // IMAGE         -> Image
+        5 => 5,              // FONT_RESOURCE -> Font
+        8 => 6,              // MEDIA         -> Media
+        7 => 7,              // OBJECT        -> Object
+        13 => 8,             // XHR           -> XmlHttpRequest
+        14 => 9,             // PING          -> Ping
+        _ => RESOURCE_OTHER, // incl. -1 sentinel, SUB_RESOURCE(6), future classes
+    }
+}
 /// Cap CEF callbacks held while waiting for shell resource verdicts. The shell
 /// answers immediately in normal operation, so hitting this is backpressure or a
 /// wedged peer; fail closed instead of retaining unbounded live callbacks.
@@ -2459,7 +2498,7 @@ impl CefBrowserState {
         expected == current
     }
 
-    fn begin_resource_request(&self, url: String, callback: *mut c_void) -> c_int {
+    fn begin_resource_request(&self, url: String, resource: u8, callback: *mut c_void) -> c_int {
         if let Some((id, text)) = decode_page_text_beacon(&url) {
             self.publish_page_text(id, text);
             if !callback.is_null() {
@@ -2522,11 +2561,7 @@ impl CefBrowserState {
         pending.insert(id, callback as usize);
         drop(pending);
 
-        let event = EventMsg::ResourceRequest {
-            id,
-            url,
-            resource: RESOURCE_OTHER,
-        };
+        let event = EventMsg::ResourceRequest { id, url, resource };
         let sent = self
             .frame_sink
             .lock()
@@ -3842,7 +3877,11 @@ unsafe extern "C" fn on_before_resource_load(
         let Some(url) = request_url(request, state.string_userfree_free) else {
             return RV_CONTINUE;
         };
-        state.begin_resource_request(url, callback)
+        // Classify the request so the shell can exempt a top-level Document from
+        // the mixed-content / generic ad-filter cancellation that a hardcoded
+        // RESOURCE_OTHER used to trigger (the Google-News redirect nav bug).
+        let resource = cef_resource_type_to_wire(request_resource_type(request));
+        state.begin_resource_request(url, resource, callback)
     })
     .unwrap_or(RV_CONTINUE)
 }
@@ -5727,6 +5766,24 @@ fn request_url(
         value
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Read `cef_request_t::get_resource_type` — the request's resource class
+/// (`MAIN_FRAME`=0, `SCRIPT`=3, `XHR`=13, …) as a raw `cef_resource_type_t` int.
+/// Returns the `-1` sentinel when the vtable slot is null so the caller maps it
+/// to `RESOURCE_OTHER` via [`cef_resource_type_to_wire`] rather than mis-reading
+/// a class of 0 (MAIN_FRAME) from a missing method. Mirrors [`request_url`].
+fn request_resource_type(request: *mut c_void) -> c_int {
+    let Some(get_resource_type) = read_fn(request, CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET) else {
+        return -1;
+    };
+    // SAFETY: `get_resource_type` is read from `cef_request_t::get_resource_type`,
+    // whose pinned C signature is `cef_resource_type_t (*)(cef_request_t*)` — a
+    // plain `int` enum return, no out-params.
+    let get_resource_type: unsafe extern "C" fn(*mut c_void) -> c_int =
+        unsafe { std::mem::transmute(get_resource_type) };
+    // SAFETY: CEF supplied a live `cef_request_t` for the callback duration.
+    unsafe { get_resource_type(request) }
 }
 
 /// Stamp an HTTP request header onto a live, mutable `cef_request_t` via

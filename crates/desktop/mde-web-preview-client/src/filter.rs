@@ -461,6 +461,17 @@ impl RequestFilter {
             .engine
             .match_request(url, resource_type, &self.first_party);
         if decision.is_block() {
+            // Defense-in-depth: a top-level Document navigation must never be
+            // SILENTLY cancelled by the generic ad-filter engine. Cancelling it
+            // leaves the omnibox populated but the page frozen on the prior
+            // frame — the Google-News redirect bug, where a bundled ad rule
+            // matched the redirect URL of a main-frame nav. Only the
+            // interstitial-driving blocks above (managed-policy, safe-browsing —
+            // both return before this point) may stop a top-level nav; mixed
+            // content already exempts Document in `blocks_mixed_content`.
+            if resource_type == ResourceType::Document {
+                return Decision::Allow(AllowReason::Default);
+            }
             self.blocked = self.blocked.saturating_add(1);
             self.tally.record(&decision, url);
         }
@@ -859,6 +870,52 @@ mod tests {
             f.decide("https://cdn.example.test/app.css", ResourceType::Stylesheet);
         assert!(!secure_subresource.is_block());
         assert_eq!(f.blocked_count(), 1);
+    }
+
+    #[test]
+    fn a_top_level_document_is_never_cancelled_by_the_generic_ad_filter() {
+        // The Google-News redirect bug: a bundled ad rule matched the redirect URL
+        // of a MAIN-FRAME navigation. With the request now correctly classified as
+        // a Document (not the old hardcoded RESOURCE_OTHER), the generic engine
+        // must NOT silently cancel it — cancelling filled the omnibox but froze the
+        // page. Only safe-browsing / managed-policy (interstitial) may stop a nav.
+        let mut f = bundled_filter("https://news.example.com/");
+        // As a subresource this bundled tracker URL genuinely matches a rule.
+        let as_sub = f.decide("https://doubleclick.net/ad", ResourceType::Image);
+        assert!(
+            as_sub.is_block(),
+            "the URL genuinely matches a bundled rule"
+        );
+        let blocked_after_sub = f.blocked_count();
+        // The SAME rule-matching URL as a top-level Document nav is allowed and NOT
+        // counted — the defense-in-depth exemption in `decide`.
+        let as_doc = f.decide("https://doubleclick.net/ad", ResourceType::Document);
+        assert!(
+            !as_doc.is_block(),
+            "a top-level Document nav survives the generic ad engine"
+        );
+        assert_eq!(
+            f.blocked_count(),
+            blocked_after_sub,
+            "allowing a Document must not bump the per-page block counter"
+        );
+    }
+
+    #[test]
+    fn mixed_content_exempts_a_top_level_document_but_not_an_other_subresource() {
+        let mut f = RequestFilter::empty();
+        assert!(f.set_page("https://app.example/"));
+        assert_eq!(f.first_party_scheme(), "https");
+        // A plain-HTTP `Other` subresource on an HTTPS page is mixed content.
+        let sub = f.decide("http://cdn.example.test/pixel", ResourceType::Other);
+        assert_eq!(sub.blocked_by(), Some("mixed-content:http"));
+        // The top-level HTTP Document nav is exempt — the shell drives its own
+        // "not secure" navigation prompt instead of a silent cancel.
+        let doc = f.decide("http://docs.example.test/", ResourceType::Document);
+        assert!(
+            !doc.is_block(),
+            "a top-level Document http nav is not a mixed-content block"
+        );
     }
 
     #[test]
