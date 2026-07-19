@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::bus_reader::BusReader;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_web_preview_client::MediaTransportAction;
@@ -349,17 +350,11 @@ impl Player {
     }
 
     fn latest_status(&self) -> BrowserMprisStatus {
-        let Some(root) = self.bus_root.as_ref() else {
-            return BrowserMprisStatus::default();
-        };
-        let Ok(persist) = Persist::open(root.clone()) else {
-            return BrowserMprisStatus::default();
-        };
+        // arch-11: latest-value read through the shared BusReader seam — the
+        // newest browser media-status mirror, opened per call (self-heal kept).
         let topic = browser_media_status_topic(&self.host);
-        persist
-            .read_latest(&topic)
-            .ok()
-            .flatten()
+        BusReader::new(self.bus_root.clone())
+            .latest(&topic)
             .and_then(|message| message.body)
             .and_then(|body| parse_status_body(&body).ok())
             .unwrap_or_default()

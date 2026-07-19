@@ -22,6 +22,7 @@
 //! session attached this surface shows an honest gated `EmptyState`, never a fake
 //! page (§7).
 
+use crate::bus_reader::BusReader;
 use base64::Engine as _;
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
@@ -2389,10 +2390,8 @@ impl WebState {
             return;
         }
         self.media_control_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_media_control_topic(&local_hostname());
@@ -3560,10 +3559,8 @@ impl WebState {
             return;
         }
         self.voice_command_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_voice_command_result_topic(&local_hostname());
@@ -3597,10 +3594,8 @@ impl WebState {
             return;
         }
         self.bookmarks_collection_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let Ok(msgs) = persist.list_since(
@@ -3637,10 +3632,8 @@ impl WebState {
             return;
         }
         self.speech_status_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let host = local_hostname();
@@ -3676,23 +3669,16 @@ impl WebState {
             return;
         }
         self.passkey_status_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
-            return;
-        };
+        // arch-11: latest-value read through the shared BusReader seam — the
+        // newest passkey-status mirror, opened per call (self-heal preserved).
         let topic = browser_passkey_status_topic(&local_hostname());
-        let Ok(mut msgs) = persist.list_since(&topic, None) else {
+        let Some(body) = BusReader::new(self.bus_root.clone())
+            .latest(&topic)
+            .and_then(|msg| msg.body)
+        else {
             return;
         };
-        let Some(msg) = msgs.pop() else {
-            return;
-        };
-        let Some(body) = msg.body.as_deref() else {
-            return;
-        };
-        let Ok(status) = parse_passkey_status(body) else {
+        let Ok(status) = parse_passkey_status(&body) else {
             return;
         };
         self.latest_passkey_status = Some(status);
@@ -3706,10 +3692,8 @@ impl WebState {
             return;
         }
         self.passkey_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_passkey_event_topic(&local_hostname());
@@ -3749,10 +3733,8 @@ impl WebState {
             return;
         }
         self.share_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_share_result_topic(&local_hostname());
@@ -3779,10 +3761,8 @@ impl WebState {
             return;
         }
         self.translation_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_translation_result_topic(&local_hostname());
@@ -3814,23 +3794,16 @@ impl WebState {
             return;
         }
         self.security_update_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
-            return;
-        };
+        // arch-11: latest-value read through the shared BusReader seam — the
+        // newest security-update-status mirror, opened per call (self-heal kept).
         let topic = browser_security_update_status_topic(&local_hostname());
-        let Ok(mut msgs) = persist.list_since(&topic, None) else {
+        let Some(body) = BusReader::new(self.bus_root.clone())
+            .latest(&topic)
+            .and_then(|msg| msg.body)
+        else {
             return;
         };
-        let Some(msg) = msgs.pop() else {
-            return;
-        };
-        let Some(body) = msg.body.as_deref() else {
-            return;
-        };
-        let Ok(status) = parse_security_update_status(body) else {
+        let Ok(status) = parse_security_update_status(&body) else {
             return;
         };
         self.latest_security_update = Some(status);

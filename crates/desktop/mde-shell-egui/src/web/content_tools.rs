@@ -372,10 +372,8 @@ impl WebState {
             return;
         }
         self.offline_cache_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_offline_cache_result_topic(&local_hostname());

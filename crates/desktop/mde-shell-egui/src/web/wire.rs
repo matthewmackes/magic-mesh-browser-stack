@@ -2691,3 +2691,147 @@ pub(super) fn https_upgrade(url: &str) -> String {
         .strip_prefix("http://")
         .map_or_else(|| trimmed.to_owned(), |rest| format!("https://{rest}"))
 }
+
+/// WL-ARCH-003 — shared **wire-contract fixtures** for the mirrored daemon
+/// bodies the shell's Bus readers decode (now off the [`BusReader`] seam). Each
+/// fixture is a *pinned canonical JSON body* in the exact shape the daemon
+/// worker publishes; the test decodes it through the SAME `parse_*` the poller
+/// runs and asserts the projection. If a field is renamed / retyped / dropped on
+/// either side of the wire, the matching fixture stops decoding and the test goes
+/// red — a wire-shape drift is caught here, not on a live seat.
+///
+/// [`BusReader`]: crate::bus_reader::BusReader
+#[cfg(test)]
+mod wire_contract {
+    use super::*;
+
+    /// `state/browser/<node>/passkey/status` — the latest-wins mirror
+    /// `poll_passkey_status` reads via `BusReader::latest`.
+    const PASSKEY_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "asserted",
+        "last_request_id": "req-7",
+        "last_host": "example.test",
+        "last_ceremony": "get",
+        "last_rp_id": "example.test",
+        "mirrored": true,
+        "accepted": 3,
+        "rejected": 1,
+        "hardware_state": "ready",
+        "hardware_key_count": 1,
+        "hardware_ctaphid_state": "unknown",
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/security/update` — the mirror
+    /// `refresh_security_update_status` reads via `BusReader::latest`.
+    const SECURITY_UPDATE_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "current",
+        "expected_cef_version": "127.0.0",
+        "installed_version": "127.0.0",
+        "libcef_present": true,
+        "updater_state": "idle",
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/read_aloud/status` — read by `poll_speech_statuses`.
+    const READ_ALOUD_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "speaking",
+        "last_title": "A Document",
+        "last_url": "https://page.example/a",
+        "accepted": 2,
+        "spoken": 1,
+        "rejected": 0,
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/voice/status` — read by `poll_speech_statuses`.
+    const VOICE_COMMAND_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "listening",
+        "last_mode": "command",
+        "accepted": 1,
+        "transcribed": 0,
+        "rejected": 0,
+        "updated_ms": 1000
+    }"#;
+
+    /// `event/browser/<node>/passkey` — the completion `poll_passkey_results`
+    /// drains via `BusReader::open` + `list_since`.
+    const PASSKEY_COMPLETION: &str = r#"{
+        "source": "browser_passkeys",
+        "op": "browser_passkey_created",
+        "client_request_id": "req-7"
+    }"#;
+
+    #[test]
+    fn passkey_status_wire_shape_decodes() {
+        let status = parse_passkey_status(PASSKEY_STATUS).expect("passkey status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "asserted");
+        assert_eq!(status.accepted, 3);
+        assert!(status.mirrored);
+    }
+
+    #[test]
+    fn security_update_status_wire_shape_decodes() {
+        let status =
+            parse_security_update_status(SECURITY_UPDATE_STATUS).expect("security status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "current");
+        assert!(status.libcef_present);
+    }
+
+    #[test]
+    fn read_aloud_status_wire_shape_decodes() {
+        let status = parse_read_aloud_status(READ_ALOUD_STATUS).expect("read-aloud status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "speaking");
+        assert_eq!(status.accepted, 2);
+    }
+
+    #[test]
+    fn voice_command_status_wire_shape_decodes() {
+        let status =
+            parse_voice_command_status(VOICE_COMMAND_STATUS).expect("voice status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "listening");
+        assert_eq!(status.last_mode.as_deref(), Some("command"));
+    }
+
+    #[test]
+    fn passkey_completion_wire_shape_decodes() {
+        let completion =
+            parse_passkey_completion(PASSKEY_COMPLETION).expect("passkey completion decodes");
+        assert_eq!(completion.client_request_id, "req-7");
+    }
+
+    #[test]
+    fn media_control_body_round_trips_through_its_parser() {
+        // The one mirror with an in-crate producer: build with the daemon-facing
+        // `*_body` and decode with the poller's parser — the two ends must agree.
+        let body = browser_media_control_body(
+            mde_web_preview_client::MediaTransportAction::Pause,
+            Some(7),
+            "mpris",
+            5,
+        );
+        let request = parse_browser_media_control_request(&body).expect("media control decodes");
+        assert_eq!(
+            request.action,
+            mde_web_preview_client::MediaTransportAction::Pause
+        );
+        assert_eq!(request.tab_id, Some(7));
+    }
+
+    #[test]
+    fn a_dropped_required_field_is_caught_as_drift() {
+        // The contract guard: a body missing a REQUIRED field (here `node`) must
+        // fail the parser rather than decode to a silent default — so a producer
+        // that drops the field is caught by this test.
+        let drifted = r#"{ "state": "asserted", "updated_ms": 1 }"#;
+        assert!(parse_passkey_status(drifted).is_err());
+    }
+}
