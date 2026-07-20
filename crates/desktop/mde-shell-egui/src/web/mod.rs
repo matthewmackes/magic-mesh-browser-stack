@@ -4060,7 +4060,10 @@ impl WebState {
         order.sort_by_key(|&i| !self.tabs[i].pinned);
         let new_active = order.iter().position(|&i| i == active).unwrap_or(0);
         let mut slots: Vec<Option<Tab>> = self.tabs.drain(..).map(Some).collect();
-        self.tabs = order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        self.tabs = order
+            .iter()
+            .filter_map(|&i| slots.get_mut(i).and_then(Option::take))
+            .collect();
         self.active = new_active;
     }
 
