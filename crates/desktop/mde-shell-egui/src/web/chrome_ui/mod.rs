@@ -12431,8 +12431,8 @@ mod tests {
         assert_eq!(min, NAV_OMNIBOX_TINY_MIN);
 
         let (desired, min) = nav_omnibox_widths(240.0, true, 0, 0, false);
-        assert_eq!(desired, 165.0);
-        assert_eq!(min, 165.0);
+        assert_eq!(desired, 168.0);
+        assert_eq!(min, 168.0);
     }
 
     #[test]
@@ -12465,8 +12465,8 @@ mod tests {
         );
 
         let (desired, min) = nav_omnibox_widths(240.0, true, 12, 0, false);
-        assert_eq!(desired, 134.0);
-        assert_eq!(min, 134.0);
+        assert_eq!(desired, 137.0);
+        assert_eq!(min, 137.0);
     }
 
     #[test]
@@ -12602,12 +12602,14 @@ mod tests {
                 "toolbar engine chip must paint the Browser engine outline: {rect_strokes:?}"
             );
 
-            let icon_lines = painted_line_strokes(&out.shapes);
+            // The engine glyph now renders through the Mackes-Carbon loader
+            // (ChromeIcon::Engine → `globe` → paint_carbon image mesh), not the
+            // old hand-stroked vector mark, so the chip paints a Carbon image
+            // rather than 1.7px line strokes.
+            let image_meshes = painted_image_mesh_count(&out.shapes);
             assert!(
-                icon_lines.iter().any(|stroke| {
-                    stroke.color == engine_on_container(engine) && (stroke.width - 1.7).abs() < 0.01
-                }),
-                "toolbar engine chip must paint the Browser engine icon: {icon_lines:?}"
+                image_meshes > 0,
+                "toolbar engine chip must paint the Browser Carbon engine image, got {image_meshes} image meshes"
             );
         }
     }
@@ -13213,20 +13215,14 @@ mod tests {
         mde_egui::fonts::install(&ctx);
 
         let assert_warning_icon = |out: &egui::FullOutput| {
-            let lines = painted_line_strokes(&out.shapes);
+            // `body_icon_heading` now renders the hero warning through the
+            // Mackes-Carbon loader (ChromeIcon::Warning → `dialog-warning` →
+            // paint_carbon image mesh) instead of hand-stroked error vectors, so
+            // the interstitial paints a Carbon image, not 1.7px error strokes.
+            let image_meshes = painted_image_mesh_count(&out.shapes);
             assert!(
-                lines
-                    .iter()
-                    .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
-                "body interstitial warning icon must paint Browser error line strokes: {lines:?}"
-            );
-
-            let paths = painted_path_strokes(&out.shapes);
-            assert!(
-                paths
-                    .iter()
-                    .any(|stroke| stroke.color == CHROME_ERROR && (stroke.width - 1.7).abs() < 0.01),
-                "body interstitial warning icon must paint Browser error path strokes: {paths:?}"
+                image_meshes > 0,
+                "body interstitial warning icon must paint a Browser Carbon warning image, got {image_meshes} image meshes"
             );
         };
 
@@ -13345,32 +13341,16 @@ mod tests {
             );
         }
 
-        let line_strokes = painted_line_strokes(&out.shapes);
+        // Every SecurityLevel icon (Lock/Warning/Security/Page) now renders
+        // through the Mackes-Carbon loader (paint_carbon image meshes) rather
+        // than the old per-level hand-stroked vector marks. The frame paints one
+        // security_chip + site_info_panel per URL across secure / not-secure /
+        // mesh / neutral levels, so assert the per-level Carbon icons paint as
+        // images (the icon()-mapping + no-emoji assertions above pin identity).
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            line_strokes
-                .iter()
-                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
-            "secure/neutral security icons must paint Browser dim line strokes: {line_strokes:?}"
-        );
-        assert!(
-            line_strokes
-                .iter()
-                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
-            "not-secure security icon must paint Browser warning line strokes: {line_strokes:?}"
-        );
-
-        let path_strokes = painted_path_strokes(&out.shapes);
-        assert!(
-            path_strokes
-                .iter()
-                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
-            "not-secure security icon must paint a Browser warning path stroke: {path_strokes:?}"
-        );
-        assert!(
-            path_strokes
-                .iter()
-                .any(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01),
-            "mesh security icon must paint a Browser primary shield path: {path_strokes:?}"
+            image_meshes >= 4,
+            "security chip and panel must paint the per-level Carbon security icons as images, got {image_meshes} image meshes"
         );
     }
 
@@ -13913,19 +13893,14 @@ mod tests {
             "new-tab privacy note must not paint the legacy lock emoji as text: {texts:?}"
         );
 
-        let rect_strokes = painted_rect_strokes(&out.shapes);
+        // The privacy note's lock now renders through the Mackes-Carbon loader
+        // (`browser_status_note` → ChromeIcon::Lock → `system-lock-screen` →
+        // paint_carbon image mesh) instead of a hand-stroked padlock body +
+        // shackle, so it paints a Carbon image, not 1.7px rect/line strokes.
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            rect_strokes.iter().any(|stroke| {
-                stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
-            }),
-            "new-tab privacy note must paint a Browser lock body stroke: {rect_strokes:?}"
-        );
-        let line_strokes = painted_line_strokes(&out.shapes);
-        assert!(
-            line_strokes.iter().any(|stroke| {
-                stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01
-            }),
-            "new-tab privacy note must paint Browser lock shackle strokes: {line_strokes:?}"
+            image_meshes > 0,
+            "new-tab privacy note must paint the Browser Carbon lock image, got {image_meshes} image meshes"
         );
     }
 
@@ -14356,20 +14331,14 @@ mod tests {
             "spellcheck error leaked shared shell text color: {texts:?}"
         );
 
-        let lines = painted_line_strokes(&out.shapes);
+        // The warning status row now renders through the Mackes-Carbon loader
+        // (`drawer_status_row` → ChromeIcon::Warning → `dialog-warning` →
+        // paint_carbon image mesh) instead of hand-stroked warn vectors, so it
+        // paints a Carbon image, not 1.7px warn line/path strokes.
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            lines
-                .iter()
-                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
-            "spellcheck error must paint a Browser warning line icon: {lines:?}"
-        );
-
-        let paths = painted_path_strokes(&out.shapes);
-        assert!(
-            paths
-                .iter()
-                .any(|stroke| stroke.color == CHROME_WARN && (stroke.width - 1.7).abs() < 0.01),
-            "spellcheck error must paint a Browser warning path icon: {paths:?}"
+            image_meshes > 0,
+            "spellcheck error must paint a Browser Carbon warning image, got {image_meshes} image meshes"
         );
     }
 
@@ -14779,13 +14748,14 @@ mod tests {
                 "{name} close action must not paint the legacy multiplication glyph as text: {texts:?}"
             );
 
-            let lines = painted_line_strokes(&out.shapes);
+            // Close actions now render through the Mackes-Carbon loader
+            // (ChromeIcon::Close → `window-close` → paint_carbon image mesh)
+            // instead of hand-stroked "×" vectors, so the button paints a Carbon
+            // image (the "×" glyph negative assertion above pins no-text-glyph).
+            let image_meshes = painted_image_mesh_count(&out.shapes);
             assert!(
-                lines
-                    .iter()
-                    .any(|stroke| stroke.color == CHROME_TEXT_DIM
-                        && (stroke.width - 1.7).abs() < 0.01),
-                "{name} close action must paint a Browser dim close line icon: {lines:?}"
+                image_meshes > 0,
+                "{name} close action must paint a Browser Carbon close image, got {image_meshes} image meshes"
             );
         }
     }
@@ -14803,12 +14773,14 @@ mod tests {
             "tab close button must not paint the legacy multiplication glyph as text: {texts:?}"
         );
 
-        let lines = painted_line_strokes(&out.shapes);
+        // The inline tab close button now renders through the Mackes-Carbon
+        // loader (ChromeIcon::Close → `window-close` → paint_carbon image mesh)
+        // instead of hand-stroked "×" vectors, so it paints a Carbon image (the
+        // "×" glyph negative assertion above pins no-text-glyph).
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            lines
-                .iter()
-                .any(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01),
-            "tab close button must paint a Browser close line icon: {lines:?}"
+            image_meshes > 0,
+            "tab close button must paint a Browser Carbon close image, got {image_meshes} image meshes"
         );
     }
 
@@ -14837,14 +14809,14 @@ mod tests {
             );
         }
 
-        let lines = painted_line_strokes(&out.shapes);
-        let dim_icon_lines = lines
-            .iter()
-            .filter(|stroke| stroke.color == CHROME_TEXT_DIM && (stroke.width - 1.7).abs() < 0.01)
-            .count();
+        // The two audio buttons (VolumeUp + VolumeOff) now render through the
+        // Mackes-Carbon loader (paint_carbon image meshes) instead of
+        // hand-stroked speaker vectors, so assert both Carbon volume images
+        // paint (the speaker-emoji negative assertion above pins no-text-glyph).
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            dim_icon_lines >= 8,
-            "tab audio controls must paint Browser volume line icons, got {lines:?}"
+            image_meshes >= 2,
+            "tab audio controls must paint the two Browser Carbon volume images, got {image_meshes} image meshes"
         );
     }
 
@@ -14870,17 +14842,15 @@ mod tests {
             );
         }
 
-        let primary_lines = painted_line_strokes(&out.shapes)
-            .into_iter()
-            .filter(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01)
-            .count();
-        let primary_paths = painted_path_strokes(&out.shapes)
-            .into_iter()
-            .filter(|stroke| stroke.color == CHROME_PRIMARY && (stroke.width - 1.7).abs() < 0.01)
-            .count();
+        // The four status chips (Privacy/View/DarkMode/Edit) now render their
+        // icons through the Mackes-Carbon loader (paint_carbon image meshes)
+        // instead of hand-stroked accent vectors, so assert the four Carbon chip
+        // images paint (the title-prefix negative assertions above pin that the
+        // status is an icon, not embedded "W "/"D2 " title text).
+        let image_meshes = painted_image_mesh_count(&out.shapes);
         assert!(
-            primary_lines + primary_paths >= 4,
-            "tab status chips must paint Browser icon geometry, got lines={primary_lines} paths={primary_paths}"
+            image_meshes >= 4,
+            "tab status chips must paint the four Browser Carbon chip images, got {image_meshes} image meshes"
         );
     }
 

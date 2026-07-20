@@ -12662,7 +12662,11 @@ mod tests {
         );
         assert_eq!(browser_output_label(Path::new("/")), "saved file");
 
-        let long = Path::new("/tmp/construct/abcdefghijklmnopqrstuvwxyz0123456789-output.pdf");
+        // The basename must exceed the 48-char ellipsize cap for the truncation
+        // path to engage (`browser_output_label` shows names up to 48 chars in
+        // full); this one is 57 chars so it truncates with a trailing "...".
+        let long =
+            Path::new("/tmp/construct/abcdefghijklmnopqrstuvwxyz0123456789-plus-more-output.pdf");
         let label = browser_output_label(long);
         assert!(label.ends_with("..."));
         assert!(label.chars().count() <= 48);
@@ -16891,7 +16895,14 @@ mod tests {
         run_until_texture(&mut state);
 
         helper_a.crash();
-        run_panel(&mut state); // polls all tabs
+        // Inactive tabs poll on a bounded 1s cadence (WL-PERF-003), so a single
+        // panel frame right after the crash would skip the still-fresh background
+        // tab 0. Force its next background poll due — the same idiom
+        // `many_due_inactive_browser_tabs_are_staggered_across_panel_frames`
+        // uses — so this frame observes tab 0's crash (active tab 1 always polls).
+        state.tabs[0].last_background_poll =
+            Some(Instant::now() - BACKGROUND_TAB_POLL_INTERVAL - Duration::from_millis(1));
+        run_panel(&mut state); // polls the active tab + any due background tab
         assert!(state.tabs[0].session.is_crashed(), "tab 0 crashed");
         assert!(!state.tabs[1].session.is_crashed(), "tab 1 unaffected");
     }

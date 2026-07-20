@@ -1694,7 +1694,7 @@ mod tests {
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Native blocking, passkeys, reader mode")),
+                .any(|c| c.contains("Blocking, passkeys, reader mode, site fixups")),
             "Power menu should describe active native Browser tools: {captions:?}"
         );
         assert!(
