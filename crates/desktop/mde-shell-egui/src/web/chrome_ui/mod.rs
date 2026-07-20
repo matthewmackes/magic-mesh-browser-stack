@@ -675,6 +675,67 @@ const fn chrome_icon_yamis_id(icon: ChromeIcon) -> Option<IconId> {
     }
 }
 
+/// The **Mackes-Carbon** glyph name each browser chrome icon renders through —
+/// the canonical platform icon set (freedesktop Icon-Naming-Spec names, served
+/// by the shared `mde_egui::carbon` loader). This is the mapping the icon-set
+/// foundation proves out: every one of the 45 [`ChromeIcon`] variants resolves
+/// to an embedded Carbon glyph, so `paint_chrome_icon` renders a real tinted SVG
+/// rather than a hand-rolled procedural draw.
+const fn chrome_icon_carbon_name(icon: ChromeIcon) -> &'static str {
+    match icon {
+        ChromeIcon::Back => "go-previous",
+        ChromeIcon::Forward => "go-next",
+        ChromeIcon::Reload => "view-refresh",
+        ChromeIcon::Stop => "process-stop",
+        ChromeIcon::Options => "open-menu",
+        ChromeIcon::Downloads => "download",
+        ChromeIcon::Capture => "camera-photo",
+        ChromeIcon::Bookmark => "bookmark-new",
+        ChromeIcon::Security => "security-high",
+        ChromeIcon::Warning => "dialog-warning",
+        ChromeIcon::Search => "system-search",
+        ChromeIcon::Close => "window-close",
+        ChromeIcon::ZoomIn => "zoom-in",
+        ChromeIcon::ZoomOut => "zoom-out",
+        ChromeIcon::Print => "document-print",
+        // Privacy reads as a "prevent/blocked" padlock, distinct from the
+        // Security shield (`security-high`) and the Lock screen glyph.
+        ChromeIcon::Privacy => "changes-prevent",
+        ChromeIcon::History => "document-open-recent",
+        ChromeIcon::Tabs => "view-grid",
+        ChromeIcon::Engine => "globe",
+        ChromeIcon::NewTab => "new-tab",
+        ChromeIcon::Up => "go-up",
+        ChromeIcon::Down => "go-down",
+        ChromeIcon::Check => "emblem-ok",
+        ChromeIcon::Page => "text-x-generic",
+        ChromeIcon::Edit => "document-edit",
+        ChromeIcon::View => "view",
+        ChromeIcon::Power => "system-shutdown",
+        ChromeIcon::Share => "share",
+        ChromeIcon::Find => "edit-find",
+        ChromeIcon::Audio => "audio-volume-high",
+        ChromeIcon::Play => "media-playback-start",
+        ChromeIcon::Pause => "media-playback-pause",
+        ChromeIcon::MediaStop => "media-playback-stop",
+        ChromeIcon::Previous => "media-skip-backward",
+        ChromeIcon::Next => "media-skip-forward",
+        ChromeIcon::Minus => "list-remove",
+        ChromeIcon::Plus => "list-add",
+        ChromeIcon::VolumeDown => "audio-volume-low",
+        ChromeIcon::VolumeOff => "audio-volume-muted",
+        ChromeIcon::VolumeUp => "audio-volume-high",
+        // carbon-map: closest Carbon glyph. The set has no dedicated
+        // picture-in-picture mark; `overlay` (two overlapping frames) reads as a
+        // video floating over the page, the PiP gesture.
+        ChromeIcon::PictureInPicture => "overlay",
+        ChromeIcon::DarkMode => "weather-clear-night",
+        ChromeIcon::Lock => "system-lock-screen",
+        ChromeIcon::Notifications => "notification",
+        ChromeIcon::Recommend => "star",
+    }
+}
+
 fn action_button(label: impl Into<String>, role: BrowserActionRole) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(label.into())
@@ -1657,6 +1718,14 @@ fn paint_loading_globe(painter: &egui::Painter, rect: egui::Rect, phase: f32, sc
 }
 
 fn paint_chrome_icon(painter: &egui::Painter, rect: egui::Rect, icon: ChromeIcon, color: Color32) {
+    // Mackes-Carbon is the canonical platform icon set: render the mapped glyph
+    // through the shared `mde_egui::carbon` loader first (rasterized + tinted +
+    // ctx-cached). The YAMIS texture path and the procedural draws below stay as
+    // fallbacks for the (embedded-asset-only) case where a Carbon glyph cannot
+    // rasterize or upload.
+    if mde_egui::carbon::paint_carbon(painter, rect, chrome_icon_carbon_name(icon), color) {
+        return;
+    }
     if try_paint_yamis_chrome_icon(painter, rect, icon, color) {
         return;
     }
@@ -12172,6 +12241,27 @@ mod tests {
             chrome_icon_painted_shape_count(ChromeIcon::Recommend) > 0,
             "Recommend must paint a local fallback since it has no YAMIS asset"
         );
+    }
+
+    #[test]
+    fn every_chrome_icon_maps_to_a_registered_carbon_glyph() {
+        // The icon-standard foundation: every one of the 45 browser ChromeIcons
+        // resolves to a Mackes-Carbon glyph embedded in the shared loader, and
+        // that glyph rasterizes to a non-blank tinted mask.
+        for icon in ALL_BROWSER_ICONS {
+            let name = chrome_icon_carbon_name(*icon);
+            assert!(
+                mde_egui::carbon::carbon_svg_bytes(name).is_some(),
+                "{icon:?} maps to Carbon glyph {name:?}, which must be embedded in the loader registry"
+            );
+            let raster = mde_egui::carbon::carbon_raster(name, 32, CHROME_TEXT);
+            assert!(
+                raster
+                    .as_ref()
+                    .is_some_and(|r| r.rgba.chunks_exact(4).any(|px| px[3] > 0)),
+                "{icon:?} -> Carbon glyph {name:?} must rasterize to a non-blank mask"
+            );
+        }
     }
 
     fn sized_input(w: f32, h: f32) -> egui::RawInput {
