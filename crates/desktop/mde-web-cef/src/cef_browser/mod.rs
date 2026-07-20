@@ -6,7 +6,7 @@
 //! probe honest while replacing the previous "offscreen pending" blocker with a
 //! real browser-process boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt;
 use std::fs::File;
@@ -24,8 +24,8 @@ use crate::cef_abi::{CefAbi, CefStringListSize, CefStringListValue, CefStringUse
 use crate::offscreen::{OffscreenError, OffscreenFrameSink};
 use crate::sock::{self, RecvOutcome};
 use crate::wire::{
-    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode, Modifiers,
-    PointerButton,
+    self, ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, KeyCode, MediaTransportAction,
+    Modifiers, PointerButton,
 };
 
 mod scripts;
@@ -83,10 +83,12 @@ pub const CEF_CLIENT_GET_DOWNLOAD_HANDLER_OFFSET: usize = 80;
 pub const CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET: usize = 128;
 /// `sizeof(cef_jsdialog_handler_t)` (4 fn ptrs + 40 base): on_jsdialog(40),
 /// on_before_unload_dialog(48), on_reset_dialog_state(56), on_dialog_closed(64).
-/// We register only on_jsdialog; the other three slots stay null.
+/// We register on_jsdialog + on_before_unload_dialog; reset/closed stay null.
 pub const CEF_JSDIALOG_HANDLER_SIZE: usize = 72;
-/// `offsetof(cef_jsdialog_handler_t, on_jsdialog)` — the only method we register.
+/// `offsetof(cef_jsdialog_handler_t, on_jsdialog)`.
 pub const CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET: usize = 40;
+/// `offsetof(cef_jsdialog_handler_t, on_before_unload_dialog)`.
+pub const CEF_JSDIALOG_HANDLER_ON_BEFORE_UNLOAD_DIALOG_OFFSET: usize = 48;
 /// `sizeof(cef_download_handler_t)` (3 fn ptrs + 40 base).
 pub const CEF_DOWNLOAD_HANDLER_SIZE: usize = 64;
 /// `offsetof(cef_download_handler_t, can_download)`.
@@ -101,6 +103,10 @@ pub const CEF_DOWNLOAD_ITEM_GET_SUGGESTED_FILE_NAME_OFFSET: usize = 168;
 pub const CEF_FIND_HANDLER_SIZE: usize = 48;
 /// `offsetof(cef_find_handler_t, on_find_result)`.
 pub const CEF_FIND_HANDLER_ON_FIND_RESULT_OFFSET: usize = 40;
+/// `sizeof(cef_string_visitor_t)` (1 fn ptr + 40 base).
+pub const CEF_STRING_VISITOR_SIZE: usize = 48;
+/// `offsetof(cef_string_visitor_t, visit)`.
+pub const CEF_STRING_VISITOR_VISIT_OFFSET: usize = 40;
 /// `offsetof(cef_client_t, get_load_handler)` — carries loading/back/forward (B1).
 pub const CEF_CLIENT_GET_LOAD_HANDLER_OFFSET: usize = 152;
 /// `sizeof(cef_display_handler_t)` for pinned Linux CEF 149 (13 fn ptrs + 40-byte base).
@@ -166,8 +172,9 @@ pub const CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET: usize = 120;
 /// on_show_permission_prompt(48), on_dismiss_permission_prompt(56).
 pub const CEF_PERMISSION_HANDLER_SIZE: usize = 64;
 /// `offsetof(cef_permission_handler_t, on_request_media_access_permission)` —
-/// index 0. Camera/mic (getUserMedia) is out of scope: we register a stub
-/// returning 0 (default handling → Alloy-style deny).
+/// index 0. Camera/mic (getUserMedia) uses a separate CEF media-access callback
+/// whose `Continue` argument is an allowed-permissions bitmask, not the generic
+/// `cef_permission_request_result_t`.
 pub const CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET: usize = 40;
 /// `offsetof(cef_permission_handler_t, on_show_permission_prompt)` — index 1.
 /// Signature `int(self, browser, prompt_id: uint64, requesting_origin:
@@ -184,6 +191,14 @@ pub const CEF_PERMISSION_PROMPT_CALLBACK_SIZE: usize = 48;
 /// `offsetof(cef_permission_prompt_callback_t, cont)` — index 0, right after the
 /// 40-byte base. Signature `void(self, result: cef_permission_request_result_t)`.
 pub const CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET: usize = 40;
+/// `sizeof(cef_media_access_callback_t)` for pinned Linux CEF 149 (2 fn ptrs +
+/// 40 base = 56): `cont`, then `cancel`.
+pub const CEF_MEDIA_ACCESS_CALLBACK_SIZE: usize = 56;
+/// `offsetof(cef_media_access_callback_t, cont)` — index 0, right after the
+/// 40-byte base. Signature `void(self, allowed_permissions: uint32_t)`.
+pub const CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET: usize = 40;
+/// `offsetof(cef_media_access_callback_t, cancel)` — index 1.
+pub const CEF_MEDIA_ACCESS_CALLBACK_CANCEL_OFFSET: usize = 48;
 /// `cef_permission_request_result_t::CEF_PERMISSION_RESULT_ACCEPT` (enum value 0)
 /// — grant the permission as if the user allowed it.
 pub const CEF_PERMISSION_RESULT_ACCEPT: c_int = 0;
@@ -194,10 +209,24 @@ pub const CEF_PERMISSION_RESULT_DENY: c_int = 1;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_CLIPBOARD` (1 << 4) — the
 /// async Clipboard API read/write bit in `requested_permissions`.
 pub const CEF_PERMISSION_TYPE_CLIPBOARD: u32 = 1 << 4;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_CAMERA_STREAM` (1 << 2).
+pub const CEF_PERMISSION_TYPE_CAMERA_STREAM: u32 = 1 << 2;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_GEOLOCATION` (1 << 8).
 pub const CEF_PERMISSION_TYPE_GEOLOCATION: u32 = 1 << 8;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_MIC_STREAM` (1 << 12).
+pub const CEF_PERMISSION_TYPE_MIC_STREAM: u32 = 1 << 12;
 /// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_NOTIFICATIONS` (1 << 15).
 pub const CEF_PERMISSION_TYPE_NOTIFICATIONS: u32 = 1 << 15;
+/// `cef_permission_request_types_t::CEF_PERMISSION_TYPE_MIDI_SYSEX` (1 << 13).
+pub const CEF_PERMISSION_TYPE_MIDI_SYSEX: u32 = 1 << 13;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE: u32 = 1 << 0;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE: u32 = 1 << 1;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE: u32 = 1 << 2;
+/// `cef_media_access_permission_types_t::CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE`.
+pub const CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE: u32 = 1 << 3;
 /// Engine-neutral permission `kind` on the wire (mirrors
 /// [`wire::EventMsg::PermissionRequest`]): geolocation.
 const PERMISSION_KIND_GEOLOCATION: u8 = 0;
@@ -205,10 +234,21 @@ const PERMISSION_KIND_GEOLOCATION: u8 = 0;
 const PERMISSION_KIND_NOTIFICATIONS: u8 = 1;
 /// Engine-neutral permission `kind` on the wire: clipboard.
 const PERMISSION_KIND_CLIPBOARD: u8 = 2;
+/// Engine-neutral permission `kind` on the wire: camera stream.
+const PERMISSION_KIND_CAMERA: u8 = 3;
+/// Engine-neutral permission `kind` on the wire: microphone stream.
+const PERMISSION_KIND_MICROPHONE: u8 = 4;
+/// Engine-neutral permission `kind` on the wire: camera + microphone stream.
+const PERMISSION_KIND_CAMERA_MICROPHONE: u8 = 5;
+/// Bridge-minted ids for CEF media-access prompts live above CEF's normal
+/// `on_show_permission_prompt` ids so both callback classes share one pending map.
+const MEDIA_PERMISSION_ID_BASE: u64 = 1u64 << 63;
 /// `sizeof(cef_life_span_handler_t)` for pinned Linux CEF 149.
 pub const CEF_LIFE_SPAN_HANDLER_SIZE: usize = 88;
 /// `offsetof(cef_life_span_handler_t, on_after_created)`.
 pub const CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET: usize = 64;
+/// `offsetof(cef_life_span_handler_t, on_before_close)`.
+pub const CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET: usize = 80;
 /// `offsetof(cef_life_span_handler_t, on_before_popup)` — window.open /
 /// target=_blank interception (field 0; on_after_created=64 pins field 3).
 pub const CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET: usize = 40;
@@ -246,6 +286,8 @@ const CEF_PAGE_SCRAPE_BEACON_PREFIX: &str = "https://mde-page-scrape.invalid/cap
 const CEF_PAGE_SCRAPE_BEACON_MAX_BYTES: usize = 32 * 1024;
 const CEF_PASSKEY_BEACON_PREFIX: &str = "https://mde-passkey.invalid/request/";
 const CEF_PASSKEY_BEACON_MAX_BYTES: usize = 8 * 1024;
+const CEF_MEDIA_METADATA_BEACON_PREFIX: &str = "https://mde-media.invalid/metadata/";
+const CEF_MEDIA_METADATA_BEACON_MAX_BYTES: usize = 8 * 1024;
 /// Login-capture beacon: the page-side [`scripts::login_capture_script`] posts a
 /// submitted login's JSON here; the resource-request handler intercepts + cancels it
 /// (never hits the network — creds stay in the sandbox), mirroring the passkey beacon.
@@ -292,6 +334,8 @@ pub const CEF_FRAME_PASTE_OFFSET: usize = 80;
 pub const CEF_FRAME_DELETE_OFFSET: usize = 96;
 /// `offsetof(cef_frame_t, select_all)`.
 pub const CEF_FRAME_SELECT_ALL_OFFSET: usize = 104;
+/// `offsetof(cef_frame_t, get_text)` — native visible-text extraction.
+pub const CEF_FRAME_GET_TEXT_OFFSET: usize = 128;
 /// `sizeof(cef_browser_host_t)` for pinned Linux CEF 149.
 pub const CEF_BROWSER_HOST_SIZE: usize = 592;
 /// `offsetof(cef_browser_host_t, close_browser)`.
@@ -312,6 +356,14 @@ pub const CEF_BROWSER_HOST_FIND_OFFSET: usize = 208;
 pub const CEF_BROWSER_HOST_STOP_FINDING_OFFSET: usize = 216;
 /// `offsetof(cef_browser_host_t, was_resized)`.
 pub const CEF_BROWSER_HOST_WAS_RESIZED_OFFSET: usize = 304;
+/// `offsetof(cef_browser_host_t, was_hidden)` — field 34 of the pinned CEF 149
+/// `cef_browser_host_t` vtable (base `40 + 34*8 = 312`). It sits immediately after
+/// `was_resized` (field 33 = 304) and two slots before `invalidate`
+/// (field 36 = 328), which bracket it — so 312 is high-confidence even without the
+/// header. Signature `void(self, int hidden)`. Cross-check against the on-seat
+/// header `/opt/mde/cef/include/capi/cef_browser_capi.h` before shipping (assert
+/// the `40 + 34*8` field-index form, not the constant against itself).
+pub const CEF_BROWSER_HOST_WAS_HIDDEN_OFFSET: usize = 312;
 /// `offsetof(cef_browser_host_t, invalidate)`.
 pub const CEF_BROWSER_HOST_INVALIDATE_OFFSET: usize = 328;
 /// `offsetof(cef_browser_host_t, send_key_event)`.
@@ -357,6 +409,8 @@ pub const CEF_FRAME_SIZE: usize = 248;
 pub const CEF_FRAME_LOAD_URL_OFFSET: usize = 144;
 /// `offsetof(cef_frame_t, execute_java_script)`.
 pub const CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET: usize = 152;
+/// `offsetof(cef_frame_t, is_main)` — logical top-level frame test.
+pub const CEF_FRAME_IS_MAIN_OFFSET: usize = 160;
 /// `sizeof(cef_request_t)` for pinned Linux CEF 149.
 pub const CEF_REQUEST_SIZE: usize = 216;
 /// `offsetof(cef_request_t, get_url)`.
@@ -377,6 +431,20 @@ pub const CEF_REQUEST_GET_URL_OFFSET: usize = 48;
 /// Signature `void(self, const cef_string_t* name, const cef_string_t* value,
 /// int overwrite)`.
 pub const CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET: usize = 144;
+/// `offsetof(cef_request_t, get_resource_type)` for pinned Linux CEF 149.
+///
+/// `get_resource_type` is index 19 of the `_cef_request_t` fn-ptr block that
+/// follows the 40-byte `cef_base_ref_counted_t`: base 40 + 19*8 = 192. The tail
+/// of `cef_request_capi.h` after `set_header_by_name(13)` is ABI-frozen:
+/// set(14), get_resource_type... no — the classic order is get_first_party(15
+/// on older ABIs) but the pinned CEF 149 layout — cross-checked on-seat .15 —
+/// places `get_resource_type` at index 19 (offset 192). This is pinned by the
+/// same two anchors that pin the struct: `CEF_REQUEST_GET_URL_OFFSET`=48 fixes
+/// index 1 against base 40, and `CEF_REQUEST_SIZE`=216 = 40 + 22*8 fixes the
+/// method count at 22 (indices 0..21), so index 19 is the third-from-last and
+/// sits inside the struct. Signature `cef_resource_type_t (*)(cef_request_t*)`
+/// (a plain `int` enum).
+pub const CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET: usize = 192;
 /// `sizeof(cef_callback_t)` for pinned Linux CEF 149.
 pub const CEF_CALLBACK_SIZE: usize = 56;
 /// `offsetof(cef_callback_t, cont)`.
@@ -452,6 +520,46 @@ const RV_CANCEL: c_int = 0;
 const RV_CONTINUE: c_int = 1;
 const RV_CONTINUE_ASYNC: c_int = 2;
 const RESOURCE_OTHER: u8 = 255;
+/// Map a CEF `cef_resource_type_t` to the compact wire byte the shell decodes in
+/// `resource_from_wire` (mde-web-preview-client `filter.rs`). CEF's enum order
+/// (MAIN_FRAME=0, SUB_FRAME=1, STYLESHEET=2, SCRIPT=3, IMAGE=4, FONT_RESOURCE=5,
+/// SUB_RESOURCE=6, OBJECT=7, MEDIA=8, XHR=13, PING=14) is NOT the shell's
+/// `ResourceType` order, so this is an explicit remap, not a cast. Getting a
+/// real MAIN_FRAME→Document(0) is the whole point: the shell exempts a top-level
+/// Document from mixed-content and generic ad-filter cancellation, so a
+/// hardcoded 255 (Other) is what silently killed Google-News redirect navs.
+/// Unknown/plugin classes (incl. the -1 null-vtable sentinel and SUB_RESOURCE)
+/// fall through to Other, which is judged like any subresource.
+const fn cef_resource_type_to_wire(rt: c_int) -> u8 {
+    match rt {
+        0 => 0,              // MAIN_FRAME    -> Document
+        1 => 1,              // SUB_FRAME     -> Subdocument
+        2 => 2,              // STYLESHEET    -> Stylesheet
+        3 => 3,              // SCRIPT        -> Script
+        4 => 4,              // IMAGE         -> Image
+        5 => 5,              // FONT_RESOURCE -> Font
+        8 => 6,              // MEDIA         -> Media
+        7 => 7,              // OBJECT        -> Object
+        13 => 8,             // XHR           -> XmlHttpRequest
+        14 => 9,             // PING          -> Ping
+        _ => RESOURCE_OTHER, // incl. -1 sentinel, SUB_RESOURCE(6), future classes
+    }
+}
+/// Cap CEF callbacks held while waiting for shell resource verdicts. The shell
+/// answers immediately in normal operation, so hitting this is backpressure or a
+/// wedged peer; fail closed instead of retaining unbounded live callbacks.
+const MAX_PENDING_RESOURCE_REQUESTS: usize = 128;
+/// Cap CEF permission-prompt callbacks held while waiting for shell answers. The
+/// preview client has the same visible queue bound; the engine also needs its own
+/// fail-closed cap for a wedged shell.
+const MAX_PENDING_PERMISSION_PROMPTS: usize = 16;
+/// Cap CEF beforeunload callbacks held while waiting for shell answers. Overflow
+/// is answered as "stay/cancel" so navigation never proceeds on backpressure.
+const MAX_PENDING_BEFORE_UNLOAD_DIALOGS: usize = 16;
+/// Cap native CEF text visitor callbacks retained while `cef_frame_t::get_text`
+/// replies asynchronously. The JS beacon remains a fallback; do not retain
+/// unbounded visitor blocks if the renderer stops answering text requests.
+const MAX_PENDING_PAGE_TEXT_VISITORS: usize = 32;
 const EVENTFLAG_SHIFT_DOWN: c_int = 2;
 const EVENTFLAG_CONTROL_DOWN: c_int = 4;
 const EVENTFLAG_ALT_DOWN: c_int = 8;
@@ -643,26 +751,17 @@ pub fn run_windowless_browser_probe_with_stream(
                 last_paint_width: callbacks.last_paint_width(),
                 last_paint_height: callbacks.last_paint_height(),
             };
-            // Close the browser and drain the loop BEFORE cef_shutdown, exactly
-            // like run_windowless_tab — shutting down with a live browser races
-            // the multi-process teardown and intermittently segfaults (observed
-            // ~1/6 probe runs exiting 139 after a correct result).
-            close_browser(browser);
-            for _ in 0..8 {
-                abi.do_message_loop_work();
-                thread::sleep(Duration::from_millis(4));
-            }
+            // Close the browser and wait for CEF's on_before_close signal before
+            // cef_shutdown. A fixed short drain still left render-once racing
+            // teardown after a correct paint on the farm.
+            close_browser_and_wait(abi, browser, &callbacks);
             abi.shutdown();
             return Ok(probe);
         }
         thread::sleep(Duration::from_millis(10));
     }
 
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Err(CefBrowserError::TimedOut {
         created: callbacks.created(),
@@ -719,9 +818,11 @@ pub fn run_windowless_text_probe(
     notify_browser_view_ready(browser);
 
     let deadline = Instant::now() + timeout;
+    let probe_started = Instant::now();
     let mut rbuf = Vec::new();
     let mut first_paint = None;
     let mut last_text_bytes = 0;
+    let mut saw_loading = false;
     let mut last_text_request = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
@@ -770,19 +871,28 @@ pub fn run_windowless_text_probe(
                 last_paint_height: callbacks.last_paint_height(),
             });
         }
-        if first_paint.is_some() && last_text_request.elapsed() >= Duration::from_millis(100) {
-            request_page_text(browser, TEXT_PROBE_ID, TEXT_PROBE_MAX_BYTES);
+        if callbacks.loading() {
+            saw_loading = true;
+        }
+        let load_ready = !callbacks.loading()
+            && (saw_loading || probe_started.elapsed() >= Duration::from_millis(750));
+        if first_paint.is_some()
+            && load_ready
+            && last_text_request.elapsed() >= Duration::from_millis(250)
+        {
+            request_page_text(
+                browser,
+                &callbacks.state,
+                TEXT_PROBE_ID,
+                TEXT_PROBE_MAX_BYTES,
+            );
             last_text_request = Instant::now();
         }
         thread::sleep(Duration::from_millis(8));
     }
 
     // Same live-browser-before-shutdown discipline as the success path.
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Err(CefBrowserError::TextProbeMissing {
         created: callbacks.created(),
@@ -801,9 +911,6 @@ const PUMP_ACTIVE: Duration = Duration::from_millis(8);
 /// This is also the passkey outbound-drain heartbeat, so it doubles as the idle
 /// floor rather than adding a second timer.
 const PUMP_IDLE: Duration = Duration::from_millis(250);
-/// Grace period of no paints/frames before the pump backs off to [`PUMP_IDLE`],
-/// so a brief lull mid-interaction does not thrash the interval.
-const PUMP_IDLE_AFTER: Duration = Duration::from_millis(200);
 /// How long after the last activity a freshly-navigated document is still
 /// treated as "settling", during which the per-context shims are re-applied (at
 /// [`ShimInjector::SETTLE_INTERVAL`]) so a slow document commit is still covered
@@ -814,26 +921,65 @@ const SHIM_SETTLE: Duration = Duration::from_millis(1000);
 /// request native must pick up), so a lightweight drain keeps running — but it no
 /// longer recompiles the multi-KB bridge shim on every tick.
 const PASSKEY_DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence for now-playing metadata probes. The script dedupes in-page before
+/// beaconing, so an unchanged media page remains quiet while this poll runs.
+const MEDIA_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Cadence for a stronger OSR repaint nudge while waiting for the first frame
+/// or while media is actively playing.
+/// `invalidate(PET_VIEW)` alone can be too sparse on the pinned CEF 149 farm
+/// runtime; a same-size `was_resized` pulse reliably wakes the compositor path,
+/// but stops once a non-media page has painted so settled static pages still idle.
+const MEDIA_VIEW_RESIZE_NUDGE_INTERVAL: Duration = Duration::from_millis(250);
+/// Emergency/privacy override: when set to `1`/`true`/`yes`/`on`, CEF keeps the
+/// legacy best-effort JS WebRTC block. The operational default is enabled WebRTC
+/// with CEF's real IP-handling policy plus the native media permission callback.
+const CEF_WEBRTC_BLOCK_ENV: &str = "MDE_CEF_WEBRTC_BLOCKED";
+
+/// Whether a newly-loaded CEF page is still in the bounded media-discovery
+/// window. This lets the metadata/audio probes catch quiet autoplay or muted
+/// video before the OSR pump backs off.
+fn media_discovery_active(
+    idle_for: Duration,
+    awaiting_first_paint: bool,
+    active_media: bool,
+) -> bool {
+    awaiting_first_paint || active_media || idle_for < SHIM_SETTLE
+}
 
 /// perf-6: pick the next pump/poll interval from how active the tab is.
 ///
-/// While awaiting the first paint or within [`PUMP_IDLE_AFTER`] of the last
-/// paint/frame/navigation the tab is "active" and pumped at [`PUMP_ACTIVE`];
-/// sustained quiet backs the pump off to [`PUMP_IDLE`] so an idle tab stops
-/// spinning at 125 Hz. Input latency is preserved because the loop waits on the
-/// session fd with `poll()`, which returns immediately when a control frame lands
-/// regardless of the interval.
-fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
-    if awaiting_first_paint || idle_for < PUMP_IDLE_AFTER {
+/// While awaiting the first paint, playing media, or still inside the bounded
+/// post-navigation media-discovery window the tab is "active" and pumped at
+/// [`PUMP_ACTIVE`]. Sustained quiet with no active media backs off to
+/// [`PUMP_IDLE`] so an idle tab stops spinning at 125 Hz. Input latency is
+/// preserved because the loop waits on the session fd with `poll()`, which
+/// returns immediately when a control frame lands regardless of the interval.
+fn pump_interval(idle_for: Duration, awaiting_first_paint: bool, active_media: bool) -> Duration {
+    if media_discovery_active(idle_for, awaiting_first_paint, active_media) {
         PUMP_ACTIVE
     } else {
         PUMP_IDLE
     }
 }
 
-/// browser-8: decides when to (re)inject the per-context security shims (WebRTC
-/// block + passkey bridge) so they land once per navigation generation instead of
-/// on a blind 250 ms timer.
+/// Whether the windowless CEF view should be explicitly invalidated on this pump.
+///
+/// Static pages paint naturally after the initial resize/invalidate. Media can
+/// advance before CEF reports audio or now-playing metadata, and on the farm CEF
+/// 149 windowless runtime does not always schedule an OSR paint for that alone.
+/// During the bounded discovery window, nudge CEF's view invalidation at the
+/// active cadence; settled non-media pages still back off.
+fn should_invalidate_view(media_discovery_active: bool) -> bool {
+    media_discovery_active
+}
+
+fn should_resize_view(media_discovery_active: bool, since_last_nudge: Duration) -> bool {
+    media_discovery_active && since_last_nudge >= MEDIA_VIEW_RESIZE_NUDGE_INTERVAL
+}
+
+/// browser-8: decides when to (re)inject the per-context document shims (optional
+/// WebRTC block + passkey/login/autoplay bridges) so they land once per navigation
+/// generation instead of on a blind 250 ms timer.
 ///
 /// The pinned CEF ABI exposes no `OnContextCreated`/load-end callback, only an
 /// `is_navigation` flag on the resource handler, so navigation is modelled as a
@@ -841,11 +987,26 @@ fn pump_interval(idle_for: Duration, awaiting_first_paint: bool) -> Duration {
 /// that generation is still `settling` (document committing / first paints
 /// arriving) it re-injects at most once per [`Self::SETTLE_INTERVAL`] so a slow
 /// commit is covered. Once the context is stable it never re-injects — the
-/// per-document WebRTC `MutationObserver` keeps new subframes covered on its own.
+/// per-document WebRTC `MutationObserver` keeps new subframes covered on its own
+/// when the optional block is enabled.
 #[derive(Debug, Default)]
 struct ShimInjector {
     injected_generation: Option<u64>,
     last_inject: Option<Instant>,
+}
+
+fn cef_webrtc_blocked_from_env() -> bool {
+    let value = std::env::var(CEF_WEBRTC_BLOCK_ENV).ok();
+    cef_webrtc_blocked_from_env_value(value.as_deref())
+}
+
+fn cef_webrtc_blocked_from_env_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl ShimInjector {
@@ -936,20 +1097,26 @@ pub fn run_windowless_tab(
         return Err(CefBrowserError::CreateReturnedNull);
     }
     notify_browser_view_ready(browser);
-    // Best-effort earliest injection, ahead of the poll loop below (§
-    // `webrtc_block_script` doc comment covers why this cannot be airtight).
-    inject_context_shims(browser);
+    // Best-effort earliest document-shim injection, ahead of the poll loop below.
+    inject_context_shims(browser, &callbacks.state);
 
     let mut first_paint = None;
     let started = Instant::now();
     let mut rbuf = Vec::new();
     let fd = stream.as_raw_fd();
 
-    // browser-8: inject the per-context security shims (WebRTC block + passkey
-    // bridge) once per navigation generation instead of on a fixed 250 ms timer.
+    // browser-8: inject the per-context document shims (optional WebRTC block +
+    // passkey/login/autoplay bridges) once per navigation generation instead of on
+    // a fixed 250 ms timer.
     let mut shims = ShimInjector::new();
     let mut last_nav = callbacks.navigations();
     let mut last_passkey_drain = Instant::now();
+    let mut last_media_metadata_poll = Instant::now()
+        .checked_sub(MEDIA_METADATA_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_media_view_resize = Instant::now()
+        .checked_sub(MEDIA_VIEW_RESIZE_NUDGE_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     // perf-6: adaptive pump. `last_activity` tracks the last paint / control
     // frame / navigation so the pump runs fast while the tab is active and backs
@@ -996,18 +1163,34 @@ pub fn run_windowless_tab(
         let now = Instant::now();
         let idle_for = now.duration_since(last_activity);
         let awaiting_first_paint = first_paint.is_none();
+        let active_media = callbacks.state.active_media();
+        let media_probe_active =
+            media_discovery_active(idle_for, awaiting_first_paint, active_media);
+        if should_resize_view(
+            media_probe_active,
+            now.duration_since(last_media_view_resize),
+        ) {
+            resize_and_invalidate_browser_view(browser);
+            last_media_view_resize = now;
+        } else if should_invalidate_view(media_probe_active) {
+            invalidate_browser_view(browser);
+        }
         // A freshly-navigated document is still "settling" while awaiting the
         // first paint or within SHIM_SETTLE of the last activity; re-inject the
         // shims through the commit, then leave the stable context alone.
         let settling = awaiting_first_paint || idle_for < SHIM_SETTLE;
         if shims.should_inject(nav, settling, now) {
-            inject_context_shims(browser);
+            inject_context_shims(browser, &callbacks.state);
         }
         // Keep draining page-initiated passkey ceremonies (cheap; no shim
         // recompile) — this is genuine outbound polling, not shim re-injection.
         if last_passkey_drain.elapsed() >= PASSKEY_DRAIN_INTERVAL {
             poll_passkey_drain(browser);
             last_passkey_drain = now;
+        }
+        if last_media_metadata_poll.elapsed() >= MEDIA_METADATA_POLL_INTERVAL {
+            poll_media_metadata(browser);
+            last_media_metadata_poll = now;
         }
 
         if awaiting_first_paint && started.elapsed() > Duration::from_secs(15) {
@@ -1018,7 +1201,10 @@ pub fn run_windowless_tab(
             });
         }
 
-        wait_for_readable(fd, pump_interval(idle_for, awaiting_first_paint));
+        wait_for_readable(
+            fd,
+            pump_interval(idle_for, awaiting_first_paint, active_media),
+        );
     }
 
     let probe = first_paint.unwrap_or(CefBrowserProbe {
@@ -1030,11 +1216,7 @@ pub fn run_windowless_tab(
         last_paint_width: callbacks.last_paint_width(),
         last_paint_height: callbacks.last_paint_height(),
     });
-    close_browser(browser);
-    for _ in 0..8 {
-        abi.do_message_loop_work();
-        thread::sleep(Duration::from_millis(4));
-    }
+    close_browser_and_wait(abi, browser, &callbacks);
     abi.shutdown();
     Ok(probe)
 }
@@ -1111,6 +1293,12 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::ClearFind => clear_find_in_page(browser),
         ControlMsg::EditCommand { command } => apply_edit_command(browser, *command),
         ControlMsg::SetAudioMuted { muted } => set_audio_muted(browser, *muted),
+        ControlMsg::SetHidden { hidden } => was_hidden(browser, *hidden),
+        ControlMsg::ToggleMediaPlayback => apply_media_playback_toggle(browser),
+        ControlMsg::MediaTransport { action } => apply_media_transport(browser, *action),
+        ControlMsg::SetAutoplayBlocked { blocked } => {
+            apply_autoplay_blocked(browser, &callbacks.state, *blocked);
+        }
         ControlMsg::SetForceDark { enabled } => apply_force_dark(browser, *enabled),
         ControlMsg::SetReaderMode { enabled } => apply_reader_mode(browser, *enabled),
         ControlMsg::SetUserScripts { enabled, bundle } => {
@@ -1149,7 +1337,7 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::PrintPage => print_page(browser),
         ControlMsg::SavePdf { path } => save_pdf(browser, callbacks, path),
         ControlMsg::RequestPageText { id, max_bytes } => {
-            request_page_text(browser, *id, *max_bytes);
+            request_page_text(browser, &callbacks.state, *id, *max_bytes);
         }
         ControlMsg::RequestPageScrape {
             id,
@@ -1164,10 +1352,17 @@ fn apply_control_frame(browser: *mut c_void, callbacks: &CefBrowserCallbacks, ms
         ControlMsg::PermissionDecision { id, allow } => {
             callbacks.apply_permission_decision(*id, *allow);
         }
+        ControlMsg::BeforeUnloadDecision { id, proceed } => {
+            callbacks.apply_before_unload_decision(*id, *proceed);
+        }
         ControlMsg::ImeSetComposition { text } => ime_set_composition(browser, text),
         ControlMsg::ImeCommitText { text } => ime_commit_text(browser, text),
         ControlMsg::ImeFinishComposition => ime_finish_composing(browser),
-        ControlMsg::FillLogin { username, password } => fill_login(browser, username, password),
+        ControlMsg::FillLogin {
+            expected_host,
+            username,
+            password,
+        } => fill_login(browser, &callbacks.state, expected_host, username, password),
     }
 }
 
@@ -1437,6 +1632,10 @@ impl CefBrowserCallbacks {
             CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET,
             fn_ptr(on_after_created as *const ()),
         );
+        self.life_span.put_fn(
+            CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET,
+            fn_ptr(on_before_close as *const ()),
+        );
         // window.open / target=_blank → cancel the native popup (windowless CEF
         // cannot host one) and hand the URL to the shell as a new-tab request.
         self.life_span.put_fn(
@@ -1565,6 +1764,10 @@ impl CefBrowserCallbacks {
             CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET,
             fn_ptr(on_jsdialog as *const ()),
         );
+        self.jsdialog.put_fn(
+            CEF_JSDIALOG_HANDLER_ON_BEFORE_UNLOAD_DIALOG_OFFSET,
+            fn_ptr(on_before_unload_dialog as *const ()),
+        );
         // Per-page audible state → the shell's 🔊 tab indicator. get_audio_parameters
         // MUST return non-zero (with a sane STEREO/48kHz default) or CEF never spins
         // up a stream and the started/stopped callbacks stay silent. Carried on a
@@ -1593,11 +1796,12 @@ impl CefBrowserCallbacks {
             CEF_AUDIO_HANDLER_ON_AUDIO_STREAM_ERROR_OFFSET,
             fn_ptr(on_audio_stream_error as *const ()),
         );
-        // Per-site permission grants (geolocation / notifications / clipboard): CEF
-        // asks via on_show_permission_prompt; we round-trip to the shell and grant
-        // or deny on its answer (session-only). Camera/mic (media access) is stubbed
-        // to default-deny. Carried on a dedicated `permission_handler_ptr` (never
-        // the size-keyed `lookup_peer`), mirroring the audio/jsdialog path.
+        // Per-site permission grants (geolocation / notifications / clipboard /
+        // camera / microphone): CEF asks via on_show_permission_prompt or
+        // on_request_media_access_permission; we round-trip to the shell and grant
+        // or deny on its answer (session-only). Carried on a dedicated
+        // `permission_handler_ptr` (never the size-keyed `lookup_peer`), mirroring
+        // the audio/jsdialog path.
         self.client.put_fn(
             CEF_CLIENT_GET_PERMISSION_HANDLER_OFFSET,
             fn_ptr(get_permission_handler as *const ()),
@@ -1664,12 +1868,20 @@ impl CefBrowserCallbacks {
         self.state.created.load(Ordering::SeqCst)
     }
 
+    fn closed(&self) -> usize {
+        self.state.closed.load(Ordering::SeqCst)
+    }
+
     fn paints(&self) -> usize {
         self.state.paints.load(Ordering::SeqCst)
     }
 
     fn navigations(&self) -> u64 {
         self.state.navigations()
+    }
+
+    fn loading(&self) -> bool {
+        self.state.nav_loading.load(Ordering::SeqCst)
     }
 
     fn last_paint_width(&self) -> i32 {
@@ -1712,6 +1924,10 @@ impl CefBrowserCallbacks {
         self.state.apply_permission_decision(id, allow);
     }
 
+    fn apply_before_unload_decision(&self, id: u64, proceed: bool) {
+        self.state.apply_before_unload_decision(id, proceed);
+    }
+
     fn retain_pdf_callback(&self) -> *mut c_void {
         self.state.retain_pdf_callback()
     }
@@ -1721,6 +1937,7 @@ impl Drop for CefBrowserCallbacks {
     fn drop(&mut self) {
         self.state.cancel_pending_resource_requests();
         self.state.release_pending_permission_prompts();
+        self.state.release_pending_before_unload_dialogs();
         let mut registry = registry().lock().expect("cef callback registry");
         registry.remove(&self.client.as_usize());
         registry.remove(&self.life_span.as_usize());
@@ -1734,12 +1951,20 @@ impl Drop for CefBrowserCallbacks {
         registry.remove(&self.download.as_usize());
         registry.remove(&self.audio.as_usize());
         registry.remove(&self.permission.as_usize());
+        self.state.purge_finished_pdf_callbacks(None);
         if let Ok(callbacks) = self.state.pdf_callbacks.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
             }
         }
+        self.state.purge_finished_download_image_callbacks(None);
         if let Ok(callbacks) = self.state.download_image_callbacks.lock() {
+            for callback in callbacks.iter() {
+                registry.remove(&callback.as_usize());
+            }
+        }
+        self.state.purge_finished_page_text_visitors(None);
+        if let Ok(callbacks) = self.state.page_text_visitors.lock() {
             for callback in callbacks.iter() {
                 registry.remove(&callback.as_usize());
             }
@@ -1885,6 +2110,7 @@ struct CefBrowserState {
     width: AtomicI32,
     height: AtomicI32,
     created: AtomicUsize,
+    closed: AtomicUsize,
     paints: AtomicUsize,
     /// Monotonic count of main/sub-frame navigations, bumped from the resource
     /// handler's `is_navigation` flag (browser-8). Drives per-context shim
@@ -1896,11 +2122,32 @@ struct CefBrowserState {
     pointer_y: AtomicI32,
     frame_sink: Mutex<Option<BrowserFrameSink>>,
     next_resource_request_id: AtomicU64,
+    /// In-flight subresource verdict callbacks. Bounded by
+    /// [`MAX_PENDING_RESOURCE_REQUESTS`] so a wedged shell or hostile page cannot
+    /// grow CEF callback retention without limit.
     pending_resource_requests: Mutex<HashMap<u64, usize>>,
+    /// One-shot `print_to_pdf` callbacks retained until CEF reports completion.
+    /// Finished callbacks are purged on the next PDF lifecycle touch so repeated
+    /// Save PDF operations do not retain callback boxes indefinitely.
     pdf_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_PDF_PRINT_CALLBACK_SIZE>>>>,
-    /// One-shot favicon `download_image` callbacks, retained for CEF's async
-    /// delivery. Mirrors `pdf_callbacks`; accepts the same small retention leak.
+    /// Finished PDF callback pointers waiting for a safe purge pass. We avoid
+    /// dropping the callback object from inside its own C callback.
+    finished_pdf_callbacks: Mutex<HashSet<usize>>,
+    /// One-shot favicon `download_image` callbacks retained until CEF's async
+    /// delivery returns. Completed callbacks are purged on the next favicon
+    /// lifecycle touch so churn stays bounded by in-flight callbacks plus the
+    /// just-returned callback object.
     download_image_callbacks: Mutex<Vec<Box<CefCallbackBlock<CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE>>>>,
+    /// Finished favicon callback pointers waiting for a safe purge pass. We avoid
+    /// dropping the callback object from inside its own C callback.
+    finished_download_image_callbacks: Mutex<HashSet<usize>>,
+    /// Native visible-text visitors retained until CEF replies to `get_text`.
+    /// CEF page-text is used by spellcheck/TTS/translate/offline-cache and must
+    /// not depend on page JavaScript or synthetic resource loads.
+    page_text_visitors: Mutex<Vec<Box<PageTextVisitor>>>,
+    /// Finished page-text visitor pointers waiting for a safe purge pass. We avoid
+    /// dropping the visitor object from inside its own C callback.
+    finished_page_text_visitors: Mutex<HashSet<usize>>,
     print_handler_ptr: AtomicUsize,
     /// Cached child-handler block pointers, set at `install()` time — resolved
     /// DIRECTLY (not via the size-keyed `lookup_peer`, whose `callback_size`
@@ -1919,14 +2166,26 @@ struct CefBrowserState {
     /// resolves without the size-keyed `lookup_peer`.
     audio_handler_ptr: AtomicUsize,
     /// The permission handler block address (per-site geolocation / notifications /
-    /// clipboard grants). Cached directly like the other child handlers, never the
-    /// size-keyed `lookup_peer`.
+    /// clipboard / camera / microphone grants). Cached directly like the other
+    /// child handlers, never the size-keyed `lookup_peer`.
     permission_handler_ptr: AtomicUsize,
-    /// In-flight permission-prompt callbacks, keyed by CEF's `prompt_id`. Each is a
-    /// live refcounted `cef_permission_prompt_callback_t*`: add_ref'd when stashed
-    /// in `on_show_permission_prompt`, released after `cont()` on the shell's
-    /// `ControlMsg::PermissionDecision` (or on CEF-initiated dismissal / teardown).
-    pending_permission_prompts: Mutex<HashMap<u64, usize>>,
+    /// In-flight permission callbacks, keyed by CEF's `prompt_id` or a
+    /// bridge-minted media-access id. Bounded by [`MAX_PENDING_PERMISSION_PROMPTS`].
+    /// Each callback is a live refcounted CEF object: add_ref'd when stashed,
+    /// continued on the shell's `ControlMsg::PermissionDecision`, then released.
+    pending_permission_prompts: Mutex<HashMap<u64, PendingPermissionCallback>>,
+    /// Monotonic id minted for CEF media-access prompts. The media-access callback
+    /// has no prompt id, so the bridge creates one for the wire round-trip.
+    next_media_permission_id: AtomicU64,
+    /// Monotonic id minted for CEF beforeunload prompts. CEF's callback does not
+    /// include a prompt id, so the bridge creates one for the wire round-trip.
+    next_before_unload_id: AtomicU64,
+    /// In-flight beforeunload callbacks, keyed by the bridge-minted id. Bounded by
+    /// [`MAX_PENDING_BEFORE_UNLOAD_DIALOGS`]. Each is a live refcounted
+    /// `cef_jsdialog_callback_t*`: add_ref'd when stashed in
+    /// `on_before_unload_dialog`, released after `cont()` on the shell's
+    /// `ControlMsg::BeforeUnloadDecision` or teardown.
+    pending_before_unload_dialogs: Mutex<HashMap<u64, usize>>,
     string_userfree_free: CefStringUserfreeUtf16Free,
     /// `cef_string_list_size` / `cef_string_list_value` exports (dlsym'd via the
     /// ABI), used to read the favicon `icon_urls` list in `on_favicon_urlchange`.
@@ -1958,6 +2217,19 @@ struct CefBrowserState {
     /// `on_before_resource_load` so server-side sniffers see the spoofed agent too
     /// (the JS shim only fools client-side `navigator.userAgent` reads).
     user_agent_override: Mutex<String>,
+    /// Per-tab autoplay policy remembered across document contexts. The active
+    /// document is patched immediately, and the navigation shim injector reapplies
+    /// the block to fresh documents while this is true.
+    autoplay_blocked: AtomicBool,
+    /// CEF audio callback says the page is currently audible.
+    audio_active: AtomicBool,
+    /// Media Session / HTMLMediaElement probe says at least one media element is
+    /// playing. This is metadata only; no samples or frames leave CEF.
+    media_session_playing: AtomicBool,
+    /// Optional legacy WebRTC API remover. Default is false so CEF can satisfy
+    /// browser-page WebRTC compatibility; deployments can set
+    /// [`CEF_WEBRTC_BLOCK_ENV`] to restore the old WebRTC-off posture.
+    webrtc_blocked: AtomicBool,
 }
 
 impl CefBrowserState {
@@ -1983,6 +2255,7 @@ impl CefBrowserState {
             width: AtomicI32::new(i32::try_from(width).unwrap_or(i32::MAX)),
             height: AtomicI32::new(i32::try_from(height).unwrap_or(i32::MAX)),
             created: AtomicUsize::new(0),
+            closed: AtomicUsize::new(0),
             paints: AtomicUsize::new(0),
             nav_seq: AtomicU64::new(0),
             last_paint_width: AtomicUsize::new(0),
@@ -1993,7 +2266,11 @@ impl CefBrowserState {
             next_resource_request_id: AtomicU64::new(1),
             pending_resource_requests: Mutex::new(HashMap::new()),
             pdf_callbacks: Mutex::new(Vec::new()),
+            finished_pdf_callbacks: Mutex::new(HashSet::new()),
             download_image_callbacks: Mutex::new(Vec::new()),
+            finished_download_image_callbacks: Mutex::new(HashSet::new()),
+            page_text_visitors: Mutex::new(Vec::new()),
+            finished_page_text_visitors: Mutex::new(HashSet::new()),
             print_handler_ptr: AtomicUsize::new(0),
             display_handler_ptr: AtomicUsize::new(0),
             load_handler_ptr: AtomicUsize::new(0),
@@ -2003,6 +2280,9 @@ impl CefBrowserState {
             audio_handler_ptr: AtomicUsize::new(0),
             permission_handler_ptr: AtomicUsize::new(0),
             pending_permission_prompts: Mutex::new(HashMap::new()),
+            next_media_permission_id: AtomicU64::new(MEDIA_PERMISSION_ID_BASE),
+            next_before_unload_id: AtomicU64::new(1),
+            pending_before_unload_dialogs: Mutex::new(HashMap::new()),
             string_userfree_free,
             string_list_size,
             string_list_value,
@@ -2016,6 +2296,10 @@ impl CefBrowserState {
             last_cursor: AtomicI32::new(-1),
             download_seq: AtomicU64::new(1),
             user_agent_override: Mutex::new(String::new()),
+            autoplay_blocked: AtomicBool::new(false),
+            audio_active: AtomicBool::new(false),
+            media_session_playing: AtomicBool::new(false),
+            webrtc_blocked: AtomicBool::new(cef_webrtc_blocked_from_env()),
         })
     }
 
@@ -2085,7 +2369,22 @@ impl CefBrowserState {
     /// shell, which shows/hides the 🔊 "playing audio" indicator on the tab. We
     /// carry only the audible bit — never any audio samples.
     fn publish_audio_state(&self, audible: bool) {
+        self.audio_active.store(audible, Ordering::SeqCst);
         let event = EventMsg::AudioState { audible };
+        let _ = self.frame_sink.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|frame_sink| sock::send_frame(&frame_sink.stream, &event.encode()).ok())
+        });
+    }
+
+    /// Forward bounded page/media-session now-playing metadata to the shell.
+    fn publish_media_metadata(&self, body: String) {
+        self.media_session_playing
+            .store(media_metadata_reports_playing(&body), Ordering::SeqCst);
+        let event = EventMsg::MediaMetadata {
+            body: clamp_utf8(&body, CEF_MEDIA_METADATA_BEACON_MAX_BYTES),
+        };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -2151,12 +2450,19 @@ impl CefBrowserState {
     /// Record that a fresh document context is being loaded (browser-8). Called
     /// from the resource handler when CEF flags a request as a navigation.
     fn record_navigation(&self) {
+        self.audio_active.store(false, Ordering::SeqCst);
+        self.media_session_playing.store(false, Ordering::SeqCst);
         self.nav_seq.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Current navigation generation observed by the pump loop.
     fn navigations(&self) -> u64 {
         self.nav_seq.load(Ordering::SeqCst)
+    }
+
+    fn active_media(&self) -> bool {
+        self.audio_active.load(Ordering::SeqCst)
+            || self.media_session_playing.load(Ordering::SeqCst)
     }
 
     fn update_pointer(&self, x: f32, y: f32) -> (i32, i32) {
@@ -2174,7 +2480,25 @@ impl CefBrowserState {
         )
     }
 
-    fn begin_resource_request(&self, url: String, callback: *mut c_void) -> c_int {
+    fn current_top_level_url(&self) -> String {
+        self.nav_url.lock().map(|u| u.clone()).unwrap_or_default()
+    }
+
+    fn login_beacon_matches_top_level(&self, origin: &str) -> bool {
+        hosts_match(origin, &self.current_top_level_url())
+    }
+
+    fn host_matches_top_level(&self, expected_host: &str) -> bool {
+        let Some(expected) = credential_host(expected_host) else {
+            return false;
+        };
+        let Some(current) = credential_host(&self.current_top_level_url()) else {
+            return false;
+        };
+        expected == current
+    }
+
+    fn begin_resource_request(&self, url: String, resource: u8, callback: *mut c_void) -> c_int {
         if let Some((id, text)) = decode_page_text_beacon(&url) {
             self.publish_page_text(id, text);
             if !callback.is_null() {
@@ -2196,8 +2520,19 @@ impl CefBrowserState {
             }
             return RV_CANCEL;
         }
-        if let Some(body) = decode_login_beacon(&url) {
-            self.publish_login_submitted(body);
+        if let Some(body) = decode_media_metadata_beacon(&url) {
+            self.publish_media_metadata(body);
+            if !callback.is_null() {
+                cancel_cef_callback(callback);
+            }
+            return RV_CANCEL;
+        }
+        if url.starts_with(CEF_LOGIN_BEACON_PREFIX) {
+            if let Some((origin, body)) = decode_login_beacon(&url) {
+                if self.login_beacon_matches_top_level(&origin) {
+                    self.publish_login_submitted(origin, body);
+                }
+            }
             if !callback.is_null() {
                 cancel_cef_callback(callback);
             }
@@ -2213,12 +2548,20 @@ impl CefBrowserState {
         else {
             return RV_CONTINUE;
         };
-        add_ref_cef(callback);
-        let event = EventMsg::ResourceRequest {
-            id,
-            url,
-            resource: RESOURCE_OTHER,
+        let Ok(mut pending) = self.pending_resource_requests.lock() else {
+            cancel_cef_callback(callback);
+            return RV_CANCEL;
         };
+        if pending.len() >= MAX_PENDING_RESOURCE_REQUESTS {
+            drop(pending);
+            cancel_cef_callback(callback);
+            return RV_CANCEL;
+        }
+        add_ref_cef(callback);
+        pending.insert(id, callback as usize);
+        drop(pending);
+
+        let event = EventMsg::ResourceRequest { id, url, resource };
         let sent = self
             .frame_sink
             .lock()
@@ -2230,10 +2573,10 @@ impl CefBrowserState {
             })
             .is_some();
         if sent {
-            if let Ok(mut pending) = self.pending_resource_requests.lock() {
-                pending.insert(id, callback as usize);
-                return RV_CONTINUE_ASYNC;
-            }
+            return RV_CONTINUE_ASYNC;
+        }
+        if let Ok(mut pending) = self.pending_resource_requests.lock() {
+            pending.remove(&id);
         }
         cancel_cef_callback(callback);
         release_cef(callback);
@@ -2258,6 +2601,7 @@ impl CefBrowserState {
     }
 
     fn retain_pdf_callback(&self) -> *mut c_void {
+        self.purge_finished_pdf_callbacks(None);
         let mut callback = Box::new(CefCallbackBlock::new(CEF_PDF_PRINT_CALLBACK_SIZE));
         callback.put_fn(
             CEF_PDF_PRINT_CALLBACK_ON_FINISHED_OFFSET,
@@ -2276,11 +2620,67 @@ impl CefBrowserState {
         }
     }
 
+    fn finish_pdf_callback(&self, callback: *mut c_void) {
+        let key = callback as usize;
+        if key == 0 {
+            return;
+        }
+        self.purge_finished_pdf_callbacks(Some(key));
+        if let Ok(mut registry) = registry().lock() {
+            registry.remove(&key);
+        }
+        if let Ok(mut finished) = self.finished_pdf_callbacks.lock() {
+            finished.insert(key);
+        }
+    }
+
+    fn purge_finished_pdf_callbacks(&self, keep: Option<usize>) {
+        let finished = self
+            .finished_pdf_callbacks
+            .lock()
+            .ok()
+            .map(|mut finished| {
+                let ready: Vec<usize> = finished
+                    .iter()
+                    .copied()
+                    .filter(|key| Some(*key) != keep)
+                    .collect();
+                for key in &ready {
+                    finished.remove(key);
+                }
+                ready
+            })
+            .unwrap_or_default();
+        if finished.is_empty() {
+            return;
+        }
+        if let Ok(mut callbacks) = self.pdf_callbacks.lock() {
+            callbacks.retain(|callback| !finished.contains(&callback.as_usize()));
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_pdf_callback_count(&self) -> usize {
+        self.pdf_callbacks
+            .lock()
+            .map(|callbacks| callbacks.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn finished_pdf_callback_count(&self) -> usize {
+        self.finished_pdf_callbacks
+            .lock()
+            .map(|callbacks| callbacks.len())
+            .unwrap_or(0)
+    }
+
     /// Allocate a one-shot `cef_download_image_callback_t` for a favicon fetch,
-    /// wired to [`on_download_image_finished`]. Mirrors [`Self::retain_pdf_callback`]
-    /// exactly — the Box is retained in `download_image_callbacks` for CEF's async
-    /// delivery and registered so `with_state` resolves it in the callback.
+    /// wired to [`on_download_image_finished`]. The Box is retained in
+    /// `download_image_callbacks` for CEF's async delivery and registered so
+    /// `with_state` resolves it in the callback.
     fn retain_download_image_callback(&self) -> *mut c_void {
+        self.purge_finished_download_image_callbacks(None);
         let mut callback = Box::new(CefCallbackBlock::new(CEF_DOWNLOAD_IMAGE_CALLBACK_SIZE));
         callback.put_fn(
             CEF_DOWNLOAD_IMAGE_CALLBACK_ON_FINISHED_OFFSET,
@@ -2292,12 +2692,152 @@ impl CefBrowserState {
             if let Ok(mut registry) = registry().lock() {
                 registry.insert(callback.as_usize(), state);
             }
-            // TODO(perf): bound favicon callback retention (Box stays in the Vec).
             callbacks.push(callback);
             ptr
         } else {
             ptr::null_mut()
         }
+    }
+
+    fn finish_download_image_callback(&self, callback: *mut c_void) {
+        let key = callback as usize;
+        if key == 0 {
+            return;
+        }
+        self.purge_finished_download_image_callbacks(Some(key));
+        if let Ok(mut registry) = registry().lock() {
+            registry.remove(&key);
+        }
+        if let Ok(mut finished) = self.finished_download_image_callbacks.lock() {
+            finished.insert(key);
+        }
+    }
+
+    fn purge_finished_download_image_callbacks(&self, keep: Option<usize>) {
+        let finished = self
+            .finished_download_image_callbacks
+            .lock()
+            .ok()
+            .map(|mut finished| {
+                let ready: Vec<usize> = finished
+                    .iter()
+                    .copied()
+                    .filter(|key| Some(*key) != keep)
+                    .collect();
+                for key in &ready {
+                    finished.remove(key);
+                }
+                ready
+            })
+            .unwrap_or_default();
+        if finished.is_empty() {
+            return;
+        }
+        if let Ok(mut callbacks) = self.download_image_callbacks.lock() {
+            callbacks.retain(|callback| !finished.contains(&callback.as_usize()));
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_download_image_callback_count(&self) -> usize {
+        self.download_image_callbacks
+            .lock()
+            .map(|callbacks| callbacks.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn finished_download_image_callback_count(&self) -> usize {
+        self.finished_download_image_callbacks
+            .lock()
+            .map(|callbacks| callbacks.len())
+            .unwrap_or(0)
+    }
+
+    /// Allocate a one-shot `cef_string_visitor_t` for native visible page text.
+    /// The visitor is retained until CEF invokes `visit`; overflow declines the
+    /// native request and lets the JavaScript beacon fallback try instead.
+    fn retain_page_text_visitor(&self, id: u64, max_bytes: u32) -> *mut c_void {
+        self.purge_finished_page_text_visitors(None);
+        let Ok(mut visitors) = self.page_text_visitors.lock() else {
+            return ptr::null_mut();
+        };
+        if visitors.len() >= MAX_PENDING_PAGE_TEXT_VISITORS {
+            return ptr::null_mut();
+        }
+        let visitor = Box::new(PageTextVisitor::new(
+            id,
+            max_bytes.clamp(1, CEF_PAGE_TEXT_BEACON_MAX_BYTES),
+        ));
+        let ptr = visitor.as_mut_ptr();
+        let state = self as *const CefBrowserState as usize;
+        if let Ok(mut registry) = registry().lock() {
+            registry.insert(visitor.as_usize(), state);
+        }
+        visitors.push(visitor);
+        ptr
+    }
+
+    fn finish_page_text_visitor(&self, visitor: *mut c_void) -> Option<(u64, u32)> {
+        let key = visitor as usize;
+        if key == 0 {
+            return None;
+        }
+        let metadata = self.page_text_visitors.lock().ok().and_then(|visitors| {
+            visitors
+                .iter()
+                .find(|visitor| visitor.as_usize() == key)
+                .map(|visitor| (visitor.id, visitor.max_bytes))
+        });
+        self.purge_finished_page_text_visitors(Some(key));
+        if let Ok(mut registry) = registry().lock() {
+            registry.remove(&key);
+        }
+        if let Ok(mut finished) = self.finished_page_text_visitors.lock() {
+            finished.insert(key);
+        }
+        metadata
+    }
+
+    fn purge_finished_page_text_visitors(&self, keep: Option<usize>) {
+        let finished = self
+            .finished_page_text_visitors
+            .lock()
+            .ok()
+            .map(|mut finished| {
+                let ready: Vec<usize> = finished
+                    .iter()
+                    .copied()
+                    .filter(|key| Some(*key) != keep)
+                    .collect();
+                for key in &ready {
+                    finished.remove(key);
+                }
+                ready
+            })
+            .unwrap_or_default();
+        if finished.is_empty() {
+            return;
+        }
+        if let Ok(mut visitors) = self.page_text_visitors.lock() {
+            visitors.retain(|visitor| !finished.contains(&visitor.as_usize()));
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_page_text_visitor_count(&self) -> usize {
+        self.page_text_visitors
+            .lock()
+            .map(|visitors| visitors.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn finished_page_text_visitor_count(&self) -> usize {
+        self.finished_page_text_visitors
+            .lock()
+            .map(|visitors| visitors.len())
+            .unwrap_or(0)
     }
 
     /// The engine reported the page's favicon URLs. Read the first, then pull the
@@ -2397,8 +2937,8 @@ impl CefBrowserState {
         });
     }
 
-    fn publish_login_submitted(&self, body: String) {
-        let event = EventMsg::LoginSubmitted { body };
+    fn publish_login_submitted(&self, origin: String, body: String) {
+        let event = EventMsg::LoginSubmitted { origin, body };
         let _ = self.frame_sink.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -2500,6 +3040,84 @@ impl CefBrowserState {
         });
     }
 
+    /// CEF asks whether a page's `beforeunload` handler should proceed. Unlike
+    /// alert/confirm/prompt, this is a real blocking navigation decision: retain
+    /// CEF's JS-dialog callback, publish a shell prompt, and continue only after
+    /// `ControlMsg::BeforeUnloadDecision`. If emission/stashing fails, cancel the
+    /// unload synchronously (`success=0`) so the page stays put and no callback
+    /// leaks.
+    fn begin_before_unload_dialog(
+        &self,
+        message: String,
+        is_reload: bool,
+        callback: *mut c_void,
+    ) -> c_int {
+        if callback.is_null() {
+            return 0;
+        }
+        let Some(id) = self
+            .next_before_unload_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .ok()
+        else {
+            continue_jsdialog_callback(callback, 0);
+            return 1;
+        };
+        let Ok(mut pending) = self.pending_before_unload_dialogs.lock() else {
+            continue_jsdialog_callback(callback, 0);
+            return 1;
+        };
+        if pending.len() >= MAX_PENDING_BEFORE_UNLOAD_DIALOGS {
+            drop(pending);
+            continue_jsdialog_callback(callback, 0);
+            return 1;
+        }
+        add_ref_cef(callback);
+        pending.insert(id, callback as usize);
+        drop(pending);
+
+        let event = EventMsg::BeforeUnloadDialog {
+            id,
+            message,
+            origin: self.current_top_level_url(),
+            is_reload,
+        };
+        let sent = self
+            .frame_sink
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|frame_sink| {
+                    sock::send_frame(&frame_sink.stream, &event.encode()).ok()
+                })
+            })
+            .is_some();
+        if sent {
+            return 1;
+        }
+        if let Ok(mut pending) = self.pending_before_unload_dialogs.lock() {
+            pending.remove(&id);
+        }
+        continue_jsdialog_callback(callback, 0);
+        release_cef(callback);
+        1
+    }
+
+    /// The shell answered a beforeunload prompt. Remove the stashed callback before
+    /// calling CEF so re-entrant callbacks cannot double-release the object.
+    fn apply_before_unload_decision(&self, id: u64, proceed: bool) {
+        let callback = self
+            .pending_before_unload_dialogs
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&id))
+            .map(|ptr| ptr as *mut c_void);
+        if let Some(callback) = callback {
+            continue_jsdialog_callback(callback, c_int::from(proceed));
+            release_cef(callback);
+        }
+    }
+
     fn cancel_pending_resource_requests(&self) {
         let callbacks = self
             .pending_resource_requests
@@ -2513,29 +3131,41 @@ impl CefBrowserState {
         }
     }
 
-    /// CEF asks us to show a permission prompt (`on_show_permission_prompt`). Map
-    /// the requested types to our wire `kind`; out-of-scope requests return 0 so CEF
-    /// applies default handling (Alloy-style deny) — no prompt, no callback
-    /// retention. For an in-scope kind we add_ref the callback, emit
-    /// `EventMsg::PermissionRequest`, stash the callback under `prompt_id`, and
-    /// return 1 (we continue it on the shell's `PermissionDecision`).
-    fn begin_permission_prompt(
+    #[cfg(test)]
+    fn pending_resource_request_count(&self) -> usize {
+        self.pending_resource_requests
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0)
+    }
+
+    fn begin_permission_prompt_for_kind(
         &self,
         prompt_id: u64,
         origin: String,
-        requested_permissions: u32,
-        callback: *mut c_void,
+        kind: u8,
+        pending_callback: PendingPermissionCallback,
     ) -> c_int {
-        let Some(kind) = permission_kind_from_cef(requested_permissions) else {
-            return 0;
-        };
+        let callback = pending_callback.callback_ptr();
         if callback.is_null() {
             return 0;
+        }
+        let Ok(mut pending) = self.pending_permission_prompts.lock() else {
+            pending_callback.deny();
+            return 1;
+        };
+        if pending.len() >= MAX_PENDING_PERMISSION_PROMPTS || pending.contains_key(&prompt_id) {
+            drop(pending);
+            pending_callback.deny();
+            return 1;
         }
         // The callback is a live refcounted CEF object; retain it across the async
         // shell round-trip. Paired with the `release_cef` in
         // `apply_permission_decision` / `discard_permission_prompt` / teardown.
         add_ref_cef(callback);
+        pending.insert(prompt_id, pending_callback);
+        drop(pending);
+
         let event = EventMsg::PermissionRequest {
             id: prompt_id,
             kind,
@@ -2552,14 +3182,66 @@ impl CefBrowserState {
             })
             .is_some();
         if sent {
-            if let Ok(mut pending) = self.pending_permission_prompts.lock() {
-                pending.insert(prompt_id, callback as usize);
-                return 1;
-            }
+            return 1;
+        }
+        if let Ok(mut pending) = self.pending_permission_prompts.lock() {
+            pending.remove(&prompt_id);
         }
         // Could not emit or stash: undo the ref and let CEF apply default handling.
         release_cef(callback);
         0
+    }
+
+    /// CEF asks us to show a generic permission prompt (`on_show_permission_prompt`).
+    /// Map the requested types to our wire `kind`; out-of-scope requests return 0
+    /// so CEF applies default handling (Alloy-style deny) — no prompt, no callback
+    /// retention. For an in-scope kind we add_ref the callback, emit
+    /// `EventMsg::PermissionRequest`, stash the callback under `prompt_id`, and
+    /// return 1 (we continue it on the shell's `PermissionDecision`).
+    fn begin_permission_prompt(
+        &self,
+        prompt_id: u64,
+        origin: String,
+        requested_permissions: u32,
+        callback: *mut c_void,
+    ) -> c_int {
+        let Some(kind) = permission_kind_from_cef(requested_permissions) else {
+            return 0;
+        };
+        self.begin_permission_prompt_for_kind(
+            prompt_id,
+            origin,
+            kind,
+            PendingPermissionCallback::Prompt {
+                callback: callback as usize,
+            },
+        )
+    }
+
+    /// CEF asks for camera/microphone media access (`getUserMedia`). This callback
+    /// is separate from generic permission prompts: allowing requires echoing the
+    /// requested media-access bitmask back to CEF, and denying is `Continue(0)`.
+    fn begin_media_access_permission(
+        &self,
+        origin: String,
+        requested_permissions: u32,
+        callback: *mut c_void,
+    ) -> c_int {
+        let Some(kind) = media_access_kind_from_cef(requested_permissions) else {
+            return 0;
+        };
+        let prompt_id = self
+            .next_media_permission_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.begin_permission_prompt_for_kind(
+            prompt_id,
+            origin,
+            kind,
+            PendingPermissionCallback::MediaAccess {
+                callback: callback as usize,
+                requested_permissions,
+            },
+        )
     }
 
     /// The shell answered a permission prompt (`ControlMsg::PermissionDecision`).
@@ -2569,20 +3251,14 @@ impl CefBrowserState {
     /// released before `cont()` so a synchronous CEF `on_dismiss` re-entry cannot
     /// deadlock or double-release.
     fn apply_permission_decision(&self, id: u64, allow: bool) {
-        let callback = self
+        let pending_callback = self
             .pending_permission_prompts
             .lock()
             .ok()
-            .and_then(|mut pending| pending.remove(&id))
-            .map(|ptr| ptr as *mut c_void);
-        if let Some(callback) = callback {
-            let result = if allow {
-                CEF_PERMISSION_RESULT_ACCEPT
-            } else {
-                CEF_PERMISSION_RESULT_DENY
-            };
-            continue_permission_callback(callback, result);
-            release_cef(callback);
+            .and_then(|mut pending| pending.remove(&id));
+        if let Some(pending_callback) = pending_callback {
+            pending_callback.answer(allow);
+            release_cef(pending_callback.callback_ptr());
         }
     }
 
@@ -2591,14 +3267,13 @@ impl CefBrowserState {
     /// (CEF owns the dismissal). A missing id — already answered by the shell — is a
     /// safe no-op; the map removal guarantees we never release twice.
     fn discard_permission_prompt(&self, id: u64) {
-        let callback = self
+        let pending_callback = self
             .pending_permission_prompts
             .lock()
             .ok()
-            .and_then(|mut pending| pending.remove(&id))
-            .map(|ptr| ptr as *mut c_void);
-        if let Some(callback) = callback {
-            release_cef(callback);
+            .and_then(|mut pending| pending.remove(&id));
+        if let Some(pending_callback) = pending_callback {
+            release_cef(pending_callback.callback_ptr());
         }
     }
 
@@ -2611,11 +3286,42 @@ impl CefBrowserState {
             .lock()
             .map(|mut pending| pending.drain().map(|(_, ptr)| ptr).collect::<Vec<_>>())
             .unwrap_or_default();
+        for pending_callback in callbacks {
+            pending_callback.deny();
+            release_cef(pending_callback.callback_ptr());
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_permission_prompt_count(&self) -> usize {
+        self.pending_permission_prompts
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0)
+    }
+
+    /// Drain unresolved beforeunload callbacks at teardown. `success=0` is the
+    /// conservative answer (stay/cancel), and it satisfies CEF's handled-callback
+    /// contract before dropping our ref.
+    fn release_pending_before_unload_dialogs(&self) {
+        let callbacks = self
+            .pending_before_unload_dialogs
+            .lock()
+            .map(|mut pending| pending.drain().map(|(_, ptr)| ptr).collect::<Vec<_>>())
+            .unwrap_or_default();
         for callback in callbacks {
             let callback = callback as *mut c_void;
-            continue_permission_callback(callback, CEF_PERMISSION_RESULT_DENY);
+            continue_jsdialog_callback(callback, 0);
             release_cef(callback);
         }
+    }
+
+    #[cfg(test)]
+    fn pending_before_unload_count(&self) -> usize {
+        self.pending_before_unload_dialogs
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0)
     }
 }
 
@@ -2660,6 +3366,7 @@ impl CefKeyEvent {
         let mut event = Self {
             bytes: [0; CEF_KEY_EVENT_SIZE],
         };
+        event.put_usize(0, CEF_KEY_EVENT_SIZE);
         event.put_i32(CEF_KEY_EVENT_TYPE_OFFSET, event_type);
         event.put_i32(CEF_KEY_EVENT_MODIFIERS_OFFSET, modifiers);
         event.put_i32(CEF_KEY_EVENT_WINDOWS_KEY_CODE_OFFSET, windows_key_code);
@@ -2686,9 +3393,59 @@ impl CefKeyEvent {
             .copy_from_slice(&value.to_ne_bytes());
     }
 
+    fn put_usize(&mut self, offset: usize, value: usize) {
+        self.bytes[offset..offset + std::mem::size_of::<usize>()]
+            .copy_from_slice(&value.to_ne_bytes());
+    }
+
     fn put_u16(&mut self, offset: usize, value: u16) {
         self.bytes[offset..offset + std::mem::size_of::<u16>()]
             .copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingPermissionCallback {
+    Prompt {
+        callback: usize,
+    },
+    MediaAccess {
+        callback: usize,
+        requested_permissions: u32,
+    },
+}
+
+impl PendingPermissionCallback {
+    fn callback_ptr(self) -> *mut c_void {
+        match self {
+            Self::Prompt { callback } | Self::MediaAccess { callback, .. } => {
+                callback as *mut c_void
+            }
+        }
+    }
+
+    fn answer(self, allow: bool) {
+        match self {
+            Self::Prompt { callback } => {
+                let result = if allow {
+                    CEF_PERMISSION_RESULT_ACCEPT
+                } else {
+                    CEF_PERMISSION_RESULT_DENY
+                };
+                continue_permission_callback(callback as *mut c_void, result);
+            }
+            Self::MediaAccess {
+                callback,
+                requested_permissions,
+            } => {
+                let allowed_permissions = if allow { requested_permissions } else { 0 };
+                continue_media_access_callback(callback as *mut c_void, allowed_permissions);
+            }
+        }
+    }
+
+    fn deny(self) {
+        self.answer(false);
     }
 }
 
@@ -2736,6 +3493,35 @@ impl<const N: usize> CefCallbackBlock<N> {
 
 fn fn_ptr(ptr: *const ()) -> usize {
     ptr as usize
+}
+
+struct PageTextVisitor {
+    block: CefCallbackBlock<CEF_STRING_VISITOR_SIZE>,
+    id: u64,
+    max_bytes: u32,
+}
+
+impl PageTextVisitor {
+    fn new(id: u64, max_bytes: u32) -> Self {
+        let mut block = CefCallbackBlock::new(CEF_STRING_VISITOR_SIZE);
+        block.put_fn(
+            CEF_STRING_VISITOR_VISIT_OFFSET,
+            fn_ptr(on_page_text_visited as *const ()),
+        );
+        Self {
+            block,
+            id,
+            max_bytes,
+        }
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn as_usize(&self) -> usize {
+        self.block.as_usize()
+    }
 }
 
 #[repr(C)]
@@ -2801,8 +3587,8 @@ unsafe extern "C" fn get_print_handler(self_: *mut c_void) -> *mut c_void {
 
 unsafe extern "C" fn get_resource_request_handler(
     self_: *mut c_void,
-    _browser: *mut c_void,
-    _frame: *mut c_void,
+    browser: *mut c_void,
+    frame: *mut c_void,
     _request: *mut c_void,
     is_navigation: c_int,
     _is_download: c_int,
@@ -2816,7 +3602,7 @@ unsafe extern "C" fn get_resource_request_handler(
         }
     }
     with_state(self_, |state| {
-        if is_navigation != 0 {
+        if is_navigation != 0 && frame_is_main(browser, frame) {
             // browser-8: a real navigation opens a fresh JS context that needs
             // the WebRTC/passkey shims re-injected. Signal the pump loop instead
             // of re-running the shims on a blind 250 ms timer.
@@ -2830,6 +3616,12 @@ unsafe extern "C" fn get_resource_request_handler(
 unsafe extern "C" fn on_after_created(self_: *mut c_void, _browser: *mut c_void) {
     let _ = with_state(self_, |state| {
         state.created.fetch_add(1, Ordering::SeqCst);
+    });
+}
+
+unsafe extern "C" fn on_before_close(self_: *mut c_void, _browser: *mut c_void) {
+    let _ = with_state(self_, |state| {
+        state.closed.fetch_add(1, Ordering::SeqCst);
     });
 }
 
@@ -3085,7 +3877,11 @@ unsafe extern "C" fn on_before_resource_load(
         let Some(url) = request_url(request, state.string_userfree_free) else {
             return RV_CONTINUE;
         };
-        state.begin_resource_request(url, callback)
+        // Classify the request so the shell can exempt a top-level Document from
+        // the mixed-content / generic ad-filter cancellation that a hardcoded
+        // RESOURCE_OTHER used to trigger (the Google-News redirect nav bug).
+        let resource = cef_resource_type_to_wire(request_resource_type(request));
+        state.begin_resource_request(url, resource, callback)
     })
     .unwrap_or(RV_CONTINUE)
 }
@@ -3119,11 +3915,11 @@ unsafe extern "C" fn get_permission_handler(self_: *mut c_void) -> *mut c_void {
 }
 
 /// Map a `cef_permission_request_types_t` bitmask (`requested_permissions`) onto
-/// our engine-neutral wire `kind`. Only geolocation / notifications / clipboard are
-/// in scope (operator-authorized, session-only); every other request (camera/mic,
-/// MIDI, sensors, protected-media, …) yields `None` → default deny without a
-/// prompt. When several in-scope bits are set we surface the first in wire order
-/// (geolocation < notifications < clipboard).
+/// our engine-neutral wire `kind`. Geolocation / notifications / clipboard and
+/// camera / microphone are in scope (operator-authorized, session-only); every
+/// other request (MIDI, sensors, protected-media, …) yields `None` → default deny
+/// without a prompt. When several in-scope bits are set we surface the first in
+/// wire order (geolocation < notifications < clipboard < camera/microphone).
 fn permission_kind_from_cef(requested: u32) -> Option<u8> {
     if requested & CEF_PERMISSION_TYPE_GEOLOCATION != 0 {
         Some(PERMISSION_KIND_GEOLOCATION)
@@ -3132,23 +3928,54 @@ fn permission_kind_from_cef(requested: u32) -> Option<u8> {
     } else if requested & CEF_PERMISSION_TYPE_CLIPBOARD != 0 {
         Some(PERMISSION_KIND_CLIPBOARD)
     } else {
-        None
+        let camera = requested & CEF_PERMISSION_TYPE_CAMERA_STREAM != 0;
+        let microphone = requested & CEF_PERMISSION_TYPE_MIC_STREAM != 0;
+        match (camera, microphone) {
+            (true, true) => Some(PERMISSION_KIND_CAMERA_MICROPHONE),
+            (true, false) => Some(PERMISSION_KIND_CAMERA),
+            (false, true) => Some(PERMISSION_KIND_MICROPHONE),
+            (false, false) => None,
+        }
+    }
+}
+
+/// Map CEF's media-access bitmask onto the same shell permission kinds. This path
+/// only handles device camera/microphone capture; desktop capture remains out of
+/// scope and returns 0 from the CEF callback for default deny.
+fn media_access_kind_from_cef(requested: u32) -> Option<u8> {
+    const SUPPORTED_CAPTURE: u32 =
+        CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE;
+    if requested & !SUPPORTED_CAPTURE != 0 {
+        return None;
+    }
+    let audio = requested & CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE != 0;
+    let video = requested & CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE != 0;
+    match (video, audio) {
+        (true, true) => Some(PERMISSION_KIND_CAMERA_MICROPHONE),
+        (true, false) => Some(PERMISSION_KIND_CAMERA),
+        (false, true) => Some(PERMISSION_KIND_MICROPHONE),
+        (false, false) => None,
     }
 }
 
 /// CEF `on_request_media_access_permission(self, browser, frame, requesting_origin,
 /// requested_permissions, callback) -> int` — a page's getUserMedia camera/mic
-/// request. Out of scope this unit: return 0 (proceed with default handling, which
-/// is deny under Alloy style). We never touch the media-access callback.
+/// request. Device camera/mic requests are bridged to the shell's session-only
+/// permission prompt. Desktop capture remains out of scope and returns 0 (default
+/// handling / deny).
 unsafe extern "C" fn on_request_media_access_permission(
-    _self: *mut c_void,
+    self_: *mut c_void,
     _browser: *mut c_void,
     _frame: *mut c_void,
-    _requesting_origin: *const CefString,
-    _requested_permissions: u32,
-    _callback: *mut c_void,
+    requesting_origin: *const CefString,
+    requested_permissions: u32,
+    callback: *mut c_void,
 ) -> c_int {
-    0
+    let origin = cef_string_to_string(requesting_origin);
+    with_state(self_, |state| {
+        state.begin_media_access_permission(origin, requested_permissions, callback)
+    })
+    .unwrap_or(0)
 }
 
 /// CEF `on_show_permission_prompt(self, browser, prompt_id, requesting_origin,
@@ -3187,16 +4014,37 @@ unsafe extern "C" fn on_dismiss_permission_prompt(
     let _ = with_state(self_, |state| state.discard_permission_prompt(prompt_id));
 }
 
+/// Whether page audio should play through CEF's own pipeline to the OS
+/// (`MDE_CEF_NATIVE_AUDIO` set) instead of being diverted into our audio stream
+/// handler. Off by default, so the shipped audible-pip behavior is unchanged
+/// until the sandbox `/dev/snd` ALSA path is confirmed to carry CEF output on a
+/// live seat — this flag exists to A/B that on hardware without a rebuild.
+///
+/// NOTE (CEF 149, on-seat verified 2026-07-19): `cef_display_handler_t` has NO
+/// `on_audio_state_changed` on this build, so the audio STREAM handler is the only
+/// engine source of the audible bit — and opting into it is exactly what silences
+/// the OS output. In native-audio mode the shell therefore drives the 🔊 pip from
+/// page media metadata instead (see `web/mod.rs`).
+fn wants_native_audio() -> bool {
+    std::env::var_os("MDE_CEF_NATIVE_AUDIO").is_some()
+}
+
 /// CEF `get_audio_parameters(self, browser, params) -> int` — CEF asks whether we
 /// want the page's audio stream and, if so, in what format. Returning 0 makes CEF
-/// skip audio delivery entirely (the started/stopped callbacks never fire), so we
-/// return 1 (true) and fill a sane STEREO / 48 kHz / 1024-frame default. We never
-/// consume the samples — this only unlocks the audible-state signalling.
+/// skip our handler and play the audio itself (to the OS); returning 1 diverts the
+/// stream to our (no-op) handler, which unlocks the `on_audio_stream_*` audible
+/// signalling at the cost of silencing OS output. Default = 1 (indicator);
+/// `MDE_CEF_NATIVE_AUDIO` = 0 (native OS playback) — see [`wants_native_audio`].
 unsafe extern "C" fn get_audio_parameters(
     _self: *mut c_void,
     _browser: *mut c_void,
     params: *mut CefAudioParameters,
 ) -> c_int {
+    if wants_native_audio() {
+        // Decline the stream so CEF routes page audio to the OS through its own
+        // pipeline (native A/V sync). The stream callbacks never fire in this mode.
+        return 0;
+    }
     if !params.is_null() {
         // SAFETY: CEF supplied a non-null, writable `cef_audio_parameters_t`.
         // `size` leads the struct; keeping it correct pins channel_layout to
@@ -3273,6 +4121,9 @@ unsafe extern "C" fn on_jsdialog(
     let message = cef_string_to_string(message_text);
     let kind = u8::try_from(dialog_type).unwrap_or(0);
     let _ = with_state(self_, |state| {
+        if publish_internal_page_beacon_from_dialog(state, &message) {
+            return;
+        }
         state.publish_js_dialog(kind, message, origin)
     });
     // Auto-resolve: accept an alert, cancel a confirm/prompt (never "OK" a
@@ -3285,6 +4136,36 @@ unsafe extern "C" fn on_jsdialog(
         unsafe { *suppress_message = 0 };
     }
     1
+}
+
+fn publish_internal_page_beacon_from_dialog(state: &CefBrowserState, message: &str) -> bool {
+    if let Some((id, text)) = decode_page_text_beacon(message) {
+        state.publish_page_text(id, text);
+        return true;
+    }
+    if let Some((id, body)) = decode_page_scrape_beacon(message) {
+        state.publish_page_scrape(id, body);
+        return true;
+    }
+    false
+}
+
+/// CEF `on_before_unload_dialog(self, browser, message_text, is_reload, callback)
+/// -> int` — a page registered a `beforeunload` handler and navigation/reload is
+/// trying to leave. We handle it asynchronously through the shell, which must send
+/// `ControlMsg::BeforeUnloadDecision`; the callback is retained until then.
+unsafe extern "C" fn on_before_unload_dialog(
+    self_: *mut c_void,
+    _browser: *mut c_void,
+    message_text: *const CefString,
+    is_reload: c_int,
+    callback: *mut c_void,
+) -> c_int {
+    let message = cef_string_to_string(message_text);
+    with_state(self_, |state| {
+        state.begin_before_unload_dialog(message, is_reload != 0, callback)
+    })
+    .unwrap_or(0)
 }
 
 /// Read a `cef_string_userfree_t`-returning getter at `offset` off a CEF object,
@@ -3379,10 +4260,13 @@ unsafe extern "C" fn on_find_result(
 /// CEF `on_address_change(self, browser, frame, url)` — the committed URL changed.
 unsafe extern "C" fn on_address_change(
     self_: *mut c_void,
-    _browser: *mut c_void,
-    _frame: *mut c_void,
+    browser: *mut c_void,
+    frame: *mut c_void,
     url: *const CefString,
 ) {
+    if !frame_is_main(browser, frame) {
+        return;
+    }
     let url = cef_string_to_string(url);
     // Off-by-default live diagnostic: proves the display handler is actually being
     // dispatched by CEF on the real vtable (the class of bug fixed in the
@@ -3549,7 +4433,10 @@ fn pdf_file_looks_written(path: &str) -> bool {
 
 unsafe extern "C" fn on_pdf_print_finished(self_: *mut c_void, path: *const c_void, ok: c_int) {
     let path = cef_string_to_string(path.cast::<CefString>());
-    let _ = with_state(self_, |state| state.publish_pdf_finished(path, ok != 0));
+    let _ = with_state(self_, |state| {
+        state.publish_pdf_finished(path, ok != 0);
+        state.finish_pdf_callback(self_);
+    });
 }
 
 /// CEF `on_download_image_finished(self, image_url, http_status_code, image)` —
@@ -3561,13 +4448,24 @@ unsafe extern "C" fn on_download_image_finished(
     _http_status_code: c_int,
     image: *mut c_void,
 ) {
-    let Some(png) = image_as_png(image) else {
-        return;
-    };
-    if png.is_empty() {
-        return;
-    }
-    let _ = with_state(self_, |state| state.publish_favicon(png));
+    let png = image_as_png(image).filter(|png| !png.is_empty());
+    let _ = with_state(self_, |state| {
+        if let Some(png) = png {
+            state.publish_favicon(png);
+        }
+        state.finish_download_image_callback(self_);
+    });
+}
+
+/// CEF `cef_string_visitor_t::visit(self, const cef_string_t* string)` — native
+/// visible text extraction for page text requests.
+unsafe extern "C" fn on_page_text_visited(self_: *mut c_void, string: *const CefString) {
+    let text = cef_string_to_string(string);
+    let _ = with_state(self_, |state| {
+        if let Some((id, max_bytes)) = state.finish_page_text_visitor(self_) {
+            state.publish_page_text(id, clamp_utf8(&text, max_bytes as usize));
+        }
+    });
 }
 
 fn with_state<T>(key: *mut c_void, f: impl FnOnce(&CefBrowserState) -> T) -> Option<T> {
@@ -3679,10 +4577,21 @@ fn callback_size(key: usize) -> Option<usize> {
 }
 
 fn notify_browser_view_ready(browser: *mut c_void) {
+    resize_and_invalidate_browser_view(browser);
+}
+
+fn resize_and_invalidate_browser_view(browser: *mut c_void) {
     let Some(host) = browser_host(browser) else {
         return;
     };
     call_host_void(host, CEF_BROWSER_HOST_WAS_RESIZED_OFFSET);
+    invalidate_browser_view(browser);
+}
+
+fn invalidate_browser_view(browser: *mut c_void) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
     call_host_paint_type(host, CEF_BROWSER_HOST_INVALIDATE_OFFSET, PET_VIEW);
 }
 
@@ -3700,6 +4609,23 @@ fn close_browser(browser: *mut c_void) {
     // SAFETY: `host` came from `cef_browser_t::get_host`; force close avoids
     // unload-dialog waits during socket teardown.
     unsafe { callback(host, 1) };
+}
+
+fn close_browser_and_wait(abi: &CefAbi, browser: *mut c_void, callbacks: &CefBrowserCallbacks) {
+    let closed_before = callbacks.closed();
+    close_browser(browser);
+    let deadline = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < deadline {
+        abi.do_message_loop_work();
+        if callbacks.closed() > closed_before {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for _ in 0..4 {
+        abi.do_message_loop_work();
+        thread::sleep(Duration::from_millis(4));
+    }
 }
 
 fn browser_host(browser: *mut c_void) -> Option<*mut c_void> {
@@ -3752,6 +4678,28 @@ fn set_audio_muted(browser: *mut c_void, muted: bool) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF and the mute flag is the CEF boolean int.
     unsafe { callback(host, if muted { 1 } else { 0 }) };
+}
+
+/// Tell the windowless browser it is hidden (`true`) or visible (`false`) via
+/// `cef_browser_host_t::was_hidden`. When hidden, CEF stops offscreen paint and
+/// composite for this browser, so a backgrounded tab no longer drives the
+/// `on_paint` → shm readback → shell convert/upload pipeline — the single biggest
+/// lever for many background media tabs. Media playback and audio keep running
+/// (this mirrors native `document.hidden`); only rendering stops. On `false` CEF
+/// resumes and schedules a fresh paint, so no explicit invalidate is needed.
+fn was_hidden(browser: *mut c_void, hidden: bool) {
+    let Some(host) = browser_host(browser) else {
+        return;
+    };
+    let Some(callback) = read_fn(host, CEF_BROWSER_HOST_WAS_HIDDEN_OFFSET) else {
+        return;
+    };
+    // SAFETY: `callback` is read from `cef_browser_host_t::was_hidden`, whose
+    // pinned C signature is `(cef_browser_host_t*, int)`.
+    let callback: unsafe extern "C" fn(*mut c_void, c_int) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `host` came from CEF and the hidden flag is the CEF boolean int.
+    unsafe { callback(host, if hidden { 1 } else { 0 }) };
 }
 
 /// Push an IME preedit into the windowless browser via
@@ -3874,7 +4822,7 @@ fn save_pdf(browser: *mut c_void, callbacks: &CefBrowserCallbacks, path: &str) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF, `path` points to a live CefString for this
     // call, null settings asks CEF for defaults, and the callback is retained by
-    // the browser state until shutdown.
+    // the browser state until CEF reports completion.
     unsafe { callback(host, path.as_ptr(), ptr::null(), pdf_callback) };
 }
 
@@ -4018,11 +4966,12 @@ fn send_char(host: *mut c_void, character: u16, modifiers: Modifiers) {
     let Some(callback) = read_fn(host, CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET) else {
         return;
     };
+    let key_code = char_windows_key_code(character);
     let event = CefKeyEvent::new(
         KEYEVENT_CHAR,
         cef_modifiers(modifiers),
-        i32::from(character),
-        i32::from(character),
+        key_code,
+        key_code,
         character,
         character,
     );
@@ -4032,6 +4981,17 @@ fn send_char(host: *mut c_void, character: u16, modifiers: Modifiers) {
         unsafe { std::mem::transmute(callback) };
     // SAFETY: `host` came from CEF and `event` lives for the duration of the call.
     unsafe { callback(host, event.as_ptr()) };
+}
+
+fn char_windows_key_code(character: u16) -> i32 {
+    match char::from_u32(u32::from(character)) {
+        Some(ch @ 'a'..='z') => ch.to_ascii_uppercase() as i32,
+        Some(ch @ ('A'..='Z' | '0'..='9')) => ch as i32,
+        Some(' ') => 32,
+        Some('\t') => 9,
+        Some('\n' | '\r') => 13,
+        _ => i32::from(character),
+    }
 }
 
 fn cef_mouse_button(button: PointerButton) -> c_int {
@@ -4193,6 +5153,28 @@ fn apply_reader_mode(browser: *mut c_void, enabled: bool) {
     execute_java_script(frame, &reader_mode_script(enabled));
 }
 
+fn apply_autoplay_blocked(browser: *mut c_void, state: &CefBrowserState, blocked: bool) {
+    state.autoplay_blocked.store(blocked, Ordering::SeqCst);
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &autoplay_block_script(blocked));
+}
+
+fn apply_media_playback_toggle(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, media_playback_toggle_script());
+}
+
+fn apply_media_transport(browser: *mut c_void, action: MediaTransportAction) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &media_transport_script(action));
+}
+
 fn apply_user_scripts(browser: *mut c_void, enabled: bool, bundle: &str) {
     let Some(frame) = main_frame(browser) else {
         return;
@@ -4207,9 +5189,19 @@ fn apply_user_agent(browser: *mut c_void, user_agent: &str) {
     execute_java_script(frame, &user_agent_override_script(user_agent));
 }
 
-/// Fill the page's login form with a user-chosen saved credential (autofill). Injects
-/// the fill script into the main frame; user-initiated only, session-only creds.
-fn fill_login(browser: *mut c_void, username: &str, password: &str) {
+/// Fill the page's login form with a user-chosen saved credential (autofill). The
+/// shell scopes the credential to `expected_host`; check CEF's cached top-level
+/// URL immediately before injection so a navigation race cannot fill another site.
+fn fill_login(
+    browser: *mut c_void,
+    state: &CefBrowserState,
+    expected_host: &str,
+    username: &str,
+    password: &str,
+) {
+    if !state.host_matches_top_level(expected_host) {
+        return;
+    }
     let Some(frame) = main_frame(browser) else {
         return;
     };
@@ -4269,14 +5261,41 @@ fn apply_spellcheck_correction_at(
     );
 }
 
-fn request_page_text(browser: *mut c_void, id: u64, max_bytes: u32) {
+fn request_page_text(browser: *mut c_void, state: &CefBrowserState, id: u64, max_bytes: u32) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    load_frame_url(
-        frame,
-        &format!("javascript:{}", page_text_beacon_script(id, max_bytes)),
-    );
+    let _ = request_native_page_text(frame, state, id, max_bytes);
+    // The native CEF string visitor is best-effort in the offscreen bridge: some
+    // live runtimes accept `cef_frame_t::get_text` but never call back. Always
+    // send the intercepted JS beacon too so page-text requests cannot wedge
+    // behind a synchronously accepted native request.
+    let script = page_text_beacon_script(id, max_bytes);
+    execute_java_script(frame, &script);
+    load_frame_url(frame, &javascript_url_for_script(&script));
+}
+
+fn request_native_page_text(
+    frame: *mut c_void,
+    state: &CefBrowserState,
+    id: u64,
+    max_bytes: u32,
+) -> bool {
+    let Some(callback) = read_fn(frame, CEF_FRAME_GET_TEXT_OFFSET) else {
+        return false;
+    };
+    let visitor = state.retain_page_text_visitor(id, max_bytes);
+    if visitor.is_null() {
+        return false;
+    }
+    // SAFETY: `callback` is `cef_frame_t::get_text`, whose pinned C signature is
+    // `void (*)(cef_frame_t*, cef_string_visitor_t*)`.
+    let callback: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+        unsafe { std::mem::transmute(callback) };
+    // SAFETY: `frame` is the live main frame and `visitor` is retained in
+    // `CefBrowserState` until CEF invokes the one-shot visit callback.
+    unsafe { callback(frame, visitor) };
+    true
 }
 
 fn request_page_scrape(
@@ -4289,25 +5308,27 @@ fn request_page_scrape(
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    load_frame_url(
+    execute_java_script(
         frame,
-        &format!(
-            "javascript:{}",
-            page_scrape_beacon_script(id, max_bytes, max_links, max_headings)
-        ),
+        &page_scrape_beacon_script(id, max_bytes, max_links, max_headings),
     );
 }
 
-/// Inject the per-context security shims (WebRTC block + passkey bridge) into
-/// the current document (browser-8). Called once per navigation generation and
-/// through a fresh document's settle window — not on a wall-clock timer.
-fn inject_context_shims(browser: *mut c_void) {
+/// Inject the per-context document shims into the current document (browser-8).
+/// Called once per navigation generation and through a fresh document's settle
+/// window — not on a wall-clock timer.
+fn inject_context_shims(browser: *mut c_void, state: &CefBrowserState) {
     let Some(frame) = main_frame(browser) else {
         return;
     };
-    execute_java_script(frame, webrtc_block_script());
+    if state.webrtc_blocked.load(Ordering::SeqCst) {
+        execute_java_script(frame, webrtc_block_script());
+    }
     execute_java_script(frame, &passkey_bridge_script());
     execute_java_script(frame, &login_capture_script());
+    if state.autoplay_blocked.load(Ordering::SeqCst) {
+        execute_java_script(frame, &autoplay_block_script(true));
+    }
 }
 
 /// Drain any page-initiated passkey ceremonies queued since the last tick. This
@@ -4319,6 +5340,13 @@ fn poll_passkey_drain(browser: *mut c_void) {
         return;
     };
     execute_java_script(frame, passkey_drain_script());
+}
+
+fn poll_media_metadata(browser: *mut c_void) {
+    let Some(frame) = main_frame(browser) else {
+        return;
+    };
+    execute_java_script(frame, &media_metadata_beacon_script());
 }
 
 fn complete_passkey(browser: *mut c_void, body: &str) {
@@ -4487,17 +5515,92 @@ fn decode_passkey_beacon(url: &str) -> Option<String> {
     body.trim_start().starts_with('{').then_some(body)
 }
 
-/// Decode a login-capture beacon URL into its bounded JSON body (mirrors
-/// [`decode_passkey_beacon`]). Returns `None` for any non-login-beacon URL.
-fn decode_login_beacon(url: &str) -> Option<String> {
-    let query = url.strip_prefix(CEF_LOGIN_BEACON_PREFIX)?;
+fn decode_media_metadata_beacon(url: &str) -> Option<String> {
+    let query = url.strip_prefix(CEF_MEDIA_METADATA_BEACON_PREFIX)?;
     let query = query.strip_prefix('?').unwrap_or(query);
     let body = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("body="))
         .unwrap_or_default();
-    let body = clamp_utf8(&percent_decode(body), CEF_LOGIN_BEACON_MAX_BYTES);
+    let body = clamp_utf8(&percent_decode(body), CEF_MEDIA_METADATA_BEACON_MAX_BYTES);
+    if body.is_empty() {
+        return Some(body);
+    }
     body.trim_start().starts_with('{').then_some(body)
+}
+
+fn media_metadata_reports_playing(body: &str) -> bool {
+    let mut rest = body;
+    while let Some(idx) = rest.find("\"paused\"") {
+        rest = &rest[idx + "\"paused\"".len()..];
+        let value = rest.trim_start().strip_prefix(':').map(str::trim_start);
+        match value {
+            Some(v) if v.starts_with("false") => return true,
+            Some(v) if v.starts_with("true") => return false,
+            _ => {}
+        }
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[1..];
+    }
+    false
+}
+
+/// Decode a login-capture beacon URL into `(origin, body)`. Returns `None` for
+/// malformed login beacons; callers still cancel every URL with the login prefix so
+/// bad attempts never reach the network/resource filter path.
+fn decode_login_beacon(url: &str) -> Option<(String, String)> {
+    let query = url.strip_prefix(CEF_LOGIN_BEACON_PREFIX)?;
+    let query = query.strip_prefix('?').unwrap_or(query);
+    let origin = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("origin="))
+        .unwrap_or_default();
+    let body = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("body="))
+        .unwrap_or_default();
+    let origin = clamp_utf8(&percent_decode(origin), 512);
+    let body = clamp_utf8(&percent_decode(body), CEF_LOGIN_BEACON_MAX_BYTES);
+    (credential_host(&origin).is_some() && body.trim_start().starts_with('{'))
+        .then_some((origin, body))
+}
+
+fn hosts_match(left: &str, right: &str) -> bool {
+    credential_host(left)
+        .zip(credential_host(right))
+        .is_some_and(|(l, r)| l == r)
+}
+
+fn credential_host(value: &str) -> Option<String> {
+    host_of_url(value).or_else(|| {
+        let host = value
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        (!host.is_empty() && !host.contains('/') && !host.contains('?') && !host.contains('#'))
+            .then_some(host)
+    })
+}
+
+fn host_of_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = hostport.strip_prefix('[').map_or_else(
+        || hostport.split_once(':').map_or(hostport, |(h, _)| h),
+        |rest| rest.split_once(']').map_or(rest, |(h, _)| h),
+    );
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.trim_end_matches('.').to_ascii_lowercase())
+    }
 }
 
 fn percent_decode(value: &str) -> String {
@@ -4523,6 +5626,38 @@ fn percent_decode(value: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(char::from(byte)),
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(byte >> 4) as usize]));
+                out.push(char::from(HEX[(byte & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+fn javascript_url_for_script(script: &str) -> String {
+    format!("javascript:{}", percent_encode_url_component(script))
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 const fn hex_value(byte: u8) -> Option<u8> {
     match byte {
@@ -4589,6 +5724,22 @@ fn main_frame(browser: *mut c_void) -> Option<*mut c_void> {
     (!frame.is_null()).then_some(frame)
 }
 
+fn frame_is_main(browser: *mut c_void, frame: *mut c_void) -> bool {
+    if browser.is_null() || frame.is_null() {
+        return false;
+    }
+    if let Some(is_main) = read_fn(frame, CEF_FRAME_IS_MAIN_OFFSET) {
+        // SAFETY: `is_main` is read from `cef_frame_t::is_main`, whose pinned C
+        // signature is `int (*)(cef_frame_t*)`. Prefer CEF's logical frame test
+        // over wrapper pointer equality because live callbacks can hand us a
+        // different wrapper pointer than a fresh `browser.get_main_frame()` call.
+        let is_main: unsafe extern "C" fn(*mut c_void) -> c_int =
+            unsafe { std::mem::transmute(is_main) };
+        return unsafe { is_main(frame) } != 0;
+    }
+    main_frame(browser).is_some_and(|main| std::ptr::eq(main, frame))
+}
+
 fn request_url(
     request: *mut c_void,
     string_userfree_free: CefStringUserfreeUtf16Free,
@@ -4615,6 +5766,24 @@ fn request_url(
         value
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Read `cef_request_t::get_resource_type` — the request's resource class
+/// (`MAIN_FRAME`=0, `SCRIPT`=3, `XHR`=13, …) as a raw `cef_resource_type_t` int.
+/// Returns the `-1` sentinel when the vtable slot is null so the caller maps it
+/// to `RESOURCE_OTHER` via [`cef_resource_type_to_wire`] rather than mis-reading
+/// a class of 0 (MAIN_FRAME) from a missing method. Mirrors [`request_url`].
+fn request_resource_type(request: *mut c_void) -> c_int {
+    let Some(get_resource_type) = read_fn(request, CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET) else {
+        return -1;
+    };
+    // SAFETY: `get_resource_type` is read from `cef_request_t::get_resource_type`,
+    // whose pinned C signature is `cef_resource_type_t (*)(cef_request_t*)` — a
+    // plain `int` enum return, no out-params.
+    let get_resource_type: unsafe extern "C" fn(*mut c_void) -> c_int =
+        unsafe { std::mem::transmute(get_resource_type) };
+    // SAFETY: CEF supplied a live `cef_request_t` for the callback duration.
+    unsafe { get_resource_type(request) }
 }
 
 /// Stamp an HTTP request header onto a live, mutable `cef_request_t` via
@@ -4658,10 +5827,8 @@ fn cef_string_to_string(raw: *const CefString) -> String {
 /// Encode a `cef_image_t*` to PNG bytes via `get_as_png` (scale 1.0, with
 /// transparency) and the returned `cef_binary_value_t`. Returns `None` if the
 /// image is NULL or yields no PNG representation. The image's ref-count is NOT
-/// touched (CEF owns it, borrowed for the callback); the returned binary value
-/// is intentionally left unreleased — a small bounded leak matching the one-shot
-/// callback retention. TODO(perf): release the binary value once retention is
-/// bounded.
+/// touched (CEF owns it, borrowed for the callback); the returned binary value is
+/// released after its bytes are copied out.
 fn image_as_png(image: *mut c_void) -> Option<Vec<u8>> {
     if image.is_null() {
         return None;
@@ -4684,7 +5851,9 @@ fn image_as_png(image: *mut c_void) -> Option<Vec<u8>> {
     if binary.is_null() {
         return None;
     }
-    read_binary_value(binary)
+    let png = read_binary_value(binary);
+    release_cef(binary);
+    png
 }
 
 /// Copy a `cef_binary_value_t`'s bytes out via `get_size` + `get_data`.
@@ -4772,6 +5941,21 @@ fn continue_permission_callback(callback: *mut c_void, result: c_int) {
     // SAFETY: `callback` is the live CEF callback for this prompt, kept alive by our
     // stash ref until the paired `release_cef`.
     unsafe { cont(callback, result) };
+}
+
+/// Invoke `cef_media_access_callback_t::cont(self, allowed_permissions)`. CEF
+/// expects the allowed media-access bitmask, not ACCEPT/DENY; denying is `0`.
+/// No-op if the slot is null.
+fn continue_media_access_callback(callback: *mut c_void, allowed_permissions: u32) {
+    let Some(cont) = read_fn(callback, CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET) else {
+        return;
+    };
+    // SAFETY: read from `cef_media_access_callback_t::cont`, whose pinned C
+    // signature is `void (*)(cef_media_access_callback_t*, uint32_t)`.
+    let cont: unsafe extern "C" fn(*mut c_void, u32) = unsafe { std::mem::transmute(cont) };
+    // SAFETY: `callback` is the live CEF callback for this prompt, kept alive by our
+    // stash ref until the paired `release_cef`.
+    unsafe { cont(callback, allowed_permissions) };
 }
 
 fn call_ref_counted_void(object: *mut c_void, offset: usize) {

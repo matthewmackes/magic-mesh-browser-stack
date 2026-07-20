@@ -1,41 +1,33 @@
-//! The Browser surface's shared **MENUBAR-ALL** top bar (design: `menubar-all.md`).
+//! Browser command model and shared menu renderer.
 //!
-//! The UPPERCASE `BROWSER` title in the Terminals-group accent, the real
-//! `WebSession` menus, and a live status cluster — the one shared
-//! `mde_egui::menubar::MenuBar` every surface embeds. **Page** carries the
-//! address-bar's open seam; Edit / View / History / Bookmarks bind to the session
-//! + page-actions seams the toolbar chrome already drives (§6 glue, no new
-//! behaviour). Engine choice lives in the tab strip as explicit `+ Servo` and
-//! `+ CEF` buttons. A context-gated item renders **disabled** and an absent
-//! capability is **omitted** (§7): no page-text Copy, no keyboard chord table —
-//! and BROWSER-DD-8 **Power mode** is a real View toggle that reveals the
-//! separate Power menu while keeping unfinished power tools honestly captioned. The
-//! status cluster shows the active engine, committed URL, session lifecycle,
-//! http/https security state, and ad-filter shield (BOOKMARKS-7). `use super::{…}`
-//! pulls in the parent's body builders, engine/state/target types, and action
-//! topics. A pure relocation from the `web` god-module.
-
+//! The command tree is Browser-owned: Page / Edit / View / History / Privacy /
+//! Bookmarks bind to real `WebSession` and page-action seams (§6 glue, no new
+//! behaviour). BROWSER-CHROME retires the default shared MENUBAR-ALL top strip for
+//! this surface, so `chrome_ui` renders these same state-gated actions in the
+//! internal Options page. The old shared Browser bar renderer remains test-only
+//! as a regression harness for the retired dropdown/status-chip model.
+#[cfg(test)]
+use super::media_metadata_chip_label;
 use super::{
-    bookmark_add_body, chat_share_body, local_hostname, publish, publish_browser_send_tab,
-    publish_browser_share, BrowserEngine, BrowserPasskeyStatus, BrowserReadAloudStatus,
-    BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
+    bookmark_add_body, chat_share_body, local_hostname, pdf_file_looks_readable, publish,
+    publish_browser_send_tab, publish_browser_share, BrowserEngine, BrowserPasskeyStatus,
+    BrowserReadAloudStatus, BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
     BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
     DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
     ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
 };
 use mde_egui::egui;
-use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+use mde_egui::menubar::{Entry, Item, Menu};
+#[cfg(test)]
+use mde_egui::menubar::{MenuBar, MenuBarModel};
+#[cfg(test)]
 use mde_egui::{ChipTone, StatusChip, Style};
+#[cfg(test)]
 use mde_web_preview_client::SessionState;
 
-/// The lock glyph a secure (https) page wears in the security chip.
-const LOCK: &str = "\u{1F512}";
-/// The open-lock glyph a plain (http) page wears in the security chip.
-const UNLOCK: &str = "\u{1F513}";
-/// The ad-filter shield glyph (matches the toolbar "N blocked" readout).
-const SHIELD: &str = "\u{2298}";
 /// The committed-URL chip truncates to this many characters so a long address
 /// never crowds the status cluster.
+#[cfg(test)]
 const URL_MAX: usize = 42;
 
 fn print_options_active(settings: &CupsPrintSettings) -> bool {
@@ -65,11 +57,17 @@ pub(super) enum MenuAction {
     /// Load the address-bar draft on the active tab (`WebSession::load` —
     /// the toolbar Go button's exact seam, MENU-3).
     OpenAddress,
+    /// Select the engine used for newly opened Browser tabs.
+    SelectEngine(BrowserEngine),
     /// Toggle the BROWSER-DD-2 vertical tab layout.
     ToggleVerticalTabs,
     /// Toggle the browser download manager drawer.
     ToggleDownloads,
     ToggleHistory,
+    /// Toggle the vertical-rail notifications panel.
+    ToggleNotifications,
+    /// Toggle the vertical-rail recommendations panel.
+    ToggleRecommendations,
     /// Toggle the BOOKMARKS-BAR horizontal bookmarks bar below the nav chrome.
     ToggleBookmarksBar,
     /// Toggle BROWSER-DD-8 power mode.
@@ -88,6 +86,12 @@ pub(super) enum MenuAction {
     OpenFind,
     /// Toggle the active tab's audio mute state.
     ToggleAudioMute,
+    /// Toggle active page media playback.
+    ToggleMediaPlayback,
+    /// Toggle the shell-owned Browser media mini-player/PiP overlay.
+    TogglePictureInPicture,
+    /// Toggle autoplay blocking for the active tab.
+    ToggleAutoplayBlock,
     /// Toggle forced dark styling for the active tab.
     ToggleForceDark,
     /// Toggle reader-mode styling for the active tab.
@@ -202,13 +206,18 @@ struct Snapshot {
     has_tab: bool,
     /// Engine that owns the active tab, if any.
     active_engine: Option<BrowserEngine>,
+    /// Engine selected for future tabs.
+    future_engine: BrowserEngine,
     /// The active tab has crashed.
     crashed: bool,
+    /// The active tab is a Browser-owned internal page, not helper page content.
+    internal_page: bool,
     /// A back-history entry exists.
     can_back: bool,
     /// A forward-history entry exists.
     can_forward: bool,
     /// A load is in progress.
+    #[cfg(test)]
     loading: bool,
     /// The address bar holds a non-empty draft (gates Page → Open, MENU-3).
     typed_address: bool,
@@ -225,6 +234,10 @@ struct Snapshot {
     /// Download manager drawer is open.
     downloads_open: bool,
     history_open: bool,
+    /// Vertical-rail notifications panel is open.
+    notifications_open: bool,
+    /// Vertical-rail recommendations panel is open.
+    recommendations_open: bool,
     /// The BOOKMARKS-BAR bookmarks bar is shown.
     bookmarks_bar_visible: bool,
     /// Active browser-originated transfer count.
@@ -235,6 +248,15 @@ struct Snapshot {
     power_mode: bool,
     /// Active tab audio is muted.
     audio_muted: bool,
+    /// Active tab now-playing label extracted from page/media-session metadata.
+    #[cfg(test)]
+    media_metadata_chip: Option<String>,
+    /// A Browser media tab is selected and can own the shell PiP overlay.
+    media_pip_available: bool,
+    /// The Browser media PiP overlay is currently open.
+    media_pip_open: bool,
+    /// Active tab blocks page-initiated autoplay until user activation.
+    autoplay_blocked: bool,
     /// Active tab force-dark styling is enabled.
     force_dark: bool,
     /// Active tab reader-mode styling is enabled.
@@ -256,6 +278,7 @@ struct Snapshot {
     /// A user save-as-PDF completed successfully and is still readable.
     has_saved_pdf: bool,
     /// The ad-filter blocked-request count for this page (BOOKMARKS-7).
+    #[cfg(test)]
     blocked: u32,
     /// The current first-party host, if the committed URL has one.
     current_site: Option<String>,
@@ -263,13 +286,20 @@ struct Snapshot {
     current_site_permissions: Option<String>,
     /// Whether the native blocker is enabled for the current first-party host.
     site_blocking_enabled: bool,
+    /// Mesh-synced filter-list source status.
+    filter_lists: String,
+    /// Operator custom filter-rule source status.
+    custom_filters: String,
     /// Safe-browsing mesh blocklist status.
     safe_browsing: String,
+    /// Operator-managed URL policy status.
+    managed_policy: String,
     /// Per-site data manager status.
     site_data: String,
     /// The committed URL.
     url: String,
     /// The session lifecycle, or `None` with no tab.
+    #[cfg(test)]
     state: Option<SessionState>,
     /// Daemon-owned read-aloud/TTS status for this node.
     read_aloud_status: Option<BrowserReadAloudStatus>,
@@ -290,7 +320,7 @@ impl Snapshot {
     /// Whether there is a live page (a non-crashed tab with a URL) to act on —
     /// the gate the page-family items (Copy URL / bookmark / share) share.
     fn has_page(&self) -> bool {
-        self.has_tab && !self.crashed && !self.url.trim().is_empty()
+        self.has_tab && !self.crashed && !self.internal_page && !self.url.trim().is_empty()
     }
 }
 
@@ -305,18 +335,26 @@ fn snapshot(state: &WebState) -> Snapshot {
             Snapshot {
                 has_tab: true,
                 active_engine: Some(tab.engine),
+                future_engine: state.engine,
                 crashed: tab.session.is_crashed(),
+                internal_page: tab.internal_page.is_some(),
                 can_back: nav.can_back,
                 can_forward: nav.can_forward,
+                #[cfg(test)]
                 loading: nav.loading,
                 typed_address: false,
+                #[cfg(test)]
                 blocked: tab.session.blocked_count(),
                 current_site: state.active_first_party(),
                 current_site_permissions: state.active_site_permission_summary(),
                 site_blocking_enabled: state.active_site_blocking_enabled(),
+                filter_lists: state.filter_list_summary(),
+                custom_filters: state.custom_filter_rules_summary(),
                 safe_browsing: state.safe_browsing_summary(),
+                managed_policy: state.managed_policy_summary(),
                 site_data: state.site_data_summary(),
                 url: nav.url.clone(),
+                #[cfg(test)]
                 state: Some(tab.session.state().clone()),
                 vertical_tabs: state.vertical_tabs,
                 container: tab.container,
@@ -325,11 +363,21 @@ fn snapshot(state: &WebState) -> Snapshot {
                 find_open: state.find_open,
                 downloads_open: state.downloads_open,
                 history_open: state.history_open,
+                notifications_open: state.notifications_open,
+                recommendations_open: state.recommendations_open,
                 bookmarks_bar_visible: state.bookmarks_bar_visible,
                 active_downloads,
                 total_downloads,
                 power_mode: state.power_mode,
                 audio_muted: tab.muted,
+                #[cfg(test)]
+                media_metadata_chip: tab
+                    .session
+                    .media_metadata()
+                    .and_then(|metadata| media_metadata_chip_label(&metadata.body)),
+                media_pip_available: state.media_pip_available(),
+                media_pip_open: state.media_pip_open,
+                autoplay_blocked: tab.autoplay_blocked,
                 force_dark: tab.force_dark,
                 reader_mode: tab.reader_mode,
                 user_scripts: tab.user_scripts,
@@ -339,7 +387,10 @@ fn snapshot(state: &WebState) -> Snapshot {
                 capture_region_mode: state.capture_region_mode,
                 print_settings_open: state.print_settings_open,
                 print_options_active: print_options_active(&state.cups_settings),
-                has_saved_pdf: state.last_saved_pdf.is_some(),
+                has_saved_pdf: state
+                    .last_saved_pdf
+                    .as_ref()
+                    .is_some_and(|saved| pdf_file_looks_readable(&saved.path)),
                 read_aloud_status: state.latest_read_aloud_status.clone(),
                 voice_command_status: state.latest_voice_command_status.clone(),
                 passkey_status: state.latest_passkey_status.clone(),
@@ -351,19 +402,30 @@ fn snapshot(state: &WebState) -> Snapshot {
         });
     let (active_downloads, total_downloads) = state.download_counts();
     snap.typed_address = !state.address.trim().is_empty();
+    snap.future_engine = state.engine;
     snap.vertical_tabs = state.vertical_tabs;
     snap.page_zoom_percent = state.page_zoom_percent;
     snap.find_open = state.find_open;
     snap.downloads_open = state.downloads_open;
+    snap.notifications_open = state.notifications_open;
+    snap.recommendations_open = state.recommendations_open;
     snap.bookmarks_bar_visible = state.bookmarks_bar_visible;
     snap.power_mode = state.power_mode;
+    snap.media_pip_available = state.media_pip_available();
+    snap.media_pip_open = state.media_pip_open;
     snap.capture_region_mode = state.capture_region_mode;
     snap.print_settings_open = state.print_settings_open;
     snap.print_options_active = print_options_active(&state.cups_settings);
-    snap.has_saved_pdf = state.last_saved_pdf.is_some();
+    snap.has_saved_pdf = state
+        .last_saved_pdf
+        .as_ref()
+        .is_some_and(|saved| pdf_file_looks_readable(&saved.path));
     snap.active_downloads = active_downloads;
     snap.total_downloads = total_downloads;
+    snap.filter_lists = state.filter_list_summary();
+    snap.custom_filters = state.custom_filter_rules_summary();
     snap.safe_browsing = state.safe_browsing_summary();
+    snap.managed_policy = state.managed_policy_summary();
     snap.site_data = state.site_data_summary();
     snap.read_aloud_status = state.latest_read_aloud_status.clone();
     snap.voice_command_status = state.latest_voice_command_status.clone();
@@ -387,7 +449,7 @@ fn snapshot(state: &WebState) -> Snapshot {
 fn reopen_closed_label(s: &Snapshot) -> String {
     s.last_closed.as_deref().map_or_else(
         || "Reopen Closed Tab".to_owned(),
-        |last| format!("Reopen \u{201C}{}\u{201D}", super::ellipsize(last, 24)),
+        |last| format!("Reopen \"{}\"", super::ellipsize(last, 24)),
     )
 }
 
@@ -405,11 +467,12 @@ const fn reload_label(crashed: bool) -> &'static str {
 /// seam), Edit (Copy URL), View (Reload, zoom, find, and the named BROWSER-DD-8
 /// Power-mode toggle), History (Back/Forward, gated on the live history),
 /// Privacy, and Bookmarks (add plus share). New-tab engine choice is handled by
-/// the tab strip's explicit `+ Servo` and `+ CEF` buttons.
+/// the tab strip's Browser-local segmented engine selector.
 fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
     let has_page = s.has_page();
     let can_tools = s.has_tab && !s.crashed;
-    let can_chromium_devtools = can_tools && s.active_engine == Some(BrowserEngine::Cef);
+    let can_page_tools = can_tools && !s.internal_page;
+    let can_chromium_devtools = can_page_tools && s.active_engine == Some(BrowserEngine::Cef);
     let can_prompt_device_api = has_page && s.current_site.is_some();
     let mut menus = vec![
         Menu::new(
@@ -419,6 +482,25 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                     .shortcut("Enter")
                     .enabled(s.typed_address && s.has_tab && !s.crashed),
             )],
+        ),
+        Menu::new(
+            "Engine",
+            vec![
+                Entry::Item(
+                    Item::new(
+                        MenuAction::SelectEngine(BrowserEngine::Cef),
+                        "Use Chromium for New Tabs",
+                    )
+                    .checked(s.future_engine == BrowserEngine::Cef),
+                ),
+                Entry::Item(
+                    Item::new(
+                        MenuAction::SelectEngine(BrowserEngine::Servo),
+                        "Use Lightweight for New Tabs",
+                    )
+                    .checked(s.future_engine == BrowserEngine::Servo),
+                ),
+            ],
         ),
         Menu::new(
             "Edit",
@@ -457,6 +539,22 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                     },
                 )),
                 Entry::Item(Item::new(
+                    MenuAction::ToggleNotifications,
+                    if s.notifications_open {
+                        "Hide Notifications"
+                    } else {
+                        "Show Notifications"
+                    },
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ToggleRecommendations,
+                    if s.recommendations_open {
+                        "Hide Recommendations"
+                    } else {
+                        "Show Recommendations"
+                    },
+                )),
+                Entry::Item(Item::new(
                     MenuAction::ToggleBookmarksBar,
                     if s.bookmarks_bar_visible {
                         "Hide Bookmarks Bar"
@@ -480,35 +578,35 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         MenuAction::CycleContainer,
                         format!("Container: {}", s.container.label()),
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CycleDisplayTarget,
                         format!("Display Target: {}", s.display_target.label()),
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Separator,
                 Entry::Item(
                     Item::new(MenuAction::ZoomIn, "Zoom In")
                         .shortcut("Ctrl++")
-                        .enabled(can_tools && s.page_zoom_percent < super::PAGE_ZOOM_MAX),
+                        .enabled(can_page_tools && s.page_zoom_percent < super::PAGE_ZOOM_MAX),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ZoomOut, "Zoom Out")
                         .shortcut("Ctrl+-")
-                        .enabled(can_tools && s.page_zoom_percent > super::PAGE_ZOOM_MIN),
+                        .enabled(can_page_tools && s.page_zoom_percent > super::PAGE_ZOOM_MIN),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ResetZoom, "Actual Size")
                         .shortcut("Ctrl+0")
-                        .enabled(can_tools && s.page_zoom_percent != 100),
+                        .enabled(can_page_tools && s.page_zoom_percent != 100),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::OpenFind, "Find in Page")
                         .shortcut("Ctrl+F")
-                        .enabled(can_tools),
+                        .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -519,7 +617,33 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Mute Tab"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleMediaPlayback, "Play/Pause Media")
+                        .enabled(can_page_tools),
+                ),
+                Entry::Item(
+                    Item::new(
+                        MenuAction::TogglePictureInPicture,
+                        if s.media_pip_open {
+                            "Hide Picture-in-Picture"
+                        } else {
+                            "Show Picture-in-Picture"
+                        },
+                    )
+                    .enabled(s.media_pip_available),
+                ),
+                Entry::Item(
+                    Item::new(
+                        MenuAction::ToggleAutoplayBlock,
+                        if s.autoplay_blocked {
+                            "Allow Autoplay"
+                        } else {
+                            "Block Autoplay"
+                        },
+                    )
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -530,7 +654,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Enable Force Dark"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
@@ -541,69 +665,69 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Enable Reader Mode"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::ToggleUserScripts,
                         if s.user_scripts {
-                            "Disable Curated Userscripts"
+                            "Disable Site Fixups"
                         } else {
-                            "Enable Curated Userscripts"
+                            "Enable Site Fixups"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
                 Entry::Caption(format!(
-                    "Userscript library: {CURATED_USERSCRIPT_COUNT} bundled site fixups"
-                )),
-                Entry::Item(Item::new(
-                    MenuAction::OpenSiteStyles,
-                    "Site Styles (your CSS)\u{2026}",
+                    "Site fixups: {CURATED_USERSCRIPT_COUNT} bundled compatibility rules"
                 )),
                 Entry::Item(
-                    Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_tools),
-                ),
-                Entry::Item(Item::new(MenuAction::ReadAloud, "Read Aloud").enabled(can_tools)),
-                Entry::Item(
-                    Item::new(MenuAction::TranslatePage, "Translate Page").enabled(can_tools),
+                    Item::new(MenuAction::OpenSiteStyles, "Site Styles...").enabled(can_page_tools),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::SaveOfflineCopy, "Save Offline Copy").enabled(can_tools),
+                    Item::new(MenuAction::CheckSpelling, "Check Spelling").enabled(can_page_tools),
+                ),
+                Entry::Item(Item::new(MenuAction::ReadAloud, "Read Aloud").enabled(can_page_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::TranslatePage, "Translate Page").enabled(can_page_tools),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::VoiceCommand, "Voice Command").enabled(can_tools),
+                    Item::new(MenuAction::SaveOfflineCopy, "Save Offline Copy")
+                        .enabled(can_page_tools),
                 ),
-                Entry::Item(Item::new(MenuAction::Dictate, "Dictate").enabled(can_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::VoiceCommand, "Voice Command").enabled(can_page_tools),
+                ),
+                Entry::Item(Item::new(MenuAction::Dictate, "Dictate").enabled(can_page_tools)),
                 Entry::Item(
                     Item::new(MenuAction::CaptureViewport, "Capture Viewport")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CaptureFullPage, "Capture Full Page")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
-                    Item::new(MenuAction::CaptureMhtml, "Capture MHTML")
-                        .enabled(can_tools && s.can_capture),
+                    Item::new(MenuAction::CaptureMhtml, "Capture Web Archive")
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CaptureAnnotatedViewport,
                         "Capture with Annotation",
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(MenuAction::CaptureCalloutViewport, "Capture with Callout")
-                        .enabled(can_tools && s.can_capture),
+                        .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
                         MenuAction::CaptureFreehandViewport,
                         "Capture Freehand Markup",
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
                 Entry::Item(
                     Item::new(
@@ -614,9 +738,9 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Capture Region"
                         },
                     )
-                    .enabled(can_tools && s.can_capture),
+                    .enabled(can_page_tools && s.can_capture),
                 ),
-                Entry::Item(Item::new(MenuAction::PrintPage, "Print Page").enabled(can_tools)),
+                Entry::Item(Item::new(MenuAction::PrintPage, "Print Page").enabled(can_page_tools)),
                 Entry::Item(
                     Item::new(
                         MenuAction::TogglePrintSettings,
@@ -626,9 +750,11 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                             "Print Settings"
                         },
                     )
-                    .enabled(can_tools),
+                    .enabled(can_page_tools),
                 ),
-                Entry::Item(Item::new(MenuAction::SavePdf, "Save Page as PDF").enabled(can_tools)),
+                Entry::Item(
+                    Item::new(MenuAction::SavePdf, "Save Page as PDF").enabled(can_page_tools),
+                ),
                 Entry::Item(
                     Item::new(MenuAction::OpenLastPdf, "Open Last PDF").enabled(s.has_saved_pdf),
                 ),
@@ -655,14 +781,18 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
         ),
         Menu::new("Privacy", {
             let mut entries = vec![
-                Entry::Caption("Cookies: blocked by the sandboxed engine".to_owned()),
-                Entry::Caption("Third-party cookies: blocked (no cookie store)".to_owned()),
+                Entry::Caption("Cookies: blocked for this session".to_owned()),
+                Entry::Caption("Third-party cookies: blocked".to_owned()),
                 Entry::Caption("Session data: cleared on tab close".to_owned()),
                 Entry::Caption(s.site_data.clone()),
-                Entry::Caption("Filter lists: bundled seed + synced/custom rules".to_owned()),
+                Entry::Caption(
+                    "Protections: blocking, passkeys, reader mode, site fixups, and site styles active"
+                        .to_owned(),
+                ),
                 Entry::Caption(s.safe_browsing.clone()),
+                Entry::Caption(s.managed_policy.clone()),
                 Entry::Caption(format!(
-                    "Permissions: default deny ({DEFAULT_DENIED_PERMISSIONS})"
+                    "Permissions: blocked by default ({DEFAULT_DENIED_PERMISSIONS})"
                 )),
                 Entry::Separator,
                 Entry::Item(
@@ -686,9 +816,15 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                 ),
                 Entry::Item(
                     Item::new(MenuAction::ClearAllBrowsingData, "Clear All Browsing Data")
-                        .enabled(s.has_tab && !s.crashed),
+                    .enabled(s.has_tab && !s.crashed),
                 ),
             ];
+            if !s.filter_lists.trim().is_empty() {
+                entries.insert(4, Entry::Caption(s.filter_lists.clone()));
+            }
+            if !s.custom_filters.trim().is_empty() {
+                entries.insert(5, Entry::Caption(s.custom_filters.clone()));
+            }
             if let Some(site) = &s.current_site {
                 entries.insert(4, Entry::Caption(format!("This site: {site}")));
             }
@@ -728,7 +864,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
     ];
     if s.power_mode {
         menus.insert(
-                3,
+                4,
                 Menu::new(
                     "Power",
                     vec![
@@ -744,7 +880,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                                 .enabled(has_page),
                         ),
                         Entry::Item(
-                            Item::new(MenuAction::ExportMediaManifest, "Export Media Manifest")
+                            Item::new(MenuAction::ExportMediaManifest, "Export Media List")
                                 .enabled(has_page),
                         ),
                         Entry::Item(
@@ -760,14 +896,14 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                                 MenuAction::CycleUserAgent,
                                 format!("User Agent: {}", s.user_agent.label()),
                             )
-                            .enabled(can_tools),
+                            .enabled(can_page_tools),
                         ),
                         Entry::Item(
                             Item::new(
                                 MenuAction::CycleDeviceProfile,
                                 format!("Device Profile: {}", s.device_profile.label()),
                             )
-                            .enabled(can_tools),
+                            .enabled(can_page_tools),
                         ),
                         Entry::Item(
                             Item::new(MenuAction::PromptCameraPermission, "Prompt Camera Access")
@@ -800,39 +936,37 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
                         ),
                         Entry::Separator,
                         Entry::Caption(
+                            "Blocking, passkeys, reader mode, site fixups, and site \
+                             styles are active for this Browser build."
+                                .to_owned(),
+                        ),
+                        Entry::Caption(
                             "UA/device overrides change page-visible navigator, screen, and \
-                             viewport metadata; native request-header and compositor emulation \
-                             remain follow-up hooks."
+                             viewport metadata for the active tab."
                                 .to_owned(),
                         ),
                         Entry::Caption(
                             "Device API prompts record explicit per-site deny decisions for camera, \
-                             microphone, location, notifications, and clipboard while helper \
-                             enforcement remains default-deny."
+                             microphone, location, notifications, and clipboard while the default \
+                             stays deny."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Chromium DevTools opens the CEF helper's loopback debugging portal; \
-                             active CEF pages are selected from Chromium's target list when \
-                             discovery is available. Servo DevTools remain a follow-up hook."
+                            "Chromium DevTools opens the local debugging portal; active Chromium \
+                             pages are selected from the target list when discovery is available."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Media Manifest exports observed image/media/HLS/DASH requests; \
-                             Download Observed Media queues per-asset request files through \
-                             Transfers, Download Observed Images narrows that batch to every \
-                             observed image candidate, and blocked resources are marked for \
-                             Power-mode ignore-blocking retrieval. Transfers now performs native \
-                             direct/HLS/DASH fetches; native device emulation remains a follow-up \
-                             tool."
+                            "Export Media List saves observed image, video, HLS, and DASH requests; \
+                             Download Observed Media queues each asset through Transfers, Download \
+                             Observed Images narrows that batch to image candidates, and blocked \
+                             resources can be retried with a direct fetch."
                                 .to_owned(),
                         ),
                         Entry::Caption(
-                            "Export Page Scrape requests visible text plus DOM links/headings, writes \
-                             bounded crawl seed/article/crawl-manifest JSON/CSV/Markdown artifacts, \
-                             and submits the files through Transfers; the daemon executes bounded \
-                             same-origin depth-1 crawl packages while deeper recursive discovery remains \
-                             open."
+                            "Export Page Scrape saves visible text, links, headings, article details, \
+                             and same-site crawl seeds as JSON, CSV, and Markdown files, then sends \
+                             those files to Transfers. Crawl packages stay limited to same-site depth 1."
                                 .to_owned(),
                         ),
                     ],
@@ -845,6 +979,7 @@ fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
 /// The lifecycle status chip: Loading (a load in flight or the pre-first-frame
 /// state), Live (a painted, settled page), Crashed, or an idle "No session"
 /// with no tab.
+#[cfg(test)]
 fn state_chip(s: &Snapshot) -> StatusChip {
     match &s.state {
         None => StatusChip::new("No session", ChipTone::Neutral),
@@ -860,43 +995,49 @@ fn state_chip(s: &Snapshot) -> StatusChip {
     }
 }
 
-/// The http/https security chip for the committed URL — a lock (Ok) for https,
-/// an open lock (Warn) for http, or `None` for a schemeless address
-/// (`about:blank`, empty) with no security state to report.
+/// The http/https security chip for the committed URL: Ok for https, Warn for
+/// http, or `None` for a schemeless address (`about:blank`, empty) with no
+/// security state to report.
+#[cfg(test)]
 fn security_chip(s: &Snapshot) -> Option<StatusChip> {
     if !s.has_tab {
         return None;
     }
     let url = s.url.trim();
     if url.starts_with("https://") {
-        Some(StatusChip::with_icon(LOCK, "https", ChipTone::Ok))
+        Some(StatusChip::new("https", ChipTone::Ok))
     } else if url.starts_with("http://") {
-        Some(StatusChip::with_icon(UNLOCK, "http", ChipTone::Warn))
+        Some(StatusChip::new("http", ChipTone::Warn))
     } else {
         None
     }
 }
 
-/// Truncate a URL to [`URL_MAX`] characters (an ellipsis tail) so the chip
+/// Truncate a URL to [`URL_MAX`] characters (an ASCII ellipsis tail) so the chip
 /// stays compact; a short URL is verbatim.
+#[cfg(test)]
 fn truncate_url(url: &str) -> String {
     let url = url.trim();
-    if url.chars().count() <= URL_MAX {
-        return url.to_owned();
-    }
-    let head: String = url.chars().take(URL_MAX - 1).collect();
-    format!("{head}\u{2026}")
+    super::ellipsize(url, URL_MAX)
 }
 
-/// Build the live status cluster: the active engine (MENU-3 — every live
-/// session is the sandboxed Servo helper today, so the chip appears only when
-/// a tab actually runs one, §7), the committed URL, the lifecycle state, the
-/// http/https security state, and the ad-filter shield (a `0` count stays
-/// hidden, §7).
+#[cfg(test)]
+fn engine_chrome_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Lightweight",
+    }
+}
+
+/// Build the live status cluster: the active engine (only while a tab is
+/// actually running a page engine, §7), the committed URL, the lifecycle state,
+/// the http/https security state, and the blocked-request count (a `0` count
+/// stays hidden, §7).
+#[cfg(test)]
 fn build_status(s: &Snapshot) -> Vec<StatusChip> {
     let mut chips = Vec::new();
     if let Some(engine) = s.active_engine {
-        chips.push(StatusChip::new(engine.label(), ChipTone::Info));
+        chips.push(StatusChip::new(engine_chrome_label(engine), ChipTone::Info));
     }
     if s.has_tab && !s.url.trim().is_empty() {
         chips.push(StatusChip::new(truncate_url(&s.url), ChipTone::Neutral));
@@ -921,20 +1062,27 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
         chips.push(StatusChip::new("Find", ChipTone::Info));
     }
     if s.active_downloads > 0 {
-        chips.push(StatusChip::with_icon(
-            "\u{2193}",
-            s.active_downloads.to_string(),
+        chips.push(StatusChip::new(
+            format!("Downloads {}", s.active_downloads),
             ChipTone::Info,
         ));
     } else if s.downloads_open && s.total_downloads > 0 {
-        chips.push(StatusChip::with_icon(
-            "\u{2193}",
-            s.total_downloads.to_string(),
+        chips.push(StatusChip::new(
+            format!("Downloads {}", s.total_downloads),
             ChipTone::Neutral,
         ));
     }
     if s.has_tab && s.audio_muted {
         chips.push(StatusChip::new("Muted", ChipTone::Warn));
+    }
+    if let Some(label) = &s.media_metadata_chip {
+        chips.push(StatusChip::new(label, ChipTone::Info));
+    }
+    if s.media_pip_open {
+        chips.push(StatusChip::new("PiP", ChipTone::Info));
+    }
+    if s.has_tab && s.autoplay_blocked {
+        chips.push(StatusChip::new("Autoplay", ChipTone::Warn));
     }
     if s.has_tab && s.force_dark {
         chips.push(StatusChip::new("Dark", ChipTone::Info));
@@ -943,7 +1091,7 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
         chips.push(StatusChip::new("Reader", ChipTone::Info));
     }
     if s.has_tab && s.user_scripts {
-        chips.push(StatusChip::new("Userscripts", ChipTone::Info));
+        chips.push(StatusChip::new("Fixups", ChipTone::Info));
     }
     if s.has_tab {
         let user_agent = s.user_agent.chip();
@@ -996,9 +1144,8 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
         chips.push(chip);
     }
     if s.blocked > 0 {
-        chips.push(StatusChip::with_icon(
-            SHIELD,
-            s.blocked.to_string(),
+        chips.push(StatusChip::new(
+            format!("Blocked {}", s.blocked),
             ChipTone::Warn,
         ));
     }
@@ -1006,19 +1153,24 @@ fn build_status(s: &Snapshot) -> Vec<StatusChip> {
 }
 
 /// Render the BROWSER bar and return the action the operator picked this frame.
+#[cfg(test)]
 pub(super) fn show(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
     let snap = snapshot(state);
     let menus = build_menus(&snap);
     let status = build_status(&snap);
     let model = MenuBarModel {
-        // The dock groups Browser under **Terminals** (teal), so the title
-        // wears that categorical accent (lock 2).
         title: "Browser",
-        accent: Style::ACCENT_TERMINALS,
+        accent: Style::ACCENT_WEB,
         menus: &menus,
         status: &status,
     };
     MenuBar::show(ui, &model)
+}
+
+/// Build the state-gated Browser command menus for chrome-owned presentation.
+pub(super) fn chrome_menus(state: &WebState) -> Vec<Menu<MenuAction>> {
+    let snap = snapshot(state);
+    build_menus(&snap)
 }
 
 /// The active tab's committed URL, or empty with no tab.
@@ -1070,6 +1222,7 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
             // HTTPS-only prompt for explicit http:// targets.
             state.submit_address();
         }
+        MenuAction::SelectEngine(engine) => state.select_engine(engine),
         MenuAction::ToggleVerticalTabs => state.toggle_vertical_tabs(),
         MenuAction::ToggleDownloads => {
             state.downloads_open = !state.downloads_open;
@@ -1078,6 +1231,8 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
             }
         }
         MenuAction::ToggleHistory => state.history_open = !state.history_open,
+        MenuAction::ToggleNotifications => state.toggle_notifications(),
+        MenuAction::ToggleRecommendations => state.toggle_recommendations(),
         MenuAction::ToggleBookmarksBar => state.toggle_bookmarks_bar(),
         MenuAction::TogglePowerMode => state.toggle_power_mode(),
         MenuAction::CycleContainer => state.cycle_active_tab_container(),
@@ -1087,6 +1242,9 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
         MenuAction::ResetZoom => state.reset_zoom(),
         MenuAction::OpenFind => state.open_find_bar(),
         MenuAction::ToggleAudioMute => state.toggle_active_tab_mute(),
+        MenuAction::ToggleMediaPlayback => state.toggle_active_tab_media_playback(),
+        MenuAction::TogglePictureInPicture => state.toggle_media_pip(),
+        MenuAction::ToggleAutoplayBlock => state.toggle_active_tab_autoplay_blocked(),
         MenuAction::ToggleForceDark => state.toggle_active_tab_force_dark(),
         MenuAction::ToggleReaderMode => state.toggle_active_tab_reader_mode(),
         MenuAction::ToggleUserScripts => state.toggle_active_tab_user_scripts(),
@@ -1272,7 +1430,9 @@ mod tests {
         Snapshot {
             has_tab: true,
             active_engine: Some(BrowserEngine::Servo),
+            future_engine: BrowserEngine::Servo,
             crashed: false,
+            internal_page: false,
             can_back: true,
             can_forward: false,
             loading: false,
@@ -1284,11 +1444,17 @@ mod tests {
             find_open: false,
             downloads_open: false,
             history_open: false,
+            notifications_open: false,
+            recommendations_open: false,
             bookmarks_bar_visible: false,
             active_downloads: 0,
             total_downloads: 0,
             power_mode: false,
             audio_muted: false,
+            media_metadata_chip: None,
+            media_pip_available: false,
+            media_pip_open: false,
+            autoplay_blocked: false,
             force_dark: false,
             reader_mode: false,
             user_scripts: false,
@@ -1302,11 +1468,14 @@ mod tests {
             blocked: 3,
             current_site: Some("example.com".to_owned()),
             current_site_permissions: Some(
-                "example.com: all sensitive prompts denied by default".to_owned(),
+                "example.com: all sensitive prompts blocked by default".to_owned(),
             ),
             site_blocking_enabled: true,
-            safe_browsing: "Safe browsing: 2 mesh-hosted unsafe hosts loaded".to_owned(),
-            site_data: "Site data: 1 tracked site · 1 open tab · example.com cleared 0 times"
+            filter_lists: "Filter lists: 3 filter sources loaded".to_owned(),
+            custom_filters: "Custom filters: 2 custom rules loaded".to_owned(),
+            safe_browsing: "Safe browsing: 2 unsafe site rules loaded".to_owned(),
+            managed_policy: "Managed policy: 3 URL block rules loaded".to_owned(),
+            site_data: "Site data: 1 tracked site; 1 open tab; example.com cleared 0 times"
                 .to_owned(),
             url: "https://example.com/path".to_owned(),
             state: Some(SessionState::Live),
@@ -1325,14 +1494,56 @@ mod tests {
         let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
         assert_eq!(
             titles,
-            ["Page", "Edit", "View", "History", "Privacy", "Bookmarks"]
+            [
+                "Page",
+                "Engine",
+                "Edit",
+                "View",
+                "History",
+                "Privacy",
+                "Bookmarks"
+            ]
         );
-        // Engine selection is not hidden in a menu; the tab strip exposes
-        // explicit + Servo and + CEF new-tab buttons. File/Help are also
-        // honestly omitted rather than present-but-dead menus (§7).
-        assert!(!titles.contains(&"Engine"));
+        // File/Help are honestly omitted rather than present-but-dead menus (§7).
         assert!(!titles.contains(&"File"));
         assert!(!titles.contains(&"Help"));
+    }
+
+    #[test]
+    fn engine_menu_selects_the_future_tab_runtime() {
+        let engine = build_menus(&https_page())
+            .into_iter()
+            .find(|m| m.title == "Engine")
+            .expect("Engine menu present");
+        let cef = engine
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Item(i) if i.id == MenuAction::SelectEngine(BrowserEngine::Cef) => Some(i),
+                _ => None,
+            })
+            .expect("CEF engine row present");
+        let servo = engine
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Item(i) if i.id == MenuAction::SelectEngine(BrowserEngine::Servo) => Some(i),
+                _ => None,
+            })
+            .expect("Lightweight engine row present");
+        assert_eq!(cef.label, "Use Chromium for New Tabs");
+        assert_eq!(cef.checked, Some(false));
+        assert_eq!(servo.label, "Use Lightweight for New Tabs");
+        assert_eq!(servo.checked, Some(true));
+
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+        apply(
+            &ctx,
+            &mut state,
+            MenuAction::SelectEngine(BrowserEngine::Cef),
+        );
+        assert_eq!(state.engine, BrowserEngine::Cef);
     }
 
     #[test]
@@ -1405,6 +1616,7 @@ mod tests {
             titles,
             [
                 "Page",
+                "Engine",
                 "Edit",
                 "View",
                 "Power",
@@ -1431,7 +1643,9 @@ mod tests {
         )));
         assert!(power.entries.iter().any(|e| matches!(
             e,
-            Entry::Item(i) if i.id == MenuAction::ExportMediaManifest && i.enabled
+            Entry::Item(i) if i.id == MenuAction::ExportMediaManifest
+                && i.label == "Export Media List"
+                && i.enabled
         )));
         assert!(power.entries.iter().any(|e| matches!(
             e,
@@ -1469,6 +1683,51 @@ mod tests {
                 && i.label == "Prompt Clipboard Access"
                 && i.enabled
         )));
+        let captions: Vec<&str> = power
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Caption(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Blocking, passkeys, reader mode, site fixups")),
+            "Power menu should describe active native Browser tools: {captions:?}"
+        );
+        assert!(
+            captions.iter().all(|c| {
+                let lower = c.to_ascii_lowercase();
+                !lower.contains("follow-up")
+                    && !lower.contains("placeholder")
+                    && !lower.contains("stub")
+                    && !lower.contains("v1")
+                    && !lower.contains("power-mode")
+                    && !lower.contains("recursive discovery")
+                    && !lower.contains("remains open")
+                    && !lower.contains("manifest")
+                    && !lower.contains("helper")
+                    && !lower.contains("cef")
+                    && !lower.contains("dom")
+            }),
+            "Power menu captions must not expose internal planning terms: {captions:?}"
+        );
+        let labels: Vec<&str> = power
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item(i) => Some(i.label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.to_ascii_lowercase().contains("manifest")),
+            "Power menu item labels must not expose implementation terms: {labels:?}"
+        );
         let chips = build_status(&snap);
         assert!(
             chips.iter().any(|chip| chip.text == "Power"),
@@ -1534,6 +1793,24 @@ mod tests {
         assert!(item(MenuAction::TogglePowerMode).enabled);
         assert_eq!(item(MenuAction::ToggleAudioMute).label, "Mute Tab");
         assert!(item(MenuAction::ToggleAudioMute).enabled);
+        assert_eq!(
+            item(MenuAction::ToggleMediaPlayback).label,
+            "Play/Pause Media"
+        );
+        assert!(item(MenuAction::ToggleMediaPlayback).enabled);
+        assert_eq!(
+            item(MenuAction::TogglePictureInPicture).label,
+            "Show Picture-in-Picture"
+        );
+        assert!(
+            !item(MenuAction::TogglePictureInPicture).enabled,
+            "ordinary non-media pages should not advertise a PiP overlay"
+        );
+        assert_eq!(
+            item(MenuAction::ToggleAutoplayBlock).label,
+            "Block Autoplay"
+        );
+        assert!(item(MenuAction::ToggleAutoplayBlock).enabled);
         assert_eq!(item(MenuAction::ToggleForceDark).label, "Enable Force Dark");
         assert!(item(MenuAction::ToggleForceDark).enabled);
         assert_eq!(
@@ -1543,9 +1820,11 @@ mod tests {
         assert!(item(MenuAction::ToggleReaderMode).enabled);
         assert_eq!(
             item(MenuAction::ToggleUserScripts).label,
-            "Enable Curated Userscripts"
+            "Enable Site Fixups"
         );
         assert!(item(MenuAction::ToggleUserScripts).enabled);
+        assert_eq!(item(MenuAction::OpenSiteStyles).label, "Site Styles...");
+        assert!(item(MenuAction::OpenSiteStyles).enabled);
         assert_eq!(item(MenuAction::CheckSpelling).label, "Check Spelling");
         assert!(item(MenuAction::CheckSpelling).enabled);
         assert_eq!(item(MenuAction::ReadAloud).label, "Read Aloud");
@@ -1558,6 +1837,7 @@ mod tests {
         assert!(item(MenuAction::Dictate).enabled);
         assert!(item(MenuAction::CaptureViewport).enabled);
         assert!(item(MenuAction::CaptureFullPage).enabled);
+        assert_eq!(item(MenuAction::CaptureMhtml).label, "Capture Web Archive");
         assert!(item(MenuAction::CaptureMhtml).enabled);
         assert!(item(MenuAction::CaptureAnnotatedViewport).enabled);
         assert!(item(MenuAction::CaptureCalloutViewport).enabled);
@@ -1589,9 +1869,12 @@ mod tests {
             find_open: true,
             downloads_open: true,
             history_open: false,
+            notifications_open: false,
+            recommendations_open: false,
             active_downloads: 2,
             total_downloads: 3,
             audio_muted: true,
+            autoplay_blocked: true,
             force_dark: true,
             reader_mode: true,
             user_scripts: true,
@@ -1605,14 +1888,16 @@ mod tests {
         assert!(texts.contains(&"Work".to_owned()));
         assert!(texts.contains(&"Display 2".to_owned()));
         assert!(texts.contains(&"Find".to_owned()));
-        assert!(texts.contains(&"2".to_owned()));
+        assert!(texts.contains(&"Downloads 2".to_owned()));
         assert!(texts.contains(&"Muted".to_owned()));
+        assert!(texts.contains(&"Autoplay".to_owned()));
         assert!(texts.contains(&"Dark".to_owned()));
         assert!(texts.contains(&"Reader".to_owned()));
-        assert!(texts.contains(&"Userscripts".to_owned()));
+        assert!(texts.contains(&"Fixups".to_owned()));
 
         let muted = Snapshot {
             audio_muted: true,
+            autoplay_blocked: true,
             force_dark: true,
             reader_mode: true,
             user_scripts: true,
@@ -1631,6 +1916,15 @@ mod tests {
             })
             .expect("mute item present");
         assert_eq!(unmute.label, "Unmute Tab");
+        let allow_autoplay = view
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Item(i) if i.id == MenuAction::ToggleAutoplayBlock => Some(i),
+                _ => None,
+            })
+            .expect("autoplay item present");
+        assert_eq!(allow_autoplay.label, "Allow Autoplay");
         let disable_dark = view
             .entries
             .iter()
@@ -1656,21 +1950,198 @@ mod tests {
                 Entry::Item(i) if i.id == MenuAction::ToggleUserScripts => Some(i),
                 _ => None,
             })
-            .expect("userscripts item present");
-        assert_eq!(disable_scripts.label, "Disable Curated Userscripts");
+            .expect("site-fixups item present");
+        assert_eq!(disable_scripts.label, "Disable Site Fixups");
+    }
+
+    #[test]
+    fn internal_browser_pages_do_not_advertise_page_content_tools() {
+        let internal = Snapshot {
+            internal_page: true,
+            power_mode: true,
+            can_capture: true,
+            url: "mde://browser/options".to_owned(),
+            ..https_page()
+        };
+        let menus = build_menus(&internal);
+        let item = |menu_title: &str, id: MenuAction| {
+            menus
+                .iter()
+                .find(|m| m.title == menu_title)
+                .unwrap_or_else(|| panic!("{menu_title} menu present"))
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == id => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{menu_title} item {id:?} present"))
+        };
+
+        assert!(
+            item("View", MenuAction::TogglePowerMode).enabled,
+            "Browser chrome settings remain reachable on internal pages"
+        );
+        for id in [
+            MenuAction::CycleContainer,
+            MenuAction::CycleDisplayTarget,
+            MenuAction::ZoomIn,
+            MenuAction::OpenFind,
+            MenuAction::ToggleAudioMute,
+            MenuAction::ToggleMediaPlayback,
+            MenuAction::ToggleAutoplayBlock,
+            MenuAction::ToggleForceDark,
+            MenuAction::ToggleReaderMode,
+            MenuAction::ToggleUserScripts,
+            MenuAction::OpenSiteStyles,
+            MenuAction::CheckSpelling,
+            MenuAction::ReadAloud,
+            MenuAction::TranslatePage,
+            MenuAction::SaveOfflineCopy,
+            MenuAction::VoiceCommand,
+            MenuAction::Dictate,
+            MenuAction::CaptureViewport,
+            MenuAction::CaptureFullPage,
+            MenuAction::CaptureMhtml,
+            MenuAction::CaptureAnnotatedViewport,
+            MenuAction::CaptureCalloutViewport,
+            MenuAction::CaptureFreehandViewport,
+            MenuAction::CaptureRegion,
+            MenuAction::PrintPage,
+            MenuAction::TogglePrintSettings,
+            MenuAction::SavePdf,
+        ] {
+            assert!(
+                !item("View", id).enabled,
+                "{id:?} must wait for a helper-backed page, not an internal page"
+            );
+        }
+
+        for id in [
+            MenuAction::OpenViewSource,
+            MenuAction::OpenChromiumDevtools,
+            MenuAction::ExportActivePageScrape,
+            MenuAction::ExportMediaManifest,
+            MenuAction::DownloadObservedMedia,
+            MenuAction::DownloadObservedImages,
+            MenuAction::CycleUserAgent,
+            MenuAction::CycleDeviceProfile,
+            MenuAction::PromptCameraPermission,
+            MenuAction::PromptMicrophonePermission,
+            MenuAction::PromptLocationPermission,
+            MenuAction::PromptNotificationsPermission,
+            MenuAction::PromptClipboardPermission,
+        ] {
+            assert!(
+                !item("Power", id).enabled,
+                "{id:?} must not advertise against Browser-owned internal pages"
+            );
+        }
+        assert!(!item("Edit", MenuAction::CopyUrl).enabled);
+        assert!(!item("Bookmarks", MenuAction::AddBookmark).enabled);
+        assert!(item("Bookmarks", MenuAction::OpenBookmarksManager).enabled);
+    }
+
+    #[test]
+    fn open_last_pdf_menu_requires_a_readable_pdf_path() {
+        let item_enabled = |state: &WebState| {
+            super::chrome_menus(state)
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("View menu present")
+                .entries
+                .into_iter()
+                .find_map(|e| match e {
+                    Entry::Item(i) if i.id == MenuAction::OpenLastPdf => Some(i.enabled),
+                    _ => None,
+                })
+                .expect("Open Last PDF item present")
+        };
+        let tmp = tempfile::tempdir().expect("pdf menu tempdir");
+        let path = tmp.path().join("page.pdf");
+        let mut state = WebState::default();
+        state.last_saved_pdf = Some(crate::web::SavedPdf {
+            path: path.clone(),
+            url: "https://example.com/report".to_owned(),
+            title: "Report".to_owned(),
+        });
+
+        assert!(
+            !item_enabled(&state),
+            "a remembered but missing PDF path must not enable the viewer row"
+        );
+        std::fs::write(&path, b"%PDF-1.7\n").expect("write readable PDF header");
+        assert!(
+            item_enabled(&state),
+            "a readable PDF path enables the CEF viewer row"
+        );
+        std::fs::remove_file(&path).expect("remove PDF");
+        assert!(
+            !item_enabled(&state),
+            "deleting the remembered PDF disables the row again"
+        );
+    }
+
+    #[test]
+    fn picture_in_picture_menu_tracks_selected_browser_media() {
+        let media = Snapshot {
+            media_metadata_chip: Some("Now: Track".to_owned()),
+            media_pip_available: true,
+            ..https_page()
+        };
+        let view = build_menus(&media)
+            .into_iter()
+            .find(|m| m.title == "View")
+            .expect("View menu present");
+        let pip = view
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Item(item) if item.id == MenuAction::TogglePictureInPicture => Some(item),
+                _ => None,
+            })
+            .expect("PiP item present");
+        assert_eq!(pip.label, "Show Picture-in-Picture");
+        assert!(pip.enabled);
+
+        let open = Snapshot {
+            media_pip_open: true,
+            ..media
+        };
+        let view = build_menus(&open)
+            .into_iter()
+            .find(|m| m.title == "View")
+            .expect("View menu present");
+        let pip = view
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Item(item) if item.id == MenuAction::TogglePictureInPicture => Some(item),
+                _ => None,
+            })
+            .expect("PiP item present");
+        assert_eq!(pip.label, "Hide Picture-in-Picture");
+        assert!(pip.enabled);
+        assert!(
+            build_status(&open).iter().any(|chip| chip.text == "PiP"),
+            "open Browser PiP should be visible in the status cluster"
+        );
     }
 
     #[test]
     fn the_engine_chip_reads_the_live_helper() {
-        // A tab runs the sandboxed Servo helper → the engine chip shows; with
-        // no session there is no engine to claim (§7).
+        // A tab with a live page engine shows an engine chip; with no session
+        // there is no engine to claim (§7).
         let chips = build_status(&https_page());
-        assert_eq!(chips[0].text, "Servo", "the engine chip leads the cluster");
+        assert_eq!(
+            chips[0].text, "Lightweight",
+            "the engine chip leads the cluster"
+        );
         assert_eq!(chips[0].tone, ChipTone::Info);
         assert!(
             !build_status(&Snapshot::default())
                 .iter()
-                .any(|c| c.text == "Servo"),
+                .any(|c| c.text == "Lightweight"),
             "no tab ⇒ no engine chip"
         );
     }
@@ -1679,17 +2150,24 @@ mod tests {
     fn active_engine_chip_does_not_depend_on_future_tab_default() {
         let snap = Snapshot {
             active_engine: Some(BrowserEngine::Servo),
+            future_engine: BrowserEngine::Cef,
             ..https_page()
         };
         let chips = build_status(&snap);
         assert_eq!(
-            chips[0].text, "Servo",
+            chips[0].text, "Lightweight",
             "the status chip reads the actual active tab engine"
         );
-        assert!(
-            build_menus(&snap).iter().all(|m| m.title != "Engine"),
-            "future-tab engine choice lives in the tab strip, not a menu"
-        );
+        let engine = build_menus(&snap)
+            .into_iter()
+            .find(|m| m.title == "Engine")
+            .expect("future-tab engine controls live in Options");
+        assert!(engine.entries.iter().any(|e| matches!(
+            e,
+            Entry::Item(i)
+                if i.id == MenuAction::SelectEngine(BrowserEngine::Cef)
+                    && i.checked == Some(true)
+        )));
     }
 
     #[test]
@@ -1710,7 +2188,9 @@ mod tests {
             ..https_page()
         };
         assert!(
-            !build_status(&idle).iter().any(|c| c.text == "TTS idle"),
+            !build_status(&idle)
+                .iter()
+                .any(|c| c.text == "Read aloud idle"),
             "idle workers do not crowd the status cluster"
         );
 
@@ -1745,7 +2225,7 @@ mod tests {
         let chips = build_status(&active);
         assert!(chips
             .iter()
-            .any(|c| { c.text == "TTS speaking" && c.tone == ChipTone::Info }));
+            .any(|c| { c.text == "Reading aloud" && c.tone == ChipTone::Info }));
         assert!(chips
             .iter()
             .any(|c| { c.text == "Dictation unavailable" && c.tone == ChipTone::Warn }));
@@ -1899,7 +2379,7 @@ mod tests {
 
         assert!(chips
             .iter()
-            .any(|c| { c.text == "CEF mismatch" && c.tone == ChipTone::Warn }));
+            .any(|c| { c.text == "Chromium mismatch" && c.tone == ChipTone::Warn }));
     }
 
     #[test]
@@ -1957,14 +2437,15 @@ mod tests {
         };
         let item = reopen(&with_stack);
         assert!(item.enabled, "a retained closed tab enables the reopen");
-        assert_eq!(item.label, "Reopen \u{201C}Example\u{201D}");
+        assert_eq!(item.label, "Reopen \"Example\"");
+        assert!(item.label.is_ascii());
     }
 
     #[test]
     fn the_page_family_items_disable_without_a_live_page() {
         // No tab → page/session items grey (Copy URL / Reload / Back / Forward /
-        // Add Bookmark / Send in Chat / Share), while the pure chrome layout
-        // toggles remain usable.
+        // Add Bookmark / Send in Chat / Share), while pure chrome controls for
+        // future tabs and layout remain usable.
         let menus = build_menus(&Snapshot::default());
         for menu in &menus {
             for entry in &menu.entries {
@@ -1973,12 +2454,15 @@ mod tests {
                         item.enabled,
                         matches!(
                             item.label.as_str(),
-                            "Vertical Tabs"
+                            "Use Chromium for New Tabs"
+                                | "Use Lightweight for New Tabs"
+                                | "Vertical Tabs"
                                 | "Show Downloads"
                                 | "Show History"
+                                | "Show Notifications"
+                                | "Show Recommendations"
                                 | "Show Bookmarks Bar"
                                 | "Open Bookmarks Manager"
-                                | "Site Styles (your CSS)\u{2026}"
                         ),
                         "{} has the expected no-page gate",
                         item.label
@@ -2049,29 +2533,64 @@ mod tests {
                 .any(|c| c.contains("Session data: cleared on tab close")),
             "clear-on-close policy is visible"
         );
+        let site_data = captions
+            .iter()
+            .find(|c| c.contains("Site data: 1 tracked site"))
+            .expect("the per-site data manager summary is visible");
+        assert!(site_data.is_ascii(), "site-data caption = {site_data}");
         assert!(
-            captions
-                .iter()
-                .any(|c| c.contains("Site data: 1 tracked site")),
-            "the per-site data manager summary is visible"
+            !site_data.contains('·'),
+            "site-data caption must use ASCII separators: {site_data}"
         );
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Filter lists: bundled seed + synced/custom rules")),
+                .any(|c| c.contains("Filter lists: 3 filter sources loaded")),
             "the filter-list policy source is visible"
         );
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Safe browsing: 2 mesh-hosted unsafe hosts loaded")),
+                .any(|c| c.contains("Custom filters: 2 custom rules loaded")),
+            "the operator custom-filter source status is visible"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Protections: blocking, passkeys, reader mode")),
+            "the Browser protection policy is visible"
+        );
+        assert!(
+            captions.iter().all(|c| {
+                let lower = c.to_ascii_lowercase();
+                !lower.contains("follow-up")
+                    && !lower.contains("placeholder")
+                    && !lower.contains("stub")
+                    && !lower.contains("no cookie store")
+                    && !lower.contains("native blocker")
+                    && !lower.contains("userscript")
+                    && !(lower.contains("unsafe") && lower.contains("host"))
+                    && !lower.contains("mesh-hosted")
+            }),
+            "privacy captions must stay user-facing: {captions:?}"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Safe browsing: 2 unsafe site rules loaded")),
             "the safe-browsing mesh blocklist status is visible"
         );
         assert!(
             captions
                 .iter()
-                .any(|c| c.contains("Permissions: default deny")),
-            "the default-deny permission manager policy is visible"
+                .any(|c| c.contains("Managed policy: 3 URL block rules loaded")),
+            "the managed URL policy status is visible"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.contains("Permissions: blocked by default")),
+            "the blocked-by-default permission manager policy is visible"
         );
         assert!(
             captions
@@ -2170,13 +2689,89 @@ mod tests {
     fn the_status_cluster_reflects_the_live_page() {
         let chips = build_status(&https_page());
         let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
-        // Engine · URL · Live · https · 3 blocked, left→right (MENU-3 leads
+        // Engine / URL / Live / https / blocked count, left-to-right (MENU-3 leads
         // with the active engine).
-        assert_eq!(texts[0], "Servo");
+        assert_eq!(texts[0], "Lightweight");
         assert_eq!(texts[1], "https://example.com/path");
         assert!(texts.contains(&"Live"), "the lifecycle chip is present");
         assert!(texts.contains(&"https"), "the security chip is present");
-        assert!(texts.contains(&"3"), "the ad-filter shield shows the count");
+        assert!(
+            texts.contains(&"Blocked 3"),
+            "the blocked-request chip shows the count"
+        );
+    }
+
+    #[test]
+    fn the_status_cluster_surfaces_now_playing_metadata() {
+        let playing = Snapshot {
+            media_metadata_chip: Some("Now: Track - Artist".to_owned()),
+            ..https_page()
+        };
+        let chips = build_status(&playing);
+
+        assert!(chips
+            .iter()
+            .any(|c| { c.text == "Now: Track - Artist" && c.tone == ChipTone::Info }));
+    }
+
+    #[test]
+    fn the_status_cluster_uses_ascii_download_labels_not_arrow_glyph_icons() {
+        let active = Snapshot {
+            active_downloads: 2,
+            total_downloads: 5,
+            downloads_open: true,
+            ..https_page()
+        };
+        let active_chip = build_status(&active)
+            .into_iter()
+            .find(|chip| chip.text == "Downloads 2")
+            .expect("active download count chip");
+        assert_eq!(active_chip.tone, ChipTone::Info);
+        assert_eq!(active_chip.icon, None);
+        assert!(active_chip.text.is_ascii());
+
+        let drawer = Snapshot {
+            active_downloads: 0,
+            total_downloads: 5,
+            downloads_open: true,
+            ..https_page()
+        };
+        let drawer_chip = build_status(&drawer)
+            .into_iter()
+            .find(|chip| chip.text == "Downloads 5")
+            .expect("drawer download count chip");
+        assert_eq!(drawer_chip.tone, ChipTone::Neutral);
+        assert_eq!(drawer_chip.icon, None);
+        assert!(drawer_chip.text.is_ascii());
+    }
+
+    #[test]
+    fn the_status_cluster_uses_ascii_security_and_block_labels_not_glyph_icons() {
+        let secure_chip = security_chip(&https_page()).expect("https chip");
+        assert_eq!(secure_chip.text, "https");
+        assert_eq!(secure_chip.tone, ChipTone::Ok);
+        assert_eq!(secure_chip.icon, None);
+        assert!(secure_chip.text.is_ascii());
+
+        let plain = Snapshot {
+            has_tab: true,
+            url: "http://plain.example/".to_owned(),
+            state: Some(SessionState::Live),
+            ..Snapshot::default()
+        };
+        let plain_chip = security_chip(&plain).expect("http chip");
+        assert_eq!(plain_chip.text, "http");
+        assert_eq!(plain_chip.tone, ChipTone::Warn);
+        assert_eq!(plain_chip.icon, None);
+        assert!(plain_chip.text.is_ascii());
+
+        let blocked_chip = build_status(&https_page())
+            .into_iter()
+            .find(|chip| chip.text == "Blocked 3")
+            .expect("blocked-request count chip");
+        assert_eq!(blocked_chip.tone, ChipTone::Warn);
+        assert_eq!(blocked_chip.icon, None);
+        assert!(blocked_chip.text.is_ascii());
     }
 
     #[test]
@@ -2237,9 +2832,10 @@ mod tests {
         let out = truncate_url(long);
         assert!(out.chars().count() <= URL_MAX, "truncated within the cap");
         assert!(
-            out.ends_with('\u{2026}'),
-            "a truncated URL wears an ellipsis"
+            out.ends_with("..."),
+            "a truncated URL wears an ASCII ellipsis"
         );
+        assert!(out.is_ascii(), "truncated URL copy stays ASCII: {out}");
     }
 
     #[test]
@@ -2263,6 +2859,9 @@ mod tests {
             MenuAction::ResetZoom,
             MenuAction::OpenFind,
             MenuAction::ToggleAudioMute,
+            MenuAction::ToggleMediaPlayback,
+            MenuAction::TogglePictureInPicture,
+            MenuAction::ToggleAutoplayBlock,
             MenuAction::ToggleForceDark,
             MenuAction::ToggleReaderMode,
             MenuAction::ToggleUserScripts,
@@ -2321,11 +2920,39 @@ mod tests {
     fn the_view_menu_toggles_vertical_tabs() {
         let ctx = egui::Context::default();
         let mut state = WebState::default();
-        assert!(!state.vertical_tabs);
-        apply(&ctx, &mut state, MenuAction::ToggleVerticalTabs);
         assert!(state.vertical_tabs);
         apply(&ctx, &mut state, MenuAction::ToggleVerticalTabs);
         assert!(!state.vertical_tabs);
+        apply(&ctx, &mut state, MenuAction::ToggleVerticalTabs);
+        assert!(state.vertical_tabs);
+    }
+
+    #[test]
+    fn the_view_menu_toggles_notifications_and_recommendations() {
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+
+        assert!(!state.notifications_open);
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(state.notifications_open);
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(!state.notifications_open);
+
+        assert!(!state.recommendations_open);
+        apply(&ctx, &mut state, MenuAction::ToggleRecommendations);
+        assert!(state.recommendations_open);
+        apply(&ctx, &mut state, MenuAction::ToggleRecommendations);
+        assert!(!state.recommendations_open);
+    }
+
+    #[test]
+    fn opening_notifications_from_the_menu_clears_the_unread_count() {
+        let ctx = egui::Context::default();
+        let mut state = WebState::default();
+        state.notifications_unread = 3;
+        apply(&ctx, &mut state, MenuAction::ToggleNotifications);
+        assert!(state.notifications_open);
+        assert_eq!(state.notifications_unread, 0);
     }
 
     #[test]

@@ -28,14 +28,14 @@ pub(super) fn login_fill_script(username: &str, password: &str) -> String {
 }
 
 /// Page-side login-capture bridge (password-manager auto-capture): a capture-phase
-/// `submit` listener beacons `{origin, username, password}` for any form carrying a
-/// non-empty password field to the login-capture URL, which the engine intercepts +
-/// cancels before the network (the credential never leaves the sandbox — the same
-/// channel passkey ceremonies use). Idempotent per context. Injected with the other
-/// per-context security shims; the shell offers to save what it reports.
+/// `submit` listener beacons username/password for any form carrying a non-empty
+/// password field to the login-capture URL, which the engine intercepts + cancels
+/// before the network. The engine validates the separate `origin` query value
+/// against CEF's cached top-level URL before the shell sees the event. Idempotent
+/// per context.
 pub(super) fn login_capture_script() -> String {
     format!(
-        "(function(){{if(window.__mdeLoginCaptureInstalled)return;window.__mdeLoginCaptureInstalled=true;document.addEventListener('submit',function(e){{try{{var form=e.target;if(!form||!form.querySelector)return;var pw=form.querySelector('input[type=password]');if(!pw||!pw.value)return;var u=form.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');var body=JSON.stringify({{origin:location.origin,username:u?u.value:'',password:pw.value}});fetch('{prefix}?body='+encodeURIComponent(body),{{mode:'no-cors',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}}},true);}})();",
+        "(function(){{if(window.__mdeLoginCaptureInstalled)return;window.__mdeLoginCaptureInstalled=true;document.addEventListener('submit',function(e){{try{{var form=e.target;if(!form||!form.querySelector)return;var pw=form.querySelector('input[type=password]');if(!pw||!pw.value)return;var u=form.querySelector('input[autocomplete=username],input[type=email],input[name*=user i],input[name*=email i],input[id*=user i],input[type=text]');var body=JSON.stringify({{username:u?u.value:'',password:pw.value}});fetch('{prefix}?origin='+encodeURIComponent(location.origin)+'&body='+encodeURIComponent(body),{{mode:'no-cors',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}}},true);}})();",
         prefix = CEF_LOGIN_BEACON_PREFIX
     )
 }
@@ -97,6 +97,69 @@ html.mde-reader-mode img, html.mde-reader-mode video {
     let css = js_string_literal(css);
     format!(
         "(function(){{var id='mde-cef-reader-style';var root=document.head||document.documentElement;if(!root)return;var el=document.getElementById(id);if(!el){{el=document.createElement('style');el.id=id;root.appendChild(el);}}el.textContent={css};document.documentElement.classList.add('mde-reader-mode');}})();"
+    )
+}
+
+pub(super) fn autoplay_block_script(blocked: bool) -> String {
+    if !blocked {
+        return r#"(function(){var s=window.__mdeAutoplayBlocker;if(s){try{if(s.observer)s.observer.disconnect();}catch(_e){}try{document.removeEventListener('pointerdown',s.allow,true);document.removeEventListener('keydown',s.allow,true);document.removeEventListener('touchstart',s.allow,true);document.removeEventListener('click',s.allow,true);}catch(_e){}try{if(s.originalPlay&&s.patchedPlay&&window.HTMLMediaElement&&HTMLMediaElement.prototype.play===s.patchedPlay){HTMLMediaElement.prototype.play=s.originalPlay;}}catch(_e){}}delete window.__mdeAutoplayBlocker;delete document.documentElement.dataset.mdeAutoplayBlocked;})();"#.to_owned();
+    }
+    r#"(function(){var root=document.documentElement;if(!root)return;root.dataset.mdeAutoplayBlocked='true';var s=window.__mdeAutoplayBlocker;if(s&&s.sweep){s.sweep(document);return;}s={allowed:false};window.__mdeAutoplayBlocker=s;s.allow=function(e){if(e&&e.isTrusted===false)return;s.allowed=true;};document.addEventListener('pointerdown',s.allow,true);document.addEventListener('keydown',s.allow,true);document.addEventListener('touchstart',s.allow,true);document.addEventListener('click',s.allow,true);s.blockedError=function(){try{return new DOMException('Autoplay blocked by MDE Browser','NotAllowedError');}catch(_e){var err=new Error('Autoplay blocked by MDE Browser');err.name='NotAllowedError';return err;}};s.sweep=function(scope){try{var base=scope&&scope.querySelectorAll?scope:document;var media=base.querySelectorAll('audio[autoplay],video[autoplay]');for(var i=0;i<media.length;i++){var el=media[i];if(s.allowed||el.dataset.mdeAutoplayAllowed==='true')continue;el.autoplay=false;el.removeAttribute('autoplay');try{el.pause();}catch(_e){}}}catch(_e){}};try{var proto=window.HTMLMediaElement&&HTMLMediaElement.prototype;if(proto&&proto.play&&!s.originalPlay){s.originalPlay=proto.play;s.patchedPlay=function(){if(s.allowed||this.dataset.mdeAutoplayAllowed==='true'||!document.documentElement.dataset.mdeAutoplayBlocked){return s.originalPlay.apply(this,arguments);}try{this.pause();}catch(_e){}return Promise.reject(s.blockedError());};try{Object.defineProperty(proto,'play',{value:s.patchedPlay,writable:true,configurable:true});}catch(_e){proto.play=s.patchedPlay;}}}catch(_e){}if(window.MutationObserver){s.observer=new MutationObserver(function(records){for(var i=0;i<records.length;i++){for(var j=0;j<records[i].addedNodes.length;j++){var n=records[i].addedNodes[j];if(n&&n.nodeType===1)s.sweep(n);}}});s.observer.observe(document.documentElement,{childList:true,subtree:true});}s.sweep(document);})();"#.to_owned()
+}
+
+pub(super) const fn media_playback_toggle_script() -> &'static str {
+    r#"(function(){try{var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){return !el.ended&&(el.readyState>0||el.currentSrc||el.src);});if(!list.length)return;var playing=list.find(function(el){return !el.paused&&!el.ended;});if(playing){for(var i=0;i<list.length;i++){if(!list[i].paused&&!list[i].ended){try{list[i].pause();}catch(_e){}}}return;}var target=list.find(function(el){return el.paused&&!el.ended;})||list[0];try{target.dataset.mdeAutoplayAllowed='true';}catch(_e){}try{var p=target.play();if(p&&p.catch)p.catch(function(){});}catch(_e){}}catch(_e){}})();"#
+}
+
+pub(super) fn media_transport_script(action: MediaTransportAction) -> String {
+    let action = match action {
+        MediaTransportAction::PlayPause => "playPause",
+        MediaTransportAction::Play => "play",
+        MediaTransportAction::Pause => "pause",
+        MediaTransportAction::Stop => "stop",
+        MediaTransportAction::Next => "next",
+        MediaTransportAction::Previous => "previous",
+        MediaTransportAction::VolumeUp => "volumeUp",
+        MediaTransportAction::VolumeDown => "volumeDown",
+    };
+    format!(
+        r#"(function(){{try{{var action='{action}';var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){{return !el.ended&&(el.readyState>0||el.currentSrc||el.src||el.currentTime>0);}});if(!list.length)return;var playing=list.find(function(el){{return !el.paused&&!el.ended;}});var current=playing||list.find(function(el){{return el.currentTime>0&&!el.ended;}})||list[0];function clamp(v){{v=Number(v);return isFinite(v)?Math.max(0,Math.min(1,v)):1;}}function play(el){{if(!el)return;try{{el.dataset.mdeAutoplayAllowed='true';}}catch(_e){{}}try{{var p=el.play();if(p&&p.catch)p.catch(function(){{}});}}catch(_e){{}}}}function pause(el){{try{{el.pause();}}catch(_e){{}}}}function seek(el,t){{try{{if(isFinite(t)){{if(el.fastSeek)el.fastSeek(t);else el.currentTime=t;}}}}catch(_e){{}}}}function volume(el,delta){{if(!el)return;try{{el.volume=clamp((isFinite(el.volume)?el.volume:1)+delta);if(delta>0)el.muted=false;}}catch(_e){{}}}}function pauseActive(){{for(var i=0;i<list.length;i++){{if(!list[i].paused&&!list[i].ended)pause(list[i]);}}}}if(action==='pause'){{pauseActive();return;}}if(action==='stop'){{for(var i=0;i<list.length;i++){{pause(list[i]);seek(list[i],0);}}return;}}if(action==='volumeUp'||action==='volumeDown'){{volume(current,action==='volumeUp'?0.05:-0.05);return;}}if(action==='play'){{play(current);return;}}if(action==='playPause'){{if(playing)pauseActive();else play(current);return;}}var dir=action==='next'?1:-1;var wasPlaying=!!playing;var idx=Math.max(0,list.indexOf(current));if(list.length>1){{pause(current);var target=list[(idx+dir+list.length)%list.length];seek(target,0);play(target);return;}}if(action==='next'){{var end=isFinite(current.duration)&&current.duration>0?current.duration:current.currentTime+30;seek(current,end);}}else{{seek(current,0);}}if(wasPlaying)play(current);}}catch(_e){{}}}})();"#
+    )
+}
+
+pub(super) fn media_metadata_beacon_script() -> String {
+    format!(
+        r#"(function(){{try{{
+function trim(v,n){{v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?v.slice(0,n):v;}}
+function has(v){{return trim(v,2048).length>0;}}
+function meta(sel){{try{{var el=document.querySelector(sel);return el?(el.content||el.getAttribute('content')||''):'';}}catch(_e){{return '';}}}}
+function ms(v){{v=Number(v);return isFinite(v)&&v>0?Math.round(v*1000):0;}}
+function pct(v){{v=Number(v);return isFinite(v)?Math.round(Math.max(0,Math.min(1,v))*100):null;}}
+var list=[];
+try{{list=[].slice.call(document.querySelectorAll('audio,video'));}}catch(_e){{}}
+var media=list.find(function(el){{return !el.paused&&!el.ended;}})||list.find(function(el){{return !el.ended&&(el.currentTime>0||el.readyState>0||el.currentSrc||el.src);}})||null;
+var md={{}};
+try{{md=(navigator.mediaSession&&navigator.mediaSession.metadata)||{{}};}}catch(_e){{md={{}};}}
+var artwork='';
+try{{if(md.artwork&&md.artwork.length)artwork=md.artwork[0].src||'';}}catch(_e){{}}
+var hasSession=has(md.title)||has(md.artist)||has(md.album)||has(artwork);
+function publish(body){{if(body===window.__mdeMediaMetadataLast)return;window.__mdeMediaMetadataLast=body;var url='{prefix}?body='+encodeURIComponent(body);try{{if(window.fetch)fetch(url,{{mode:'no-cors',cache:'no-store',keepalive:true}}).catch(function(){{}});}}catch(_e){{}}try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=url;(document.body||document.documentElement).appendChild(img);}}catch(_e){{}}}}
+if(!media&&!hasSession){{publish('');return;}}
+var source=media?(media.currentSrc||media.src||''):'';
+var body=JSON.stringify({{
+  title:trim(md.title||meta('meta[property="og:title"]')||meta('meta[name="twitter:title"]')||document.title||'',160),
+  artist:trim(md.artist||meta('meta[name="author"]')||'',160),
+  album:trim(md.album||'',160),
+  artwork_url:trim(artwork||meta('meta[property="og:image"]')||meta('meta[name="twitter:image"]')||'',2048),
+  source_url:trim(source||location.href||'',2048),
+  paused:media?!!media.paused:true,
+  duration_ms:ms(media&&media.duration),
+  position_ms:ms(media&&media.currentTime),
+  volume_percent:pct(media&&media.volume)
+}});
+publish(body);
+}}catch(_e){{}}}})();"#,
+        prefix = CEF_MEDIA_METADATA_BEACON_PREFIX
     )
 }
 
@@ -282,17 +345,16 @@ while((node=walker.nextNode())&&total<512){{
 pub(super) fn page_text_beacon_script(id: u64, max_bytes: u32) -> String {
     let max_bytes = max_bytes.clamp(1, CEF_PAGE_TEXT_BEACON_MAX_BYTES);
     format!(
-        "(function(){{try{{var cap={max_bytes};var root=document.body||document.documentElement;\
-var text=root?String(root.innerText||root.textContent||''):'';\
-text=text.replace(/\\s+/g,' ').trim();if(text.length>cap)text=text.slice(0,cap);\
-var img=document.createElement('img');img.alt='';img.width=1;img.height=1;\
-img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
-img.src='{}{}?text='+encodeURIComponent(text);\
-(document.body||document.documentElement).appendChild(img);}}catch(err){{\
-var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;\
-fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';\
-fallback.src='{}{}?text=';(document.body||document.documentElement).appendChild(fallback);}}}})();",
-        CEF_PAGE_TEXT_BEACON_PREFIX, id, CEF_PAGE_TEXT_BEACON_PREFIX, id
+        r#"(function(){{function send(u){{
+try{{if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});}}catch(_){{}}
+try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);}}catch(_){{}}
+try{{var frame=document.createElement('iframe');frame.title='';frame.setAttribute('aria-hidden','true');frame.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;border:0';frame.src=u;(document.body||document.documentElement).appendChild(frame);}}catch(_){{}}
+try{{window.alert(u);}}catch(_){{}}
+}}try{{var cap={max_bytes};var root=document.body||document.documentElement;
+var text=root?String(root.innerText||root.textContent||''):'';
+text=text.replace(/\s+/g,' ').trim();if(text.length>cap)text=text.slice(0,cap);
+send('{prefix}{id}?text='+encodeURIComponent(text));}}catch(err){{send('{prefix}{id}?text=');}}}})();"#,
+        prefix = CEF_PAGE_TEXT_BEACON_PREFIX,
     )
 }
 
@@ -330,8 +392,9 @@ function payload(){{return {{text:normalized,text_truncated:trim(raw,2147483647)
 var body=JSON.stringify(payload());
 if(body.length>bodyCap){{links=links.slice(0,32);headings=headings.slice(0,16);normalized=trim(normalized,8192);articleText=trim(articleText,4096);body=JSON.stringify(payload());}}
 if(body.length>bodyCap){{links=[];headings=[];normalized=trim(normalized,4096);articleText=trim(articleText,2048);body=JSON.stringify(payload());}}
-var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src='{prefix}{id}?body='+encodeURIComponent(body);(document.body||document.documentElement).appendChild(img);
-}}catch(err){{var fallback=document.createElement('img');fallback.alt='';fallback.width=1;fallback.height=1;fallback.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';fallback.src='{prefix}{id}?body=';(document.body||document.documentElement).appendChild(fallback);}}}})();"#,
+function send(u){{try{{if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});}}catch(_){{}}try{{var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.referrerPolicy='no-referrer';img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);}}catch(_){{}}try{{var frame=document.createElement('iframe');frame.title='';frame.setAttribute('aria-hidden','true');frame.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;border:0';frame.src=u;(document.body||document.documentElement).appendChild(frame);}}catch(_){{}}try{{window.alert(u);}}catch(_){{}}}}
+send('{prefix}{id}?body='+encodeURIComponent(body));
+}}catch(err){{try{{var u='{prefix}{id}?body=';if(window.fetch)fetch(u,{{mode:'no-cors',cache:'no-store'}}).catch(function(){{}});var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px';img.src=u;(document.body||document.documentElement).appendChild(img);try{{window.alert(u);}}catch(_){{}}}}catch(_){{}}}}}})();"#,
         body_cap = CEF_PAGE_SCRAPE_BEACON_MAX_BYTES,
         prefix = CEF_PAGE_SCRAPE_BEACON_PREFIX,
     )
@@ -349,11 +412,15 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 /// points instead, matching the CEF community's own recommended technique
 /// (remove the interfaces from the renderer's global scope at script-inject
 /// time) and this codebase's existing shim-injection pattern
-/// (`passkey_bridge_script`). Injected once per navigation generation (and
-/// re-applied through a fresh document's settle window — see `ShimInjector` /
+/// (`passkey_bridge_script`). This is now an opt-in emergency/privacy override
+/// (`MDE_CEF_WEBRTC_BLOCKED=1`), not the normal CEF posture: browser-page WebRTC
+/// compatibility needs these APIs reachable, while privacy is handled by the real
+/// Chromium IP-handling policy plus native media permission callbacks.
+///
+/// When enabled, it is injected once per navigation generation (and re-applied
+/// through a fresh document's settle window — see `ShimInjector` /
 /// `inject_context_shims`) rather than on a blind 250 ms timer; the installed
 /// `MutationObserver` keeps late subframes covered within a stable document.
-/// This is a baseline privacy default, not a per-tab, user-toggleable feature.
 ///
 /// This is defense-in-depth, not an airtight guarantee: this ABI has no
 /// `OnContextCreated`-equivalent early-injection hook, so a page's own inline
@@ -367,29 +434,25 @@ var img=document.createElement('img');img.alt='';img.width=1;img.height=1;img.st
 ///
 /// Cross-engine posture (browser-5). The shell runs CEF and Servo
 /// interchangeably on the same seat (CEF is the default when its runtime is
-/// present; the `mde-web-preview` Servo helper is the fallback), so a given
-/// user's WebRTC guarantee depends on which engine rendered the page. The two
-/// engines are deliberately brought as close as each platform allows:
+/// present; the `mde-web-preview` Servo helper is the fallback), so WebRTC
+/// capability depends on which engine rendered the page:
 /// * Servo turns WebRTC off at the engine level — `secure_preferences()` sets
 ///   `dom_webrtc_enabled = false`, so `RTCPeerConnection` never exists and there
-///   is no bypass. This is the *reference* posture; it must not be weakened.
+///   is no bypass.
 /// * CEF has no equivalent hard off switch on a prebuilt binary (see the
-///   `chromium_privacy_switches()` doc), so it reaches parity for the *actual
-///   harm* — the raw-local-IP leak — via the engine-level
-///   `--force-webrtc-ip-handling-policy` switch above, and removes the JS API
-///   surface only best-effort via this shim.
+///   `chromium_privacy_switches()` doc), so its normal operational posture is
+///   WebRTC available, constrained for the *actual harm* — raw-local-IP leaks —
+///   by the engine-level `--force-webrtc-ip-handling-policy` switch above and by
+///   the shell's session-only camera/microphone permission prompt.
 ///
-/// Residual gap flagged for the operator (CEF-only, and minimized, not closed):
-/// because this ABI has no early `OnContextCreated` hook, a hostile page's own
-/// inline script can touch the WebRTC *API surface* (e.g. construct an
-/// `RTCPeerConnection`) in the sub-tick before this shim's first injection lands.
-/// That surviving connection still cannot leak a raw local IP — the engine-level
-/// ip-handling switch blocks non-proxied UDP regardless — so the residual is API
-/// *presence*, not the IP leak Servo defends against. Fully closing it needs
-/// either the build-time `enable_webrtc=false` GN flag (unavailable on the
-/// vendored CEF) or a native `CefPermissionHandler` deny (no ABI vtable offset
-/// verified from the pinned CEF 149 headers). Revisit if either becomes
-/// available.
+/// Residual gap flagged for the operator (CEF-only): if the opt-in block is used,
+/// this ABI still has no early `OnContextCreated` hook, so a hostile page's own
+/// inline script can touch the WebRTC API surface in the sub-tick before this
+/// shim's first injection lands. That surviving connection still cannot leak a raw
+/// local IP — the engine-level IP-handling switch blocks non-proxied UDP
+/// regardless — so the residual is API presence, not the IP leak Servo defends
+/// against. Fully closing that mode needs the build-time `enable_webrtc=false` GN
+/// flag, unavailable on the vendored CEF.
 pub(super) const fn webrtc_block_script() -> &'static str {
     // browser-3: the removal is applied to EVERY reachable frame, not just the
     // main frame. `strip(w)` deletes the JS-reachable WebRTC surface on a target
@@ -398,11 +461,10 @@ pub(super) const fn webrtc_block_script() -> &'static str {
     // A `MutationObserver` re-sweeps on DOM mutation so a *newly inserted* iframe
     // is patched as soon as it appears, between the 250ms poll ticks. Cross-origin
     // subframes are unreachable from JS by same-origin policy (property access on
-    // them throws and is swallowed) — the `--force-webrtc-ip-handling-policy`
-    // switch remains the backstop for that residual, see this file's cef_init
-    // companion. A native `CefPermissionHandler`/ICE-layer deny would be airtight
-    // but the pinned CEF 149 ABI exposes no permission-handler or frame-enumeration
-    // vtable offset verified from the farm headers, so it is not attempted here.
+    // them throws and is swallowed). The native `CefPermissionHandler` now gates
+    // camera/microphone access; this opt-in script only removes reachable API
+    // symbols for deployments that want the legacy posture, with the IP-handling
+    // switch as the transport privacy backstop.
     "(function(){function strip(w){try{delete w.RTCPeerConnection;}catch(_e){}try{delete w.webkitRTCPeerConnection;}catch(_e){}try{delete w.RTCDataChannel;}catch(_e){}try{delete w.RTCSessionDescription;}catch(_e){}try{delete w.RTCIceCandidate;}catch(_e){}try{if(w.MediaDevices&&w.MediaDevices.prototype){delete w.MediaDevices.prototype.getUserMedia;delete w.MediaDevices.prototype.getDisplayMedia;}}catch(_e){}try{if(w.navigator&&w.navigator.mediaDevices){delete w.navigator.mediaDevices.getUserMedia;delete w.navigator.mediaDevices.getDisplayMedia;}}catch(_e){}try{delete w.navigator.getUserMedia;}catch(_e){}try{delete w.navigator.webkitGetUserMedia;}catch(_e){}try{delete w.navigator.mozGetUserMedia;}catch(_e){}}function sweep(w){try{strip(w);}catch(_e){}var kids=null;try{kids=w.frames;}catch(_e){kids=null;}if(kids){for(var i=0;i<kids.length;i++){var cw=null;try{cw=kids[i];}catch(_e){cw=null;}if(cw&&cw!==w){try{sweep(cw);}catch(_e){}}}}}sweep(window);try{if(!window.__mdeWebrtcBlockObserver&&window.MutationObserver&&document&&document.documentElement){window.__mdeWebrtcBlockObserver=new MutationObserver(function(){try{sweep(window);}catch(_e){}});window.__mdeWebrtcBlockObserver.observe(document.documentElement,{childList:true,subtree:true});}}catch(_e){}})();"
 }
 

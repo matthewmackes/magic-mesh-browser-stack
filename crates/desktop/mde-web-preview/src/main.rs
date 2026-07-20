@@ -49,6 +49,9 @@ const FIRST_FRAME_WATCHDOG: Duration = Duration::from_millis(750);
 
 /// Cadence for draining the in-page WebAuthn/passkey bridge.
 const PASSKEY_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence for reading page/media-session now-playing metadata. The script
+/// dedupes in-page before returning a body, so unchanged pages stay quiet.
+const MEDIA_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// The session socket the shell hands the `tab` child as its stdin (fd 0) — see
 /// `mde-web-preview-client`'s `WebSession::spawn`.
@@ -165,6 +168,9 @@ fn run_tab(args: &[String]) -> Result<()> {
     let mut last_passkey_poll = Instant::now()
         .checked_sub(PASSKEY_BRIDGE_POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut last_media_metadata_poll = Instant::now()
+        .checked_sub(MEDIA_METADATA_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         // (a) Apply every pending control frame the shell sent.
         match sock::recv(&socket) {
@@ -201,6 +207,15 @@ fn run_tab(args: &[String]) -> Result<()> {
             last_passkey_poll = Instant::now();
         }
 
+        if last_media_metadata_poll.elapsed() >= MEDIA_METADATA_POLL_INTERVAL {
+            if let Ok(socket) = socket.try_clone() {
+                engine.poll_media_metadata(move |body| {
+                    let _ = sock::send_frame(&socket, &EventMsg::MediaMetadata { body }.encode());
+                });
+            }
+            last_media_metadata_poll = Instant::now();
+        }
+
         // (c) First-frame watchdog: if nothing has been delivered yet and the grace
         //     window elapsed, force a frame so a slow/heavy page (which may never
         //     fire a prompt frame-ready) cannot hang the shell on "Loading…". Keyed
@@ -234,11 +249,11 @@ fn run_tab(args: &[String]) -> Result<()> {
 }
 
 /// Apply one control frame from the shell to the engine. Navigation is wired to the
-/// engine's existing methods; zoom/find/force-dark/audio-mute use the helper's
-/// DOM script seam. `Resize`/`Input`/`ResourceVerdict`/`CosmeticFilters` are
+/// engine's existing methods; zoom/find/force-dark/audio-mute/autoplay-block use
+/// the helper's DOM script seam. `Resize`/`ResourceVerdict`/`CosmeticFilters` are
 /// decoded (so the framed stream stays in sync) but not yet acted on — Servo
-/// currently exposes no live-resize, input-injection, or helper-side ad-filter
-/// hook here; these remain future work, not investigated limitations.
+/// currently exposes no live-resize or helper-side ad-filter hook here; these
+/// remain future work, not investigated limitations.
 ///
 /// `Stop` is decoded-and-intentionally-ignored for a DIFFERENT reason (DD-2,
 /// investigated 2026-07-10, not "not yet"): the pinned `servo` 0.3.0 crate's
@@ -265,6 +280,7 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         ControlMsg::Reload => engine.reload(),
         ControlMsg::Back => engine.go_back(1),
         ControlMsg::Forward => engine.go_forward(1),
+        ControlMsg::Input(event) => engine.apply_input(event),
         ControlMsg::SetZoom { percent } => engine.set_zoom(*percent),
         // Servo's find has no continue-from-current hook, so `find_next` is ignored
         // (the same engine limitation as the no-cancel-load note above).
@@ -275,6 +291,9 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         } => engine.find_in_page(query, *backwards),
         ControlMsg::ClearFind => engine.clear_find(),
         ControlMsg::SetAudioMuted { muted } => engine.set_audio_muted(*muted),
+        ControlMsg::ToggleMediaPlayback => engine.toggle_media_playback(),
+        ControlMsg::MediaTransport { action } => engine.media_transport(*action),
+        ControlMsg::SetAutoplayBlocked { blocked } => engine.set_autoplay_blocked(*blocked),
         ControlMsg::SetForceDark { enabled } => engine.set_force_dark(*enabled),
         ControlMsg::SetReaderMode { enabled } => engine.set_reader_mode(*enabled),
         ControlMsg::SetUserScripts { enabled, bundle } => {
@@ -336,17 +355,17 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         // comment for the full source-level investigation (DD-2, 2026-07-10).
         ControlMsg::Stop => {}
         ControlMsg::Resize { .. }
-        | ControlMsg::Input(_)
         | ControlMsg::ResourceVerdict { .. }
         | ControlMsg::CosmeticFilters(_)
         | ControlMsg::SavePdf { .. }
         // No-ops on the Servo fallback: EditCommand (in-page edit menu),
-        // PermissionDecision (Servo has no permission-prompt round-trip), and the
-        // IME preedit controls (IME is wired for CEF only) all have no Servo path.
+        // PermissionDecision/BeforeUnloadDecision (Servo has no prompt round-trip),
+        // and the IME preedit controls (IME is wired for CEF only) all have no Servo path.
         // Listed explicitly rather than `_ =>` so a NEW wire control forces a
         // conscious Servo decision instead of silently no-op'ing.
         | ControlMsg::EditCommand { .. }
         | ControlMsg::PermissionDecision { .. }
+        | ControlMsg::BeforeUnloadDecision { .. }
         | ControlMsg::ImeSetComposition { .. }
         | ControlMsg::ImeCommitText { .. }
         | ControlMsg::ImeFinishComposition

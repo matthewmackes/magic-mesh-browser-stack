@@ -61,14 +61,18 @@ pub use mde_web_wire as wire;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
-pub use filter::{resource_from_wire, resource_to_wire, RequestFilter, SafeBrowsingBlocklist};
+pub use filter::{
+    resource_from_wire, resource_to_wire, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist,
+};
 pub use frame::{FrameReader, FrameSnapshot, PixelFormat, ReaderError};
 pub use input::map_event;
 pub use session::{
-    CertError, JsDialog, NavState, PasskeyRequestStatus, PermissionRequest, ResourceRequestStatus,
-    SessionState, WebSession,
+    BeforeUnloadDialog, CertError, JsDialog, LoginCaptureStatus, MediaMetadataStatus, NavState,
+    PasskeyRequestStatus, PermissionRequest, ResourceRequestStatus, SessionState, WebSession,
 };
-pub use wire::{ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, WireError};
+pub use wire::{
+    ControlMsg, CursorKind, EditCommand, EventMsg, InputEvent, MediaTransportAction, WireError,
+};
 
 // The ad-filter engine types the shell compiles a session's [`RequestFilter`]
 // from (BOOKMARKS-7). Re-exported so the Browser surface + the live-helper spawn

@@ -11,6 +11,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use crate::browser_power_mode_enabled;
+
 /// `sizeof(cef_main_args_t)` for pinned Linux CEF 149.
 pub const CEF_MAIN_ARGS_SIZE: usize = 16;
 /// `offsetof(cef_main_args_t, argc)`.
@@ -77,6 +79,16 @@ pub const CEF_GENERIC_LOCALE: &str = "en-US";
 /// Stable Accept-Language list exposed to web content by the Chromium helper.
 pub const CEF_GENERIC_ACCEPT_LANGUAGE: &str = "en-US,en";
 
+/// Ephemeral CEF cache root inside the sandbox's private writable `/tmp`.
+///
+/// The OS sandbox provides `/tmp` as a fresh tmpfs and does not bind `$HOME` or
+/// `/var`, so these paths satisfy CEF's process-singleton/cache requirement
+/// without creating persistent browsing state.
+pub const CEF_EPHEMERAL_ROOT_CACHE_PATH: &str = "/tmp/mde-web-cef-cache";
+
+/// Per-profile CEF cache path under [`CEF_EPHEMERAL_ROOT_CACHE_PATH`].
+pub const CEF_EPHEMERAL_CACHE_PATH: &str = "/tmp/mde-web-cef-cache/profile";
+
 /// Default loopback Chromium DevTools discovery port for the CEF helper, used
 /// **only** when the operator has explicitly opted the debug endpoint in (see
 /// [`remote_debugging_port`]).
@@ -85,6 +97,22 @@ pub const CEF_REMOTE_DEBUGGING_PORT: i32 = 9222;
 /// Environment variable that opts the Chromium DevTools Protocol (CDP)
 /// remote-debugging endpoint in at launch. Absent/off by default.
 pub const CEF_REMOTE_DEBUG_ENV: &str = "MDE_CEF_REMOTE_DEBUG";
+
+fn disabled_chromium_features(browser_power_mode: bool) -> String {
+    let mut features = vec![
+        "AutofillServerCommunication",
+        "DevicePosture",
+        "InterestCohort",
+        "MediaRouter",
+        "PaymentRequest",
+        "PrivacySandboxAdsAPIs",
+        "Translate",
+    ];
+    if !browser_power_mode {
+        features.extend(["WebBluetooth", "WebGPU", "WebUSB"]);
+    }
+    format!("--disable-features={}", features.join(","))
+}
 
 /// Resolved opt-in state for the CDP remote-debugging endpoint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,13 +292,23 @@ impl CefSettings {
     #[must_use]
     pub fn status_line(&self) -> String {
         format!(
-            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={} remote_debugging_port={}",
+            "CEF_INIT_PLAN settings_size={} no_sandbox={} windowless={} external_pump={} multi_threaded_loop={} remote_debugging_port={} root_cache_path={} cache_path={}",
             self.get_usize(CEF_SETTINGS_SIZE_OFFSET),
             self.get_i32(CEF_SETTINGS_NO_SANDBOX_OFFSET),
             self.get_i32(CEF_SETTINGS_WINDOWLESS_RENDERING_ENABLED_OFFSET),
             self.get_i32(CEF_SETTINGS_EXTERNAL_MESSAGE_PUMP_OFFSET),
             self.get_i32(CEF_SETTINGS_MULTI_THREADED_MESSAGE_LOOP_OFFSET),
-            self.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET)
+            self.get_i32(CEF_SETTINGS_REMOTE_DEBUGGING_PORT_OFFSET),
+            if self.get_usize(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET) == 0 {
+                0
+            } else {
+                1
+            },
+            if self.get_usize(CEF_SETTINGS_CACHE_PATH_OFFSET) == 0 {
+                0
+            } else {
+                1
+            }
         )
     }
 
@@ -308,6 +346,10 @@ pub struct CefInitPaths {
     pub locales_dir_path: PathBuf,
     /// CEF log file path.
     pub log_file: PathBuf,
+    /// App-level cache root. Under the sandbox this is a private tmpfs path.
+    pub root_cache_path: PathBuf,
+    /// Per-profile cache path. Under the sandbox this is a private tmpfs path.
+    pub cache_path: PathBuf,
     /// Vetted unpacked extension directories to load, when extension support is enabled.
     pub extension_dirs: Vec<PathBuf>,
 }
@@ -322,6 +364,8 @@ impl CefInitPaths {
             locales_dir_path: resources_dir.join("locales"),
             resources_dir_path: resources_dir,
             log_file: std::env::temp_dir().join("mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         }
     }
@@ -357,9 +401,10 @@ impl CefInitPaths {
             // See the function doc: Chromium's internal sandbox is off ON PURPOSE
             // — the OS sandbox (mde-web-sandbox) is the operative confinement.
             "--no-sandbox".to_owned(),
-            "--disable-gpu".to_owned(),
-            "--disable-gpu-compositing".to_owned(),
             "--ozone-platform=headless".to_owned(),
+            "--disable-background-timer-throttling".to_owned(),
+            "--disable-renderer-backgrounding".to_owned(),
+            "--disable-backgrounding-occluded-windows".to_owned(),
             format!("--lang={CEF_GENERIC_LOCALE}"),
             format!("--user-agent={CEF_GENERIC_USER_AGENT}"),
             format!("--accept-lang={CEF_GENERIC_ACCEPT_LANGUAGE}"),
@@ -374,6 +419,7 @@ impl CefInitPaths {
                 self.resources_dir_path.join("icudtl.dat").display()
             ),
         ];
+        let browser_power_mode = browser_power_mode_enabled();
         // SECURITY (security-4): only expose the unauthenticated CDP
         // remote-debugging endpoint when explicitly opted in — never on the
         // default/shipped launch path. See [`remote_debugging_port`].
@@ -394,7 +440,7 @@ impl CefInitPaths {
             switches.push(format!("--load-extension={dirs}"));
             switches.push("--disable-component-extensions-with-background-pages".to_owned());
         }
-        switches.extend(chromium_privacy_switches().map(str::to_owned));
+        switches.extend(chromium_privacy_switches(browser_power_mode));
         switches
     }
 }
@@ -426,14 +472,15 @@ impl CefInitPaths {
 /// proxied/relayed transport, which is the correct mechanism for the
 /// local-IP-leak concern this bundle is defending against.
 ///
-/// The actual JS-reachable WebRTC surface (`RTCPeerConnection`,
-/// `getUserMedia`) has no real command-line or `cef_settings_t` kill switch
-/// on a prebuilt CEF binary, so it is now removed at the renderer level
-/// instead — see `cef_browser::webrtc_block_script`/`inject_context_shims`,
-/// injected per navigation on every `run_windowless_tab` session the same way
-/// the passkey bridge shim is.
-fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
-    [
+/// The JS-reachable WebRTC surface (`RTCPeerConnection`, `getUserMedia`) has no
+/// real command-line or `cef_settings_t` kill switch on a prebuilt CEF binary.
+/// Since BROWSER-DD-9's camera/microphone permission path exists, CEF leaves that
+/// surface reachable by default for browser-page compatibility and relies on the
+/// real IP-handling switch above plus native media permission prompts. Operators
+/// can still restore the legacy best-effort JS removal with
+/// `MDE_CEF_WEBRTC_BLOCKED=1` — see `cef_browser::webrtc_block_script`.
+fn chromium_privacy_switches(browser_power_mode: bool) -> impl Iterator<Item = String> {
+    let mut switches = [
         "--disable-background-networking",
         "--disable-breakpad",
         "--disable-client-side-phishing-detection",
@@ -447,9 +494,12 @@ fn chromium_privacy_switches() -> impl Iterator<Item = &'static str> {
         "--disable-speech-api",
         "--disable-sync",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-        "--disable-features=AutofillServerCommunication,DevicePosture,InterestCohort,MediaRouter,PaymentRequest,PrivacySandboxAdsAPIs,Translate,WebBluetooth,WebGPU,WebUSB",
     ]
     .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    switches.push(disabled_chromium_features(browser_power_mode));
+    switches.into_iter()
 }
 
 /// Owned settings storage with backing UTF-16 strings kept alive for CEF.
@@ -481,6 +531,18 @@ impl CefSettingsOwned {
             &mut strings,
             CEF_SETTINGS_ACCEPT_LANGUAGE_LIST_OFFSET,
             CEF_GENERIC_ACCEPT_LANGUAGE,
+        );
+        set_path_string(
+            &mut settings,
+            &mut strings,
+            CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET,
+            &paths.root_cache_path,
+        );
+        set_path_string(
+            &mut settings,
+            &mut strings,
+            CEF_SETTINGS_CACHE_PATH_OFFSET,
+            &paths.cache_path,
         );
         set_path_string(
             &mut settings,
@@ -581,7 +643,41 @@ impl std::error::Error for CefInitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CEF_BROWSER_POWER_MODE_ENV;
     use std::mem::{align_of, offset_of, size_of};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn linux_main_args_layout_matches_pinned_cef_headers() {
@@ -633,6 +729,8 @@ mod tests {
         let line = settings.status_line();
         assert!(line.contains("CEF_INIT_PLAN"));
         assert!(line.contains("windowless=1"));
+        assert!(line.contains("root_cache_path=0"));
+        assert!(line.contains("cache_path=0"));
         assert!(line.contains(&format!(
             "remote_debugging_port={}",
             remote_debugging_port()
@@ -659,9 +757,13 @@ mod tests {
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
         assert_ne!(
             settings.ptr_field(CEF_SETTINGS_BROWSER_SUBPROCESS_PATH_OFFSET),
             0
@@ -677,17 +779,51 @@ mod tests {
             1
         );
         assert!(settings.status_line().contains("CEF_INIT_PLAN"));
+        assert!(settings.status_line().contains("root_cache_path=1"));
+        assert!(settings.status_line().contains("cache_path=1"));
+    }
+
+    #[test]
+    fn owned_settings_pin_ephemeral_cache_paths_inside_private_tmpfs() {
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        assert_eq!(
+            paths.root_cache_path,
+            PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH)
+        );
+        assert_eq!(paths.cache_path, PathBuf::from(CEF_EPHEMERAL_CACHE_PATH));
+        assert!(
+            paths.cache_path.starts_with(&paths.root_cache_path),
+            "CEF cache_path must stay under root_cache_path"
+        );
+
+        let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
+        let encoded = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_ROOT_CACHE_PATH)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_CACHE_PATH)));
+        assert!(settings.status_line().contains("root_cache_path=1"));
+        assert!(settings.status_line().contains("cache_path=1"));
     }
 
     #[test]
     fn init_paths_emit_early_chromium_resource_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
         );
         let switches = paths.command_line_switches();
         assert!(switches.contains(&"--no-sandbox".to_owned()));
-        assert!(switches.contains(&"--disable-gpu".to_owned()));
         assert!(switches.contains(&"--ozone-platform=headless".to_owned()));
         assert!(switches
             .iter()
@@ -704,7 +840,27 @@ mod tests {
     }
 
     #[test]
+    fn init_paths_keep_compositor_available_and_disable_background_throttling() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(!switches.contains(&"--disable-gpu".to_owned()));
+        assert!(!switches.contains(&"--disable-gpu-compositing".to_owned()));
+        assert!(switches.contains(&"--disable-background-timer-throttling".to_owned()));
+        assert!(switches.contains(&"--disable-renderer-backgrounding".to_owned()));
+        assert!(switches.contains(&"--disable-backgrounding-occluded-windows".to_owned()));
+    }
+
+    #[test]
     fn init_paths_emit_cef_privacy_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::remove_var(CEF_BROWSER_POWER_MODE_ENV);
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
@@ -717,11 +873,10 @@ mod tests {
         assert!(switches.contains(&"--disable-sync".to_owned()));
         assert!(switches.contains(&"--disable-extensions".to_owned()));
         assert!(switches.contains(&"--disable-metrics-reporting".to_owned()));
-        // browser-5 cross-engine parity: this engine-level switch is CEF's
-        // counterpart to Servo's `dom_webrtc_enabled = false` hard-off. Pinning
-        // the strongest policy value (`disable_non_proxied_udp`) guards against a
-        // silent downgrade that would drop CEF's raw-local-IP-leak guarantee
-        // below Servo's. See `cef_browser::webrtc_block_script` for the layering.
+        // browser-5 cross-engine privacy: CEF leaves WebRTC reachable for browser
+        // compatibility, so this engine-level policy is the raw-local-IP-leak
+        // guarantee. Pinning the strongest policy value
+        // (`disable_non_proxied_udp`) guards against a silent downgrade.
         assert!(switches
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned()));
         assert!(switches.iter().any(|s| {
@@ -733,15 +888,37 @@ mod tests {
     }
 
     #[test]
+    fn browser_power_mode_preserves_advanced_cef_runtime_switches() {
+        let _env = env_lock();
+        let _power = EnvRestore::capture(CEF_BROWSER_POWER_MODE_ENV);
+        std::env::set_var(CEF_BROWSER_POWER_MODE_ENV, "true");
+        let paths = CefInitPaths::new(
+            "/usr/libexec/mackesd/mde-web-cef-renderer",
+            "/opt/mde/cef/Resources",
+        );
+        let switches = paths.command_line_switches();
+        assert!(!switches.contains(&"--disable-gpu".to_owned()));
+        assert!(!switches.contains(&"--disable-gpu-compositing".to_owned()));
+        let disabled = switches
+            .iter()
+            .find(|s| s.starts_with("--disable-features="))
+            .expect("disable-features switch");
+        assert!(disabled.contains("PrivacySandboxAdsAPIs"));
+        assert!(!disabled.contains("WebGPU"));
+        assert!(!disabled.contains("WebUSB"));
+        assert!(!disabled.contains("WebBluetooth"));
+    }
+
+    #[test]
     fn init_paths_never_emit_the_inert_disable_webrtc_switch() {
         // `--disable-webrtc` is not a real Chromium switch: verified absent
         // from the live `content_switches.cc`/`chrome_switches.cc` upstream
         // registries, and Chromium silently no-ops unrecognized `--` switches
         // rather than erroring — so shipping it here was a false sense of
         // privacy hardening (WebRTC stayed fully reachable). Regression guard
-        // against reintroducing it; the real mitigations are
-        // `--force-webrtc-ip-handling-policy` (kept above) plus renderer-level
-        // API removal (`cef_browser::webrtc_block_script`).
+        // against reintroducing it; the real mitigations are the
+        // `--force-webrtc-ip-handling-policy` switch, native media permission
+        // prompts, and the opt-in `MDE_CEF_WEBRTC_BLOCKED=1` API removal.
         let paths = CefInitPaths::new(
             "/usr/libexec/mackesd/mde-web-cef-renderer",
             "/opt/mde/cef/Resources",
@@ -866,11 +1043,15 @@ mod tests {
             resources_dir_path: PathBuf::from("/opt/mde/cef/Resources"),
             locales_dir_path: PathBuf::from("/opt/mde/cef/Resources/locales"),
             log_file: PathBuf::from("/tmp/mde-web-cef-renderer.log"),
+            root_cache_path: PathBuf::from(CEF_EPHEMERAL_ROOT_CACHE_PATH),
+            cache_path: PathBuf::from(CEF_EPHEMERAL_CACHE_PATH),
             extension_dirs: Vec::new(),
         };
         let settings = CefSettingsOwned::windowless_no_sandbox(&paths);
         let encoded = |text: &str| text.encode_utf16().collect::<Vec<_>>();
 
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_ROOT_CACHE_PATH_OFFSET), 0);
+        assert_ne!(settings.ptr_field(CEF_SETTINGS_CACHE_PATH_OFFSET), 0);
         assert_ne!(settings.ptr_field(CEF_SETTINGS_USER_AGENT_OFFSET), 0);
         assert_ne!(settings.ptr_field(CEF_SETTINGS_LOCALE_OFFSET), 0);
         assert_ne!(
@@ -882,6 +1063,12 @@ mod tests {
         assert!(settings
             ._strings
             .contains(&encoded(CEF_GENERIC_ACCEPT_LANGUAGE)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_ROOT_CACHE_PATH)));
+        assert!(settings
+            ._strings
+            .contains(&encoded(CEF_EPHEMERAL_CACHE_PATH)));
     }
 
     #[test]

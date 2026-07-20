@@ -2,10 +2,8 @@
 //! "fixups" (declutter/reader/quiet rules for ~100 well-known hosts) plus the
 //! `curated_userscript_bundle()` builder that renders them into the injectable JS
 //! the Browser helper runs to apply the matching host's rule set. Self-contained
-//! data + one pure string builder; `use super::*` only pulls the parent scope in
-//! for the serde_json encode. A pure relocation from the `web` god-module.
-
-use super::*;
+//! data + one pure string builder using `serde_json` directly. A pure relocation
+//! from the `web` god-module.
 
 #[derive(Clone, Copy)]
 pub(super) struct CuratedUserscriptRule {

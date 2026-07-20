@@ -18,6 +18,8 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned idle-tab suspend request topic.
 pub const ACTION_TOPIC: &str = "action/browser/tab-suspend";
 
@@ -95,6 +97,7 @@ pub struct BrowserTabSuspendWorker {
     now_fn: NowFn,
     bus_root_override: Option<std::path::PathBuf>,
     status: TabSuspendStatus,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserTabSuspendWorker {
@@ -124,6 +127,7 @@ impl BrowserTabSuspendWorker {
                 last_suspend_ms: None,
                 updated_ms,
             },
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -193,10 +197,11 @@ impl BrowserTabSuspendWorker {
         self.publish_status(persist);
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&self.status) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 

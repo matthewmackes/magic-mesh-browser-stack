@@ -26,7 +26,7 @@ policy_module(mde_web_cef, 1.0.0)
 # permissive stub.
 #
 # NOTE (platform standard): the operator sets SELinux DISABLED platform-wide
-# (2026-06-20); Quasar-cloud nodes target Enforcing (QC-22). Where SELinux is
+# (2026-06-20); Construct-cloud nodes target Enforcing (QC-22). Where SELinux is
 # disabled the kernel never enforces this module and the loader
 # (setup-selinux-web-cef.sh) self-skips — the OS sandbox above remains the
 # operative confinement. This module ships + loads so that any node running
@@ -54,6 +54,19 @@ role system_r types mde_web_cef_t;
 
 gen_require(`
 	type unconfined_t;
+	type unconfined_service_t;
+	type sshd_session_t;
+	type root_t;
+	type tmp_t;
+	type tmpfs_t;
+	type fs_t;
+	type device_t;
+	type random_device_t;
+	type proc_t;
+	type proc_psi_t;
+	type sysctl_fs_t;
+	type node_t;
+	type unreserved_port_t;
 	role unconfined_r;
 ')
 
@@ -63,9 +76,11 @@ gen_require(`
 # operator's role set.
 role unconfined_r types mde_web_cef_t;
 domain_auto_trans(unconfined_t, mde_web_cef_exec_t, mde_web_cef_t)
-allow mde_web_cef_t unconfined_t:fd use;
-allow mde_web_cef_t unconfined_t:process sigchld;
-allow mde_web_cef_t unconfined_t:unix_stream_socket { connectto read write };
+domain_auto_trans(unconfined_service_t, mde_web_cef_exec_t, mde_web_cef_t)
+allow mde_web_cef_t { unconfined_t unconfined_service_t sshd_session_t }:fd use;
+allow mde_web_cef_t { unconfined_t unconfined_service_t sshd_session_t }:process sigchld;
+allow mde_web_cef_t { unconfined_t unconfined_service_t sshd_session_t }:unix_stream_socket { connectto read write };
+allow mde_web_cef_t { unconfined_t unconfined_service_t sshd_session_t }:fifo_file { getattr ioctl read write append };
 
 ########################################
 #
@@ -80,9 +95,20 @@ allow mde_web_cef_t unconfined_t:unix_stream_socket { connectto read write };
 # mde_web_cef_exec_t binary as its renderer/GPU/utility subprocesses (staying
 # in-domain via can_exec below), and V8's JIT needs writable+executable memory.
 allow mde_web_cef_t self:capability { setuid setgid sys_chroot sys_admin };
-allow mde_web_cef_t self:cap_userns { setuid setgid sys_admin sys_chroot };
+allow mde_web_cef_t self:cap_userns { setuid setgid setpcap sys_admin sys_chroot };
 allow mde_web_cef_t self:user_namespace create;
 allow mde_web_cef_t self:process { fork setsched setrlimit setpgid getsched signal signull setcap execmem execstack getcap };
+allow mde_web_cef_t root_t:dir mounton;
+allow mde_web_cef_t tmp_t:dir { add_name create getattr mounton open read remove_name rmdir search setattr write };
+allow mde_web_cef_t tmpfs_t:dir mounton;
+allow mde_web_cef_t tmpfs_t:file { map mounton };
+allow mde_web_cef_t tmpfs_t:filesystem { mount remount };
+allow mde_web_cef_t fs_t:filesystem { getattr remount unmount };
+allow mde_web_cef_t device_t:filesystem remount;
+allow mde_web_cef_t proc_t:filesystem mount;
+allow mde_web_cef_t proc_psi_t:dir { getattr open read search };
+allow mde_web_cef_t proc_psi_t:file { getattr open read };
+allow mde_web_cef_t random_device_t:chr_file getattr;
 allow mde_web_cef_t self:fifo_file rw_fifo_file_perms;
 allow mde_web_cef_t self:unix_stream_socket create_stream_socket_perms;
 allow mde_web_cef_t self:unix_dgram_socket create_socket_perms;
@@ -93,6 +119,10 @@ allow mde_web_cef_t self:shm create_shm_perms;
 fs_manage_tmpfs_files(mde_web_cef_t)
 fs_manage_tmpfs_dirs(mde_web_cef_t)
 fs_getattr_tmpfs(mde_web_cef_t)
+allow mde_web_cef_t tmpfs_t:lnk_file { create getattr read unlink };
+allow mde_web_cef_t tmpfs_t:sock_file { create getattr unlink };
+allow mde_web_cef_t sysctl_fs_t:file { getattr open read };
+allow mde_web_cef_t self:netlink_kobject_uevent_socket { bind create getattr getopt setopt };
 
 # --- Read-only program + resources + vendored CEF runtime ---------------------
 # The domain reads (and executes) only its own binaries/libs, the vendored CEF
@@ -126,6 +156,8 @@ corenet_all_recvfrom_unlabeled(mde_web_cef_t)
 sysnet_dns_name_resolve(mde_web_cef_t)
 allow mde_web_cef_t self:tcp_socket create_stream_socket_perms;
 allow mde_web_cef_t self:udp_socket create_socket_perms;
+allow mde_web_cef_t node_t:udp_socket node_bind;
+allow mde_web_cef_t unreserved_port_t:udp_socket name_bind;
 
 # --- Diagnostics -------------------------------------------------------------
 # stderr diagnostics only; no persistent history/log of browsed content.

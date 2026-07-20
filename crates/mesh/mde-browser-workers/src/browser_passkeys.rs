@@ -11,18 +11,14 @@
 //! ## User-presence posture (security-2)
 //!
 //! The authenticator-data User Present (`UP`) bit is set **only** when the
-//! ceremony carried a real presence signal (`PasskeyRequest::user_present`,
-//! populated from a shim-observed user gesture / transient activation) — never
-//! hardcoded. A ceremony with no verified presence honestly signs `UP=0`, which
-//! a relying party rejects, rather than fabricating "a human was here".
-//!
-//! DEFERRED: this presence signal is *page-asserted* (the injected shim runs in
-//! the page's own JS context, so a hostile same-origin page could in principle
-//! forge it for its own `rp_id`). A trustworthy, unforgeable presence gate — a
-//! shell-rendered consent prompt the page cannot script — is intentionally out
-//! of scope for this hardening pass (it is a sizable new UI). Until it lands,
-//! `UP` reflects the best available honest signal (a checked gesture) instead of
-//! a constant, and the shim refuses to auto-dispatch a gesture-less ceremony.
+//! ceremony carried a real presence signal (`PasskeyRequest::user_present`) —
+//! never hardcoded. In the production Browser path, `mde-shell-egui` holds each
+//! page-origin ceremony behind a shell-rendered Approve/Deny prompt and stamps
+//! `user_present=true` only after approval; a denied ceremony never reaches this
+//! worker. A ceremony with no verified presence honestly signs `UP=0`, which a
+//! relying party rejects, rather than fabricating "a human was here". User
+//! Verified (`UV`) remains unset; this is consent/presence, not PIN/biometric
+//! verification.
 
 // arch-7: unconditionally compiled — `mde-browser-workers` IS the async worker
 // code; `mackesd` pulls it in only under its own `async-services` feature.
@@ -45,6 +41,8 @@ use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 
 use mde_worker_core::{ShutdownToken, Worker};
+
+use crate::RetainedStatusPublisher;
 
 /// Browser-owned WebAuthn/passkey ceremony handoff topic.
 pub const ACTION_TOPIC: &str = "action/browser/passkey";
@@ -130,15 +128,15 @@ pub struct PasskeyRequest {
     pub allow_credentials: Vec<String>,
     /// Optional browser-suggested timeout.
     pub timeout_ms: Option<u64>,
-    /// Whether a user-presence step (a real user gesture / transient
-    /// activation, reported by the injected shim) accompanied this ceremony.
+    /// Whether a user-presence step accompanied this ceremony. In the normal
+    /// Browser path this is stamped by the trusted shell after its Approve/Deny
+    /// prompt; older helper/direct-Bus paths may omit it.
     ///
     /// security-2: the authenticator-data User Present (`UP`) bit is set **only**
     /// when this is true, rather than hardcoded. Defaults to `false` when the
     /// producer omits the signal, so an absent/forged-empty request yields an
     /// honest UP=0 (which a relying party rejects) instead of a fabricated
-    /// "human was here". This is a page-asserted signal, not yet an unforgeable
-    /// shell consent prompt — see the module note on the deferred consent UI.
+    /// "human was here". This is consent/presence, not user verification.
     pub user_present: bool,
 }
 
@@ -250,6 +248,7 @@ pub struct BrowserPasskeysWorker {
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
     status: PasskeyStatus,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserPasskeysWorker {
@@ -294,6 +293,7 @@ impl BrowserPasskeysWorker {
                 hardware_probe_ms: updated_ms,
                 updated_ms,
             },
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -573,28 +573,46 @@ impl BrowserPasskeysWorker {
         self.publish_status(persist);
     }
 
-    fn status_with_hardware(&self) -> PasskeyStatus {
-        let mut status = self.status.clone();
+    fn refresh_hardware_status(&mut self) {
         let hardware = probe_hardware_key_status(Path::new("/sys/class/hidraw"), Path::new("/dev"));
-        status.hardware_state = hardware.state;
-        status.hardware_key_count = hardware.key_count;
-        status.hardware_readable_count = hardware.readable_count;
-        status.hardware_ctaphid_state = hardware.ctaphid_state;
-        status.hardware_ctaphid_init_frame_count = hardware.ctaphid_init_frame_count;
-        status.hardware_ctaphid_live_state = hardware.ctaphid_live_state;
-        status.hardware_ctaphid_live_channel_id = hardware.ctaphid_live_channel_id;
-        status.hardware_ctaphid_live_protocol_version = hardware.ctaphid_live_protocol_version;
-        status.hardware_ctaphid_live_device_version = hardware.ctaphid_live_device_version;
-        status.hardware_ctaphid_live_capabilities = hardware.ctaphid_live_capabilities;
-        status.hardware_ctaphid_live_error = hardware.ctaphid_live_error;
-        status.hardware_probe_ms = self.now_ms();
-        status
+        let changed = self.status.hardware_state != hardware.state
+            || self.status.hardware_key_count != hardware.key_count
+            || self.status.hardware_readable_count != hardware.readable_count
+            || self.status.hardware_ctaphid_state != hardware.ctaphid_state
+            || self.status.hardware_ctaphid_init_frame_count != hardware.ctaphid_init_frame_count
+            || self.status.hardware_ctaphid_live_state != hardware.ctaphid_live_state
+            || self.status.hardware_ctaphid_live_channel_id != hardware.ctaphid_live_channel_id
+            || self.status.hardware_ctaphid_live_protocol_version
+                != hardware.ctaphid_live_protocol_version
+            || self.status.hardware_ctaphid_live_device_version
+                != hardware.ctaphid_live_device_version
+            || self.status.hardware_ctaphid_live_capabilities != hardware.ctaphid_live_capabilities
+            || self.status.hardware_ctaphid_live_error != hardware.ctaphid_live_error;
+        if !changed {
+            return;
+        }
+        self.status.hardware_state = hardware.state;
+        self.status.hardware_key_count = hardware.key_count;
+        self.status.hardware_readable_count = hardware.readable_count;
+        self.status.hardware_ctaphid_state = hardware.ctaphid_state;
+        self.status.hardware_ctaphid_init_frame_count = hardware.ctaphid_init_frame_count;
+        self.status.hardware_ctaphid_live_state = hardware.ctaphid_live_state;
+        self.status.hardware_ctaphid_live_channel_id = hardware.ctaphid_live_channel_id;
+        self.status.hardware_ctaphid_live_protocol_version = hardware.ctaphid_live_protocol_version;
+        self.status.hardware_ctaphid_live_device_version = hardware.ctaphid_live_device_version;
+        self.status.hardware_ctaphid_live_capabilities = hardware.ctaphid_live_capabilities;
+        self.status.hardware_ctaphid_live_error = hardware.ctaphid_live_error;
+        let now = self.now_ms();
+        self.status.hardware_probe_ms = now;
+        self.status.updated_ms = now;
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
+        self.refresh_hardware_status();
         let topic = format!("{STATE_PREFIX}{}", self.node);
-        if let Ok(body) = serde_json::to_string(&self.status_with_hardware()) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+        if let Ok(body) = serde_json::to_string(&self.status) {
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 
@@ -787,7 +805,7 @@ fn parse_request(body: &str, id: &str) -> Result<PasskeyRequest, String> {
     if timeout_ms.is_some_and(|ms| !(1_000..=600_000).contains(&ms)) {
         return Err("timeout_ms out of range".to_owned());
     }
-    // security-2: presence signal from the shim. Absent => not present.
+    // security-2: presence signal from the Browser shell. Absent => not present.
     let user_present = v
         .get("user_present")
         .and_then(serde_json::Value::as_bool)

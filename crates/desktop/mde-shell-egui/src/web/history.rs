@@ -80,6 +80,7 @@ impl HistoryStore {
 
     /// Back-fill the most-recent visit's title once the engine reports it (Title
     /// and NavState are separate events, so the title usually lags the commit).
+    #[cfg(test)]
     pub(super) fn set_latest_title(&mut self, url: &str, title: &str) {
         let url = url.trim();
         if url.is_empty() || title.is_empty() {

@@ -35,19 +35,54 @@ impl BrowserSpellcheckResult {
         self.error.is_some() || !self.misses.is_empty()
     }
 
+    pub(super) fn user_facing_error(&self) -> Option<String> {
+        self.error.as_deref().and_then(spellcheck_error_label)
+    }
+
     pub(super) fn summary(&self) -> String {
-        if let Some(error) = self.error.as_deref() {
-            if error.trim().is_empty() {
-                "Spellcheck unavailable".to_owned()
-            } else {
-                format!("Spellcheck unavailable: {error}")
-            }
+        if let Some(error) = self.user_facing_error() {
+            format!("Spellcheck unavailable: {error}")
+        } else if self.error.is_some() {
+            "Spellcheck unavailable".to_owned()
         } else {
             let count = self.misses.len();
             let plural = if count == 1 { "" } else { "s" };
             format!("{count} possible misspelling{plural}")
         }
     }
+}
+
+pub(super) fn spellcheck_error_label(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("hunspell") {
+        if lower.contains("not installed") || lower.contains("missing") {
+            return Some("Spelling dictionary is not installed".to_owned());
+        }
+        if lower.contains("permission") || lower.contains("denied") {
+            return Some("Spelling dictionary cannot be opened".to_owned());
+        }
+        return Some("Spelling dictionary unavailable".to_owned());
+    }
+    if lower.contains("spell-check unavailable") || lower.contains("spellcheck unavailable") {
+        return Some("Spelling service unavailable".to_owned());
+    }
+    if lower.contains("worker")
+        || lower.contains("runtime")
+        || lower.contains("backend")
+        || lower.contains("/opt/")
+        || lower.contains("/usr/")
+        || lower.contains('\\')
+        || lower.contains(" path")
+    {
+        return Some("Spelling service unavailable".to_owned());
+    }
+
+    Some(sentence_case_ascii(trimmed))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +147,7 @@ pub(super) struct OfflineCacheResource {
     pub(super) url: String,
     pub(super) resource: String,
     pub(super) allowed: bool,
+    pub(super) blocked_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +170,7 @@ pub(super) struct OfflineCacheViewportTexture {
 /// pulls in the parent's `spellcheck_highlight_words` / `spellcheck_notice` helpers
 /// and `WebState`'s private fields. A pure relocation from the `web` god-module.
 impl WebState {
+    #[cfg(test)]
     pub(super) fn apply_spellcheck_correction(
         &mut self,
         tab_index: usize,
@@ -335,10 +372,8 @@ impl WebState {
             return;
         }
         self.offline_cache_result_last_poll = Some(Instant::now());
-        let Some(root) = self.bus_root.as_deref() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        // arch-11: open through the shared BusReader seam.
+        let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
             return;
         };
         let topic = browser_offline_cache_result_topic(&local_hostname());
@@ -452,7 +487,7 @@ impl WebState {
         let archive = result
             .archive_mhtml
             .as_ref()
-            .ok_or_else(|| "offline copy has no MHTML archive".to_owned())?;
+            .ok_or_else(|| "offline copy has no saved archive".to_owned())?;
         let bytes = offline_cache_archive_bytes(archive)?;
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)
@@ -572,6 +607,7 @@ impl WebState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn export_active_page_metadata_scrape_to_dirs(
         &mut self,
         spool_dir: PathBuf,

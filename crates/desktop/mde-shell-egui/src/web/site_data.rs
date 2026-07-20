@@ -19,14 +19,14 @@ pub(super) struct SiteDataManager {
 }
 
 impl SiteDataManager {
-    pub(super) fn observe_open_tabs<'a>(
-        &mut self,
-        hosts: impl IntoIterator<Item = &'a str>,
-        now_ms: u64,
-    ) {
+    pub(super) fn observe_open_tabs<I, S>(&mut self, hosts: I, now_ms: u64)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut counts = BTreeMap::<String, u32>::new();
         for host in hosts {
-            let host = host.trim().to_ascii_lowercase();
+            let host = host.as_ref().trim().to_ascii_lowercase();
             if !host.is_empty() {
                 *counts.entry(host).or_insert(0) += 1;
             }
@@ -76,14 +76,14 @@ impl SiteDataManager {
             .map_or(0, |s| s.cleared_count);
         match active_host {
             Some(host) => format!(
-                "Site data: {} tracked site{} · {open_tabs} open tab{} · {host} cleared {cleared} time{}",
+                "Site data: {} tracked site{}; {open_tabs} open tab{}; {host} cleared {cleared} time{}",
                 self.sites.len(),
                 plural(self.sites.len()),
                 plural_u32(open_tabs),
                 plural_u32(cleared),
             ),
             None => format!(
-                "Site data: {} tracked site{} · {open_tabs} open tab{}",
+                "Site data: {} tracked site{}; {open_tabs} open tab{}",
                 self.sites.len(),
                 plural(self.sites.len()),
                 plural_u32(open_tabs),

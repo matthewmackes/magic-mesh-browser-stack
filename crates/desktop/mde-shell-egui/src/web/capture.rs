@@ -31,7 +31,7 @@ pub(super) fn browser_capture_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Magic Mesh Browser Captures")
+        .join(format!("{} Captures", browser_product_label()))
 }
 
 pub(super) fn browser_pdf_dir() -> PathBuf {
@@ -39,7 +39,7 @@ pub(super) fn browser_pdf_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Documents")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Magic Mesh Browser PDFs")
+        .join(format!("{} PDFs", browser_product_label()))
 }
 
 pub(super) fn browser_print_spool_dir() -> PathBuf {
@@ -395,7 +395,7 @@ pub(super) fn active_page_scrape_documents(
     }
     let csv = csv.into_bytes();
     let seed_md = if crawl_seed.is_empty() {
-        "No same-origin crawl seed URLs were observed in helper resource telemetry.".to_owned()
+        "No same-origin crawl seed URLs were observed for this page.".to_owned()
     } else {
         crawl_seed
             .iter()
@@ -414,11 +414,11 @@ pub(super) fn active_page_scrape_documents(
         Some(text) if !text.is_empty() => {
             format!("```text\n{}\n```", text.replace("```", "`\\`\\`"))
         }
-        Some(_) => "No visible page text was returned by the helper.".to_owned(),
+        Some(_) => "No visible page text was available for this page.".to_owned(),
         None => "Visible page text was not requested for this export path.".to_owned(),
     };
     let crawl_manifest_md = if crawl_manifest.is_empty() {
-        "No same-origin crawl targets were available for the handoff manifest.".to_owned()
+        "No same-origin crawl targets were available for this export.".to_owned()
     } else {
         crawl_manifest
             .iter()
@@ -438,7 +438,7 @@ pub(super) fn active_page_scrape_documents(
     let links_md = if dom_extract.links.is_empty() {
         match dom_extract.status {
             "not_requested" => "DOM links were not requested for this export path.".to_owned(),
-            _ => "No DOM links were returned by the helper.".to_owned(),
+            _ => "No DOM links were available for this page.".to_owned(),
         }
     } else {
         dom_extract
@@ -460,7 +460,7 @@ pub(super) fn active_page_scrape_documents(
     let headings_md = if dom_extract.headings.is_empty() {
         match dom_extract.status {
             "not_requested" => "DOM headings were not requested for this export path.".to_owned(),
-            _ => "No DOM headings were returned by the helper.".to_owned(),
+            _ => "No DOM headings were available for this page.".to_owned(),
         }
     } else {
         dom_extract
@@ -509,19 +509,19 @@ pub(super) fn active_page_scrape_documents(
             lines.push("```".to_owned());
             lines.join("\n")
         }
-        Some(_) => "No article/main-body text was returned by the helper.".to_owned(),
+        Some(_) => "No article/main-body text was available for this page.".to_owned(),
         None => match dom_extract.status {
             "not_requested" => {
                 "Article/main-body extraction was not requested for this export path.".to_owned()
             }
-            _ => "No article/main-body text was returned by the helper.".to_owned(),
+            _ => "No article/main-body text was available for this page.".to_owned(),
         },
     };
     let md = format!(
-        "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest handoff\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 handoff targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nRecursive network fetching remains a follow-up scraper hook.\n",
+        "# {}\n\n- URL: `{}`\n- Engine: `{}`\n- Captured: `{}`\n- Scope: active page metadata with bounded crawl seed, extracted text, DOM links/headings/article metadata, and crawl manifest\n- Crawl seed URLs: `{}`\n- Crawl manifest URLs: `{}` depth-1 same-origin targets, execution `not_started`\n- Extracted text: `{}` chars, status `{}`, truncated `{}`\n- DOM extract: status `{}`, links `{}`, headings `{}`\n- Article extract: status `{}`, chars `{}`, truncated `{}`\n\n## Extracted Text\n\n{}\n\n## Article Extract\n\n{}\n\n## DOM Links\n\n{}\n\n## DOM Headings\n\n{}\n\n## Crawl Manifest\n\n{}\n\n## Crawl Seed\n\n{}\n\nThis export records bounded same-origin crawl targets and does not recursively fetch them.\n",
         markdown_heading_text(&label),
         url.replace('`', "\\`"),
-        engine.label(),
+        browser_engine_export_label(engine),
         unix_ms,
         crawl_seed.len(),
         crawl_manifest.len(),
@@ -543,6 +543,13 @@ pub(super) fn active_page_scrape_documents(
     )
     .into_bytes();
     Ok(vec![("json", json), ("csv", csv), ("md", md)])
+}
+
+fn browser_engine_export_label(engine: BrowserEngine) -> &'static str {
+    match engine {
+        BrowserEngine::Cef => "Chromium",
+        BrowserEngine::Servo => "Lightweight",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,6 +974,7 @@ fn media_manifest_items(
                 "resource": offline_cache_resource_type_name(resource.resource),
                 "kind": kind,
                 "allowed": resource.allowed,
+                "blocked_by": resource.blocked_by.as_deref(),
                 "filename_hint": media_filename_hint(url),
             }))
         })
@@ -977,6 +985,7 @@ fn media_manifest_items(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn active_page_media_asset_requests(
     page_url: &str,
     title: &str,
@@ -1058,6 +1067,7 @@ pub(super) fn active_page_media_asset_requests_with_selection(
             "resource": offline_cache_resource_type_name(resource.resource),
             "kind": kind,
             "allowed_by_page_filter": resource.allowed,
+            "blocked_by_page_filter": resource.blocked_by.as_deref(),
             "ignore_blocking": !resource.allowed,
             "suggested_filename": filename_hint,
             "rename_strategy": "auto_rename_by_url_hint",
@@ -1208,7 +1218,8 @@ pub(super) fn mhtml_capture_document(url: &str, title: &str, unix_ms: u64, png: 
         "Content-Type: multipart/related; type=\"text/html\"; boundary=\"{BOUNDARY}\"\r\n"
     ));
     out.push_str(&format!(
-        "Subject: Magic Mesh Browser Capture - {}\r\n\r\n",
+        "Subject: {} Capture - {}\r\n\r\n",
+        browser_product_label(),
         mhtml_header_value(&html_escape(&label))
     ));
     out.push_str(&format!("--{BOUNDARY}\r\n"));
@@ -1277,7 +1288,8 @@ pub(super) fn offline_cache_mhtml_document(
         "Content-Type: multipart/related; type=\"text/html\"; boundary=\"{BOUNDARY}\"\r\n"
     ));
     out.push_str(&format!(
-        "Subject: Magic Mesh Browser Offline Copy - {}\r\n\r\n",
+        "Subject: {} Offline Copy - {}\r\n\r\n",
+        browser_product_label(),
         mhtml_header_value(&html_escape(&label))
     ));
     out.push_str(&format!("--{BOUNDARY}\r\n"));
@@ -1428,14 +1440,14 @@ pub(super) fn annotate_capture_image(
             img.pixels.len()
         ));
     }
-    let mut out = egui::ColorImage::new([w, out_h], Style::BG);
+    let mut out = egui::ColorImage::new([w, out_h], super::chrome_ui::CHROME_SURFACE);
     out.pixels[..expected].copy_from_slice(&img.pixels);
     for y in h..out_h {
         for x in 0..w {
             out.pixels[y * w + x] = if y == h {
-                Style::ACCENT
+                super::chrome_ui::CHROME_PRIMARY
             } else {
-                Style::SURFACE
+                super::chrome_ui::CHROME_SURFACE_CONTAINER
             };
         }
     }
@@ -1444,7 +1456,7 @@ pub(super) fn annotate_capture_image(
         6,
         h + 6,
         &caption.to_ascii_uppercase(),
-        Style::TEXT,
+        super::chrome_ui::CHROME_TEXT,
     );
     Ok(out)
 }
@@ -1456,7 +1468,7 @@ pub(super) fn annotate_callout_capture_image(
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
     if w < 16 || h < 12 {
-        draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
+        draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", super::chrome_ui::CHROME_TEXT);
         return Ok(out);
     }
 
@@ -1464,7 +1476,7 @@ pub(super) fn annotate_callout_capture_image(
     let box_h = (h / 3).clamp(8, 96);
     let x = (w.saturating_sub(box_w)) / 2;
     let y = (h.saturating_sub(box_h)) / 2;
-    let accent = Style::ACCENT;
+    let accent = super::chrome_ui::CHROME_PRIMARY;
     draw_rect_outline(&mut out, x, y, box_w, box_h, accent);
 
     let leader_start_x = x.saturating_add(box_w);
@@ -1492,9 +1504,9 @@ pub(super) fn annotate_callout_capture_image(
         leader_end_x.saturating_sub(8),
         leader_end_y.saturating_add(1),
         "1",
-        Style::TEXT_STRONG,
+        super::chrome_ui::CHROME_PRIMARY,
     );
-    draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", Style::TEXT_STRONG);
+    draw_tiny_text(&mut out, 6, h + 6, "CALLOUT", super::chrome_ui::CHROME_TEXT);
     Ok(out)
 }
 
@@ -1504,7 +1516,7 @@ pub(super) fn annotate_freehand_capture_image(
 ) -> Result<egui::ColorImage, String> {
     let [w, h] = img.size;
     let mut out = annotate_capture_image(img, caption)?;
-    let stroke = Style::TEXT_STRONG;
+    let stroke = super::chrome_ui::CHROME_PRIMARY;
     if w < 16 || h < 12 {
         draw_tiny_text(&mut out, 6, h + 6, "FREEHAND", stroke);
         return Ok(out);

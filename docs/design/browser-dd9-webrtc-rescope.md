@@ -27,11 +27,19 @@ this doc cites — see `docs/THREAT_MODEL.md` §8 and the doc comment on
 `chromium_privacy_switches()` in `cef_init.rs` for the full evidence trail)
 and has been fixed: the dead switch is removed, `--force-webrtc-ip-handling-
 policy` is confirmed-real and kept, and a renderer-level JS shim
-(`cef_browser::webrtc_block_script`) now actually removes the WebRTC surface
-pending DD-9. This does **not** change DD-9's own scope or recommendation
-below (CEF WebRTC is still off by design, not yet a shipped feature) — it
-only means the engine-choice table's "may not even be real" framing and the
-Rollup's "unverified... worth checking" line are now historical, not current.
+(`cef_browser::webrtc_block_script`) initially removed the WebRTC surface
+pending native permission work. This paragraph is historical; the 2026-07-14
+update below supersedes the temporary CEF-WebRTC-off posture after the native
+permission and sandbox prerequisites landed.
+
+**Update 2026-07-14:** the browser-page CEF WebRTC prerequisite work has moved
+from design into code. `on_request_media_access_permission` is wired to the
+Browser's session-only camera/microphone prompt, the shared sandbox exposes
+only `/dev/snd` and `/dev/videoN` capture devices when present, and CEF no
+longer deletes `RTCPeerConnection`/`getUserMedia` by default. The old JS
+remover remains available only as `MDE_CEF_WEBRTC_BLOCKED=1`. This advances
+the browser-page compatibility half of DD-9; it does **not** implement the mesh
+call/conferencing app, screen share, PiP, or multi-party design.
 
 ## What DD-9 actually asks for
 
@@ -461,15 +469,10 @@ call over the mesh between two paired nodes**, nothing past it.
 
 1. **CEF only.** No Servo WebRTC work in this slice (leave it honestly gated,
    `dom_webrtc_enabled: false`, pointing at this doc + servo/servo#41396).
-2. **Verify, then narrowly reverse, the disable switch.** First confirm at
-   runtime whether `--disable-webrtc` is actually load-bearing today (§ above);
-   remove it either way once confirmed, but keep
-   `--force-webrtc-ip-handling-policy` — tightened, if practical, to a mesh-aware
-   policy that only ever offers the Nebula interface rather than the stock
-   "any non-proxied UDP" exclusion.
-3. **A minimal, security-reviewed camera/mic device grant** for the CEF helper
-   process (today undocumented/unmanaged, unlike Servo's explicit allowlist) —
-   audit what device access CEF's helper actually has before adding to it.
+2. **Historical / landed:** the inert `--disable-webrtc` switch has been
+   verified false and removed; `--force-webrtc-ip-handling-policy` remains.
+3. **Historical / landed prerequisite:** CEF camera/microphone permission and
+   sandbox capture-device visibility now exist for browser-page WebRTC.
 4. **Signaling over the existing Bus**, peer-directory-addressed, new
    `action/webrtc/*`-shaped topic (or folded into `mde-chat`'s existing
    `CallAction` message kind) — no external signaling server.
@@ -518,9 +521,9 @@ app == extend VOIP-GW's SIP stack vs. new WebRTC" product decision.
   (DRM-level capture with no compositor portal to lean on; a compositing model
   that can show something over an inactive `Surface`) that have nothing to do
   with WebRTC itself and would still be required even if WebRTC were free.
-- **A real local-IP-leak privacy question is open independent of DD-9** — it's
-  unverified whether `--disable-webrtc` currently does anything, which is worth
-  checking regardless of whether this feature ever ships.
+- **Historical:** the `--disable-webrtc` local-IP-leak question has since been
+  resolved; it was inert. CEF now relies on the real IP-handling policy and
+  native media permission prompts.
 
 ## Out of scope (this doc)
 
@@ -533,6 +536,4 @@ app == extend VOIP-GW's SIP stack vs. new WebRTC" product decision.
   background-audio/autoplay-blocking (conventional, smaller, engine-preference-flag
   work not investigated in depth here).
 - Verifying whether `--disable-webrtc` is functionally real in the pinned CEF
-  149 build — flagged as the first concrete step of any real slice, not
-  performed here (would need a live CEF build + a runtime probe, not source
-  reading).
+  149 build — historical; completed 2026-07-10 and confirmed inert.

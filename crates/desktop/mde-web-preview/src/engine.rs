@@ -21,10 +21,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use embedder_traits::JSValue;
 use euclid::{Box2D, Point2D};
+use mde_web_wire::{
+    InputEvent as WireInputEvent, KeyCode as WireKeyCode, MediaTransportAction,
+    Modifiers as WireModifiers, PointerButton as WirePointerButton,
+};
 use servo::{
-    EventLoopWaker, LoadStatus, PermissionRequest, Preferences, RenderingContext, Servo,
-    ServoBuilder, ServoDelegate, SoftwareRenderingContext, WebView, WebViewBuilder,
-    WebViewDelegate,
+    Code, CompositionEvent, CompositionState, DevicePoint, EventLoopWaker, ImeEvent,
+    InputEvent as ServoInputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers as ServoModifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NamedKey, PermissionRequest, Preferences,
+    RenderingContext, Servo, ServoBuilder, ServoDelegate, SoftwareRenderingContext, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 
 use crate::shm::{FrameChannel, PixelFormat};
@@ -204,6 +211,8 @@ pub struct Engine {
     shared: Rc<Shared>,
     width: u32,
     height: u32,
+    pointer_x: Cell<f32>,
+    pointer_y: Cell<f32>,
     /// When the engine booted — the `MDE_WEB_DEBUG` trace timebase.
     booted: Instant,
 }
@@ -250,6 +259,8 @@ impl Engine {
             shared,
             width,
             height,
+            pointer_x: Cell::new(0.0),
+            pointer_y: Cell::new(0.0),
             booted: Instant::now(),
         })
     }
@@ -546,6 +557,76 @@ impl Engine {
         let _ = self.webview.go_forward(amount);
     }
 
+    /// Forward one shell input event into Servo's native webview input API.
+    pub fn apply_input(&self, event: &WireInputEvent) {
+        match event {
+            WireInputEvent::PointerMoved { x, y } => {
+                self.pointer_x.set(*x);
+                self.pointer_y.set(*y);
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseMove(MouseMoveEvent::new(
+                        servo_point(*x, *y),
+                    )));
+            }
+            WireInputEvent::PointerButton {
+                x,
+                y,
+                button,
+                pressed,
+                modifiers: _,
+            } => {
+                self.pointer_x.set(*x);
+                self.pointer_y.set(*y);
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseButton(MouseButtonEvent::new(
+                        if *pressed {
+                            MouseButtonAction::Down
+                        } else {
+                            MouseButtonAction::Up
+                        },
+                        servo_mouse_button(*button),
+                        servo_point(*x, *y),
+                    )));
+            }
+            WireInputEvent::PointerGone => {
+                self.webview
+                    .notify_input_event(ServoInputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+            }
+            WireInputEvent::Scroll {
+                delta_x,
+                delta_y,
+                modifiers: _,
+            } => {
+                self.webview
+                    .notify_input_event(ServoInputEvent::Wheel(WheelEvent::new(
+                        WheelDelta {
+                            x: f64::from(*delta_x),
+                            y: f64::from(*delta_y),
+                            z: 0.0,
+                            mode: WheelMode::DeltaPixel,
+                        },
+                        servo_point(self.pointer_x.get(), self.pointer_y.get()),
+                    )));
+            }
+            WireInputEvent::Key {
+                key,
+                pressed,
+                modifiers,
+            } => {
+                if let Some(event) = servo_keyboard_event(*key, *pressed, *modifiers) {
+                    self.webview.notify_input_event(event);
+                }
+            }
+            WireInputEvent::Text(text) => {
+                for event in servo_text_events(text) {
+                    self.webview.notify_input_event(event);
+                }
+            }
+        }
+    }
+
     /// Set page zoom through Servo's page script seam. This is intentionally the
     /// same bounded DOM transform CEF uses until Servo exposes a native zoom API.
     pub fn set_zoom(&self, percent: u16) {
@@ -566,7 +647,7 @@ impl Engine {
         self.evaluate_page_script(clear_find_script());
     }
 
-    /// Apply or remove Quasar forced-dark styling in the Servo tab.
+    /// Apply or remove Construct forced-dark styling in the Servo tab.
     pub fn set_force_dark(&self, enabled: bool) {
         self.evaluate_page_script(&force_dark_script(enabled));
     }
@@ -703,6 +784,38 @@ impl Engine {
     /// HTML media element already present and any media element inserted later.
     pub fn set_audio_muted(&self, muted: bool) {
         self.evaluate_page_script(audio_mute_script(muted));
+    }
+
+    /// Toggle playback on the active page's HTML media elements.
+    pub fn toggle_media_playback(&self) {
+        self.evaluate_page_script(media_playback_toggle_script());
+    }
+
+    /// Run one media transport action on the active page's HTML media elements.
+    pub fn media_transport(&self, action: MediaTransportAction) {
+        self.evaluate_page_script(&media_transport_script(action));
+    }
+
+    /// Read bounded page/media-session now-playing metadata.
+    pub fn poll_media_metadata<F>(&self, publish: F)
+    where
+        F: FnOnce(String) + 'static,
+    {
+        self.webview
+            .evaluate_javascript(media_metadata_script(), move |result| {
+                let body = match result {
+                    Ok(JSValue::String(body)) => clamp_utf8(body.trim(), 8 * 1024),
+                    _ => return,
+                };
+                if body.is_empty() || body.trim_start().starts_with('{') {
+                    publish(body);
+                }
+            });
+    }
+
+    /// Apply or remove autoplay blocking in the Servo tab until user activation.
+    pub fn set_autoplay_blocked(&self, blocked: bool) {
+        self.evaluate_page_script(&autoplay_block_script(blocked));
     }
 
     /// Ask the page to invoke its print flow. Servo does not expose a native
@@ -1151,12 +1264,224 @@ fn clamp_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
+fn servo_point(x: f32, y: f32) -> WebViewPoint {
+    WebViewPoint::Device(DevicePoint::new(x, y))
+}
+
+const fn servo_mouse_button(button: WirePointerButton) -> MouseButton {
+    match button {
+        WirePointerButton::Primary => MouseButton::Left,
+        WirePointerButton::Secondary => MouseButton::Right,
+        WirePointerButton::Middle => MouseButton::Middle,
+    }
+}
+
+fn servo_modifiers(modifiers: WireModifiers) -> ServoModifiers {
+    let mut servo_modifiers = ServoModifiers::empty();
+    if modifiers.has(WireModifiers::CTRL) {
+        servo_modifiers |= ServoModifiers::CONTROL;
+    }
+    if modifiers.has(WireModifiers::SHIFT) {
+        servo_modifiers |= ServoModifiers::SHIFT;
+    }
+    if modifiers.has(WireModifiers::ALT) {
+        servo_modifiers |= ServoModifiers::ALT;
+    }
+    if modifiers.has(WireModifiers::COMMAND) {
+        servo_modifiers |= ServoModifiers::META;
+    }
+    servo_modifiers
+}
+
+fn servo_keyboard_event(
+    key: WireKeyCode,
+    pressed: bool,
+    modifiers: WireModifiers,
+) -> Option<ServoInputEvent> {
+    let (key, code) = servo_key_and_code(key, modifiers)?;
+    Some(ServoInputEvent::Keyboard(KeyboardEvent::new_without_event(
+        if pressed {
+            KeyState::Down
+        } else {
+            KeyState::Up
+        },
+        key,
+        code,
+        Location::Standard,
+        servo_modifiers(modifiers),
+        false,
+        false,
+    )))
+}
+
+fn servo_text_events(text: &str) -> Vec<ServoInputEvent> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ServoInputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: CompositionState::Start,
+            data: String::new(),
+        })),
+        ServoInputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: CompositionState::End,
+            data: text.to_owned(),
+        })),
+    ]
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat wire-key to DOM-key/code table is easier to audit"
+)]
+fn servo_key_and_code(key: WireKeyCode, modifiers: WireModifiers) -> Option<(Key, Code)> {
+    let shift = modifiers.has(WireModifiers::SHIFT);
+    Some(match key {
+        WireKeyCode::Enter => (Key::Named(NamedKey::Enter), Code::Enter),
+        WireKeyCode::Escape => (Key::Named(NamedKey::Escape), Code::Escape),
+        WireKeyCode::Backspace => (Key::Named(NamedKey::Backspace), Code::Backspace),
+        WireKeyCode::Tab => (Key::Named(NamedKey::Tab), Code::Tab),
+        WireKeyCode::Space => (Key::Character(" ".to_owned()), Code::Space),
+        WireKeyCode::Delete => (Key::Named(NamedKey::Delete), Code::Delete),
+        WireKeyCode::Insert => (Key::Named(NamedKey::Insert), Code::Insert),
+        WireKeyCode::Home => (Key::Named(NamedKey::Home), Code::Home),
+        WireKeyCode::End => (Key::Named(NamedKey::End), Code::End),
+        WireKeyCode::PageUp => (Key::Named(NamedKey::PageUp), Code::PageUp),
+        WireKeyCode::PageDown => (Key::Named(NamedKey::PageDown), Code::PageDown),
+        WireKeyCode::ArrowUp => (Key::Named(NamedKey::ArrowUp), Code::ArrowUp),
+        WireKeyCode::ArrowDown => (Key::Named(NamedKey::ArrowDown), Code::ArrowDown),
+        WireKeyCode::ArrowLeft => (Key::Named(NamedKey::ArrowLeft), Code::ArrowLeft),
+        WireKeyCode::ArrowRight => (Key::Named(NamedKey::ArrowRight), Code::ArrowRight),
+        WireKeyCode::A => (letter_key('a', shift), Code::KeyA),
+        WireKeyCode::B => (letter_key('b', shift), Code::KeyB),
+        WireKeyCode::C => (letter_key('c', shift), Code::KeyC),
+        WireKeyCode::D => (letter_key('d', shift), Code::KeyD),
+        WireKeyCode::E => (letter_key('e', shift), Code::KeyE),
+        WireKeyCode::F => (letter_key('f', shift), Code::KeyF),
+        WireKeyCode::G => (letter_key('g', shift), Code::KeyG),
+        WireKeyCode::H => (letter_key('h', shift), Code::KeyH),
+        WireKeyCode::I => (letter_key('i', shift), Code::KeyI),
+        WireKeyCode::J => (letter_key('j', shift), Code::KeyJ),
+        WireKeyCode::K => (letter_key('k', shift), Code::KeyK),
+        WireKeyCode::L => (letter_key('l', shift), Code::KeyL),
+        WireKeyCode::M => (letter_key('m', shift), Code::KeyM),
+        WireKeyCode::N => (letter_key('n', shift), Code::KeyN),
+        WireKeyCode::O => (letter_key('o', shift), Code::KeyO),
+        WireKeyCode::P => (letter_key('p', shift), Code::KeyP),
+        WireKeyCode::Q => (letter_key('q', shift), Code::KeyQ),
+        WireKeyCode::R => (letter_key('r', shift), Code::KeyR),
+        WireKeyCode::S => (letter_key('s', shift), Code::KeyS),
+        WireKeyCode::T => (letter_key('t', shift), Code::KeyT),
+        WireKeyCode::U => (letter_key('u', shift), Code::KeyU),
+        WireKeyCode::V => (letter_key('v', shift), Code::KeyV),
+        WireKeyCode::W => (letter_key('w', shift), Code::KeyW),
+        WireKeyCode::X => (letter_key('x', shift), Code::KeyX),
+        WireKeyCode::Y => (letter_key('y', shift), Code::KeyY),
+        WireKeyCode::Z => (letter_key('z', shift), Code::KeyZ),
+        WireKeyCode::Num0 => (Key::Character("0".to_owned()), Code::Digit0),
+        WireKeyCode::Num1 => (Key::Character("1".to_owned()), Code::Digit1),
+        WireKeyCode::Num2 => (Key::Character("2".to_owned()), Code::Digit2),
+        WireKeyCode::Num3 => (Key::Character("3".to_owned()), Code::Digit3),
+        WireKeyCode::Num4 => (Key::Character("4".to_owned()), Code::Digit4),
+        WireKeyCode::Num5 => (Key::Character("5".to_owned()), Code::Digit5),
+        WireKeyCode::Num6 => (Key::Character("6".to_owned()), Code::Digit6),
+        WireKeyCode::Num7 => (Key::Character("7".to_owned()), Code::Digit7),
+        WireKeyCode::Num8 => (Key::Character("8".to_owned()), Code::Digit8),
+        WireKeyCode::Num9 => (Key::Character("9".to_owned()), Code::Digit9),
+        WireKeyCode::F1 => (Key::Named(NamedKey::F1), Code::F1),
+        WireKeyCode::F2 => (Key::Named(NamedKey::F2), Code::F2),
+        WireKeyCode::F3 => (Key::Named(NamedKey::F3), Code::F3),
+        WireKeyCode::F4 => (Key::Named(NamedKey::F4), Code::F4),
+        WireKeyCode::F5 => (Key::Named(NamedKey::F5), Code::F5),
+        WireKeyCode::F6 => (Key::Named(NamedKey::F6), Code::F6),
+        WireKeyCode::F7 => (Key::Named(NamedKey::F7), Code::F7),
+        WireKeyCode::F8 => (Key::Named(NamedKey::F8), Code::F8),
+        WireKeyCode::F9 => (Key::Named(NamedKey::F9), Code::F9),
+        WireKeyCode::F10 => (Key::Named(NamedKey::F10), Code::F10),
+        WireKeyCode::F11 => (Key::Named(NamedKey::F11), Code::F11),
+        WireKeyCode::F12 => (Key::Named(NamedKey::F12), Code::F12),
+    })
+}
+
+fn letter_key(ch: char, shift: bool) -> Key {
+    if shift {
+        Key::Character(ch.to_ascii_uppercase().to_string())
+    } else {
+        Key::Character(ch.to_string())
+    }
+}
+
 const fn audio_mute_script(muted: bool) -> &'static str {
     if muted {
         "(function(){var key='mdeServoAudioMuted';var apply=function(root){var list=(root||document).querySelectorAll? (root||document).querySelectorAll('audio,video') : [];for(var i=0;i<list.length;i++){list[i].muted=true;list[i].defaultMuted=true;}};document.documentElement.dataset[key]='true';apply(document);if(window.__mdeServoAudioMuteObserver)window.__mdeServoAudioMuteObserver.disconnect();window.__mdeServoAudioMuteObserver=new MutationObserver(function(records){for(var r=0;r<records.length;r++){for(var n=0;n<records[r].addedNodes.length;n++){var node=records[r].addedNodes[n];if(node&&node.matches&&node.matches('audio,video')){node.muted=true;node.defaultMuted=true;}apply(node);}}});window.__mdeServoAudioMuteObserver.observe(document.documentElement,{childList:true,subtree:true});})();"
     } else {
         "(function(){var key='mdeServoAudioMuted';delete document.documentElement.dataset[key];if(window.__mdeServoAudioMuteObserver){window.__mdeServoAudioMuteObserver.disconnect();window.__mdeServoAudioMuteObserver=null;}var list=document.querySelectorAll?document.querySelectorAll('audio,video'):[];for(var i=0;i<list.length;i++){list[i].muted=false;list[i].defaultMuted=false;}})();"
     }
+}
+
+fn autoplay_block_script(blocked: bool) -> String {
+    if !blocked {
+        return r#"(function(){var s=window.__mdeServoAutoplayBlocker;if(s){try{if(s.observer)s.observer.disconnect();}catch(_e){}try{document.removeEventListener('pointerdown',s.allow,true);document.removeEventListener('keydown',s.allow,true);document.removeEventListener('touchstart',s.allow,true);document.removeEventListener('click',s.allow,true);}catch(_e){}try{if(s.originalPlay&&s.patchedPlay&&window.HTMLMediaElement&&HTMLMediaElement.prototype.play===s.patchedPlay){HTMLMediaElement.prototype.play=s.originalPlay;}}catch(_e){}}delete window.__mdeServoAutoplayBlocker;delete document.documentElement.dataset.mdeServoAutoplayBlocked;})();"#.to_owned();
+    }
+    r#"(function(){var root=document.documentElement;if(!root)return;root.dataset.mdeServoAutoplayBlocked='true';var s=window.__mdeServoAutoplayBlocker;if(s&&s.sweep){s.sweep(document);return;}s={allowed:false};window.__mdeServoAutoplayBlocker=s;s.allow=function(e){if(e&&e.isTrusted===false)return;s.allowed=true;};document.addEventListener('pointerdown',s.allow,true);document.addEventListener('keydown',s.allow,true);document.addEventListener('touchstart',s.allow,true);document.addEventListener('click',s.allow,true);s.blockedError=function(){try{return new DOMException('Autoplay blocked by MDE Browser','NotAllowedError');}catch(_e){var err=new Error('Autoplay blocked by MDE Browser');err.name='NotAllowedError';return err;}};s.sweep=function(scope){try{var base=scope&&scope.querySelectorAll?scope:document;var media=base.querySelectorAll('audio[autoplay],video[autoplay]');for(var i=0;i<media.length;i++){var el=media[i];if(s.allowed||el.dataset.mdeAutoplayAllowed==='true')continue;el.autoplay=false;el.removeAttribute('autoplay');try{el.pause();}catch(_e){}}}catch(_e){}};try{var proto=window.HTMLMediaElement&&HTMLMediaElement.prototype;if(proto&&proto.play&&!s.originalPlay){s.originalPlay=proto.play;s.patchedPlay=function(){if(s.allowed||this.dataset.mdeAutoplayAllowed==='true'||!document.documentElement.dataset.mdeServoAutoplayBlocked){return s.originalPlay.apply(this,arguments);}try{this.pause();}catch(_e){}return Promise.reject(s.blockedError());};try{Object.defineProperty(proto,'play',{value:s.patchedPlay,writable:true,configurable:true});}catch(_e){proto.play=s.patchedPlay;}}}catch(_e){}if(window.MutationObserver){s.observer=new MutationObserver(function(records){for(var i=0;i<records.length;i++){for(var j=0;j<records[i].addedNodes.length;j++){var n=records[i].addedNodes[j];if(n&&n.nodeType===1)s.sweep(n);}}});s.observer.observe(document.documentElement,{childList:true,subtree:true});}s.sweep(document);})();"#.to_owned()
+}
+
+const fn media_playback_toggle_script() -> &'static str {
+    r#"(function(){try{var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){return !el.ended&&(el.readyState>0||el.currentSrc||el.src);});if(!list.length)return;var playing=list.find(function(el){return !el.paused&&!el.ended;});if(playing){for(var i=0;i<list.length;i++){if(!list[i].paused&&!list[i].ended){try{list[i].pause();}catch(_e){}}}return;}var target=list.find(function(el){return el.paused&&!el.ended;})||list[0];try{target.dataset.mdeAutoplayAllowed='true';}catch(_e){}try{var p=target.play();if(p&&p.catch)p.catch(function(){});}catch(_e){}}catch(_e){}})();"#
+}
+
+fn media_transport_script(action: MediaTransportAction) -> String {
+    let action = match action {
+        MediaTransportAction::PlayPause => "playPause",
+        MediaTransportAction::Play => "play",
+        MediaTransportAction::Pause => "pause",
+        MediaTransportAction::Stop => "stop",
+        MediaTransportAction::Next => "next",
+        MediaTransportAction::Previous => "previous",
+        MediaTransportAction::VolumeUp => "volumeUp",
+        MediaTransportAction::VolumeDown => "volumeDown",
+    };
+    format!(
+        r#"(function(){{try{{var action='{action}';var list=[].slice.call(document.querySelectorAll('audio,video')).filter(function(el){{return !el.ended&&(el.readyState>0||el.currentSrc||el.src||el.currentTime>0);}});if(!list.length)return;var playing=list.find(function(el){{return !el.paused&&!el.ended;}});var current=playing||list.find(function(el){{return el.currentTime>0&&!el.ended;}})||list[0];function clamp(v){{v=Number(v);return isFinite(v)?Math.max(0,Math.min(1,v)):1;}}function play(el){{if(!el)return;try{{el.dataset.mdeAutoplayAllowed='true';}}catch(_e){{}}try{{var p=el.play();if(p&&p.catch)p.catch(function(){{}});}}catch(_e){{}}}}function pause(el){{try{{el.pause();}}catch(_e){{}}}}function seek(el,t){{try{{if(isFinite(t)){{if(el.fastSeek)el.fastSeek(t);else el.currentTime=t;}}}}catch(_e){{}}}}function volume(el,delta){{if(!el)return;try{{el.volume=clamp((isFinite(el.volume)?el.volume:1)+delta);if(delta>0)el.muted=false;}}catch(_e){{}}}}function pauseActive(){{for(var i=0;i<list.length;i++){{if(!list[i].paused&&!list[i].ended)pause(list[i]);}}}}if(action==='pause'){{pauseActive();return;}}if(action==='stop'){{for(var i=0;i<list.length;i++){{pause(list[i]);seek(list[i],0);}}return;}}if(action==='volumeUp'||action==='volumeDown'){{volume(current,action==='volumeUp'?0.05:-0.05);return;}}if(action==='play'){{play(current);return;}}if(action==='playPause'){{if(playing)pauseActive();else play(current);return;}}var dir=action==='next'?1:-1;var wasPlaying=!!playing;var idx=Math.max(0,list.indexOf(current));if(list.length>1){{pause(current);var target=list[(idx+dir+list.length)%list.length];seek(target,0);play(target);return;}}if(action==='next'){{var end=isFinite(current.duration)&&current.duration>0?current.duration:current.currentTime+30;seek(current,end);}}else{{seek(current,0);}}if(wasPlaying)play(current);}}catch(_e){{}}}})();"#
+    )
+}
+
+const fn media_metadata_script() -> &'static str {
+    r#"(function(){try{
+function trim(v,n){v=String(v||'').replace(/\s+/g,' ').trim();return v.length>n?v.slice(0,n):v;}
+function has(v){return trim(v,2048).length>0;}
+function meta(sel){try{var el=document.querySelector(sel);return el?(el.content||el.getAttribute('content')||''):'';}catch(_e){return '';}}
+function ms(v){v=Number(v);return isFinite(v)&&v>0?Math.round(v*1000):0;}
+function pct(v){v=Number(v);return isFinite(v)?Math.round(Math.max(0,Math.min(1,v))*100):null;}
+var list=[];
+try{list=[].slice.call(document.querySelectorAll('audio,video'));}catch(_e){}
+var media=list.find(function(el){return !el.paused&&!el.ended;})||list.find(function(el){return !el.ended&&(el.currentTime>0||el.readyState>0||el.currentSrc||el.src);})||null;
+var md={};
+try{md=(navigator.mediaSession&&navigator.mediaSession.metadata)||{};}catch(_e){md={};}
+var artwork='';
+try{if(md.artwork&&md.artwork.length)artwork=md.artwork[0].src||'';}catch(_e){}
+var hasSession=has(md.title)||has(md.artist)||has(md.album)||has(artwork);
+if(!media&&!hasSession){
+  if(window.__mdeMediaMetadataLast==='')return null;
+  window.__mdeMediaMetadataLast='';
+  return '';
+}
+var source=media?(media.currentSrc||media.src||''):'';
+var body=JSON.stringify({
+  title:trim(md.title||meta('meta[property="og:title"]')||meta('meta[name="twitter:title"]')||document.title||'',160),
+  artist:trim(md.artist||meta('meta[name="author"]')||'',160),
+  album:trim(md.album||'',160),
+  artwork_url:trim(artwork||meta('meta[property="og:image"]')||meta('meta[name="twitter:image"]')||'',2048),
+  source_url:trim(source||location.href||'',2048),
+  paused:media?!!media.paused:true,
+  duration_ms:ms(media&&media.duration),
+  position_ms:ms(media&&media.currentTime),
+  volume_percent:pct(media&&media.volume)
+});
+if(body===window.__mdeMediaMetadataLast)return null;
+window.__mdeMediaMetadataLast=body;
+return body;
+}catch(_e){return '';}})();"#
 }
 
 fn userscript_library_script(enabled: bool, bundle: &str) -> String {
@@ -1205,12 +1530,22 @@ fn js_string_array_literal(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_mute_script, clamp_utf8, clear_find_script, device_profile_script,
-        find_in_page_script, force_dark_script, page_scrape_script, page_text_script,
+        audio_mute_script, autoplay_block_script, clamp_utf8, clear_find_script,
+        device_profile_script, find_in_page_script, force_dark_script, media_metadata_script,
+        media_playback_toggle_script, media_transport_script, page_scrape_script, page_text_script,
         page_zoom_script, passkey_bridge_drain_script, passkey_complete_script, print_page_script,
-        reader_mode_script, secure_preferences, spellcheck_correction_all_script,
+        reader_mode_script, secure_preferences, servo_keyboard_event, servo_mouse_button,
+        servo_point, servo_text_events, spellcheck_correction_all_script,
         spellcheck_correction_at_script, spellcheck_correction_script, spellcheck_highlight_script,
         user_agent_override_script, userscript_library_script, GENERIC_USER_AGENT,
+    };
+    use mde_web_wire::{
+        KeyCode as WireKeyCode, MediaTransportAction, Modifiers as WireModifiers,
+        PointerButton as WirePointerButton,
+    };
+    use servo::{
+        Code, CompositionState, InputEvent as ServoInputEvent, Key, KeyState,
+        Modifiers as ServoModifiers, MouseButton, WebViewPoint,
     };
 
     #[test]
@@ -1251,6 +1586,63 @@ mod tests {
         let backward = find_in_page_script("mesh", true);
         assert!(backward.contains(r#"window.find("mesh",false,true"#));
         assert!(clear_find_script().contains("removeAllRanges"));
+    }
+
+    #[test]
+    fn servo_keyboard_mapping_preserves_keys_and_modifiers() {
+        let event = servo_keyboard_event(WireKeyCode::A, true, WireModifiers(WireModifiers::CTRL))
+            .expect("keyboard event");
+        let ServoInputEvent::Keyboard(event) = event else {
+            panic!("expected keyboard event")
+        };
+        assert_eq!(event.event.state, KeyState::Down);
+        assert_eq!(event.event.key, Key::Character("a".to_owned()));
+        assert_eq!(event.event.code, Code::KeyA);
+        assert!(event.event.modifiers.contains(ServoModifiers::CONTROL));
+
+        let event = servo_keyboard_event(WireKeyCode::ArrowDown, false, WireModifiers::default())
+            .expect("keyboard event");
+        let ServoInputEvent::Keyboard(event) = event else {
+            panic!("expected keyboard event")
+        };
+        assert_eq!(event.event.state, KeyState::Up);
+        assert_eq!(event.event.key, Key::Named(servo::NamedKey::ArrowDown));
+        assert_eq!(event.event.code, Code::ArrowDown);
+    }
+
+    #[test]
+    fn servo_text_mapping_commits_as_ime_composition() {
+        let events = servo_text_events("hi");
+        assert_eq!(events.len(), 2);
+        let ServoInputEvent::Ime(servo::ImeEvent::Composition(start)) = &events[0] else {
+            panic!("expected composition start")
+        };
+        assert_eq!(start.state, CompositionState::Start);
+        assert_eq!(start.data, "");
+
+        let ServoInputEvent::Ime(servo::ImeEvent::Composition(end)) = &events[1] else {
+            panic!("expected composition end")
+        };
+        assert_eq!(end.state, CompositionState::End);
+        assert_eq!(end.data, "hi");
+        assert!(servo_text_events("").is_empty());
+    }
+
+    #[test]
+    fn servo_pointer_mapping_uses_device_pixels() {
+        assert_eq!(
+            servo_mouse_button(WirePointerButton::Primary),
+            MouseButton::Left
+        );
+        assert_eq!(
+            servo_mouse_button(WirePointerButton::Secondary),
+            MouseButton::Right
+        );
+        let WebViewPoint::Device(point) = servo_point(25.0, 40.0) else {
+            panic!("expected device point")
+        };
+        assert_eq!(point.x, 25.0);
+        assert_eq!(point.y, 40.0);
     }
 
     #[test]
@@ -1356,6 +1748,78 @@ mod tests {
         assert!(disable.contains("muted=false"));
         assert!(disable.contains("defaultMuted=false"));
         assert!(disable.contains("delete document.documentElement.dataset"));
+    }
+
+    #[test]
+    fn servo_autoplay_block_script_patches_media_play_and_cleans_up() {
+        let enable = autoplay_block_script(true);
+        assert!(enable.contains("__mdeServoAutoplayBlocker"));
+        assert!(enable.contains("mdeServoAutoplayBlocked"));
+        assert!(enable.contains("HTMLMediaElement.prototype"));
+        assert!(enable.contains("MutationObserver"));
+        assert!(enable.contains("removeAttribute('autoplay')"));
+        assert!(enable.contains("Promise.reject"));
+        assert!(!enable.contains("</script>"));
+
+        let disable = autoplay_block_script(false);
+        assert!(disable.contains("observer.disconnect"));
+        assert!(disable.contains("HTMLMediaElement.prototype.play=s.originalPlay"));
+        assert!(disable.contains("delete window.__mdeServoAutoplayBlocker"));
+        assert!(disable.contains("delete document.documentElement.dataset.mdeServoAutoplayBlocked"));
+    }
+
+    #[test]
+    fn servo_media_playback_toggle_script_drives_html_media_elements() {
+        let script = media_playback_toggle_script();
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains("pause()"));
+        assert!(script.contains("play()"));
+        assert!(script.contains("mdeAutoplayAllowed"));
+        assert!(
+            !script.contains("</script>"),
+            "media transport is injected as bounded script text only"
+        );
+    }
+
+    #[test]
+    fn servo_media_transport_script_covers_page_media_actions() {
+        for (action, token) in [
+            (MediaTransportAction::PlayPause, "playPause"),
+            (MediaTransportAction::Play, "play"),
+            (MediaTransportAction::Pause, "pause"),
+            (MediaTransportAction::Stop, "stop"),
+            (MediaTransportAction::Next, "next"),
+            (MediaTransportAction::Previous, "previous"),
+            (MediaTransportAction::VolumeUp, "volumeUp"),
+            (MediaTransportAction::VolumeDown, "volumeDown"),
+        ] {
+            let script = media_transport_script(action);
+            assert!(script.contains("querySelectorAll('audio,video')"));
+            assert!(script.contains(&format!("action='{token}'")));
+            assert!(script.contains("pauseActive"));
+            assert!(script.contains("fastSeek"));
+            assert!(script.contains("volume(current"));
+            assert!(script.contains("mdeAutoplayAllowed"));
+            assert!(
+                !script.contains("</script>"),
+                "media transport is injected as bounded script text only"
+            );
+        }
+    }
+
+    #[test]
+    fn servo_media_metadata_script_reads_media_session_and_html_media() {
+        let script = media_metadata_script();
+        assert!(script.contains("navigator.mediaSession"));
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains("duration_ms"));
+        assert!(script.contains("position_ms"));
+        assert!(script.contains("volume_percent"));
+        assert!(script.contains("__mdeMediaMetadataLast"));
+        assert!(script.contains("JSON.stringify"));
+        assert!(script.contains("return null"));
+        assert!(script.contains("return '';"));
+        assert!(!script.contains("</script>"));
     }
 
     #[test]

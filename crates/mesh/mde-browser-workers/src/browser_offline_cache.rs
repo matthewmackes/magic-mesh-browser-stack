@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::RetainedStatusPublisher;
+
 /// Browser-owned offline cache action topic.
 pub const ACTION_TOPIC: &str = "action/browser/offline-cache";
 
@@ -90,6 +92,7 @@ pub struct BrowserOfflineCacheWorker {
     now_fn: NowFn,
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
+    status_publisher: RetainedStatusPublisher,
 }
 
 impl BrowserOfflineCacheWorker {
@@ -111,6 +114,7 @@ impl BrowserOfflineCacheWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            status_publisher: RetainedStatusPublisher::new(),
         }
     }
 
@@ -207,16 +211,19 @@ impl BrowserOfflineCacheWorker {
         let mut failed = false;
         for (cache_id, body) in local_cache_entries(&self.local_root) {
             let dst = cache_path(&self.share_root, &cache_id);
-            if let Err(e) = write_atomic(&dst, &body) {
-                tracing::debug!(
-                    target: "mackesd::browser_offline_cache",
-                    path = %dst.display(),
-                    error = %e,
-                    "browser offline-cache mirror skipped"
-                );
-                failed = true;
-            } else {
-                mirrored_any = true;
+            match write_atomic_if_changed(&dst, &body) {
+                Ok(changed) => {
+                    mirrored_any |= changed;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "mackesd::browser_offline_cache",
+                        path = %dst.display(),
+                        error = %e,
+                        "browser offline-cache mirror skipped"
+                    );
+                    failed = true;
+                }
             }
         }
         if mirrored_any {
@@ -228,7 +235,7 @@ impl BrowserOfflineCacheWorker {
         }
     }
 
-    fn publish_status(&self, persist: &Persist) {
+    fn publish_status(&mut self, persist: &Persist) {
         let status = OfflineCacheStatus {
             node: self.node.clone(),
             syncing: self.share_writable() && !self.pending_local,
@@ -241,7 +248,8 @@ impl BrowserOfflineCacheWorker {
         };
         let topic = format!("{STATE_PREFIX}{}", self.node);
         if let Ok(body) = serde_json::to_string(&status) {
-            let _ = persist.write(&topic, Priority::Min, None, Some(&body));
+            self.status_publisher
+                .publish(persist, &topic, Priority::Min, body);
         }
     }
 
@@ -831,6 +839,14 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
+}
+
+fn write_atomic_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
+    if matches!(std::fs::read_to_string(path), Ok(current) if current == body) {
+        return Ok(false);
+    }
+    write_atomic(path, body)?;
+    Ok(true)
 }
 
 /// Resolve the local durable offline-cache root for this host.

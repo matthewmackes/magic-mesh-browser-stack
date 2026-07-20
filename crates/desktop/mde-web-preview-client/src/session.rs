@@ -24,22 +24,31 @@ use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::Child;
+use std::time::{Duration, Instant};
 
 use crate::egui::{self, ColorImage};
 use crate::filter::{self, RequestFilter};
 use crate::frame::FrameReader;
 use crate::scm::{self, RecvOutcome};
-use crate::wire::{ControlMsg, CursorKind, EventMsg};
+use crate::wire::{ControlMsg, CursorKind, EventMsg, MediaTransportAction};
 use crate::{input, wire};
 
 /// How many `recvmsg` batches one [`WebSession::poll`] drains before yielding
 /// (a bound so a flooding helper can't spin the UI thread).
 const MAX_RECV_PER_POLL: usize = 64;
 const MAX_RECENT_RESOURCE_REQUESTS: usize = 128;
+const MAX_PENDING_JS_DIALOGS: usize = 16;
+const MAX_PENDING_BEFORE_UNLOADS: usize = 16;
 /// A generous cap on queued, not-yet-answered permission prompts. Real pages raise
 /// a handful at most; the bound stops a hostile page from growing the queue (and the
 /// engine's held-callback set) without limit. An overflow auto-denies the oldest.
 const MAX_PENDING_PERMISSIONS: usize = 16;
+const HELPER_GRACEFUL_SHUTDOWN: Duration = Duration::from_millis(250);
+const SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 /// A session's live status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +87,7 @@ pub struct PdfSaveStatus {
 }
 
 /// One page-text extraction result from the helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PageTextStatus {
     /// Request id originally supplied by the shell.
     pub id: u64,
@@ -86,8 +95,18 @@ pub struct PageTextStatus {
     pub text: String,
 }
 
+impl std::fmt::Debug for PageTextStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageTextStatus")
+            .field("id", &self.id)
+            .field("text", &"<redacted>")
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
+}
+
 /// One structured active-page scrape result from the helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PageScrapeStatus {
     /// Request id originally supplied by the shell.
     pub id: u64,
@@ -95,11 +114,46 @@ pub struct PageScrapeStatus {
     pub body: String,
 }
 
+impl std::fmt::Debug for PageScrapeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageScrapeStatus")
+            .field("id", &self.id)
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// One helper-observed passkey/WebAuthn ceremony request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PasskeyRequestStatus {
-    /// Bounded helper JSON body with public ceremony metadata.
+    /// Bounded helper JSON body with ceremony metadata and user/credential hints.
     pub body: String,
+}
+
+impl std::fmt::Debug for PasskeyRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyRequestStatus")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+/// One page/media-session now-playing metadata update from the helper.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaMetadataStatus {
+    /// Bounded helper JSON body with page-provided now-playing metadata.
+    pub body: String,
+}
+
+impl std::fmt::Debug for MediaMetadataStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaMetadataStatus")
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 /// A page-initiated request to open a new window/tab (window.open, target=_blank).
@@ -157,29 +211,83 @@ pub struct JsDialog {
     pub origin: String,
 }
 
+/// A page `beforeunload` prompt waiting for the user's leave/stay decision. The
+/// engine holds the CEF JS dialog callback open and awaits
+/// [`crate::ControlMsg::BeforeUnloadDecision`] carrying the same `id`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BeforeUnloadDialog {
+    /// Correlates the prompt with its decision.
+    pub id: u64,
+    /// Page-provided prompt text (possibly empty on modern browsers).
+    pub message: String,
+    /// The top-level page URL/origin available to the engine.
+    pub origin: String,
+    /// Whether the unload is caused by reload rather than leaving/closing.
+    pub is_reload: bool,
+}
+
+impl std::fmt::Debug for BeforeUnloadDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BeforeUnloadDialog")
+            .field("id", &self.id)
+            .field("message", &"<redacted>")
+            .field("message_bytes", &self.message.len())
+            .field("origin", &self.origin)
+            .field("is_reload", &self.is_reload)
+            .finish()
+    }
+}
+
 /// A page's pending request for a powerful capability (geolocation / notifications
-/// / clipboard). The engine holds the CEF permission callback open and awaits the
-/// shell's [`crate::ControlMsg::PermissionDecision`] carrying the same `id`; the
-/// shell prompts the user, then calls [`WebSession::answer_permission`].
+/// / clipboard / camera / microphone). The engine holds the CEF permission
+/// callback open and awaits the shell's [`crate::ControlMsg::PermissionDecision`]
+/// carrying the same `id`; the shell prompts the user, then calls
+/// [`WebSession::answer_permission`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     /// Correlates the request with its decision.
     pub id: u64,
-    /// Engine-neutral kind: `0` geolocation, `1` notifications, `2` clipboard.
+    /// Engine-neutral kind: `0` geolocation, `1` notifications, `2` clipboard, `3`
+    /// camera, `4` microphone, `5` camera + microphone.
     pub kind: u8,
     /// The requesting page's origin (scheme + host).
     pub origin: String,
 }
 
+/// A submitted login reported by the engine after top-level origin binding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginCaptureStatus {
+    /// Engine-derived origin that owns the submitted login.
+    pub origin: String,
+    /// Bounded JSON body carrying username/password fields.
+    pub body: String,
+}
+
+impl std::fmt::Debug for LoginCaptureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginCaptureStatus")
+            .field("origin", &self.origin)
+            .field("body", &"<redacted>")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// One subresource request observed by the shell-side request filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRequestStatus {
+    /// Shell-local monotonically increasing observation sequence for this session.
+    /// This is not part of the helper wire protocol; it lets the shell audit only
+    /// newly observed requests from the bounded recent-resource window.
+    pub seq: u64,
     /// Requested subresource URL.
     pub url: String,
     /// Compact resource-type discriminant from [`crate::resource_to_wire`].
     pub resource: u8,
     /// Whether the shell allowed the request to continue.
     pub allowed: bool,
+    /// The filter/policy that blocked the request, when [`Self::allowed`] is false.
+    pub blocked_by: Option<String>,
 }
 
 /// One driven browser session.
@@ -200,6 +308,8 @@ pub struct WebSession {
     /// The page is currently producing audio (Chromium's audible state). Drives the
     /// tab-strip 🔊 indicator. Independent of mute — a muted-but-playing tab stays true.
     audible: bool,
+    /// Latest bounded page/media-session now-playing metadata observed by the helper.
+    media_metadata: Option<MediaMetadataStatus>,
     /// The latest engine-fetched favicon (PNG bytes), if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     favicon: Option<Vec<u8>>,
@@ -211,9 +321,19 @@ pub struct WebSession {
     /// A top-level navigation blocked by the mesh safe-browsing list — the URL drives
     /// a full-page "unsafe site" interstitial (mirrors [`Self::cert_error`]).
     safe_browsing_block: Option<String>,
+    /// A top-level navigation blocked by operator-managed Browser policy.
+    /// The shell paints a managed-policy interstitial from this state.
+    managed_policy_block: Option<String>,
     /// The latest JS dialog (alert/confirm/prompt) the page raised. The engine
     /// already auto-resolved it; this is a passive notice for the shell.
     pending_js_dialog: Option<JsDialog>,
+    /// Drainable JS dialog notices. The latest accessor above keeps compatibility
+    /// with existing callers; this queue lets the shell surface each event once.
+    js_dialog_events: VecDeque<JsDialog>,
+    /// Page beforeunload prompts awaiting a leave/stay decision, oldest first.
+    /// Bounded so a hostile page cannot grow the queue or CEF callback set without
+    /// limit; overflow answers the oldest with `proceed=false` (stay/cancel).
+    pending_before_unloads: VecDeque<BeforeUnloadDialog>,
     /// Page permission requests awaiting the user's allow/block, oldest first (the
     /// shell prompts for the FRONT). A queue, not a single slot: a page can raise
     /// several prompts in quick succession (e.g. geolocation + notifications), and
@@ -229,9 +349,11 @@ pub struct WebSession {
     passkey_events: VecDeque<PasskeyRequestStatus>,
     /// Bounded JSON bodies from submitted login forms (auto-capture); the shell
     /// drains these and offers to save the credential (session-only).
-    login_captures: VecDeque<String>,
+    login_captures: VecDeque<LoginCaptureStatus>,
     download_events: VecDeque<DownloadStatus>,
     popup_requests: VecDeque<PopupRequestStatus>,
+    /// Shell-local sequence assigned to observed resource requests.
+    resource_seq: u64,
     recent_resource_requests: VecDeque<ResourceRequestStatus>,
     /// BOOKMARKS-7 — the ad-filter engine judging each helper subresource query +
     /// the per-page blocked count. Defaults to a blocks-nothing filter; the shell
@@ -261,11 +383,15 @@ impl WebSession {
             cursor: CursorKind::default(),
             fullscreen: false,
             audible: false,
+            media_metadata: None,
             favicon: None,
             find_result: None,
             cert_error: None,
             safe_browsing_block: None,
+            managed_policy_block: None,
             pending_js_dialog: None,
+            js_dialog_events: VecDeque::new(),
+            pending_before_unloads: VecDeque::new(),
             pending_permissions: VecDeque::new(),
             last_seq: 0,
             pending: None,
@@ -276,6 +402,7 @@ impl WebSession {
             login_captures: VecDeque::new(),
             download_events: VecDeque::new(),
             popup_requests: VecDeque::new(),
+            resource_seq: 0,
             recent_resource_requests: VecDeque::new(),
             filter: RequestFilter::empty(),
         })
@@ -448,25 +575,35 @@ impl WebSession {
                 let resource_type = filter::resource_from_wire(resource);
                 let decision = self.filter.decide(&url, resource_type);
                 let allowed = !decision.is_block();
-                // A blocked TOP-LEVEL document from the safe-browsing list drives the
-                // full-page "unsafe site" interstitial (the block itself still drops
-                // the request; this adds the honest warning the audit found missing).
-                if !allowed
-                    && matches!(resource_type, mde_adblock::ResourceType::Document)
-                    && decision
-                        .blocked_by()
+                let blocked_by = decision.blocked_by().map(str::to_owned);
+                // A blocked TOP-LEVEL document drives a full-page interstitial
+                // instead of silently leaving the old page frame visible. The
+                // block itself still drops the request before the network.
+                if !allowed && matches!(resource_type, mde_adblock::ResourceType::Document) {
+                    if blocked_by
+                        .as_deref()
                         .is_some_and(|filter| filter.starts_with("safe-browsing"))
-                {
-                    self.safe_browsing_block = Some(url.clone());
+                    {
+                        self.safe_browsing_block = Some(url.clone());
+                    } else if blocked_by
+                        .as_deref()
+                        .is_some_and(|filter| filter.starts_with("managed-policy"))
+                    {
+                        self.managed_policy_block = Some(url.clone());
+                    }
                 }
+                self.resource_seq = self.resource_seq.saturating_add(1);
+                let seq = self.resource_seq;
                 if self.recent_resource_requests.len() >= MAX_RECENT_RESOURCE_REQUESTS {
                     self.recent_resource_requests.pop_front();
                 }
                 self.recent_resource_requests
                     .push_back(ResourceRequestStatus {
+                        seq,
                         url,
                         resource,
                         allowed,
+                        blocked_by,
                     });
                 self.send(&ControlMsg::ResourceVerdict { id, allow: allowed });
             }
@@ -483,12 +620,13 @@ impl WebSession {
             EventMsg::PasskeyRequest { body } => {
                 self.passkey_events.push_back(PasskeyRequestStatus { body });
             }
-            EventMsg::LoginSubmitted { body } => {
+            EventMsg::LoginSubmitted { origin, body } => {
                 const MAX_PENDING_LOGIN_CAPTURES: usize = 16;
                 if self.login_captures.len() >= MAX_PENDING_LOGIN_CAPTURES {
                     self.login_captures.pop_front();
                 }
-                self.login_captures.push_back(body);
+                self.login_captures
+                    .push_back(LoginCaptureStatus { origin, body });
             }
             EventMsg::Download {
                 id,
@@ -515,6 +653,10 @@ impl WebSession {
             EventMsg::CursorChanged { kind } => self.cursor = kind,
             EventMsg::Fullscreen { enabled } => self.fullscreen = enabled,
             EventMsg::AudioState { audible } => self.audible = audible,
+            EventMsg::MediaMetadata { body } => {
+                let body = body.trim().to_owned();
+                self.media_metadata = (!body.is_empty()).then_some(MediaMetadataStatus { body });
+            }
             EventMsg::PermissionRequest { id, kind, origin } => {
                 if self.pending_permissions.len() >= MAX_PENDING_PERMISSIONS {
                     // Overflow: deny the oldest so the engine releases its held CEF
@@ -538,10 +680,36 @@ impl WebSession {
                 message,
                 origin,
             } => {
-                self.pending_js_dialog = Some(JsDialog {
+                let dialog = JsDialog {
                     kind,
                     message,
                     origin,
+                };
+                self.pending_js_dialog = Some(dialog.clone());
+                if self.js_dialog_events.len() >= MAX_PENDING_JS_DIALOGS {
+                    self.js_dialog_events.pop_front();
+                }
+                self.js_dialog_events.push_back(dialog);
+            }
+            EventMsg::BeforeUnloadDialog {
+                id,
+                message,
+                origin,
+                is_reload,
+            } => {
+                if self.pending_before_unloads.len() >= MAX_PENDING_BEFORE_UNLOADS {
+                    if let Some(dropped) = self.pending_before_unloads.pop_front() {
+                        self.send(&ControlMsg::BeforeUnloadDecision {
+                            id: dropped.id,
+                            proceed: false,
+                        });
+                    }
+                }
+                self.pending_before_unloads.push_back(BeforeUnloadDialog {
+                    id,
+                    message,
+                    origin,
+                    is_reload,
                 });
             }
             EventMsg::FindResult { count, active, .. } => {
@@ -585,7 +753,7 @@ impl WebSession {
 
     /// Drain submitted-login JSON bodies (auto-capture) reported by the helper. The
     /// shell parses each and offers to save the credential (session-only).
-    pub fn drain_login_captures(&mut self) -> Vec<String> {
+    pub fn drain_login_captures(&mut self) -> Vec<LoginCaptureStatus> {
         self.login_captures.drain(..).collect()
     }
 
@@ -605,6 +773,33 @@ impl WebSession {
     #[must_use]
     pub fn recent_resource_requests(&self) -> Vec<ResourceRequestStatus> {
         self.recent_resource_requests.iter().cloned().collect()
+    }
+
+    /// Whether the recent-resource window contains rows newer than `seq`.
+    ///
+    /// Resource sequence numbers are monotonically appended, so hot poll paths can
+    /// check the newest row before deciding whether to scan or clone the bounded
+    /// request history.
+    #[must_use]
+    pub fn has_recent_resource_requests_after(&self, seq: u64) -> bool {
+        self.recent_resource_requests
+            .back()
+            .is_some_and(|resource| resource.seq > seq)
+    }
+
+    /// Recent subresource requests observed after `seq`.
+    ///
+    /// The full recent list backs operator-facing site-info summaries. Hot shell
+    /// poll paths that only need newly observed rows should use this sequence
+    /// window so an unchanged active tab does not clone the full bounded history
+    /// every frame.
+    #[must_use]
+    pub fn recent_resource_requests_after(&self, seq: u64) -> Vec<ResourceRequestStatus> {
+        self.recent_resource_requests
+            .iter()
+            .filter(|resource| resource.seq > seq)
+            .cloned()
+            .collect()
     }
 
     /// The session's live status.
@@ -650,6 +845,12 @@ impl WebSession {
         self.audible
     }
 
+    /// Latest page/media-session now-playing metadata observed by the helper.
+    #[must_use]
+    pub const fn media_metadata(&self) -> Option<&MediaMetadataStatus> {
+        self.media_metadata.as_ref()
+    }
+
     /// The latest engine-fetched favicon as PNG bytes, if the page reported one.
     /// The shell uploads it as the tab-strip icon.
     #[must_use]
@@ -662,6 +863,9 @@ impl WebSession {
         // A fresh navigation clears any interstitial from the prior page.
         self.cert_error = None;
         self.safe_browsing_block = None;
+        self.managed_policy_block = None;
+        self.pending_js_dialog = None;
+        self.js_dialog_events.clear();
         self.nav.loading = true;
         self.send(&ControlMsg::Load(url.into()));
     }
@@ -712,17 +916,21 @@ impl WebSession {
 
     /// Autofill a user-chosen saved login into the page's first login form (the engine
     /// injects a fill script). User-initiated; session-only credentials.
-    pub fn fill_login(&mut self, username: String, password: String) {
-        self.send(&ControlMsg::FillLogin { username, password });
+    pub fn fill_login(&mut self, expected_host: String, username: String, password: String) {
+        self.send(&ControlMsg::FillLogin {
+            expected_host,
+            username,
+            password,
+        });
     }
 
-    /// Find text on the current page.
     /// Run a clipboard/editing command on the page's focused element (in-page
     /// context menu). Reuses the engine's native frame edit commands.
     pub fn edit_command(&mut self, command: crate::wire::EditCommand) {
         self.send(&ControlMsg::EditCommand { command });
     }
 
+    /// Find text on the current page.
     pub fn find_in_page(&mut self, query: impl Into<String>, backwards: bool, find_next: bool) {
         self.send(&ControlMsg::FindInPage {
             query: query.into(),
@@ -754,12 +962,48 @@ impl WebSession {
         self.safe_browsing_block.as_deref()
     }
 
+    /// The URL of a top-level navigation blocked by managed Browser policy, if any.
+    #[must_use]
+    pub fn managed_policy_block(&self) -> Option<&str> {
+        self.managed_policy_block.as_deref()
+    }
+
+    /// Clear the managed-policy interstitial after the shell has handled it.
+    pub fn clear_managed_policy_block(&mut self) {
+        self.managed_policy_block = None;
+    }
+
     /// The latest JavaScript dialog (alert/confirm/prompt) a page raised. The
     /// engine already auto-resolved it (the page did not block); the shell may
     /// surface this as a passive, non-blocking notice.
     #[must_use]
     pub const fn pending_js_dialog(&self) -> Option<&JsDialog> {
         self.pending_js_dialog.as_ref()
+    }
+
+    /// Drain JavaScript dialog notices the engine already auto-resolved. Each event
+    /// is surfaced at most once to the shell; [`Self::pending_js_dialog`] remains
+    /// the latest retained value for status accessors/tests.
+    pub fn drain_js_dialog_events(&mut self) -> Vec<JsDialog> {
+        self.js_dialog_events.drain(..).collect()
+    }
+
+    /// The oldest pending beforeunload prompt awaiting a leave/stay decision, if
+    /// any. The shell renders this and replies via [`Self::answer_before_unload`].
+    #[must_use]
+    pub fn pending_before_unload(&self) -> Option<&BeforeUnloadDialog> {
+        self.pending_before_unloads.front()
+    }
+
+    /// Answer the oldest pending beforeunload prompt: `proceed=true` leaves or
+    /// reloads the page, `false` stays. A no-op when no prompt is pending.
+    pub fn answer_before_unload(&mut self, proceed: bool) {
+        if let Some(dialog) = self.pending_before_unloads.pop_front() {
+            self.send(&ControlMsg::BeforeUnloadDecision {
+                id: dialog.id,
+                proceed,
+            });
+        }
     }
 
     /// The oldest pending permission request awaiting the user's allow/block, if any
@@ -791,6 +1035,38 @@ impl WebSession {
     /// Set whether tab audio is muted.
     pub fn set_audio_muted(&mut self, muted: bool) {
         self.send(&ControlMsg::SetAudioMuted { muted });
+    }
+
+    /// Tell the helper whether this tab is hidden (backgrounded/occluded). A
+    /// hidden tab drives CEF `WasHidden(true)`, which stops its offscreen paint
+    /// and shm readback so an unseen tab no longer burns decode/copy work.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.send(&ControlMsg::SetHidden { hidden });
+    }
+
+    /// The current published frame sequence for this tab — the shm seqlock
+    /// counter, which the engine advances by two on every `OnPaint` publish.
+    /// Sampling it over time yields the engine's real published frame rate, the
+    /// honest signal that a hidden tab has stopped painting. `0` before the first
+    /// frame or when no frame region is mapped.
+    #[must_use]
+    pub fn published_frame_seq(&self) -> u64 {
+        self.reader.as_ref().map_or(0, |reader| reader.sequence())
+    }
+
+    /// Ask the helper to toggle media playback on the active page.
+    pub fn toggle_media_playback(&mut self) {
+        self.send(&ControlMsg::ToggleMediaPlayback);
+    }
+
+    /// Ask the helper to run one media transport action on the active page.
+    pub fn media_transport(&mut self, action: MediaTransportAction) {
+        self.send(&ControlMsg::MediaTransport { action });
+    }
+
+    /// Set whether page-initiated autoplay is blocked until user activation.
+    pub fn set_autoplay_blocked(&mut self, blocked: bool) {
+        self.send(&ControlMsg::SetAutoplayBlocked { blocked });
     }
 
     /// Set whether forced-dark styling is enabled for this tab.
@@ -957,18 +1233,47 @@ impl Drop for WebSession {
     /// deliberately does **not** signal the child (it detaches it) — which is how
     /// orphaned `tab` helper pairs accumulated live (BUG-BROWSER-4) across shell
     /// restarts, closed tabs, and respawn-on-reload swaps that drop the old
-    /// session. So this KILLs then WAITs: `kill` stops a still-running helper and
-    /// `wait` reaps it (leaving no zombie either — an already-exited child was
-    /// reaped by [`Self::poll`]'s `try_wait`, so `wait` is then a cheap cached
-    /// read). Best-effort: an already-gone child makes `kill` error, which is the
-    /// goal state and is ignored, and `wait` never blocks on a reaped pid. A
-    /// test / fake-helper session carries no child and this is a no-op.
+    /// session. So this first closes the session socket, giving a cooperative
+    /// helper a short EOF-driven exit window, then KILLs and WAITs on failure.
+    /// `wait` reaps the child (leaving no zombie either — an already-exited child
+    /// was reaped by [`Self::poll`]'s `try_wait`, so `wait` is then a cheap cached
+    /// read). CEF adds one wrapper hop (`mde-web-cef` → renderer bridge), so the
+    /// live spawn starts a helper process group and teardown kills that whole
+    /// group if the grace window does not exit cleanly.
+    /// Best-effort: an already-gone child makes `kill` error, which is the goal
+    /// state and is ignored, and `wait` never blocks on a reaped pid. A test /
+    /// fake-helper session carries no child and this is a no-op.
     fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !wait_for_child_exit(&mut child, HELPER_GRACEFUL_SHUTDOWN) {
+                kill_helper_process_group(&child);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn kill_helper_process_group(child: &Child) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: helpers spawned by `WebSession::spawn` are made process-group
+    // leaders. Sending SIGKILL to `-pid` kills that helper tree; if the caller
+    // supplied a non-group-leader test child, `kill` fails harmlessly.
+    let _ = unsafe { kill(-pid, SIGKILL) };
 }
 
 /// Everything the live spawn needs to launch a sandboxed browser helper
@@ -978,6 +1283,8 @@ impl Drop for WebSession {
 pub struct SpawnSpec {
     /// Path to the browser helper binary (`mde-web-preview` or `mde-web-cef`).
     pub helper_bin: std::path::PathBuf,
+    /// Environment values to add to the helper process.
+    pub env: Vec<(String, String)>,
     /// The first URL to load.
     pub url: String,
     /// Initial view width in device pixels.
@@ -998,9 +1305,12 @@ impl WebSession {
     /// # Errors
     /// Fails if the socketpair or the child process cannot be created.
     pub fn spawn(spec: &SpawnSpec) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
         let (shell_end, helper_end) = UnixStream::pair()?;
-        let child = Command::new(&spec.helper_bin)
+        let mut command = Command::new(&spec.helper_bin);
+        command
             .arg("tab")
             .args([
                 "--url",
@@ -1010,8 +1320,10 @@ impl WebSession {
                 "--height",
                 &spec.height.to_string(),
             ])
+            .envs(spec.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::from(OwnedFd::from(helper_end)))
-            .spawn()?;
+            .process_group(0);
+        let child = command.spawn()?;
         Self::from_stream(shell_end, Some(child))
     }
 }
@@ -1092,13 +1404,75 @@ mod tests {
             }
         );
         assert_eq!(session.blocked_count(), 1, "the blocked request is counted");
+        let recent = session.recent_resource_requests();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].seq, 1);
+        assert_eq!(recent[0].url, "https://www.google-analytics.com/collect");
         assert_eq!(
-            session.recent_resource_requests(),
+            recent[0].resource,
+            filter::resource_to_wire(mde_adblock::ResourceType::Script)
+        );
+        assert!(!recent[0].allowed);
+        assert!(
+            recent[0]
+                .blocked_by
+                .as_deref()
+                .is_some_and(|rule| rule.contains("google")),
+            "tracker block should retain the matched rule: {:?}",
+            recent[0].blocked_by
+        );
+    }
+
+    #[test]
+    fn recent_resource_requests_after_returns_only_newer_rows() {
+        let (mut session, mut peer) = filtered_session();
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://news.example.com/".to_owned(),
+            },
+        );
+        let _cosmetic = read_control_after_poll(&mut session, &mut peer);
+
+        for id in 1..=3 {
+            send_event(
+                &peer,
+                &EventMsg::ResourceRequest {
+                    id,
+                    url: format!("https://cdn.example.com/{id}.js"),
+                    resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                },
+            );
+            let _verdict = read_control_after_poll(&mut session, &mut peer);
+        }
+
+        let all = session.recent_resource_requests();
+        assert_eq!(all.len(), 3);
+        assert!(
+            session.has_recent_resource_requests_after(2),
+            "the newest resource sequence should expose a cheap hot-path signal"
+        );
+        assert_eq!(
+            session.recent_resource_requests_after(2),
             vec![ResourceRequestStatus {
-                url: "https://www.google-analytics.com/collect".to_owned(),
+                seq: 3,
+                url: "https://cdn.example.com/3.js".to_owned(),
                 resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
-                allowed: false,
-            }]
+                allowed: true,
+                blocked_by: None,
+            }],
+            "hot poll paths should clone only requests beyond their sequence watermark"
+        );
+        assert!(
+            !session.has_recent_resource_requests_after(3),
+            "an unchanged watermark should avoid scanning or cloning the resource window"
+        );
+        assert!(
+            session.recent_resource_requests_after(3).is_empty(),
+            "an unchanged active tab should not clone its full recent-resource history"
         );
     }
 
@@ -1129,6 +1503,109 @@ mod tests {
             ControlMsg::ResourceVerdict { id: 2, allow: true }
         );
         assert_eq!(session.blocked_count(), 0);
+    }
+
+    #[test]
+    fn mixed_content_subresource_is_blocked_over_the_seam() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/".to_owned(),
+            },
+        );
+        session.poll();
+        assert_no_control_pending(&peer);
+
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 7,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 7,
+                allow: false
+            }
+        );
+        assert_eq!(session.blocked_count(), 1);
+        assert_eq!(
+            session.recent_resource_requests(),
+            vec![ResourceRequestStatus {
+                seq: 1,
+                url: "http://cdn.example.test/app.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+                allowed: false,
+                blocked_by: Some("mixed-content:http".to_owned()),
+            }]
+        );
+        assert!(session.safe_browsing_block().is_none());
+        assert!(session.managed_policy_block().is_none());
+    }
+
+    #[test]
+    fn a_top_level_document_http_nav_is_allowed_but_a_subresource_is_cancelled() {
+        // The Google-News redirect bug reproduced over the seam: with the request
+        // correctly classified (Document, not the old hardcoded RESOURCE_OTHER), a
+        // top-level https->http navigation is allowed while the SAME http URL as a
+        // subresource is still cancelled as mixed content.
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        send_event(
+            &peer,
+            &EventMsg::NavState {
+                can_back: false,
+                can_forward: false,
+                loading: false,
+                url: "https://portal.example/".to_owned(),
+            },
+        );
+        session.poll();
+        assert_no_control_pending(&peer);
+
+        // Top-level Document nav -> allow (the shell drives its own prompt).
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 10,
+                url: "http://docs.example.test/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 10,
+                allow: true
+            }
+        );
+        // Same http URL as a Script subresource -> mixed-content cancel.
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 11,
+                url: "http://docs.example.test/x.js".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Script),
+            },
+        );
+        assert_eq!(
+            read_control_after_poll(&mut session, &mut peer),
+            ControlMsg::ResourceVerdict {
+                id: 11,
+                allow: false
+            }
+        );
+        // A benign http Document nav must not arm any full-page interstitial.
+        assert!(session.safe_browsing_block().is_none());
+        assert!(session.managed_policy_block().is_none());
     }
 
     #[test]
@@ -1215,6 +1692,46 @@ mod tests {
     }
 
     #[test]
+    fn media_metadata_event_folds_to_the_latest_body() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.media_metadata().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: r#"{"title":"First"}"#.to_owned(),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.media_metadata().map(|m| m.body.as_str()),
+            Some(r#"{"title":"First"}"#)
+        );
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: r#"{"title":"Second","paused":false}"#.to_owned(),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.media_metadata().map(|m| m.body.as_str()),
+            Some(r#"{"title":"Second","paused":false}"#)
+        );
+
+        send_event(
+            &peer,
+            &EventMsg::MediaMetadata {
+                body: "   ".to_owned(),
+            },
+        );
+        session.poll();
+        assert!(session.media_metadata().is_none());
+    }
+
+    #[test]
     fn a_permission_request_prompts_then_the_answer_replies_with_the_id() {
         let (shell, mut peer) = UnixStream::pair().expect("socketpair");
         let mut session = WebSession::from_stream(shell, None).expect("session");
@@ -1224,15 +1741,15 @@ mod tests {
             &peer,
             &EventMsg::PermissionRequest {
                 id: 42,
-                kind: 0,
-                origin: "https://maps.example".to_owned(),
+                kind: 5,
+                origin: "https://meet.example".to_owned(),
             },
         );
         session.poll();
         let pending = session.pending_permission().expect("a pending prompt");
         assert_eq!(pending.id, 42);
-        assert_eq!(pending.kind, 0);
-        assert_eq!(pending.origin, "https://maps.example");
+        assert_eq!(pending.kind, 5);
+        assert_eq!(pending.origin, "https://meet.example");
 
         // Answering sends the engine a decision carrying the request's id and clears it.
         session.answer_permission(true);
@@ -1245,6 +1762,80 @@ mod tests {
             ControlMsg::PermissionDecision {
                 id: 42,
                 allow: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_before_unload_prompt_roundtrips_the_user_decision() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        assert!(session.pending_before_unload().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::BeforeUnloadDialog {
+                id: 42,
+                message: "You have unsaved changes".to_owned(),
+                origin: "https://editor.example/doc/1".to_owned(),
+                is_reload: false,
+            },
+        );
+        session.poll();
+        let pending = session
+            .pending_before_unload()
+            .expect("a pending beforeunload prompt");
+        assert_eq!(pending.id, 42);
+        assert_eq!(pending.message, "You have unsaved changes");
+        assert_eq!(pending.origin, "https://editor.example/doc/1");
+        assert!(!pending.is_reload);
+
+        session.answer_before_unload(false);
+        assert!(
+            session.pending_before_unload().is_none(),
+            "answering clears the pending prompt"
+        );
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 42,
+                proceed: false
+            }
+        );
+    }
+
+    #[test]
+    fn before_unload_queue_overflow_answers_stay_for_the_oldest() {
+        let (shell, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        for id in 0..=MAX_PENDING_BEFORE_UNLOADS as u64 {
+            send_event(
+                &peer,
+                &EventMsg::BeforeUnloadDialog {
+                    id,
+                    message: format!("draft {id}"),
+                    origin: "https://editor.example".to_owned(),
+                    is_reload: false,
+                },
+            );
+        }
+
+        session.poll();
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 0,
+                proceed: false
+            }
+        );
+        assert_eq!(session.pending_before_unload().map(|p| p.id), Some(1));
+
+        session.answer_before_unload(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::BeforeUnloadDecision {
+                id: 1,
+                proceed: true
             }
         );
     }
@@ -1350,6 +1941,38 @@ mod tests {
         assert!(
             session.safe_browsing_block().is_none(),
             "a blocked subresource is not a full-page interstitial"
+        );
+    }
+
+    #[test]
+    fn a_top_level_managed_policy_block_drives_the_interstitial_state() {
+        let (shell, peer) = UnixStream::pair().expect("socketpair");
+        let mut session = WebSession::from_stream(shell, None).expect("session");
+        session.set_filter(
+            RequestFilter::empty()
+                .with_managed_policy(filter::ManagedUrlPolicy::from_rules(["blocked.example"])),
+        );
+        assert!(session.managed_policy_block().is_none());
+
+        send_event(
+            &peer,
+            &EventMsg::ResourceRequest {
+                id: 1,
+                url: "https://blocked.example/".to_owned(),
+                resource: filter::resource_to_wire(mde_adblock::ResourceType::Document),
+            },
+        );
+        session.poll();
+        assert_eq!(
+            session.managed_policy_block(),
+            Some("https://blocked.example/")
+        );
+        assert!(session.safe_browsing_block().is_none());
+
+        session.load("https://ok.example/");
+        assert!(
+            session.managed_policy_block().is_none(),
+            "fresh navigations clear the managed-policy interstitial"
         );
     }
 
@@ -1477,6 +2100,22 @@ mod tests {
                 origin: "https://app.example/".to_owned(),
             })
         );
+        assert_eq!(
+            session.drain_js_dialog_events(),
+            vec![JsDialog {
+                kind: 1,
+                message: "Delete this item?".to_owned(),
+                origin: "https://app.example/".to_owned(),
+            }]
+        );
+        assert!(
+            session.drain_js_dialog_events().is_empty(),
+            "dialog notices are drained exactly once"
+        );
+        assert!(
+            session.pending_js_dialog().is_some(),
+            "the latest dialog accessor remains available after draining notices"
+        );
     }
 
     #[test]
@@ -1492,13 +2131,17 @@ mod tests {
 
         session.poll();
 
+        let events = session.drain_page_text_events();
         assert_eq!(
-            session.drain_page_text_events(),
+            events,
             vec![PageTextStatus {
                 id: 7,
                 text: "visible page words".to_owned(),
             }]
         );
+        let debug = format!("{events:?}");
+        assert!(!debug.contains("visible page words"));
+        assert!(debug.contains("<redacted>"));
         assert!(
             session.drain_page_text_events().is_empty(),
             "page-text events are drained exactly once"
@@ -1508,7 +2151,7 @@ mod tests {
     #[test]
     fn passkey_requests_are_queued_for_the_shell() {
         let (mut session, peer) = filtered_session();
-        let body = r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz"}"#;
+        let body = r#"{"ceremony":"get","origin":"https://login.example","rp_id":"login.example","challenge_b64url":"abcdefghijklmnopqrstuvwxyz","user_handle_b64url":"secret-handle"}"#;
         send_event(
             &peer,
             &EventMsg::PasskeyRequest {
@@ -1518,16 +2161,66 @@ mod tests {
 
         session.poll();
 
+        let events = session.drain_passkey_events();
         assert_eq!(
-            session.drain_passkey_events(),
+            events,
             vec![PasskeyRequestStatus {
                 body: body.to_owned(),
             }]
         );
+        let debug = format!("{events:?}");
+        assert!(!debug.contains("secret-handle"));
+        assert!(debug.contains("<redacted>"));
         assert!(
             session.drain_passkey_events().is_empty(),
             "passkey events are drained exactly once"
         );
+    }
+
+    #[test]
+    fn page_scrape_status_debug_redacts_the_dom_body() {
+        let event = PageScrapeStatus {
+            id: 11,
+            body: r#"{"text":"private page body","links":["https://example.test/private"]}"#
+                .to_owned(),
+        };
+
+        assert_eq!(event.id, 11);
+        assert!(event.body.contains("private page body"));
+        let debug = format!("{event:?}");
+        assert!(debug.contains("PageScrapeStatus"));
+        assert!(!debug.contains("private page body"));
+        assert!(!debug.contains("https://example.test/private"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn login_capture_status_debug_redacts_the_credential_body() {
+        let (mut session, peer) = filtered_session();
+        let body = r#"{"username":"alice@example.com","password":"hunter2"}"#;
+        send_event(
+            &peer,
+            &EventMsg::LoginSubmitted {
+                origin: "https://login.example".to_owned(),
+                body: body.to_owned(),
+            },
+        );
+
+        session.poll();
+
+        let captures = session.drain_login_captures();
+        assert_eq!(
+            captures,
+            vec![LoginCaptureStatus {
+                origin: "https://login.example".to_owned(),
+                body: body.to_owned(),
+            }]
+        );
+        let debug = format!("{captures:?}");
+        assert!(debug.contains("https://login.example"));
+        assert!(!debug.contains("alice@example.com"));
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]
@@ -1634,6 +2327,37 @@ mod tests {
         assert_eq!(
             read_control(&mut peer),
             ControlMsg::SetAudioMuted { muted: false }
+        );
+
+        session.toggle_media_playback();
+        assert_eq!(read_control(&mut peer), ControlMsg::ToggleMediaPlayback);
+
+        for action in [
+            MediaTransportAction::PlayPause,
+            MediaTransportAction::Play,
+            MediaTransportAction::Pause,
+            MediaTransportAction::Stop,
+            MediaTransportAction::Next,
+            MediaTransportAction::Previous,
+            MediaTransportAction::VolumeUp,
+            MediaTransportAction::VolumeDown,
+        ] {
+            session.media_transport(action);
+            assert_eq!(
+                read_control(&mut peer),
+                ControlMsg::MediaTransport { action }
+            );
+        }
+
+        session.set_autoplay_blocked(true);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAutoplayBlocked { blocked: true }
+        );
+        session.set_autoplay_blocked(false);
+        assert_eq!(
+            read_control(&mut peer),
+            ControlMsg::SetAutoplayBlocked { blocked: false }
         );
 
         session.set_force_dark(true);
@@ -1949,10 +2673,22 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    fn wait_until_pids_are_gone(pids: &[u32], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pids.iter().all(|pid| !pid_alive(*pid)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn drop_reaps_the_live_helper_child_leaving_no_orphan() {
         use std::process::Command;
-        use std::time::{Duration, Instant};
 
         // Servo (the real helper) isn't spawnable in-test, so a long-lived `sleep`
         // stands in for the sandboxed helper child: its pid is unambiguously alive
@@ -1974,16 +2710,51 @@ mod tests {
         // its `/proc` entry — both keep the path present. `wait` in Drop is
         // synchronous, so this settles at once; the short poll only guards against
         // scheduler jitter.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut gone = !pid_alive(pid);
-        while !gone && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-            gone = !pid_alive(pid);
-        }
+        let gone = wait_until_pids_are_gone(&[pid], Duration::from_secs(2));
         assert!(
             gone,
             "the helper child leaked past the session drop (orphan or zombie)"
         );
+    }
+
+    #[test]
+    fn drop_kills_the_live_helper_process_group_leaving_no_renderer_child() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // CEF is launched through an `mde-web-cef` wrapper which starts the real
+        // renderer bridge beneath it. Model that shape with a shell parent and a
+        // background child; dropping the session must not leave the child alive.
+        let (shell, _helper) = UnixStream::pair().expect("socketpair");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 600 & printf '%s\\n' \"$!\"; wait")
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a stand-in helper process tree");
+        let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("read background child pid");
+        let renderer_pid: u32 = line
+            .trim()
+            .parse()
+            .expect("background child pid should be numeric");
+        let wrapper_pid = child.id();
+        assert!(pid_alive(wrapper_pid), "the wrapper should be running");
+        assert!(
+            pid_alive(renderer_pid),
+            "the renderer stand-in should be running"
+        );
+
+        let session = WebSession::from_stream(shell, Some(child)).expect("session");
+        drop(session);
+
+        let gone = wait_until_pids_are_gone(&[wrapper_pid, renderer_pid], Duration::from_secs(2));
+        assert!(gone, "the helper process group leaked past session drop");
     }
 
     #[test]
@@ -2276,6 +3047,7 @@ mod tests {
         session.reload();
         session.ime_commit_text("x".to_owned());
         session.answer_permission(true);
+        session.answer_before_unload(true);
         session.set_zoom(150);
         assert_no_control_pending(&peer);
     }

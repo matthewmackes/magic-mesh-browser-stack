@@ -70,24 +70,50 @@ fn render_once_hands_runtime_contract_to_the_bridge() {
     assert!(stdout.contains("CEF_OK"), "{stdout}");
     assert!(stdout.contains("CEF_LAUNCH"), "{stdout}");
     assert!(stdout.contains("CEF_EXTENSIONS_READY"), "{stdout}");
-    assert!(stdout.contains("extensions=1"), "{stdout}");
-    let log = fs::read_to_string(&log).expect("bridge log");
-    assert!(log.contains("argv=render-once --url https://example.com/"));
-    assert!(log.contains(&format!("root={}", runtime.display())));
-    assert!(log.contains(&format!(
+    assert!(stdout.contains("CEF_EXTENSIONS_SKIPPED_V1"), "{stdout}");
+    assert!(stdout.contains("extensions=0"), "{stdout}");
+    let bridge_log = fs::read_to_string(&log).expect("bridge log");
+    assert!(bridge_log.contains("argv=render-once --url https://example.com/"));
+    assert!(bridge_log.contains(&format!("root={}", runtime.display())));
+    assert!(bridge_log.contains(&format!(
         "lib={}",
         runtime.join("Release/libcef.so").display()
     )));
-    assert!(log.contains(&format!("release={}", runtime.join("Release").display())));
-    assert!(log.contains(&format!(
+    assert!(bridge_log.contains(&format!("release={}", runtime.join("Release").display())));
+    assert!(bridge_log.contains(&format!(
         "resources={}",
         runtime.join("Resources").display()
     )));
-    assert!(log.contains(&format!("extensions={}", extension_dir.display())));
-    assert!(log.contains(&format!("extension_registry={}", registry.display())));
-    assert!(log.contains("extension_power=true"));
-    assert!(log.contains(&format!("ld={}", runtime.join("Release").display())));
-    assert!(log.contains("/usr/lib64"));
+    assert!(log_has_line(&bridge_log, "extensions="), "{bridge_log}");
+    assert!(
+        log_has_line(&bridge_log, "extension_registry="),
+        "{bridge_log}"
+    );
+    assert!(bridge_log.contains("extension_power=true"));
+    assert!(bridge_log.contains(&format!("ld={}", runtime.join("Release").display())));
+    assert!(bridge_log.contains("/usr/lib64"));
+
+    let lab_output = Command::new(env!("CARGO_BIN_EXE_mde-web-cef"))
+        .arg("render-once")
+        .arg("--url")
+        .arg("https://example.com/")
+        .env("MDE_CEF_ROOT", &runtime)
+        .env("MDE_CEF_BRIDGE_BIN", &bridge)
+        .env("MDE_CEF_EXTENSION_REGISTRY", &registry)
+        .env("MDE_CEF_EXTENSION_POWER_MODE", "true")
+        .env("MDE_CEF_WEBEXTENSIONS_LAB", "true")
+        .env("LD_LIBRARY_PATH", "/usr/lib64")
+        .output()
+        .expect("run helper with webextensions lab");
+
+    assert_eq!(lab_output.status.code(), Some(77));
+    let lab_stdout = String::from_utf8(lab_output.stdout).expect("stdout utf8");
+    assert!(lab_stdout.contains("CEF_EXTENSIONS_READY"), "{lab_stdout}");
+    assert!(lab_stdout.contains("extensions=1"), "{lab_stdout}");
+    let lab_log = fs::read_to_string(&log).expect("bridge lab log");
+    assert!(lab_log.contains(&format!("extensions={}", extension_dir.display())));
+    assert!(lab_log.contains(&format!("extension_registry={}", registry.display())));
+    assert!(lab_log.contains("extension_power=true"));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -136,14 +162,43 @@ fn packaged_smoke_extension_registry_reaches_the_bridge() {
     assert_eq!(output.status.code(), Some(77));
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.contains("CEF_EXTENSIONS_READY"), "{stdout}");
-    assert!(stdout.contains("extensions=1"), "{stdout}");
-    let log = fs::read_to_string(&log).expect("bridge log");
-    assert!(log.contains(&format!("extensions={}", smoke_extension.display())));
-    assert!(log.contains(&format!("extension_registry={}", registry.display())));
-    assert!(log.contains("extension_power=true"));
+    assert!(stdout.contains("CEF_EXTENSIONS_SKIPPED_V1"), "{stdout}");
+    assert!(stdout.contains("extensions=0"), "{stdout}");
+    let bridge_log = fs::read_to_string(&log).expect("bridge log");
+    assert!(log_has_line(&bridge_log, "extensions="), "{bridge_log}");
+    assert!(
+        log_has_line(&bridge_log, "extension_registry="),
+        "{bridge_log}"
+    );
+    assert!(bridge_log.contains("extension_power=true"));
+
+    let lab_output = Command::new(env!("CARGO_BIN_EXE_mde-web-cef"))
+        .arg("render-once")
+        .arg("--url")
+        .arg("https://example.com/")
+        .env("MDE_CEF_ROOT", &runtime)
+        .env("MDE_CEF_BRIDGE_BIN", &bridge)
+        .env("MDE_CEF_EXTENSION_REGISTRY", &registry)
+        .env("MDE_CEF_EXTENSION_POWER_MODE", "true")
+        .env("MDE_CEF_WEBEXTENSIONS_LAB", "true")
+        .output()
+        .expect("run helper with webextensions lab");
+
+    assert_eq!(lab_output.status.code(), Some(77));
+    let lab_stdout = String::from_utf8(lab_output.stdout).expect("stdout utf8");
+    assert!(lab_stdout.contains("CEF_EXTENSIONS_READY"), "{lab_stdout}");
+    assert!(lab_stdout.contains("extensions=1"), "{lab_stdout}");
+    let lab_log = fs::read_to_string(&log).expect("bridge lab log");
+    assert!(lab_log.contains(&format!("extensions={}", smoke_extension.display())));
+    assert!(lab_log.contains(&format!("extension_registry={}", registry.display())));
+    assert!(lab_log.contains("extension_power=true"));
     let _ = fs::remove_dir_all(root);
 }
 
 fn temp_root(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()))
+}
+
+fn log_has_line(log: &str, expected: &str) -> bool {
+    log.lines().any(|line| line == expected)
 }

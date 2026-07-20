@@ -13,9 +13,26 @@ fn control_and_event_wire_bytes_are_pinned() {
         ]
     );
     assert_eq!(ControlMsg::Stop.encode(), [8]);
+    assert_eq!(
+        ControlMsg::FillLogin {
+            expected_host: "h".to_owned(),
+            username: "u".to_owned(),
+            password: "p".to_owned(),
+        }
+        .encode(),
+        [35, 1, 0, 0, 0, b'h', 1, 0, 0, 0, b'u', 1, 0, 0, 0, b'p']
+    );
     assert_eq!(EventMsg::AttachFrame.encode(), [0]);
     assert_eq!(
         EventMsg::PaintReady { seq: 42 }.encode(),
         [1, 42, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        EventMsg::LoginSubmitted {
+            origin: "o".to_owned(),
+            body: "{}".to_owned(),
+        }
+        .encode(),
+        [22, 1, 0, 0, 0, b'o', 2, 0, 0, 0, b'{', b'}']
     );
 }

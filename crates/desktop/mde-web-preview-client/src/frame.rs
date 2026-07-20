@@ -25,7 +25,7 @@ use std::sync::atomic::{fence, AtomicU64, Ordering};
 
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 
-use crate::egui::ColorImage;
+use crate::egui::{Color32, ColorImage};
 
 /// Region magic: ASCII `"MWP1"` — must equal the writer's (`mde-web-preview`'s
 /// `shm::MAGIC`). This is the compile-time anchor of the shared wire contract.
@@ -110,19 +110,30 @@ pub struct FrameSnapshot {
 impl FrameSnapshot {
     /// Convert into an [`egui::ColorImage`] for upload to a `TextureHandle`.
     ///
-    /// RGBA is uploaded directly; BGRA is swizzled to RGBA first. The alpha is
-    /// treated as unmultiplied (Servo's read-back is straight alpha).
+    /// RGBA is uploaded directly; BGRA is swizzled to RGBA. The alpha is treated
+    /// as unmultiplied (the read-back is straight alpha).
+    ///
+    /// # Performance
+    /// `epaint` stores pixels as `Color32` internally, so building a
+    /// `Vec<Color32>` is unavoidable on the CPU-readback path. The BGRA branch
+    /// therefore fuses the channel reorder *into* that mandatory build in one
+    /// linear pass — reading `px[2],px[1],px[0],px[3]` directly. The previous
+    /// implementation instead `clone()`d the whole frame, ran a separate
+    /// in-place B↔R swap pass, and *then* built the `Color32` buffer: for a
+    /// 1080p frame that is one extra ~8 MB allocation and one extra full-frame
+    /// scan eliminated on every published paint (see `docs/design/browser-perf-native.md`).
     #[must_use]
     pub fn to_color_image(&self) -> ColorImage {
         let size = [self.width as usize, self.height as usize];
         match self.format {
             PixelFormat::Rgba8 => ColorImage::from_rgba_unmultiplied(size, &self.pixels),
             PixelFormat::Bgra8 => {
-                let mut rgba = self.pixels.clone();
-                for px in rgba.chunks_exact_mut(4) {
-                    px.swap(0, 2); // B <-> R
-                }
-                ColorImage::from_rgba_unmultiplied(size, &rgba)
+                let pixels = self
+                    .pixels
+                    .chunks_exact(4)
+                    .map(|px| Color32::from_rgba_unmultiplied(px[2], px[1], px[0], px[3]))
+                    .collect();
+                ColorImage { size, pixels }
             }
         }
     }
@@ -336,6 +347,31 @@ mod tests {
         let img = reader.snapshot().expect("frame").to_color_image();
         let p = img.pixels[0];
         assert_eq!((p.r(), p.g(), p.b()), (30, 20, 10), "R/B swizzled");
+    }
+
+    #[test]
+    fn bgra_fused_conversion_swizzles_every_pixel() {
+        // A 2x2 opaque BGRA frame with four distinct pixels, each stored B,G,R,A.
+        // Guards the single-pass fused converter against a per-pixel indexing bug
+        // that the 1x1 case above cannot catch.
+        let writer = FrameWriter::create(2, 2).expect("create shm");
+        let px: Vec<u8> = vec![
+            1, 2, 3, 255, // px0: B=1 G=2 R=3
+            4, 5, 6, 255, // px1: B=4 G=5 R=6
+            7, 8, 9, 255, // px2: B=7 G=8 R=9
+            10, 11, 12, 255, // px3: B=10 G=11 R=12
+        ];
+        writer.emit(2, 2, PixelFormat::Bgra8, &px).expect("emit");
+        let reader = FrameReader::map(writer.dup_fd().expect("dup")).expect("map");
+        let img = reader.snapshot().expect("frame").to_color_image();
+        assert_eq!(img.size, [2, 2]);
+        assert_eq!(img.pixels.len(), 4, "one Color32 per source pixel");
+        // Every pixel: R and B swapped, G and A preserved (opaque passthrough).
+        let expect = [(3, 2, 1), (6, 5, 4), (9, 8, 7), (12, 11, 10)];
+        for (i, (r, g, b)) in expect.into_iter().enumerate() {
+            let p = img.pixels[i];
+            assert_eq!((p.r(), p.g(), p.b(), p.a()), (r, g, b, 255), "pixel {i}");
+        }
     }
 
     #[test]

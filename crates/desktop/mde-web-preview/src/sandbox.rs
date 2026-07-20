@@ -41,14 +41,19 @@
 //! cgroup limit strings, the rootfs bind plan) are unit-tested here, and the
 //! privileged `apply` sequence performs the real syscalls at tab startup.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::prctl;
 use nix::unistd::{fork, pivot_root, sethostname, ForkResult, Gid, Pid, Uid};
+
+const CGROUP_FS: &str = "/sys/fs/cgroup";
+const DELEGATE_SUBGROUP_ENV: &str = "MDE_WEB_SANDBOX_DELEGATE_SUBGROUP";
 
 /// The confinement limits + identity for one sandboxed tab process.
 ///
@@ -95,6 +100,22 @@ impl SandboxPolicy {
     #[must_use]
     pub fn cgroup_cpu_max(&self) -> String {
         format!("{} {}", self.cpu_quota_us, self.cpu_period_us)
+    }
+
+    /// The stable prefix for this policy's private tmpfs rootfs mountpoints.
+    #[must_use]
+    pub fn rootfs_path_prefix(&self) -> PathBuf {
+        PathBuf::from(format!("/tmp/.mde-{}-root", self.hostname))
+    }
+
+    /// The actual per-launch rootfs mountpoint. It is intentionally unique per
+    /// helper launch so a killed verifier or crashed browser cannot poison the
+    /// next process by leaving a stale fixed `/tmp/.mde-web-preview-root` path.
+    #[must_use]
+    pub fn rootfs_path_for_run(&self, host_pid: u32, run_id: u128) -> PathBuf {
+        let mut path: OsString = self.rootfs_path_prefix().into_os_string();
+        path.push(format!("-{host_pid}-{run_id}"));
+        PathBuf::from(path)
     }
 }
 
@@ -241,6 +262,7 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
     // (e.g. 1000), not the overflow id. Read them here, while still mapped.
     let uid = Uid::current().as_raw();
     let gid = Gid::current().as_raw();
+    let rootfs_path = policy.rootfs_path_for_run(std::process::id(), rootfs_run_id());
 
     // 3. new user + mount + IPC + UTS + cgroup + PID namespaces (NOT network).
     // CLONE_NEWPID hides host processes AND is what lets step 6 mount a *fresh*
@@ -270,7 +292,7 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
     // proceeds. The process is single-threaded here (the engine is not yet built),
     // so this fork is async-signal-safe.
     match unsafe { fork() }.context("fork into pid namespace")? {
-        ForkResult::Parent { child } => supervise_child(child), // never returns
+        ForkResult::Parent { child } => supervise_child(child, rootfs_path), // never returns
         ForkResult::Child => {}
     }
 
@@ -283,7 +305,7 @@ pub fn apply(policy: SandboxPolicy) -> Result<()> {
     }
 
     // 6. read-only rootfs + tmpfs (incl. a fresh procfs), then pivot into it.
-    build_rootfs().context("rootfs")?;
+    build_rootfs(policy, &rootfs_path).context("rootfs")?;
 
     // 7. generic hostname (UTS namespace).
     sethostname(policy.hostname).context("sethostname")?;
@@ -314,7 +336,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 /// Supervise the confined child: forward graceful-termination signals to it, reap
 /// it, and exit with its status. Never returns — the pre-fork process's sole job
 /// from here is to be a faithful proxy for the sandboxed engine's lifetime.
-fn supervise_child(child: Pid) -> ! {
+fn supervise_child(child: Pid, rootfs_path: PathBuf) -> ! {
     SUPERVISED_CHILD.store(child.as_raw(), Ordering::SeqCst);
     // Forward the signals a tab supervisor is expected to relay so the engine can
     // shut down cleanly when BOOKMARKS-6 stops the tab.
@@ -346,14 +368,41 @@ fn supervise_child(child: Pid) -> ! {
         }
         // Stopped/continued — keep waiting for a terminal status.
     };
+    cleanup_rootfs_mountpoint(&rootfs_path);
     std::process::exit(code);
+}
+
+/// Best-effort cleanup of the host-visible per-run rootfs mountpoint.
+///
+/// The supervisor is the right owner: the confined child has pivoted into the
+/// tmpfs root and then detached its old root, while the supervisor still tracks
+/// the host-side mountpoint and can remove it after the engine exits. A hard
+/// `SIGKILL` can still strand a directory, which is why mountpoints remain
+/// per-run and collision-safe.
+fn cleanup_rootfs_mountpoint(rootfs_path: &Path) {
+    let _ = umount2(rootfs_path, MntFlags::MNT_DETACH);
+    let _ = std::fs::remove_dir(rootfs_path);
 }
 
 /// Create + enter a per-process child cgroup with the policy's memory/CPU caps.
 fn enter_cgroup(policy: SandboxPolicy) -> Result<()> {
     // cgroup v2 unified hierarchy only.
     let current = current_cgroup_path().context("read /proc/self/cgroup")?;
-    let base = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
+    let delegate_subgroup = std::env::var(DELEGATE_SUBGROUP_ENV).ok();
+    let candidates = cgroup_base_candidates(&current, delegate_subgroup.as_deref());
+
+    let mut errors = Vec::new();
+    for base in candidates {
+        match enter_cgroup_at_base(policy, &base) {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(format!("{}: {e:#}", base.display())),
+        }
+    }
+
+    Err(anyhow::anyhow!("{}", errors.join("; ")))
+}
+
+fn enter_cgroup_at_base(policy: SandboxPolicy, base: &Path) -> Result<()> {
     let leaf = base.join(format!("mde-web-preview-{}", std::process::id()));
 
     // Ask the parent to delegate memory+cpu to child cgroups (best-effort).
@@ -365,6 +414,39 @@ fn enter_cgroup(policy: SandboxPolicy) -> Result<()> {
     std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string())
         .context("cgroup.procs")?;
     Ok(())
+}
+
+fn cgroup_base_candidates(current: &str, delegate_subgroup: Option<&str>) -> Vec<PathBuf> {
+    let current_base = Path::new(CGROUP_FS).join(current.trim_start_matches('/'));
+    let mut candidates = Vec::with_capacity(2);
+
+    if let Some(subgroup) = valid_delegate_subgroup(delegate_subgroup) {
+        if current_base.file_name().and_then(|name| name.to_str()) == Some(subgroup) {
+            if let Some(parent) = current_base.parent() {
+                if parent != Path::new(CGROUP_FS) {
+                    candidates.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    candidates.push(current_base);
+    candidates.dedup();
+    candidates
+}
+
+fn valid_delegate_subgroup(raw: Option<&str>) -> Option<&str> {
+    let subgroup = raw?.trim();
+    if subgroup.is_empty()
+        || subgroup == "."
+        || subgroup == ".."
+        || subgroup.contains('/')
+        || subgroup.contains('\\')
+    {
+        None
+    } else {
+        Some(subgroup)
+    }
 }
 
 /// Parse the unified-hierarchy path out of `/proc/self/cgroup` (`0::/...`).
@@ -379,10 +461,18 @@ fn current_cgroup_path() -> Result<String> {
     Ok(path)
 }
 
+fn rootfs_run_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 /// Build the fresh tmpfs root, bind the read-only runtime into it, and
 /// `pivot_root` so it becomes `/`.
-fn build_rootfs() -> Result<()> {
-    let newroot = Path::new("/tmp/.mde-web-preview-root");
+fn build_rootfs(policy: SandboxPolicy, rootfs_path: &Path) -> Result<()> {
+    validate_rootfs_mountpoint(policy, rootfs_path)?;
+    let newroot = rootfs_path;
 
     // Make all existing mounts private so our changes don't propagate out.
     mount(
@@ -394,8 +484,11 @@ fn build_rootfs() -> Result<()> {
     )
     .context("make-rprivate /")?;
 
-    // A fresh tmpfs as the new root.
-    std::fs::create_dir_all(newroot)?;
+    // A fresh tmpfs as the new root. The mountpoint is unique per launch; if it
+    // somehow already exists, fail with a contextual collision instead of reusing
+    // a stale root that may have been left by a killed verifier.
+    std::fs::create_dir(newroot)
+        .with_context(|| format!("create rootfs mountpoint {}", newroot.display()))?;
     mount(
         Some("tmpfs"),
         newroot,
@@ -449,9 +542,48 @@ fn build_rootfs() -> Result<()> {
     std::fs::create_dir_all(&oldroot)?;
     pivot_root(newroot, &oldroot).context("pivot_root")?;
     nix::unistd::chdir("/").context("chdir /")?;
+    cleanup_oldroot_mountpoint(rootfs_path);
     umount2("/oldroot", MntFlags::MNT_DETACH).context("detach oldroot")?;
     // Best-effort tidy of the now-empty mountpoint.
     let _ = std::fs::remove_dir("/oldroot");
+    Ok(())
+}
+
+/// Remove the old-root view of the host-visible rootfs mountpoint before
+/// detaching `/oldroot`. After the detach, the child can no longer reach the
+/// host path, and the supervisor may be resolving paths from a detached root.
+fn cleanup_oldroot_mountpoint(rootfs_path: &Path) {
+    let Ok(relative) = rootfs_path.strip_prefix("/") else {
+        return;
+    };
+    let _ = std::fs::remove_dir(Path::new("/oldroot").join(relative));
+}
+
+fn validate_rootfs_mountpoint(policy: SandboxPolicy, path: &Path) -> Result<()> {
+    let prefix = policy.rootfs_path_prefix();
+    let expected_parent = prefix
+        .parent()
+        .context("rootfs prefix must have a parent")?;
+    anyhow::ensure!(
+        path.parent() == Some(expected_parent),
+        "rootfs mountpoint must stay under {}",
+        expected_parent.display()
+    );
+
+    let expected_name = prefix
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("rootfs prefix must be valid utf-8")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("rootfs mountpoint must be valid utf-8")?;
+    anyhow::ensure!(
+        name.starts_with(&format!("{expected_name}-")),
+        "rootfs mountpoint {} does not match policy prefix {}",
+        path.display(),
+        prefix.display()
+    );
     Ok(())
 }
 
@@ -648,6 +780,77 @@ mod tests {
         let p = SandboxPolicy::tab();
         assert_eq!(p.cgroup_memory_max(), (1024u64 * 1024 * 1024).to_string());
         assert_eq!(p.cgroup_cpu_max(), "80000 100000");
+    }
+
+    #[test]
+    fn rootfs_mountpoint_is_unique_per_servo_helper_run() {
+        let p = SandboxPolicy::tab();
+        assert_eq!(
+            p.rootfs_path_prefix(),
+            PathBuf::from("/tmp/.mde-web-preview-root")
+        );
+        assert_eq!(
+            p.rootfs_path_for_run(123, 456),
+            PathBuf::from("/tmp/.mde-web-preview-root-123-456")
+        );
+    }
+
+    #[test]
+    fn rootfs_mountpoint_validation_rejects_cross_policy_or_out_of_tmp_paths() {
+        let p = SandboxPolicy::tab();
+        validate_rootfs_mountpoint(p, &p.rootfs_path_for_run(77, 88))
+            .expect("policy-owned rootfs path accepted");
+        validate_rootfs_mountpoint(p, Path::new("/tmp/.mde-web-cef-root-77-88"))
+            .expect_err("wrong engine prefix rejected");
+        validate_rootfs_mountpoint(p, Path::new("/var/tmp/.mde-web-preview-root-77-88"))
+            .expect_err("rootfs path outside /tmp rejected");
+    }
+
+    #[test]
+    fn cleanup_rootfs_mountpoint_removes_normal_empty_run_dirs() {
+        let path = std::env::temp_dir().join(format!(
+            ".mde-web-preview-root-test-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("create cleanup fixture");
+
+        cleanup_rootfs_mountpoint(&path);
+
+        assert!(
+            !path.exists(),
+            "normal sandbox exits must not leak host-visible rootfs dirs"
+        );
+    }
+
+    #[test]
+    fn cleanup_oldroot_mountpoint_ignores_relative_paths_without_panicking() {
+        cleanup_oldroot_mountpoint(Path::new("tmp/.mde-web-preview-root-1-2"));
+    }
+
+    #[test]
+    fn cgroup_base_uses_delegated_parent_when_process_lives_in_unit_subgroup() {
+        let candidates =
+            cgroup_base_candidates("/system.slice/mde-shell-egui.service/shell", Some("shell"));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/sys/fs/cgroup/system.slice/mde-shell-egui.service"),
+                PathBuf::from("/sys/fs/cgroup/system.slice/mde-shell-egui.service/shell"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cgroup_base_stays_local_without_a_matching_safe_delegate_subgroup() {
+        for subgroup in [None, Some("main"), Some("../shell"), Some("shell/nested")] {
+            assert_eq!(
+                cgroup_base_candidates("/system.slice/mde-shell-egui.service/shell", subgroup,),
+                vec![PathBuf::from(
+                    "/sys/fs/cgroup/system.slice/mde-shell-egui.service/shell"
+                )]
+            );
+        }
     }
 
     #[test]

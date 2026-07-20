@@ -14,6 +14,7 @@ browser-cef-webextension-smoke [--url URL] [--marker TEXT] [--registry PATH]
 Runs mde-web-cef with:
   MDE_CEF_BROWSER_PROBE=1
   MDE_CEF_EXTENSION_POWER_MODE=true
+  MDE_CEF_WEBEXTENSIONS_LAB=true
   MDE_CEF_TEXT_PROBE_EXPECT=<marker>
 
 Without --url, the runner serves a local login form and requires the packaged
@@ -150,6 +151,7 @@ fi
 
 export MDE_CEF_EXTENSION_REGISTRY="$REGISTRY"
 export MDE_CEF_EXTENSION_POWER_MODE=true
+export MDE_CEF_WEBEXTENSIONS_LAB=true
 export MDE_CEF_BROWSER_PROBE=1
 export MDE_CEF_TEXT_PROBE_EXPECT="$MARKER"
 

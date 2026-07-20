@@ -2,7 +2,7 @@
 use super::*;
 use std::mem::{align_of, size_of};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -83,9 +83,11 @@ fn popup_compose_needs_both_a_view_and_popup_pixels() {
 #[test]
 fn before_popup_offset_reconciles_with_the_life_span_layout() {
     // cef_life_span_handler_t (CEF 149): on_before_popup is field 0; the proven
-    // on_after_created=64 pins field 3, and the handler size 88 pins 6 fields.
+    // on_after_created=64 pins field 3, on_before_close is field 5, and the
+    // handler size 88 pins 6 fields.
     assert_eq!(CEF_LIFE_SPAN_ON_BEFORE_POPUP_OFFSET, 40);
     assert_eq!(CEF_LIFE_SPAN_ON_AFTER_CREATED_OFFSET, 40 + 3 * 8);
+    assert_eq!(CEF_LIFE_SPAN_ON_BEFORE_CLOSE_OFFSET, 40 + 5 * 8);
     assert_eq!(CEF_LIFE_SPAN_HANDLER_SIZE, 40 + 6 * 8);
 }
 
@@ -124,17 +126,72 @@ fn certificate_error_offset_sits_inside_the_request_handler_layout() {
 }
 
 #[test]
+fn get_resource_type_offset_sits_inside_the_request_layout() {
+    // cef_request_t (pinned CEF 149, cross-checked on-seat .15): get_resource_type
+    // is index 19 of the fn-ptr block that follows the 40-byte base, so
+    // 40 + 19*8 = 192. Anchored non-tautologically against the two struct-pinning
+    // constants: get_url=48 fixes index 1 (40 + 1*8), and CEF_REQUEST_SIZE=216 =
+    // 40 + 22*8 fixes the method count at 22 (indices 0..21), so index 19 is the
+    // third-from-last fn ptr and must sit inside the struct.
+    assert_eq!(CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET, 40 + 19 * 8);
+    assert_eq!(CEF_REQUEST_GET_URL_OFFSET, 40 + 1 * 8);
+    assert_eq!(CEF_REQUEST_SIZE, 40 + 22 * 8);
+    assert!(
+        CEF_REQUEST_SET_HEADER_BY_NAME_OFFSET < CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET,
+        "set_header_by_name (idx 13) precedes get_resource_type (idx 19)"
+    );
+    assert!(
+        CEF_REQUEST_GET_RESOURCE_TYPE_OFFSET < CEF_REQUEST_SIZE - 8,
+        "get_resource_type fn ptr lies wholly inside cef_request_t"
+    );
+}
+
+#[test]
+fn cef_resource_type_maps_to_the_shell_wire_bytes() {
+    // CEF cef_resource_type_t (on-seat) -> the compact byte resource_from_wire
+    // decodes in mde-web-preview-client filter.rs. The remap is deliberate: CEF's
+    // MEDIA=8/XHR=13/PING=14 are NOT the shell ResourceType discriminants, so a
+    // cast would mis-classify them.
+    assert_eq!(cef_resource_type_to_wire(0), 0, "MAIN_FRAME -> Document");
+    assert_eq!(cef_resource_type_to_wire(1), 1, "SUB_FRAME -> Subdocument");
+    assert_eq!(cef_resource_type_to_wire(2), 2, "STYLESHEET");
+    assert_eq!(cef_resource_type_to_wire(3), 3, "SCRIPT");
+    assert_eq!(cef_resource_type_to_wire(4), 4, "IMAGE");
+    assert_eq!(cef_resource_type_to_wire(5), 5, "FONT_RESOURCE -> Font");
+    assert_eq!(cef_resource_type_to_wire(8), 6, "MEDIA -> Media");
+    assert_eq!(cef_resource_type_to_wire(7), 7, "OBJECT");
+    assert_eq!(cef_resource_type_to_wire(13), 8, "XHR -> XmlHttpRequest");
+    assert_eq!(cef_resource_type_to_wire(14), 9, "PING -> Ping");
+    // The null-vtable sentinel and any unmapped/plugin class fall back to Other,
+    // NOT to the MAIN_FRAME (0) a naive cast of -1 or 6 would risk.
+    assert_eq!(
+        cef_resource_type_to_wire(-1),
+        RESOURCE_OTHER,
+        "null sentinel"
+    );
+    assert_eq!(cef_resource_type_to_wire(6), RESOURCE_OTHER, "SUB_RESOURCE");
+    assert_eq!(
+        cef_resource_type_to_wire(99),
+        RESOURCE_OTHER,
+        "future class"
+    );
+}
+
+#[test]
 fn jsdialog_offsets_reconcile_with_the_pinned_cef_layout() {
     // cef_client_t: get_jsdialog_handler is index 11 (base 40 + 11*8 = 128),
     // sitting between get_permission_handler(120) and get_keyboard_handler(136),
     // and inside the proven CEF_CLIENT_SIZE=192.
     assert_eq!(CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET, 40 + 11 * 8);
     assert!(CEF_CLIENT_GET_JSDIALOG_HANDLER_OFFSET < CEF_CLIENT_SIZE - 8);
-    // cef_jsdialog_handler_t: on_jsdialog is index 0 (base 40), and the struct is
-    // 4 methods (72 bytes); on_jsdialog fits inside it.
+    // cef_jsdialog_handler_t: on_jsdialog is index 0 (base 40),
+    // on_before_unload_dialog is index 1 (48), and the struct is 4 methods
+    // (72 bytes); both registered slots fit inside it.
     assert_eq!(CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET, 40);
+    assert_eq!(CEF_JSDIALOG_HANDLER_ON_BEFORE_UNLOAD_DIALOG_OFFSET, 40 + 8);
     assert_eq!(CEF_JSDIALOG_HANDLER_SIZE, 40 + 4 * 8);
     assert!(CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET < CEF_JSDIALOG_HANDLER_SIZE);
+    assert!(CEF_JSDIALOG_HANDLER_ON_BEFORE_UNLOAD_DIALOG_OFFSET < CEF_JSDIALOG_HANDLER_SIZE);
     // The jsdialog callback's cont slot reuses the shared cont offset (40).
     assert_eq!(CEF_CALLBACK_CONT_OFFSET, 40);
 }
@@ -357,6 +414,7 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_FRAME_SIZE, 248);
     assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 144);
     assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 152);
+    assert_eq!(CEF_FRAME_IS_MAIN_OFFSET, 160);
     assert_eq!(CEF_REQUEST_SIZE, 216);
     assert_eq!(CEF_REQUEST_GET_URL_OFFSET, 48);
     // set_header_by_name is index 13 of the fn-ptr block after the 40-byte base;
@@ -369,6 +427,8 @@ fn callback_layout_matches_pinned_cef_headers() {
     assert_eq!(CEF_CALLBACK_CANCEL_OFFSET, 48);
     assert_eq!(CEF_PDF_PRINT_CALLBACK_SIZE, 48);
     assert_eq!(CEF_PDF_PRINT_CALLBACK_ON_FINISHED_OFFSET, 40);
+    assert_eq!(CEF_STRING_VISITOR_SIZE, 48);
+    assert_eq!(CEF_STRING_VISITOR_VISIT_OFFSET, 40);
     assert_eq!(CEF_MOUSE_EVENT_SIZE, 12);
     assert_eq!(CEF_MOUSE_EVENT_X_OFFSET, 0);
     assert_eq!(CEF_MOUSE_EVENT_Y_OFFSET, 4);
@@ -441,16 +501,17 @@ fn mouse_event_sets_header_pinned_fields() {
 #[test]
 fn key_event_sets_header_pinned_fields() {
     let event = CefKeyEvent::new(
-        KEYEVENT_CHAR,
+        KEYEVENT_RAWKEYDOWN,
         EVENTFLAG_SHIFT_DOWN,
         65,
         65,
         b'A' as u16,
         b'A' as u16,
     );
+    assert_eq!(read_usize(&event.bytes, 0), CEF_KEY_EVENT_SIZE);
     assert_eq!(
         read_i32(&event.bytes, CEF_KEY_EVENT_TYPE_OFFSET),
-        KEYEVENT_CHAR
+        KEYEVENT_RAWKEYDOWN
     );
     assert_eq!(
         read_i32(&event.bytes, CEF_KEY_EVENT_MODIFIERS_OFFSET),
@@ -480,18 +541,181 @@ fn key_event_sets_header_pinned_fields() {
 
 static FOCUS_CALLS: AtomicI32 = AtomicI32::new(0);
 static FOCUS_LAST: AtomicI32 = AtomicI32::new(0);
+static KEY_EVENT_CALLS: AtomicI32 = AtomicI32::new(0);
+static KEY_EVENT_LAST_TYPE: AtomicI32 = AtomicI32::new(-1);
+static KEY_EVENT_LAST_WINDOWS_CODE: AtomicI32 = AtomicI32::new(-1);
+static KEY_EVENT_LAST_CHAR: AtomicI32 = AtomicI32::new(-1);
 static STOP_LOAD_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_CALLS: AtomicI32 = AtomicI32::new(0);
 static AUDIO_MUTED_LAST: AtomicI32 = AtomicI32::new(0);
 static TEST_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
+static TEST_MAIN_FRAME_PTR: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn test_browser_host(_browser: *mut c_void) -> *mut c_void {
     TEST_HOST_PTR.load(AtomicOrdering::SeqCst) as *mut c_void
 }
 
+unsafe extern "C" fn test_main_frame(_browser: *mut c_void) -> *mut c_void {
+    TEST_MAIN_FRAME_PTR.load(AtomicOrdering::SeqCst) as *mut c_void
+}
+
+unsafe extern "C" fn test_frame_is_main(_frame: *mut c_void) -> c_int {
+    1
+}
+
+unsafe extern "C" fn test_frame_is_subframe(_frame: *mut c_void) -> c_int {
+    0
+}
+
 unsafe extern "C" fn record_focus(_host: *mut c_void, focused: c_int) {
     FOCUS_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     FOCUS_LAST.store(focused, AtomicOrdering::SeqCst);
+}
+
+#[test]
+fn cef_address_changes_only_update_top_level_url_from_the_main_frame() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser
+        [CEF_BROWSER_GET_MAIN_FRAME_OFFSET..CEF_BROWSER_GET_MAIN_FRAME_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_main_frame as *const () as usize).to_ne_bytes());
+    let mut main_wrapper = vec![0u8; CEF_FRAME_SIZE];
+    let mut main = vec![0u8; CEF_FRAME_SIZE];
+    let mut subframe = vec![0u8; CEF_FRAME_SIZE];
+    main[CEF_FRAME_IS_MAIN_OFFSET..CEF_FRAME_IS_MAIN_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_frame_is_main as *const () as usize).to_ne_bytes());
+    subframe[CEF_FRAME_IS_MAIN_OFFSET..CEF_FRAME_IS_MAIN_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_frame_is_subframe as *const () as usize).to_ne_bytes());
+    TEST_MAIN_FRAME_PTR.store(main_wrapper.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+
+    let display = callbacks.state.display_ptr();
+    let browser = browser.as_mut_ptr().cast();
+    let main_url = CefStringOwned::new("https://news.example/article").expect("main url");
+    let subframe_url = CefStringOwned::new("https://ads.example/frame").expect("subframe url");
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            subframe_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "",
+        "a subframe address event must not claim top-level browser chrome"
+    );
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            main.as_mut_ptr().cast(),
+            main_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "https://news.example/article"
+    );
+
+    unsafe {
+        on_address_change(
+            display,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            subframe_url.as_ptr().cast::<CefString>(),
+        );
+    }
+    assert_eq!(
+        callbacks.state.current_top_level_url(),
+        "https://news.example/article",
+        "a later iframe navigation must not overwrite the committed page URL"
+    );
+}
+
+#[test]
+fn cef_navigation_generation_ignores_subframe_navigation_callbacks() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser
+        [CEF_BROWSER_GET_MAIN_FRAME_OFFSET..CEF_BROWSER_GET_MAIN_FRAME_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_main_frame as *const () as usize).to_ne_bytes());
+    let mut main = vec![0u8; CEF_FRAME_SIZE];
+    let mut subframe = vec![0u8; CEF_FRAME_SIZE];
+    TEST_MAIN_FRAME_PTR.store(main.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+    let request = callbacks.state.request_ptr();
+    let mut disable_default_handling = -1;
+    let browser = browser.as_mut_ptr().cast();
+
+    unsafe {
+        get_resource_request_handler(
+            request,
+            browser,
+            subframe.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            1,
+            0,
+            ptr::null(),
+            &mut disable_default_handling,
+        );
+    }
+    assert_eq!(
+        callbacks.state.navigations(),
+        0,
+        "subframe navigations should not trigger top-level reinjection cadence"
+    );
+    assert_eq!(disable_default_handling, 0);
+
+    unsafe {
+        get_resource_request_handler(
+            request,
+            browser,
+            main.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            1,
+            0,
+            ptr::null(),
+            &mut disable_default_handling,
+        );
+    }
+    assert_eq!(callbacks.state.navigations(), 1);
+}
+
+unsafe extern "C" fn record_key_event(_host: *mut c_void, event: *const c_void) {
+    KEY_EVENT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    // SAFETY: `send_char` passes a live `CefKeyEvent` byte block for the
+    // duration of this synchronous fake callback.
+    let bytes = unsafe { std::slice::from_raw_parts(event.cast::<u8>(), CEF_KEY_EVENT_SIZE) };
+    KEY_EVENT_LAST_TYPE.store(
+        read_i32(bytes, CEF_KEY_EVENT_TYPE_OFFSET),
+        AtomicOrdering::SeqCst,
+    );
+    KEY_EVENT_LAST_WINDOWS_CODE.store(
+        read_i32(bytes, CEF_KEY_EVENT_WINDOWS_KEY_CODE_OFFSET),
+        AtomicOrdering::SeqCst,
+    );
+    KEY_EVENT_LAST_CHAR.store(
+        i32::from(read_u16(bytes, CEF_KEY_EVENT_CHARACTER_OFFSET)),
+        AtomicOrdering::SeqCst,
+    );
 }
 
 #[test]
@@ -566,11 +790,16 @@ fn child_handler_pointers_resolve_non_null_to_their_registered_block() {
         callbacks.state.download_ptr(),
         callbacks.download.as_mut_ptr()
     );
+    assert_eq!(
+        callbacks.state.jsdialog_ptr(),
+        callbacks.jsdialog.as_mut_ptr()
+    );
     for ptr in [
         callbacks.state.display_ptr(),
         callbacks.state.load_ptr(),
         callbacks.state.find_ptr(),
         callbacks.state.download_ptr(),
+        callbacks.state.jsdialog_ptr(),
         // whitelisted peers must still resolve too (no regression):
         callbacks.state.render_ptr(),
         callbacks.state.request_ptr(),
@@ -817,6 +1046,60 @@ fn ime_controls_drive_cef_host_ime_slots() {
     apply_control_frame(browser_ptr, &callbacks, &ControlMsg::ImeFinishComposition);
     assert_eq!(IME_FINISH_CALLS.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(IME_FINISH_KEEP.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+fn text_input_event_sends_cef_character_key_event() {
+    FOCUS_CALLS.store(0, AtomicOrdering::SeqCst);
+    FOCUS_LAST.store(0, AtomicOrdering::SeqCst);
+    KEY_EVENT_CALLS.store(0, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_TYPE.store(-1, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_WINDOWS_CODE.store(-1, AtomicOrdering::SeqCst);
+    KEY_EVENT_LAST_CHAR.store(-1, AtomicOrdering::SeqCst);
+
+    let mut host = vec![0u8; CEF_BROWSER_HOST_SIZE];
+    host[CEF_BROWSER_HOST_SET_FOCUS_OFFSET..CEF_BROWSER_HOST_SET_FOCUS_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_focus as *const () as usize).to_ne_bytes());
+    host[CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET
+        ..CEF_BROWSER_HOST_SEND_KEY_EVENT_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(record_key_event as *const () as usize).to_ne_bytes());
+    TEST_HOST_PTR.store(host.as_mut_ptr() as usize, AtomicOrdering::SeqCst);
+
+    let mut browser = vec![0u8; CEF_BROWSER_SIZE];
+    browser[CEF_BROWSER_GET_HOST_OFFSET..CEF_BROWSER_GET_HOST_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&(test_browser_host as *const () as usize).to_ne_bytes());
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+
+    apply_input_event(
+        browser.as_mut_ptr().cast(),
+        &callbacks,
+        &InputEvent::Text("m".to_owned()),
+    );
+
+    assert_eq!(FOCUS_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(FOCUS_LAST.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(KEY_EVENT_CALLS.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        KEY_EVENT_LAST_TYPE.load(AtomicOrdering::SeqCst),
+        KEYEVENT_CHAR
+    );
+    assert_eq!(KEY_EVENT_LAST_WINDOWS_CODE.load(AtomicOrdering::SeqCst), 77);
+    assert_eq!(KEY_EVENT_LAST_CHAR.load(AtomicOrdering::SeqCst), 109);
+}
+
+#[test]
+fn text_input_uses_virtual_key_code_for_ascii_letters() {
+    assert_eq!(super::char_windows_key_code(b'm' as u16), 77);
+    assert_eq!(super::char_windows_key_code(b'M' as u16), 77);
+    assert_eq!(super::char_windows_key_code(b'7' as u16), 55);
 }
 
 #[test]
@@ -1213,7 +1496,9 @@ fn download_handler_offsets_reconcile_and_size_is_unique() {
 #[test]
 fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     // cef_frame_t: 40-byte base then 8-byte fn ptrs. is_valid=0(40), undo=1(48),
-    // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104).
+    // redo=2(56), cut=3(64), copy=4(72), paste=5(80), del=7(96), select_all=8(104),
+    // get_source=10(120), get_text=11(128), load_url=13(144), execute_js=14(152),
+    // is_main=15(160).
     assert_eq!(CEF_FRAME_UNDO_OFFSET, 40 + 1 * 8);
     assert_eq!(CEF_FRAME_REDO_OFFSET, 40 + 2 * 8);
     assert_eq!(CEF_FRAME_CUT_OFFSET, 40 + 3 * 8);
@@ -1221,9 +1506,14 @@ fn frame_edit_command_offsets_match_the_cef149_frame_layout() {
     assert_eq!(CEF_FRAME_PASTE_OFFSET, 40 + 5 * 8);
     assert_eq!(CEF_FRAME_DELETE_OFFSET, 40 + 7 * 8);
     assert_eq!(CEF_FRAME_SELECT_ALL_OFFSET, 40 + 8 * 8);
-    // Reconcile with the proven get_main_frame=152 (browser field 14, unrelated
-    // struct) — the frame commands sit well before execute_java_script (field 14).
+    assert_eq!(CEF_FRAME_GET_TEXT_OFFSET, 40 + 11 * 8);
+    assert_eq!(CEF_FRAME_LOAD_URL_OFFSET, 40 + 13 * 8);
+    assert_eq!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET, 40 + 14 * 8);
+    assert_eq!(CEF_FRAME_IS_MAIN_OFFSET, 40 + 15 * 8);
+    // Reconcile with the frame's execute_java_script slot — edit commands sit
+    // before the page-tool extraction/navigation slots.
     assert!(CEF_FRAME_SELECT_ALL_OFFSET < CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET);
+    assert!(CEF_FRAME_EXECUTE_JAVA_SCRIPT_OFFSET < CEF_FRAME_IS_MAIN_OFFSET);
 }
 
 #[test]
@@ -1282,6 +1572,148 @@ fn reader_mode_script_installs_and_clears_bounded_style() {
 }
 
 #[test]
+fn autoplay_block_script_patches_media_play_and_cleans_up() {
+    let enable = autoplay_block_script(true);
+    assert!(enable.contains("__mdeAutoplayBlocker"));
+    assert!(enable.contains("mdeAutoplayBlocked"));
+    assert!(enable.contains("HTMLMediaElement.prototype"));
+    assert!(enable.contains("MutationObserver"));
+    assert!(enable.contains("removeAttribute('autoplay')"));
+    assert!(enable.contains("Promise.reject"));
+    assert!(
+        !enable.contains("</script>"),
+        "autoplay blocking is injected as bounded script text only"
+    );
+
+    let disable = autoplay_block_script(false);
+    assert!(disable.contains("observer.disconnect"));
+    assert!(disable.contains("HTMLMediaElement.prototype.play=s.originalPlay"));
+    assert!(disable.contains("delete window.__mdeAutoplayBlocker"));
+    assert!(disable.contains("delete document.documentElement.dataset.mdeAutoplayBlocked"));
+}
+
+#[test]
+fn media_playback_toggle_script_drives_html_media_elements() {
+    let script = media_playback_toggle_script();
+    assert!(script.contains("querySelectorAll('audio,video')"));
+    assert!(script.contains("pause()"));
+    assert!(script.contains("play()"));
+    assert!(script.contains("mdeAutoplayAllowed"));
+    assert!(
+        !script.contains("</script>"),
+        "media transport is injected as bounded script text only"
+    );
+}
+
+#[test]
+fn media_transport_script_covers_page_media_actions() {
+    for (action, token) in [
+        (MediaTransportAction::PlayPause, "playPause"),
+        (MediaTransportAction::Play, "play"),
+        (MediaTransportAction::Pause, "pause"),
+        (MediaTransportAction::Stop, "stop"),
+        (MediaTransportAction::Next, "next"),
+        (MediaTransportAction::Previous, "previous"),
+        (MediaTransportAction::VolumeUp, "volumeUp"),
+        (MediaTransportAction::VolumeDown, "volumeDown"),
+    ] {
+        let script = media_transport_script(action);
+        assert!(script.contains("querySelectorAll('audio,video')"));
+        assert!(script.contains(&format!("action='{token}'")));
+        assert!(script.contains("pauseActive"));
+        assert!(script.contains("fastSeek"));
+        assert!(script.contains("volume(current"));
+        assert!(script.contains("mdeAutoplayAllowed"));
+        assert!(
+            !script.contains("</script>"),
+            "media transport is injected as bounded script text only"
+        );
+    }
+}
+
+#[test]
+fn media_metadata_beacon_script_is_bounded_and_decodable() {
+    let script = media_metadata_beacon_script();
+    assert!(script.contains("navigator.mediaSession"));
+    assert!(script.contains("querySelectorAll('audio,video')"));
+    assert!(script.contains("duration_ms"));
+    assert!(script.contains("position_ms"));
+    assert!(script.contains("volume_percent"));
+    assert!(script.contains("__mdeMediaMetadataLast"));
+    assert!(script.contains(CEF_MEDIA_METADATA_BEACON_PREFIX));
+    assert!(script.contains("encodeURIComponent(body)"));
+    assert!(script.contains("publish('')"));
+    assert!(
+        !script.contains("</script>"),
+        "media metadata is injected as bounded script text only"
+    );
+
+    let body = decode_media_metadata_beacon(
+        "https://mde-media.invalid/metadata/?body=%7B%22title%22%3A%22Track%22%2C%22paused%22%3Afalse%7D",
+    )
+    .expect("media metadata beacon");
+    assert_eq!(body, r#"{"title":"Track","paused":false}"#);
+    assert_eq!(
+        decode_media_metadata_beacon("https://mde-media.invalid/metadata/?body=not-json"),
+        None
+    );
+    assert_eq!(
+        decode_media_metadata_beacon("https://mde-media.invalid/metadata/?body="),
+        Some(String::new())
+    );
+    assert_eq!(decode_media_metadata_beacon("https://example.com/"), None);
+}
+
+#[test]
+fn media_metadata_playing_state_is_private_and_conservative() {
+    assert!(media_metadata_reports_playing(
+        r#"{"title":"Track","paused":false}"#
+    ));
+    assert!(media_metadata_reports_playing(
+        r#"{"title":"Track","artist":"Artist","paused" : false,"position_ms":42}"#
+    ));
+    assert!(!media_metadata_reports_playing(
+        r#"{"title":"Track","paused":true}"#
+    ));
+    assert!(!media_metadata_reports_playing(r#"{"title":"Track"}"#));
+    assert!(!media_metadata_reports_playing(""));
+}
+
+#[test]
+fn autoplay_block_control_is_remembered_for_navigation_reinjection() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    assert!(!callbacks.state.autoplay_blocked.load(Ordering::SeqCst));
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::SetAutoplayBlocked { blocked: true },
+    );
+    assert!(
+        callbacks.state.autoplay_blocked.load(Ordering::SeqCst),
+        "CEF must remember autoplay blocking so fresh documents get the shim"
+    );
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::SetAutoplayBlocked { blocked: false },
+    );
+    assert!(
+        !callbacks.state.autoplay_blocked.load(Ordering::SeqCst),
+        "disabling autoplay blocking must stop navigation reinjection"
+    );
+}
+
+#[test]
 fn user_agent_override_script_installs_and_clears_page_visible_ua() {
     let enable = user_agent_override_script("Mozilla/5.0 MDE-Test");
     assert!(enable.contains("Navigator.prototype"));
@@ -1321,20 +1753,59 @@ fn login_capture_script_installs_an_idempotent_submit_beacon() {
     assert!(s.contains("mde-login.invalid/capture/")); // beacons to the intercepted URL
     assert!(s.contains("__mdeLoginCaptureInstalled")); // install-once guard
     assert!(s.contains("location.origin"));
+    assert!(s.contains("origin="));
+    assert!(s.contains("username:u?u.value:''"));
     assert!(!s.contains("</script>"));
 }
 
 #[test]
 fn decode_login_beacon_extracts_json_and_rejects_non_login_urls() {
-    // %7B{ %22" %3A: %7D}  →  {"ok":1}
-    let decoded = decode_login_beacon("https://mde-login.invalid/capture/?body=%7B%22ok%22%3A1%7D")
-        .expect("a login beacon decodes");
-    assert_eq!(decoded, "{\"ok\":1}");
+    let (origin, body) = decode_login_beacon(
+        "https://mde-login.invalid/capture/?origin=https%3A%2F%2Flogin.example&body=%7B%22ok%22%3A1%7D",
+    )
+    .expect("a login beacon decodes");
+    assert_eq!(origin, "https://login.example");
+    assert_eq!(body, "{\"ok\":1}");
     // Non-login URLs (incl. the passkey beacon) are ignored.
     assert!(decode_login_beacon("https://example.com/login").is_none());
     assert!(decode_login_beacon("https://mde-passkey.invalid/request/?body=%7B%7D").is_none());
+    // Missing origin is rejected: the engine must bind capture to a real page.
+    assert!(decode_login_beacon("https://mde-login.invalid/capture/?body=%7B%7D").is_none());
     // A body that isn't a JSON object is rejected.
-    assert!(decode_login_beacon("https://mde-login.invalid/capture/?body=notjson").is_none());
+    assert!(decode_login_beacon(
+        "https://mde-login.invalid/capture/?origin=https%3A%2F%2Flogin.example&body=notjson"
+    )
+    .is_none());
+}
+
+#[test]
+fn login_capture_origin_must_match_the_top_level_page() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    *callbacks.state.nav_url.lock().expect("nav") =
+        "https://mail.example.com/account/login".to_owned();
+
+    assert!(callbacks
+        .state
+        .login_beacon_matches_top_level("https://mail.example.com"));
+    assert!(callbacks.state.host_matches_top_level("mail.example.com"));
+    assert!(
+        !callbacks
+            .state
+            .login_beacon_matches_top_level("https://bank.example"),
+        "a forged login-capture origin must not be accepted for another host"
+    );
+    assert!(
+        !callbacks.state.host_matches_top_level("bank.example"),
+        "a stale FillLogin host must not inject into the current page"
+    );
 }
 
 #[test]
@@ -1419,6 +1890,7 @@ fn page_text_beacon_script_is_bounded_and_decodable() {
     assert!(script.contains("innerText||root.textContent"));
     assert!(script.contains("encodeURIComponent(text)"));
     assert!(script.contains("https://mde-page-text.invalid/capture/42?text="));
+    assert!(script.contains("window.alert(u)"));
 
     assert_eq!(
         decode_page_text_beacon("https://mde-page-text.invalid/capture/42?text=hello%20w%C3%B8rld"),
@@ -1431,6 +1903,16 @@ fn page_text_beacon_script_is_bounded_and_decodable() {
     assert_eq!(percent_decode("%zz+ok"), "%zz+ok");
     assert_eq!(clamp_utf8("abé", 3), "ab");
     assert_eq!(decode_page_text_beacon("https://example.com/"), None);
+}
+
+#[test]
+fn page_text_script_can_be_dispatched_as_a_javascript_url() {
+    let script = page_text_beacon_script(42, 256);
+    let url = javascript_url_for_script(&script);
+    assert!(url.starts_with("javascript:(function()%7B"));
+    assert!(url.contains("mde-page-text.invalid"));
+    assert!(!url.contains(' '));
+    assert!(!url.contains('\n'));
 }
 
 #[test]
@@ -1447,6 +1929,7 @@ fn page_scrape_beacon_script_is_bounded_and_decodable() {
     assert!(script.contains("meta[name=\"description\" i][content]"));
     assert!(script.contains("links=links.slice(0,32)"));
     assert!(script.contains("https://mde-page-scrape.invalid/capture/43?body="));
+    assert!(script.contains("window.alert(u)"));
 
     assert_eq!(
         decode_page_scrape_beacon(
@@ -1537,8 +2020,8 @@ fn passkey_shim_feature_detects_credential_type_and_gates_on_a_gesture() {
 #[test]
 fn webrtc_block_script_removes_the_reachable_webrtc_surface() {
     // `--disable-webrtc` (cef_init.rs) is confirmed non-functional (see
-    // its doc comment); this renderer-level shim is the real mitigation,
-    // so pin exactly which JS-reachable entry points it removes.
+    // its doc comment); this opt-in renderer-level shim is the emergency block,
+    // so pin exactly which JS-reachable entry points it removes when enabled.
     let script = webrtc_block_script();
     assert!(script.contains("delete w.RTCPeerConnection"));
     assert!(script.contains("delete w.webkitRTCPeerConnection"));
@@ -1584,18 +2067,117 @@ fn webrtc_block_script_covers_subframes_not_just_the_main_frame() {
 }
 
 #[test]
-fn pump_interval_backs_off_when_idle_but_stays_fast_while_active() {
+fn cef_webrtc_block_env_defaults_to_operational_surface() {
+    assert!(
+        !cef_webrtc_blocked_from_env_value(None),
+        "CEF WebRTC should be available unless explicitly blocked"
+    );
+    for value in ["0", "false", "no", "off", "", "unexpected"] {
+        assert!(
+            !cef_webrtc_blocked_from_env_value(Some(value)),
+            "{value:?} must not enable the legacy block"
+        );
+    }
+    for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+        assert!(
+            cef_webrtc_blocked_from_env_value(Some(value)),
+            "{value:?} should enable the legacy block"
+        );
+    }
+}
+
+#[test]
+fn idle_media_pump_backs_off_only_after_discovery_window() {
     // perf-6: awaiting the first paint is always active regardless of the
     // idle clock, so initial load latency is never regressed.
-    assert_eq!(pump_interval(Duration::from_secs(30), true), PUMP_ACTIVE);
-    // Recent activity (paint/frame/nav within the grace window) stays fast.
-    assert_eq!(pump_interval(Duration::ZERO, false), PUMP_ACTIVE);
-    assert_eq!(pump_interval(PUMP_IDLE_AFTER / 2, false), PUMP_ACTIVE);
+    assert_eq!(
+        pump_interval(Duration::from_secs(30), true, false),
+        PUMP_ACTIVE
+    );
+    // Recent activity and the bounded media-discovery window stay fast so CEF
+    // can observe muted/silent autoplay before backing off.
+    assert_eq!(pump_interval(Duration::ZERO, false, false), PUMP_ACTIVE);
+    assert_eq!(pump_interval(SHIM_SETTLE / 2, false, false), PUMP_ACTIVE);
+    // Active media stays fast even when the pointer is still and no new paint has
+    // reached the shell yet; this prevents video advancing only on mouse motion.
+    assert_eq!(
+        pump_interval(Duration::from_secs(30), false, true),
+        PUMP_ACTIVE
+    );
     // Sustained quiet backs off so an idle tab stops spinning at 125 Hz.
-    assert_eq!(pump_interval(PUMP_IDLE_AFTER, false), PUMP_IDLE);
-    assert_eq!(pump_interval(Duration::from_secs(5), false), PUMP_IDLE);
+    assert_eq!(pump_interval(SHIM_SETTLE, false, false), PUMP_IDLE);
+    assert_eq!(
+        pump_interval(Duration::from_secs(5), false, false),
+        PUMP_IDLE
+    );
     // The idle interval is a real, substantial back-off from the active spin.
     assert!(PUMP_IDLE >= PUMP_ACTIVE * 10);
+}
+
+#[test]
+fn idle_media_pump_invalidation_tracks_discovery_window() {
+    assert!(should_invalidate_view(media_discovery_active(
+        Duration::from_secs(30),
+        true,
+        false
+    )));
+    assert!(should_invalidate_view(media_discovery_active(
+        Duration::from_secs(30),
+        false,
+        true
+    )));
+    assert!(should_invalidate_view(media_discovery_active(
+        SHIM_SETTLE / 2,
+        false,
+        false
+    )));
+    assert!(
+        !should_invalidate_view(media_discovery_active(SHIM_SETTLE, false, false)),
+        "settled non-media pages must be allowed to idle without paint nudges"
+    );
+}
+
+#[test]
+fn idle_media_pump_resize_nudge_is_bounded() {
+    assert!(
+        !should_resize_view(false, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL),
+        "settled non-media pages must not receive resize pulses"
+    );
+    assert!(
+        !should_resize_view(true, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL / 2),
+        "resize pulses must be rate-limited"
+    );
+    assert!(should_resize_view(true, MEDIA_VIEW_RESIZE_NUDGE_INTERVAL));
+    assert!(MEDIA_VIEW_RESIZE_NUDGE_INTERVAL >= PUMP_ACTIVE * 10);
+}
+
+#[test]
+fn callback_media_state_keeps_the_pump_active_until_pause_or_navigation() {
+    let callbacks = CefBrowserCallbacks::new(
+        320,
+        200,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    assert!(!callbacks.state.active_media());
+
+    callbacks
+        .state
+        .publish_media_metadata(r#"{"title":"Track","paused":false}"#.to_owned());
+    assert!(callbacks.state.active_media());
+
+    callbacks
+        .state
+        .publish_media_metadata(r#"{"title":"Track","paused":true}"#.to_owned());
+    assert!(!callbacks.state.active_media());
+
+    callbacks.state.publish_audio_state(true);
+    assert!(callbacks.state.active_media());
+    callbacks.state.record_navigation();
+    assert!(!callbacks.state.active_media());
 }
 
 #[test]
@@ -1845,6 +2427,15 @@ fn pdf_completion_callback_publishes_helper_event() {
         panic!("expected attach")
     };
     let callback = callbacks.retain_pdf_callback();
+    assert!(!callback.is_null(), "PDF callback retained");
+    assert_eq!(callbacks.state.retained_pdf_callback_count(), 1);
+    assert!(
+        registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(callback as usize)),
+        "retained PDF callback is resolvable for CEF delivery"
+    );
     let path = unique_test_pdf_path("cef-finished-ok");
     std::fs::write(&path, b"%PDF-1.7\n% test\n").expect("pdf fixture");
     let path_text = path.to_string_lossy().into_owned();
@@ -1864,6 +2455,36 @@ fn pdf_completion_callback_publishes_helper_event() {
             path: path_text,
             ok: true,
         }
+    );
+    assert_eq!(
+        callbacks.state.retained_pdf_callback_count(),
+        1,
+        "the PDF callback currently on CEF's stack is not freed inside its own callback"
+    );
+    assert_eq!(callbacks.state.finished_pdf_callback_count(), 1);
+    assert!(
+        !registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(callback as usize)),
+        "completed PDF callback no longer resolves through the registry"
+    );
+
+    let next_callback = callbacks.retain_pdf_callback();
+
+    assert!(!next_callback.is_null(), "next PDF callback retained");
+    assert_eq!(
+        callbacks.state.retained_pdf_callback_count(),
+        1,
+        "finished PDF callbacks are purged before retaining another callback"
+    );
+    assert_eq!(callbacks.state.finished_pdf_callback_count(), 0);
+    assert!(
+        registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(next_callback as usize)),
+        "the next PDF callback remains registered"
     );
     let _ = std::fs::remove_file(path);
 }
@@ -1887,6 +2508,7 @@ fn pdf_completion_callback_rejects_missing_pdf_output() {
         panic!("expected attach")
     };
     let callback = callbacks.retain_pdf_callback();
+    assert!(!callback.is_null(), "PDF callback retained");
     let path = unique_test_pdf_path("cef-finished-missing");
     let path_text = path.to_string_lossy().into_owned();
     let cef_path = CefStringOwned::new(&path_text).expect("pdf path");
@@ -1905,6 +2527,90 @@ fn pdf_completion_callback_rejects_missing_pdf_output() {
             path: path_text,
             ok: false,
         }
+    );
+    assert_eq!(
+        callbacks.state.finished_pdf_callback_count(),
+        1,
+        "failed PDF completions still finish the one-shot callback"
+    );
+    assert!(
+        !registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(callback as usize)),
+        "failed PDF completion also removes the callback registry entry"
+    );
+}
+
+#[test]
+fn favicon_download_callbacks_are_removed_from_registry_and_purged_after_completion() {
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        None,
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let first = callbacks.state.retain_download_image_callback();
+    assert!(!first.is_null(), "favicon callback retained");
+    assert_eq!(callbacks.state.retained_download_image_callback_count(), 1);
+    assert!(
+        registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(first as usize)),
+        "retained callback is resolvable for CEF delivery"
+    );
+
+    unsafe { on_download_image_finished(first, ptr::null(), 404, ptr::null_mut()) };
+
+    assert_eq!(
+        callbacks.state.retained_download_image_callback_count(),
+        1,
+        "the callback currently on CEF's stack is not freed inside its own callback"
+    );
+    assert_eq!(callbacks.state.finished_download_image_callback_count(), 1);
+    assert!(
+        !registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(first as usize)),
+        "completed one-shot callback no longer resolves through the registry"
+    );
+
+    let second = callbacks.state.retain_download_image_callback();
+
+    assert!(!second.is_null(), "next favicon callback retained");
+    assert_eq!(
+        callbacks.state.retained_download_image_callback_count(),
+        1,
+        "finished callbacks are purged before retaining another favicon callback"
+    );
+    assert_eq!(callbacks.state.finished_download_image_callback_count(), 0);
+    assert!(
+        registry()
+            .lock()
+            .expect("registry")
+            .contains_key(&(second as usize)),
+        "the next callback remains registered"
+    );
+}
+
+#[test]
+fn favicon_png_binary_value_is_released_after_copy() {
+    let binary = TestBinaryValue::new(vec![0x89, b'P', b'N', b'G']);
+    let image = TestImage::new(binary.as_mut_ptr());
+
+    assert_eq!(
+        image_as_png(image.as_mut_ptr()),
+        Some(vec![0x89, b'P', b'N', b'G'])
+    );
+    assert_eq!(
+        binary.releases(),
+        1,
+        "cef_binary_value_t returned by get_as_png is released after copying"
     );
 }
 
@@ -1959,6 +2665,7 @@ fn resource_verdict_transport_uses_async_cef_callback() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://www.google-analytics.com/collect".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CONTINUE_ASYNC);
@@ -1986,6 +2693,105 @@ fn resource_verdict_transport_uses_async_cef_callback() {
 }
 
 #[test]
+fn resource_verdict_pending_callbacks_are_bounded_and_fail_closed() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let mut held_callbacks = Vec::new();
+    for idx in 0..MAX_PENDING_RESOURCE_REQUESTS {
+        let callback = TestCefCallback::new();
+        let id = (idx + 1) as u64;
+        let url = format!("https://ads.example/{idx}.js");
+        let rv = callbacks.state.begin_resource_request(
+            url.clone(),
+            RESOURCE_OTHER,
+            callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, RV_CONTINUE_ASYNC);
+        assert_eq!(callback.add_refs.load(Ordering::SeqCst), 1);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("resource request recv") else {
+            panic!("expected resource request")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::ResourceRequest {
+                id,
+                url,
+                resource: RESOURCE_OTHER,
+            }
+        );
+        held_callbacks.push(callback);
+    }
+    assert_eq!(
+        callbacks.state.pending_resource_request_count(),
+        MAX_PENDING_RESOURCE_REQUESTS
+    );
+
+    let overflow = TestCefCallback::new();
+    let rv = callbacks.state.begin_resource_request(
+        "https://ads.example/overflow.js".to_owned(),
+        RESOURCE_OTHER,
+        overflow.as_mut_ptr(),
+    );
+
+    assert_eq!(rv, RV_CANCEL);
+    assert_eq!(
+        callbacks.state.pending_resource_request_count(),
+        MAX_PENDING_RESOURCE_REQUESTS,
+        "overflow must not grow the held CEF callback set"
+    );
+    assert_eq!(
+        overflow.add_refs.load(Ordering::SeqCst),
+        0,
+        "overflow is canceled synchronously without taking a stash ref"
+    );
+    assert_eq!(overflow.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(overflow.releases.load(Ordering::SeqCst), 0);
+
+    callbacks.apply_resource_verdict(1, true);
+    assert_eq!(held_callbacks[0].continued.load(Ordering::SeqCst), 1);
+    assert_eq!(held_callbacks[0].releases.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        callbacks.state.pending_resource_request_count(),
+        MAX_PENDING_RESOURCE_REQUESTS - 1
+    );
+
+    let recovered = TestCefCallback::new();
+    let rv = callbacks.state.begin_resource_request(
+        "https://ads.example/recovered.js".to_owned(),
+        RESOURCE_OTHER,
+        recovered.as_mut_ptr(),
+    );
+    assert_eq!(rv, RV_CONTINUE_ASYNC, "freeing a slot allows new requests");
+    assert_eq!(recovered.add_refs.load(Ordering::SeqCst), 1);
+
+    callbacks.state.cancel_pending_resource_requests();
+    assert_eq!(
+        callbacks.state.pending_resource_request_count(),
+        0,
+        "test drains pending callbacks before dropping fake CEF callback blocks"
+    );
+}
+
+#[test]
 fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::sock::{recv, RecvOutcome};
     use crate::wire::{take_frame, EventMsg};
@@ -2007,6 +2813,7 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "mde-page-text://capture/77?text=hello%20page".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CANCEL);
@@ -2031,6 +2838,99 @@ fn page_text_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
 }
 
 #[test]
+fn media_metadata_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let cef_callback = TestCefCallback::new();
+    let rv = callbacks.state.begin_resource_request(
+        "https://mde-media.invalid/metadata/?body=%7B%22title%22%3A%22Track%22%2C%22artist%22%3A%22Artist%22%7D".to_owned(),
+        RESOURCE_OTHER,
+        cef_callback.as_mut_ptr(),
+    );
+    assert_eq!(rv, RV_CANCEL);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("media metadata recv") else {
+        panic!("expected media metadata")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::MediaMetadata {
+            body: r#"{"title":"Track","artist":"Artist"}"#.to_owned(),
+        }
+    );
+    assert_eq!(cef_callback.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.continued.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn native_page_text_visitor_publishes_and_reclaims_callback() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let visitor = callbacks.state.retain_page_text_visitor(91, 8);
+    assert!(!visitor.is_null());
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 1);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 0);
+
+    let text = CefStringOwned::new("hello native").expect("text");
+    unsafe { on_page_text_visited(visitor, text.as_ptr().cast::<CefString>()) };
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page text recv") else {
+        panic!("expected page text")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageText {
+            id: 91,
+            text: "hello na".to_owned(),
+        }
+    );
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 1);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 1);
+
+    callbacks.state.purge_finished_page_text_visitors(None);
+    assert_eq!(callbacks.state.retained_page_text_visitor_count(), 0);
+    assert_eq!(callbacks.state.finished_page_text_visitor_count(), 0);
+}
+
+#[test]
 fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::sock::{recv, RecvOutcome};
     use crate::wire::{take_frame, EventMsg};
@@ -2052,6 +2952,7 @@ fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() 
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
             "https://mde-page-scrape.invalid/capture/88?body=%7B%22text%22%3A%22hello%22%2C%22links%22%3A%5B%5D%7D".to_owned(),
+            RESOURCE_OTHER,
             cef_callback.as_mut_ptr(),
         );
     assert_eq!(rv, RV_CANCEL);
@@ -2076,6 +2977,195 @@ fn page_scrape_beacon_is_intercepted_and_published_without_adfilter_roundtrip() 
 }
 
 #[test]
+fn page_text_dialog_beacon_is_intercepted_without_user_jsdialog_event() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new("https://mde-page-text.invalid/capture/77?text=hello%20page")
+        .expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page text recv") else {
+        panic!("expected page text")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageText {
+            id: 77,
+            text: "hello page".to_owned(),
+        }
+    );
+    shell.set_nonblocking(true).expect("nonblocking shell");
+    assert!(
+        matches!(
+            recv(&shell).expect("no jsdialog event"),
+            RecvOutcome::WouldBlock
+        ),
+        "internal page-text beacons must not surface as user JS dialogs"
+    );
+}
+
+#[test]
+fn page_scrape_dialog_beacon_is_intercepted_without_user_jsdialog_event() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new(
+        "https://mde-page-scrape.invalid/capture/88?body=%7B%22text%22%3A%22hello%22%7D",
+    )
+    .expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("page scrape recv") else {
+        panic!("expected page scrape")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::PageScrape {
+            id: 88,
+            body: r#"{"text":"hello"}"#.to_owned(),
+        }
+    );
+    shell.set_nonblocking(true).expect("nonblocking shell");
+    assert!(
+        matches!(
+            recv(&shell).expect("no jsdialog event"),
+            RecvOutcome::WouldBlock
+        ),
+        "internal page-scrape beacons must not surface as user JS dialogs"
+    );
+}
+
+#[test]
+fn user_jsdialog_still_publishes_and_auto_resolves() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_jsdialog, handler) = resolve_on_jsdialog(&callbacks);
+    let origin = CefStringOwned::new("https://doc.example/").expect("origin");
+    let message = CefStringOwned::new("real alert").expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let mut suppress = -1;
+
+    let rv = unsafe {
+        on_jsdialog(
+            handler,
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            0,
+            message.as_ptr().cast::<CefString>(),
+            ptr::null(),
+            cef_callback.as_mut_ptr(),
+            &mut suppress,
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(suppress, 0);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("jsdialog recv") else {
+        panic!("expected jsdialog")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::JsDialog {
+            kind: 0,
+            message: "real alert".to_owned(),
+            origin: "https://doc.example/".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn passkey_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     use crate::sock::{recv, RecvOutcome};
     use crate::wire::{take_frame, EventMsg};
@@ -2097,6 +3187,7 @@ fn passkey_beacon_is_intercepted_and_published_without_adfilter_roundtrip() {
     let cef_callback = TestCefCallback::new();
     let rv = callbacks.state.begin_resource_request(
         "https://mde-passkey.invalid/request/?body=%7B%22ceremony%22%3A%22get%22%7D".to_owned(),
+        RESOURCE_OTHER,
         cef_callback.as_mut_ptr(),
     );
     assert_eq!(rv, RV_CANCEL);
@@ -2227,6 +3318,188 @@ unsafe extern "C" fn noop_string_list_value(
     0
 }
 
+const TEST_CEF_BINARY_VALUE_SIZE: usize = CEF_BINARY_VALUE_GET_DATA_OFFSET + size_of::<usize>();
+const TEST_CEF_IMAGE_SIZE: usize = CEF_IMAGE_GET_AS_PNG_OFFSET + size_of::<usize>();
+
+struct TestBinaryValue {
+    block: CefCallbackBlock<TEST_CEF_BINARY_VALUE_SIZE>,
+    bytes: Box<[u8]>,
+    releases: Box<AtomicUsize>,
+}
+
+impl TestBinaryValue {
+    fn new(bytes: Vec<u8>) -> Box<Self> {
+        let releases = Box::new(AtomicUsize::new(0));
+        let mut block = CefCallbackBlock::new(TEST_CEF_BINARY_VALUE_SIZE);
+        block.put_fn(
+            BASE_RELEASE_OFFSET,
+            fn_ptr(test_binary_release as *const ()),
+        );
+        block.put_fn(
+            CEF_BINARY_VALUE_GET_SIZE_OFFSET,
+            fn_ptr(test_binary_get_size as *const ()),
+        );
+        block.put_fn(
+            CEF_BINARY_VALUE_GET_DATA_OFFSET,
+            fn_ptr(test_binary_get_data as *const ()),
+        );
+        let value = Box::new(Self {
+            block,
+            bytes: bytes.into_boxed_slice(),
+            releases,
+        });
+        value.install_state_pointer();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn releases(&self) -> usize {
+        self.releases.load(Ordering::SeqCst)
+    }
+
+    fn install_state_pointer(&self) {
+        let state = TestBinaryValueState {
+            bytes: self.bytes.as_ptr() as usize,
+            len: self.bytes.len(),
+            releases: self.releases.as_ref() as *const AtomicUsize as usize,
+        };
+        test_binary_registry()
+            .lock()
+            .expect("test binary registry")
+            .insert(self.as_mut_ptr() as usize, state);
+    }
+}
+
+impl Drop for TestBinaryValue {
+    fn drop(&mut self) {
+        let _ = test_binary_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestBinaryValueState {
+    bytes: usize,
+    len: usize,
+    releases: usize,
+}
+
+fn test_binary_registry() -> &'static Mutex<HashMap<usize, TestBinaryValueState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, TestBinaryValueState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "C" fn test_binary_get_size(self_: *mut c_void) -> usize {
+    test_binary_state(self_).len
+}
+
+unsafe extern "C" fn test_binary_get_data(
+    self_: *mut c_void,
+    buffer: *mut c_void,
+    buffer_size: usize,
+    data_offset: usize,
+) -> usize {
+    if buffer.is_null() {
+        return 0;
+    }
+    let state = test_binary_state(self_);
+    let offset = data_offset.min(state.len);
+    let len = buffer_size.min(state.len.saturating_sub(offset));
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: the registry stores a pointer to the boxed test bytes, which outlive
+    // this callback; `buffer` points to the caller's writable `len`-byte output.
+    unsafe {
+        ptr::copy_nonoverlapping((state.bytes as *const u8).add(offset), buffer.cast(), len);
+    }
+    len
+}
+
+unsafe extern "C" fn test_binary_release(self_: *mut c_void) -> c_int {
+    let state = test_binary_state(self_);
+    // SAFETY: `releases` points to the boxed counter owned by `TestBinaryValue`.
+    unsafe { (*(state.releases as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+    0
+}
+
+fn test_binary_state(self_: *mut c_void) -> TestBinaryValueState {
+    *test_binary_registry()
+        .lock()
+        .expect("test binary registry")
+        .get(&(self_ as usize))
+        .expect("registered test binary value")
+}
+
+struct TestImage {
+    block: CefCallbackBlock<TEST_CEF_IMAGE_SIZE>,
+    binary: *mut c_void,
+}
+
+impl TestImage {
+    fn new(binary: *mut c_void) -> Box<Self> {
+        let mut block = CefCallbackBlock::new(TEST_CEF_IMAGE_SIZE);
+        block.put_fn(
+            CEF_IMAGE_GET_AS_PNG_OFFSET,
+            fn_ptr(test_image_get_as_png as *const ()),
+        );
+        let value = Box::new(Self { block, binary });
+        value.install_state_pointer();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn install_state_pointer(&self) {
+        test_image_registry()
+            .lock()
+            .expect("test image registry")
+            .insert(self.as_mut_ptr() as usize, self.binary as usize);
+    }
+}
+
+impl Drop for TestImage {
+    fn drop(&mut self) {
+        let _ = test_image_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+fn test_image_registry() -> &'static Mutex<HashMap<usize, usize>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "C" fn test_image_get_as_png(
+    self_: *mut c_void,
+    _scale_factor: f32,
+    _with_transparency: c_int,
+    pixel_width: *mut c_int,
+    pixel_height: *mut c_int,
+) -> *mut c_void {
+    if !pixel_width.is_null() {
+        // SAFETY: CEF-style out-param supplied by `image_as_png`.
+        unsafe { *pixel_width = 16 };
+    }
+    if !pixel_height.is_null() {
+        // SAFETY: CEF-style out-param supplied by `image_as_png`.
+        unsafe { *pixel_height = 16 };
+    }
+    test_image_registry()
+        .lock()
+        .expect("test image registry")
+        .get(&(self_ as usize))
+        .copied()
+        .unwrap_or(0) as *mut c_void
+}
+
 struct TestCefCallback {
     block: CefCallbackBlock<CEF_CALLBACK_SIZE>,
     add_refs: Box<AtomicUsize>,
@@ -2325,6 +3598,164 @@ fn test_counter(
         .expect("registered test callback");
     let ptr = select(state);
     unsafe { &*(ptr as *const AtomicUsize) }
+}
+
+/// A fake `cef_jsdialog_callback_t` recording add_ref/release counts and the
+/// `cont(success, user_input)` argument. Used by beforeunload tests without live
+/// CEF or a native dialog.
+struct TestJsDialogCallback {
+    block: CefCallbackBlock<CEF_CALLBACK_SIZE>,
+    add_refs: Box<AtomicUsize>,
+    releases: Box<AtomicUsize>,
+    conts: Box<AtomicUsize>,
+    success: Box<AtomicI32>,
+}
+
+impl TestJsDialogCallback {
+    fn new() -> Box<Self> {
+        let add_refs = Box::new(AtomicUsize::new(0));
+        let releases = Box::new(AtomicUsize::new(0));
+        let conts = Box::new(AtomicUsize::new(0));
+        let success = Box::new(AtomicI32::new(-1));
+        let mut block = CefCallbackBlock::new(CEF_CALLBACK_SIZE);
+        block.put_fn(
+            BASE_ADD_REF_OFFSET,
+            fn_ptr(test_jsdialog_add_ref as *const ()),
+        );
+        block.put_fn(
+            BASE_RELEASE_OFFSET,
+            fn_ptr(test_jsdialog_release as *const ()),
+        );
+        block.put_fn(
+            CEF_CALLBACK_CONT_OFFSET,
+            fn_ptr(test_jsdialog_cont as *const ()),
+        );
+        let value = Box::new(Self {
+            block,
+            add_refs,
+            releases,
+            conts,
+            success,
+        });
+        value.install_state_pointers();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn install_state_pointers(&self) {
+        let state = TestJsDialogCallbackState {
+            add_refs: self.add_refs.as_ref() as *const AtomicUsize as usize,
+            releases: self.releases.as_ref() as *const AtomicUsize as usize,
+            conts: self.conts.as_ref() as *const AtomicUsize as usize,
+            success: self.success.as_ref() as *const AtomicI32 as usize,
+        };
+        test_jsdialog_registry()
+            .lock()
+            .expect("test jsdialog registry")
+            .insert(self.as_mut_ptr() as usize, state);
+    }
+}
+
+impl Drop for TestJsDialogCallback {
+    fn drop(&mut self) {
+        let _ = test_jsdialog_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestJsDialogCallbackState {
+    add_refs: usize,
+    releases: usize,
+    conts: usize,
+    success: usize,
+}
+
+fn test_jsdialog_registry() -> &'static Mutex<HashMap<usize, TestJsDialogCallbackState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, TestJsDialogCallbackState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn test_jsdialog_state(self_: *mut c_void) -> TestJsDialogCallbackState {
+    test_jsdialog_registry()
+        .lock()
+        .expect("test jsdialog registry")
+        .get(&(self_ as usize))
+        .copied()
+        .expect("registered test jsdialog callback")
+}
+
+unsafe extern "C" fn test_jsdialog_add_ref(self_: *mut c_void) {
+    let state = test_jsdialog_state(self_);
+    // SAFETY: the recorder outlives the callback (owned by TestJsDialogCallback).
+    unsafe { (*(state.add_refs as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+}
+
+unsafe extern "C" fn test_jsdialog_release(self_: *mut c_void) -> c_int {
+    let state = test_jsdialog_state(self_);
+    // SAFETY: as above.
+    unsafe { (*(state.releases as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+    0
+}
+
+unsafe extern "C" fn test_jsdialog_cont(
+    self_: *mut c_void,
+    success: c_int,
+    _user_input: *const CefString,
+) {
+    let state = test_jsdialog_state(self_);
+    // SAFETY: as above.
+    unsafe {
+        (*(state.conts as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+        (*(state.success as *const AtomicI32)).store(success, Ordering::SeqCst);
+    }
+}
+
+/// `cef_jsdialog_handler_t::on_jsdialog` C signature.
+type OnJsDialogFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *const CefString,
+    c_int,
+    *const CefString,
+    *const CefString,
+    *mut c_void,
+    *mut c_int,
+) -> c_int;
+
+/// `cef_jsdialog_handler_t::on_before_unload_dialog` C signature.
+type OnBeforeUnloadFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *const CefString, c_int, *mut c_void) -> c_int;
+
+/// Resolve `on_jsdialog` through the client vtable's `get_jsdialog_handler`
+/// slot, then read the method from the installed handler.
+fn resolve_on_jsdialog(callbacks: &CefBrowserCallbacks) -> (OnJsDialogFn, *mut c_void) {
+    let handler = unsafe { get_jsdialog_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_jsdialog_handler returned null");
+    let on_jsdialog: OnJsDialogFn = unsafe {
+        std::mem::transmute(
+            read_fn(handler, CEF_JSDIALOG_HANDLER_ON_JSDIALOG_OFFSET).expect("on_jsdialog slot"),
+        )
+    };
+    (on_jsdialog, handler)
+}
+
+/// Resolve `on_before_unload_dialog` through the client vtable's
+/// `get_jsdialog_handler` slot, then read the method from the installed handler.
+fn resolve_on_before_unload(callbacks: &CefBrowserCallbacks) -> (OnBeforeUnloadFn, *mut c_void) {
+    let handler = unsafe { get_jsdialog_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_jsdialog_handler returned null");
+    let on_before_unload: OnBeforeUnloadFn = unsafe {
+        std::mem::transmute(
+            read_fn(handler, CEF_JSDIALOG_HANDLER_ON_BEFORE_UNLOAD_DIALOG_OFFSET)
+                .expect("on_before_unload_dialog slot"),
+        )
+    };
+    (on_before_unload, handler)
 }
 
 /// A fake `cef_permission_prompt_callback_t` recording add_ref/release counts and
@@ -2433,11 +3864,126 @@ unsafe extern "C" fn test_perm_cont(self_: *mut c_void, result: c_int) {
     }
 }
 
+/// A fake `cef_media_access_callback_t` recording add_ref/release counts and the
+/// `cont(allowed_permissions)` bitmask returned to CEF.
+struct TestMediaAccessCallback {
+    block: CefCallbackBlock<CEF_MEDIA_ACCESS_CALLBACK_SIZE>,
+    add_refs: Box<AtomicUsize>,
+    releases: Box<AtomicUsize>,
+    conts: Box<AtomicUsize>,
+    allowed: Box<AtomicU32>,
+}
+
+impl TestMediaAccessCallback {
+    fn new() -> Box<Self> {
+        let add_refs = Box::new(AtomicUsize::new(0));
+        let releases = Box::new(AtomicUsize::new(0));
+        let conts = Box::new(AtomicUsize::new(0));
+        let allowed = Box::new(AtomicU32::new(u32::MAX));
+        let mut block = CefCallbackBlock::new(CEF_MEDIA_ACCESS_CALLBACK_SIZE);
+        block.put_fn(BASE_ADD_REF_OFFSET, fn_ptr(test_media_add_ref as *const ()));
+        block.put_fn(BASE_RELEASE_OFFSET, fn_ptr(test_media_release as *const ()));
+        block.put_fn(
+            CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET,
+            fn_ptr(test_media_cont as *const ()),
+        );
+        let value = Box::new(Self {
+            block,
+            add_refs,
+            releases,
+            conts,
+            allowed,
+        });
+        value.install_state_pointers();
+        value
+    }
+
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.block.as_mut_ptr()
+    }
+
+    fn install_state_pointers(&self) {
+        let state = TestMediaAccessCallbackState {
+            add_refs: self.add_refs.as_ref() as *const AtomicUsize as usize,
+            releases: self.releases.as_ref() as *const AtomicUsize as usize,
+            conts: self.conts.as_ref() as *const AtomicUsize as usize,
+            allowed: self.allowed.as_ref() as *const AtomicU32 as usize,
+        };
+        test_media_registry()
+            .lock()
+            .expect("test media registry")
+            .insert(self.as_mut_ptr() as usize, state);
+    }
+}
+
+impl Drop for TestMediaAccessCallback {
+    fn drop(&mut self) {
+        let _ = test_media_registry()
+            .lock()
+            .map(|mut registry| registry.remove(&(self.as_mut_ptr() as usize)));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestMediaAccessCallbackState {
+    add_refs: usize,
+    releases: usize,
+    conts: usize,
+    allowed: usize,
+}
+
+fn test_media_registry() -> &'static Mutex<HashMap<usize, TestMediaAccessCallbackState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, TestMediaAccessCallbackState>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn test_media_state(self_: *mut c_void) -> TestMediaAccessCallbackState {
+    test_media_registry()
+        .lock()
+        .expect("test media registry")
+        .get(&(self_ as usize))
+        .copied()
+        .expect("registered test media callback")
+}
+
+unsafe extern "C" fn test_media_add_ref(self_: *mut c_void) {
+    let state = test_media_state(self_);
+    // SAFETY: the recorder outlives the callback (owned by TestMediaAccessCallback).
+    unsafe { (*(state.add_refs as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+}
+
+unsafe extern "C" fn test_media_release(self_: *mut c_void) -> c_int {
+    let state = test_media_state(self_);
+    // SAFETY: as above.
+    unsafe { (*(state.releases as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
+    0
+}
+
+unsafe extern "C" fn test_media_cont(self_: *mut c_void, allowed_permissions: u32) {
+    let state = test_media_state(self_);
+    // SAFETY: as above.
+    unsafe {
+        (*(state.conts as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+        (*(state.allowed as *const AtomicU32)).store(allowed_permissions, Ordering::SeqCst);
+    }
+}
+
 /// `cef_permission_handler_t::on_show_permission_prompt` C signature.
 type OnShowPromptFn = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
     u64,
+    *const CefString,
+    u32,
+    *mut c_void,
+) -> c_int;
+
+/// `cef_permission_handler_t::on_request_media_access_permission` C signature.
+type OnRequestMediaAccessFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
     *const CefString,
     u32,
     *mut c_void,
@@ -2460,6 +4006,238 @@ fn resolve_on_show_permission_prompt(
     (on_show, handler)
 }
 
+/// Resolve `on_request_media_access_permission` through the installed permission
+/// handler vtable.
+fn resolve_on_request_media_access(
+    callbacks: &CefBrowserCallbacks,
+) -> (OnRequestMediaAccessFn, *mut c_void) {
+    let handler = unsafe { get_permission_handler(callbacks.client_ptr()) };
+    assert!(!handler.is_null(), "get_permission_handler returned null");
+    let on_request: OnRequestMediaAccessFn = unsafe {
+        std::mem::transmute(
+            read_fn(
+                handler,
+                CEF_PERMISSION_HANDLER_ON_REQUEST_MEDIA_ACCESS_OFFSET,
+            )
+            .expect("on_request_media_access_permission slot"),
+        )
+    };
+    (on_request, handler)
+}
+
+#[test]
+fn before_unload_prompt_stashes_then_leave_continues_and_releases() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    *callbacks.state.nav_url.lock().expect("nav") = "https://editor.example/doc/1".to_owned();
+    let (on_before_unload, handler) = resolve_on_before_unload(&callbacks);
+
+    let message = CefStringOwned::new("You have unsaved changes").expect("message");
+    let cef_callback = TestJsDialogCallback::new();
+    let rv = unsafe {
+        on_before_unload(
+            handler,
+            ptr::null_mut(),
+            message.as_ptr().cast::<CefString>(),
+            0,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("beforeunload recv") else {
+        panic!("expected beforeunload request")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    assert_eq!(
+        EventMsg::decode(&payload).expect("event"),
+        EventMsg::BeforeUnloadDialog {
+            id: 1,
+            message: "You have unsaved changes".to_owned(),
+            origin: "https://editor.example/doc/1".to_owned(),
+            is_reload: false,
+        }
+    );
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::BeforeUnloadDecision {
+            id: 1,
+            proceed: true,
+        },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.success.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::BeforeUnloadDecision {
+            id: 1,
+            proceed: false,
+        },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn before_unload_prompt_teardown_answers_stay_and_releases() {
+    use crate::sock::{recv, RecvOutcome};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let cef_callback = TestJsDialogCallback::new();
+    {
+        let callbacks = CefBrowserCallbacks::new(
+            2,
+            2,
+            Some(&helper),
+            noop_userfree_free,
+            noop_string_list_size,
+            noop_string_list_value,
+        )
+        .expect("callbacks");
+        let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+            panic!("expected attach")
+        };
+        let (on_before_unload, handler) = resolve_on_before_unload(&callbacks);
+        let message = CefStringOwned::new("Draft changed").expect("message");
+        let rv = unsafe {
+            on_before_unload(
+                handler,
+                ptr::null_mut(),
+                message.as_ptr().cast::<CefString>(),
+                1,
+                cef_callback.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rv, 1);
+        assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+        assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+    }
+
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cef_callback.success.load(Ordering::SeqCst),
+        0,
+        "teardown must cancel/stay, not leave the page"
+    );
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn before_unload_prompts_are_bounded_and_overflow_stays_synchronously() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    *callbacks.state.nav_url.lock().expect("nav") = "https://editor.example/doc".to_owned();
+
+    let mut held_callbacks = Vec::new();
+    for idx in 0..MAX_PENDING_BEFORE_UNLOAD_DIALOGS {
+        let callback = TestJsDialogCallback::new();
+        let rv = callbacks.state.begin_before_unload_dialog(
+            format!("draft {idx}"),
+            false,
+            callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, 1);
+        assert_eq!(callback.add_refs.load(Ordering::SeqCst), 1);
+        assert_eq!(callback.conts.load(Ordering::SeqCst), 0);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("beforeunload recv") else {
+            panic!("expected beforeunload request")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        let expected_id = (idx + 1) as u64;
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::BeforeUnloadDialog {
+                id: expected_id,
+                message: format!("draft {idx}"),
+                origin: "https://editor.example/doc".to_owned(),
+                is_reload: false,
+            }
+        );
+        held_callbacks.push(callback);
+    }
+    assert_eq!(
+        callbacks.state.pending_before_unload_count(),
+        MAX_PENDING_BEFORE_UNLOAD_DIALOGS
+    );
+
+    let overflow = TestJsDialogCallback::new();
+    let rv = callbacks.state.begin_before_unload_dialog(
+        "overflow".to_owned(),
+        false,
+        overflow.as_mut_ptr(),
+    );
+    assert_eq!(rv, 1);
+    assert_eq!(overflow.add_refs.load(Ordering::SeqCst), 0);
+    assert_eq!(overflow.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(overflow.success.load(Ordering::SeqCst), 0);
+    assert_eq!(overflow.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        callbacks.state.pending_before_unload_count(),
+        MAX_PENDING_BEFORE_UNLOAD_DIALOGS,
+        "overflow must not grow the held CEF beforeunload callback set"
+    );
+
+    callbacks.apply_before_unload_decision(1, true);
+    assert_eq!(held_callbacks[0].conts.load(Ordering::SeqCst), 1);
+    assert_eq!(held_callbacks[0].success.load(Ordering::SeqCst), 1);
+    assert_eq!(held_callbacks[0].releases.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        callbacks.state.pending_before_unload_count(),
+        MAX_PENDING_BEFORE_UNLOAD_DIALOGS - 1
+    );
+
+    let recovered = TestJsDialogCallback::new();
+    let rv = callbacks.state.begin_before_unload_dialog(
+        "recovered".to_owned(),
+        false,
+        recovered.as_mut_ptr(),
+    );
+    assert_eq!(rv, 1, "freeing a slot allows another beforeunload prompt");
+    assert_eq!(recovered.add_refs.load(Ordering::SeqCst), 1);
+    callbacks.state.release_pending_before_unload_dialogs();
+    assert_eq!(callbacks.state.pending_before_unload_count(), 0);
+}
+
 #[test]
 fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     // get_permission_handler is index 10 of the CEF 149 client vtable — between
@@ -2478,14 +4256,26 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     // cef_permission_prompt_callback_t: cont right after the base.
     assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_CONT_OFFSET, 40);
     assert_eq!(CEF_PERMISSION_PROMPT_CALLBACK_SIZE, 40 + 8);
+    // cef_media_access_callback_t: cont + cancel after the base.
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_CONT_OFFSET, 40);
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_CANCEL_OFFSET, 40 + 8);
+    assert_eq!(CEF_MEDIA_ACCESS_CALLBACK_SIZE, 40 + 2 * 8);
     // cef_permission_request_result_t (ACCEPT=0, DENY=1, DISMISS=2, IGNORE=3).
     assert_eq!(CEF_PERMISSION_RESULT_ACCEPT, 0);
     assert_eq!(CEF_PERMISSION_RESULT_DENY, 1);
     // cef_permission_request_types_t bits (from cef_types.h).
+    assert_eq!(CEF_PERMISSION_TYPE_CAMERA_STREAM, 1 << 2);
     assert_eq!(CEF_PERMISSION_TYPE_CLIPBOARD, 1 << 4);
     assert_eq!(CEF_PERMISSION_TYPE_GEOLOCATION, 1 << 8);
+    assert_eq!(CEF_PERMISSION_TYPE_MIC_STREAM, 1 << 12);
+    assert_eq!(CEF_PERMISSION_TYPE_MIDI_SYSEX, 1 << 13);
     assert_eq!(CEF_PERMISSION_TYPE_NOTIFICATIONS, 1 << 15);
-    // Bitmask → engine-neutral wire kind (0 geo, 1 notif, 2 clipboard).
+    // cef_media_access_permission_types_t bits (from cef_types.h).
+    assert_eq!(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE, 1 << 0);
+    assert_eq!(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE, 1 << 1);
+    assert_eq!(CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE, 1 << 2);
+    assert_eq!(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE, 1 << 3);
+    // Permission bitmask → engine-neutral wire kind.
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION),
         Some(0)
@@ -2498,9 +4288,26 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
         permission_kind_from_cef(CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(2)
     );
-    assert_eq!(permission_kind_from_cef(1 << 12), None); // MIC_STREAM, out of scope
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_CAMERA_STREAM),
+        Some(3)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_MIC_STREAM),
+        Some(4)
+    );
+    assert_eq!(
+        permission_kind_from_cef(
+            CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_MIC_STREAM
+        ),
+        Some(5)
+    );
+    assert_eq!(
+        permission_kind_from_cef(CEF_PERMISSION_TYPE_MIDI_SYSEX),
+        None
+    );
     assert_eq!(permission_kind_from_cef(0), None); // NONE
-                                                   // Several in-scope bits at once → geolocation wins (wire order).
+                                                   // Several in-scope bits at once → earlier wire order wins.
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_GEOLOCATION | CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(0)
@@ -2508,6 +4315,30 @@ fn permission_handler_offsets_reconcile_with_the_pinned_cef_layout() {
     assert_eq!(
         permission_kind_from_cef(CEF_PERMISSION_TYPE_NOTIFICATIONS | CEF_PERMISSION_TYPE_CLIPBOARD),
         Some(1)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE),
+        Some(3)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE),
+        Some(4)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE
+        ),
+        Some(5)
+    );
+    assert_eq!(
+        media_access_kind_from_cef(CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE),
+        None
+    );
+    assert_eq!(
+        media_access_kind_from_cef(
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE
+        ),
+        None
     );
 }
 
@@ -2655,6 +4486,240 @@ fn permission_prompt_notifications_deny_denies_and_releases() {
 }
 
 #[test]
+fn media_access_permission_camera_mic_prompts_then_allows_requested_bits() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_request, handler) = resolve_on_request_media_access(&callbacks);
+
+    let origin = CefStringOwned::new("https://meet.example.com").expect("origin");
+    let cef_callback = TestMediaAccessCallback::new();
+    let requested_permissions =
+        CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE | CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE;
+    let rv = unsafe {
+        on_request(
+            handler,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            requested_permissions,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 0);
+
+    let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("media permission recv") else {
+        panic!("expected media permission request")
+    };
+    assert!(fds.is_empty());
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    let EventMsg::PermissionRequest { id, kind, origin } =
+        EventMsg::decode(&payload).expect("event")
+    else {
+        panic!("expected permission request");
+    };
+    assert_eq!(id, MEDIA_PERMISSION_ID_BASE);
+    assert_eq!(kind, 5);
+    assert_eq!(origin, "https://meet.example.com");
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cef_callback.allowed.load(Ordering::SeqCst),
+        requested_permissions,
+        "CEF media access grants must echo exactly the requested device bits"
+    );
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: true },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn media_access_permission_microphone_deny_returns_zero_allowed_bits() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+    let (on_request, handler) = resolve_on_request_media_access(&callbacks);
+
+    let origin = CefStringOwned::new("https://voice.example.com").expect("origin");
+    let cef_callback = TestMediaAccessCallback::new();
+    let rv = unsafe {
+        on_request(
+            handler,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            origin.as_ptr().cast::<CefString>(),
+            CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE,
+            cef_callback.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rv, 1);
+    assert_eq!(cef_callback.add_refs.load(Ordering::SeqCst), 1);
+
+    let RecvOutcome::Data { bytes, .. } = recv(&shell).expect("media permission recv") else {
+        panic!("expected media permission request")
+    };
+    let mut bytes = bytes;
+    let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+    let EventMsg::PermissionRequest { id, kind, origin } =
+        EventMsg::decode(&payload).expect("event")
+    else {
+        panic!("expected permission request");
+    };
+    assert_eq!(id, MEDIA_PERMISSION_ID_BASE);
+    assert_eq!(kind, 4);
+    assert_eq!(origin, "https://voice.example.com");
+
+    apply_control_frame(
+        ptr::null_mut(),
+        &callbacks,
+        &ControlMsg::PermissionDecision { id, allow: false },
+    );
+    assert_eq!(cef_callback.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(cef_callback.allowed.load(Ordering::SeqCst), 0);
+    assert_eq!(cef_callback.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn permission_prompts_are_bounded_and_overflow_denies_synchronously() {
+    use crate::sock::{recv, RecvOutcome};
+    use crate::wire::{take_frame, EventMsg};
+
+    let (helper, shell) = UnixStream::pair().expect("socketpair");
+    let callbacks = CefBrowserCallbacks::new(
+        2,
+        2,
+        Some(&helper),
+        noop_userfree_free,
+        noop_string_list_size,
+        noop_string_list_value,
+    )
+    .expect("callbacks");
+    let RecvOutcome::Data { .. } = recv(&shell).expect("attach recv") else {
+        panic!("expected attach")
+    };
+
+    let mut held_callbacks = Vec::new();
+    for idx in 0..MAX_PENDING_PERMISSION_PROMPTS {
+        let callback = TestPermissionCallback::new();
+        let id = idx as u64;
+        let rv = callbacks.state.begin_permission_prompt(
+            id,
+            "https://maps.example".to_owned(),
+            CEF_PERMISSION_TYPE_GEOLOCATION,
+            callback.as_mut_ptr(),
+        );
+        assert_eq!(rv, 1);
+        assert_eq!(callback.add_refs.load(Ordering::SeqCst), 1);
+        assert_eq!(callback.conts.load(Ordering::SeqCst), 0);
+
+        let RecvOutcome::Data { bytes, fds } = recv(&shell).expect("permission recv") else {
+            panic!("expected permission request")
+        };
+        assert!(fds.is_empty());
+        let mut bytes = bytes;
+        let payload = take_frame(&mut bytes).expect("frame").expect("payload");
+        assert_eq!(
+            EventMsg::decode(&payload).expect("event"),
+            EventMsg::PermissionRequest {
+                id,
+                kind: 0,
+                origin: "https://maps.example".to_owned(),
+            }
+        );
+        held_callbacks.push(callback);
+    }
+    assert_eq!(
+        callbacks.state.pending_permission_prompt_count(),
+        MAX_PENDING_PERMISSION_PROMPTS
+    );
+
+    let overflow = TestPermissionCallback::new();
+    let rv = callbacks.state.begin_permission_prompt(
+        999,
+        "https://maps.example".to_owned(),
+        CEF_PERMISSION_TYPE_GEOLOCATION,
+        overflow.as_mut_ptr(),
+    );
+    assert_eq!(rv, 1);
+    assert_eq!(overflow.add_refs.load(Ordering::SeqCst), 0);
+    assert_eq!(overflow.conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        overflow.result.load(Ordering::SeqCst),
+        CEF_PERMISSION_RESULT_DENY
+    );
+    assert_eq!(overflow.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        callbacks.state.pending_permission_prompt_count(),
+        MAX_PENDING_PERMISSION_PROMPTS,
+        "overflow must not grow the held CEF permission callback set"
+    );
+
+    callbacks.apply_permission_decision(0, true);
+    assert_eq!(held_callbacks[0].conts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        held_callbacks[0].result.load(Ordering::SeqCst),
+        CEF_PERMISSION_RESULT_ACCEPT
+    );
+    assert_eq!(held_callbacks[0].releases.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        callbacks.state.pending_permission_prompt_count(),
+        MAX_PENDING_PERMISSION_PROMPTS - 1
+    );
+
+    let recovered = TestPermissionCallback::new();
+    let rv = callbacks.state.begin_permission_prompt(
+        1000,
+        "https://maps.example".to_owned(),
+        CEF_PERMISSION_TYPE_GEOLOCATION,
+        recovered.as_mut_ptr(),
+    );
+    assert_eq!(rv, 1, "freeing a slot allows another permission prompt");
+    assert_eq!(recovered.add_refs.load(Ordering::SeqCst), 1);
+    callbacks.state.release_pending_permission_prompts();
+    assert_eq!(callbacks.state.pending_permission_prompt_count(), 0);
+}
+
+#[test]
 fn permission_prompt_out_of_scope_types_default_deny_without_emitting() {
     use crate::sock::{recv, RecvOutcome};
 
@@ -2674,17 +4739,17 @@ fn permission_prompt_out_of_scope_types_default_deny_without_emitting() {
     shell.set_nonblocking(true).expect("nonblocking");
     let (on_show, handler) = resolve_on_show_permission_prompt(&callbacks);
 
-    let origin = CefStringOwned::new("https://cam.example.com").expect("origin");
+    let origin = CefStringOwned::new("https://midi.example.com").expect("origin");
     let cef_callback = TestPermissionCallback::new();
-    // MIC_STREAM (1 << 12) alone is out of scope → return 0 (default handling / deny
-    // under Alloy style): no add_ref, no stash, nothing published.
+    // MIDI sysex remains out of scope → return 0 (default handling / deny under
+    // Alloy style): no add_ref, no stash, nothing published.
     let rv = unsafe {
         on_show(
             handler,
             ptr::null_mut(),
             3,
             origin.as_ptr().cast::<CefString>(),
-            1u32 << 12,
+            CEF_PERMISSION_TYPE_MIDI_SYSEX,
             cef_callback.as_mut_ptr(),
         )
     };

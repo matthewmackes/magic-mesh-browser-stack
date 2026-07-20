@@ -13,7 +13,10 @@
 //!
 //! Mesh/overlay hosts (`*.mesh`, `localhost`, the Nebula `10.42.0.0/16` range) are
 //! never filtered — the engine already returns an exempt allow for them, so this
-//! layer just honors its [`Decision`].
+//! layer just honors its [`Decision`]. Secure pages also reject public plain-HTTP
+//! subresources before fetch (`mixed-content:http`), preserving those mesh/overlay
+//! exemptions and leaving top-level document navigations to the shell's navigation
+//! policy.
 //!
 //! The engine is injected (the shell compiles it from the mackesd `adfilter`
 //! worker's replicated `state/adfilter` blob); the default filter blocks nothing,
@@ -78,6 +81,194 @@ impl SafeBrowsingBlocklist {
     }
 }
 
+/// Operator-managed URL blocking policy.
+///
+/// Rules are either host suffixes (`example.com`, `*.example.com`, or
+/// `host:example.com`) or URL prefixes (`https://example.com/private/` or
+/// `url:https://example.com/private/`). Unlike the ad-filter and safe-browsing
+/// list, this is an enterprise/admin policy surface, so it is enforced before
+/// mesh/overlay exemptions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedUrlPolicy {
+    rules: BTreeSet<ManagedUrlRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ManagedUrlRule {
+    Host(String),
+    UrlPrefix(String),
+}
+
+impl ManagedUrlPolicy {
+    /// Build an empty managed policy.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            rules: BTreeSet::new(),
+        }
+    }
+
+    /// Build a managed policy from operator-provided rule lines.
+    #[must_use]
+    pub fn from_rules(rules: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut policy = Self::default();
+        for rule in rules {
+            policy.insert(rule.as_ref());
+        }
+        policy
+    }
+
+    fn insert(&mut self, rule: &str) {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            return;
+        }
+        let lower = rule.to_ascii_lowercase();
+        if let Some(host) = lower.strip_prefix("host:") {
+            self.insert_host(host);
+        } else if let Some(prefix) = lower.strip_prefix("url:") {
+            self.insert_url_prefix(prefix);
+        } else if lower.contains("://") {
+            self.insert_url_prefix(&lower);
+        } else {
+            self.insert_host(&lower);
+        }
+    }
+
+    fn insert_host(&mut self, host: &str) {
+        let host = host
+            .trim()
+            .trim_start_matches("*.")
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_owned();
+        if !host.is_empty() {
+            self.rules.insert(ManagedUrlRule::Host(host));
+        }
+    }
+
+    fn insert_url_prefix(&mut self, prefix: &str) {
+        let prefix = normalized_policy_url(prefix);
+        if !prefix.is_empty() {
+            self.rules.insert(ManagedUrlRule::UrlPrefix(prefix));
+        }
+    }
+
+    /// Number of active managed-policy rules.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Whether no managed-policy rules are active.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Does this URL match a managed block rule?
+    #[must_use]
+    pub fn matches(&self, url: &str) -> Option<String> {
+        let url = url.trim();
+        let normalized_url = normalized_policy_url(url);
+        let host = host_of(&normalized_url)
+            .unwrap_or_else(|| normalized_url.clone())
+            .trim_end_matches('.')
+            .to_owned();
+        self.rules.iter().find_map(|rule| match rule {
+            ManagedUrlRule::Host(blocked) => (host == *blocked
+                || host.ends_with(&format!(".{blocked}")))
+            .then(|| format!("host:{blocked}")),
+            ManagedUrlRule::UrlPrefix(prefix) => {
+                managed_url_prefix_matches(&normalized_url, prefix).then(|| format!("url:{prefix}"))
+            }
+        })
+    }
+}
+
+fn normalized_policy_url(url: &str) -> String {
+    let lowered = url.trim().to_ascii_lowercase();
+    normalize_default_http_port(&lowered).unwrap_or(lowered)
+}
+
+fn normalize_default_http_port(lowered_url: &str) -> Option<String> {
+    let (scheme, rest) = lowered_url.split_once("://")?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let authority = normalize_policy_authority(scheme, authority)?;
+    Some(format!("{scheme}://{authority}{suffix}"))
+}
+
+fn normalize_policy_authority(scheme: &str, authority: &str) -> Option<String> {
+    if authority.is_empty() {
+        return None;
+    }
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after_host) = rest.split_once(']')?;
+        let port = after_host.strip_prefix(':');
+        return match port {
+            Some(port) if is_default_http_port(scheme, port) => Some(format!("[{host}]")),
+            Some(port) if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
+                Some(format!("[{host}]:{port}"))
+            }
+            Some(_) => None,
+            None if after_host.is_empty() => Some(format!("[{host}]")),
+            None => None,
+        };
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map_or((authority, None), |(host, port)| {
+            if port.chars().all(|ch| ch.is_ascii_digit()) {
+                (host, Some(port))
+            } else {
+                (authority, None)
+            }
+        });
+    if host.is_empty() {
+        return None;
+    }
+    match port {
+        Some(port) if is_default_http_port(scheme, port) => Some(host.to_owned()),
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host.to_owned()),
+    }
+}
+
+fn is_default_http_port(scheme: &str, port: &str) -> bool {
+    matches!((scheme, port), ("http", "80") | ("https", "443"))
+}
+
+fn managed_url_prefix_matches(url: &str, prefix: &str) -> bool {
+    if !url.starts_with(prefix) {
+        return false;
+    }
+    if !url_prefix_ends_at_authority(prefix) {
+        return true;
+    }
+    url.as_bytes()
+        .get(prefix.len())
+        .is_none_or(|next| matches!(next, b'/' | b'?' | b'#'))
+}
+
+fn url_prefix_ends_at_authority(prefix: &str) -> bool {
+    let Some((_, rest)) = prefix.split_once("://") else {
+        return false;
+    };
+    !rest.contains(['/', '?', '#'])
+}
+
 /// Map a compact wire discriminant back to a [`ResourceType`].
 ///
 /// The discriminant is `ResourceType as u8` (the same value
@@ -110,14 +301,19 @@ pub const fn resource_to_wire(ty: ResourceType) -> u8 {
 }
 
 /// The shell-side ad-filter layer for one browser session: the compiled engine,
-/// the current page's first-party host, and the per-page blocked-request count.
+/// the current page's first-party origin context, and the per-page
+/// blocked-request count.
 pub struct RequestFilter {
     /// The compiled matcher (empty = blocks nothing; the default).
     engine: Engine,
+    /// Operator-managed URL policy, enforced before any network request.
+    managed_policy: ManagedUrlPolicy,
     /// Mesh-hosted unsafe host blocklist.
     safe_browsing: SafeBrowsingBlocklist,
     /// The host of the top-level page every subresource is judged against.
     first_party: String,
+    /// The scheme of the top-level page, used for HTTPS mixed-content enforcement.
+    first_party_scheme: String,
     /// Requests blocked on the current page (reset when the page host changes).
     blocked: u32,
     /// Per-page breakdown of what was blocked (by domain / by filter), for the
@@ -138,8 +334,10 @@ impl RequestFilter {
     pub fn empty() -> Self {
         Self {
             engine: Engine::new(),
+            managed_policy: ManagedUrlPolicy::empty(),
             safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
+            first_party_scheme: String::new(),
             blocked: 0,
             tally: BlockTally::new(),
         }
@@ -150,8 +348,10 @@ impl RequestFilter {
     pub fn new(engine: Engine) -> Self {
         Self {
             engine,
+            managed_policy: ManagedUrlPolicy::empty(),
             safe_browsing: SafeBrowsingBlocklist::empty(),
             first_party: String::new(),
+            first_party_scheme: String::new(),
             blocked: 0,
             tally: BlockTally::new(),
         }
@@ -161,6 +361,13 @@ impl RequestFilter {
     #[must_use]
     pub fn with_safe_browsing(mut self, safe_browsing: SafeBrowsingBlocklist) -> Self {
         self.safe_browsing = safe_browsing;
+        self
+    }
+
+    /// Attach an operator-managed URL policy to this filter.
+    #[must_use]
+    pub fn with_managed_policy(mut self, managed_policy: ManagedUrlPolicy) -> Self {
+        self.managed_policy = managed_policy;
         self
     }
 
@@ -188,11 +395,13 @@ impl RequestFilter {
     /// changed. Returns whether the host changed (the caller re-pushes the
     /// cosmetic stylesheet on a change).
     pub fn set_page(&mut self, page_url: &str) -> bool {
+        let scheme = scheme_of(page_url).unwrap_or_default();
         let host = host_of(page_url).unwrap_or_else(|| page_url.trim().to_ascii_lowercase());
-        if host == self.first_party {
+        if host == self.first_party && scheme == self.first_party_scheme {
             return false;
         }
         self.first_party = host;
+        self.first_party_scheme = scheme;
         self.blocked = 0;
         self.tally = BlockTally::new();
         true
@@ -204,11 +413,25 @@ impl RequestFilter {
         &self.first_party
     }
 
+    /// The current first-party page scheme (`https`, `http`, or empty for hostless pages).
+    #[must_use]
+    pub fn first_party_scheme(&self) -> &str {
+        &self.first_party_scheme
+    }
+
     /// Judge one outgoing subresource request against the engine. On a
     /// [`Decision::Block`] the per-page blocked counter is incremented; the caller
     /// drops the request. Mesh/overlay + allowlisted hosts are allowed by the
     /// engine (honored, not re-derived here).
     pub fn decide(&mut self, url: &str, resource_type: ResourceType) -> Decision {
+        if let Some(rule) = self.managed_policy.matches(url) {
+            self.blocked = self.blocked.saturating_add(1);
+            let decision = Decision::Block {
+                filter: format!("managed-policy:{rule}"),
+            };
+            self.tally.record(&decision, url);
+            return decision;
+        }
         if let Some(host) = host_of(url) {
             if matches!(
                 self.engine
@@ -225,15 +448,40 @@ impl RequestFilter {
                 self.tally.record(&decision, url);
                 return decision;
             }
+            if self.blocks_mixed_content(url, resource_type) {
+                self.blocked = self.blocked.saturating_add(1);
+                let decision = Decision::Block {
+                    filter: "mixed-content:http".to_owned(),
+                };
+                self.tally.record(&decision, url);
+                return decision;
+            }
         }
         let decision = self
             .engine
             .match_request(url, resource_type, &self.first_party);
         if decision.is_block() {
+            // Defense-in-depth: a top-level Document navigation must never be
+            // SILENTLY cancelled by the generic ad-filter engine. Cancelling it
+            // leaves the omnibox populated but the page frozen on the prior
+            // frame — the Google-News redirect bug, where a bundled ad rule
+            // matched the redirect URL of a main-frame nav. Only the
+            // interstitial-driving blocks above (managed-policy, safe-browsing —
+            // both return before this point) may stop a top-level nav; mixed
+            // content already exempts Document in `blocks_mixed_content`.
+            if resource_type == ResourceType::Document {
+                return Decision::Allow(AllowReason::Default);
+            }
             self.blocked = self.blocked.saturating_add(1);
             self.tally.record(&decision, url);
         }
         decision
+    }
+
+    fn blocks_mixed_content(&self, url: &str, resource_type: ResourceType) -> bool {
+        self.first_party_scheme == "https"
+            && resource_type != ResourceType::Document
+            && url_scheme_is(url, "http")
     }
 
     /// The per-page block breakdown (by domain / by filter) — powers the "N blocked"
@@ -262,6 +510,21 @@ impl RequestFilter {
         }
         format!("{} {{ display: none !important; }}", selectors.join(", "))
     }
+}
+
+fn scheme_of(url: &str) -> Option<String> {
+    let (scheme, _) = url.trim_start().split_once("://")?;
+    (!scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')))
+    .then(|| scheme.to_ascii_lowercase())
+}
+
+fn url_scheme_is(url: &str, expected: &str) -> bool {
+    url.trim_start()
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(expected))
 }
 
 #[cfg(test)]
@@ -435,6 +698,141 @@ mod tests {
     }
 
     #[test]
+    fn managed_policy_blocks_host_suffix_and_url_prefix_before_network() {
+        let policy = ManagedUrlPolicy::from_rules([
+            "blocked.example",
+            "*.wild.example",
+            "url:https://docs.example/private/",
+        ]);
+        assert_eq!(policy.len(), 3);
+        assert_eq!(
+            policy
+                .matches("https://sub.blocked.example/path")
+                .as_deref(),
+            Some("host:blocked.example")
+        );
+        assert_eq!(
+            policy.matches("https://news.wild.example/").as_deref(),
+            Some("host:wild.example")
+        );
+        assert_eq!(
+            policy
+                .matches("https://docs.example/private/roadmap")
+                .as_deref(),
+            Some("url:https://docs.example/private/")
+        );
+        assert!(policy.matches("https://docs.example/public/").is_none());
+
+        let mut f = RequestFilter::empty().with_managed_policy(policy);
+        f.set_page("https://ok.example/");
+        let decision = f.decide("https://blocked.example/", ResourceType::Document);
+        assert_eq!(
+            decision.blocked_by(),
+            Some("managed-policy:host:blocked.example")
+        );
+        let decision = f.decide("https://docs.example/private/audit", ResourceType::Script);
+        assert_eq!(
+            decision.blocked_by(),
+            Some("managed-policy:url:https://docs.example/private/")
+        );
+        assert_eq!(f.blocked_count(), 2);
+    }
+
+    #[test]
+    fn managed_policy_url_prefixes_canonicalize_default_ports() {
+        let policy = ManagedUrlPolicy::from_rules([
+            "url:https://portal.example:443/admin/",
+            "url:http://intranet.example:80/reports/",
+        ]);
+
+        assert_eq!(
+            policy
+                .matches("https://portal.example/admin/users")
+                .as_deref(),
+            Some("url:https://portal.example/admin/")
+        );
+        assert_eq!(
+            policy
+                .matches("https://portal.example:443/admin/users")
+                .as_deref(),
+            Some("url:https://portal.example/admin/")
+        );
+        assert_eq!(
+            policy
+                .matches("http://intranet.example:80/reports/q1")
+                .as_deref(),
+            Some("url:http://intranet.example/reports/")
+        );
+        assert!(
+            policy
+                .matches("https://portal.example:444/admin/users")
+                .is_none(),
+            "non-default ports remain distinct policy targets"
+        );
+    }
+
+    #[test]
+    fn managed_policy_authority_only_url_prefixes_keep_host_boundaries() {
+        let policy = ManagedUrlPolicy::from_rules(["url:https://docs.example"]);
+
+        assert_eq!(
+            policy.matches("https://docs.example/private").as_deref(),
+            Some("url:https://docs.example")
+        );
+        assert_eq!(
+            policy
+                .matches("https://docs.example:443/private")
+                .as_deref(),
+            Some("url:https://docs.example")
+        );
+        assert!(
+            policy
+                .matches("https://docs.example.evil/private")
+                .is_none(),
+            "an authority-only URL prefix must not raw-prefix match a different host"
+        );
+    }
+
+    #[test]
+    fn managed_policy_url_prefixes_ignore_authority_userinfo() {
+        let policy = ManagedUrlPolicy::from_rules(["url:https://portal.example/admin/"]);
+
+        assert_eq!(
+            policy
+                .matches("https://alice@portal.example/admin/users")
+                .as_deref(),
+            Some("url:https://portal.example/admin/")
+        );
+        assert_eq!(
+            policy
+                .matches("https://alice:secret@portal.example:443/admin/users")
+                .as_deref(),
+            Some("url:https://portal.example/admin/")
+        );
+        assert!(
+            policy
+                .matches("https://alice@portal.example.evil/admin/users")
+                .is_none(),
+            "userinfo stripping must not collapse a different host into the protected prefix"
+        );
+    }
+
+    #[test]
+    fn managed_policy_can_block_mesh_because_it_is_admin_policy() {
+        let mut f = RequestFilter::empty()
+            .with_managed_policy(ManagedUrlPolicy::from_rules(["search.mesh"]));
+        f.set_page("https://ok.example/");
+
+        let decision = f.decide("https://search.mesh/", ResourceType::Document);
+
+        assert_eq!(
+            decision.blocked_by(),
+            Some("managed-policy:host:search.mesh")
+        );
+        assert_eq!(f.blocked_count(), 1);
+    }
+
+    #[test]
     fn safe_browsing_keeps_mesh_overlay_exempt() {
         let mut f = RequestFilter::empty().with_safe_browsing(SafeBrowsingBlocklist::from_hosts([
             "media.mesh",
@@ -451,5 +849,96 @@ mod tests {
             Decision::Allow(mde_adblock::AllowReason::Exempt)
         ));
         assert_eq!(f.blocked_count(), 0);
+    }
+
+    #[test]
+    fn https_pages_block_public_plain_http_subresources_before_network() {
+        let mut f = RequestFilter::empty();
+        assert!(f.set_page("https://app.example/"));
+        assert_eq!(f.first_party_scheme(), "https");
+
+        let mixed = f.decide("HTTP://cdn.example.test/app.js", ResourceType::Script);
+        assert_eq!(mixed.blocked_by(), Some("mixed-content:http"));
+        assert_eq!(f.blocked_count(), 1);
+
+        let top_level_http = f.decide("http://docs.example.test/", ResourceType::Document);
+        assert!(
+            !top_level_http.is_block(),
+            "top-level HTTP navigations stay with the shell navigation prompt"
+        );
+        let secure_subresource =
+            f.decide("https://cdn.example.test/app.css", ResourceType::Stylesheet);
+        assert!(!secure_subresource.is_block());
+        assert_eq!(f.blocked_count(), 1);
+    }
+
+    #[test]
+    fn a_top_level_document_is_never_cancelled_by_the_generic_ad_filter() {
+        // The Google-News redirect bug: a bundled ad rule matched the redirect URL
+        // of a MAIN-FRAME navigation. With the request now correctly classified as
+        // a Document (not the old hardcoded RESOURCE_OTHER), the generic engine
+        // must NOT silently cancel it — cancelling filled the omnibox but froze the
+        // page. Only safe-browsing / managed-policy (interstitial) may stop a nav.
+        let mut f = bundled_filter("https://news.example.com/");
+        // As a subresource this bundled tracker URL genuinely matches a rule.
+        let as_sub = f.decide("https://doubleclick.net/ad", ResourceType::Image);
+        assert!(
+            as_sub.is_block(),
+            "the URL genuinely matches a bundled rule"
+        );
+        let blocked_after_sub = f.blocked_count();
+        // The SAME rule-matching URL as a top-level Document nav is allowed and NOT
+        // counted — the defense-in-depth exemption in `decide`.
+        let as_doc = f.decide("https://doubleclick.net/ad", ResourceType::Document);
+        assert!(
+            !as_doc.is_block(),
+            "a top-level Document nav survives the generic ad engine"
+        );
+        assert_eq!(
+            f.blocked_count(),
+            blocked_after_sub,
+            "allowing a Document must not bump the per-page block counter"
+        );
+    }
+
+    #[test]
+    fn mixed_content_exempts_a_top_level_document_but_not_an_other_subresource() {
+        let mut f = RequestFilter::empty();
+        assert!(f.set_page("https://app.example/"));
+        assert_eq!(f.first_party_scheme(), "https");
+        // A plain-HTTP `Other` subresource on an HTTPS page is mixed content.
+        let sub = f.decide("http://cdn.example.test/pixel", ResourceType::Other);
+        assert_eq!(sub.blocked_by(), Some("mixed-content:http"));
+        // The top-level HTTP Document nav is exempt — the shell drives its own
+        // "not secure" navigation prompt instead of a silent cancel.
+        let doc = f.decide("http://docs.example.test/", ResourceType::Document);
+        assert!(
+            !doc.is_block(),
+            "a top-level Document http nav is not a mixed-content block"
+        );
+    }
+
+    #[test]
+    fn mixed_content_keeps_mesh_overlay_exempt_and_http_pages_unaffected() {
+        let mut f = RequestFilter::empty();
+        f.set_page("https://portal.example/");
+
+        assert!(matches!(
+            f.decide("http://media.mesh/widget.js", ResourceType::Script),
+            Decision::Allow(mde_adblock::AllowReason::Exempt)
+        ));
+        assert!(matches!(
+            f.decide("http://10.42.0.9/status.json", ResourceType::XmlHttpRequest),
+            Decision::Allow(mde_adblock::AllowReason::Exempt)
+        ));
+        assert_eq!(f.blocked_count(), 0);
+
+        assert!(f.set_page("http://portal.example/"));
+        assert_eq!(f.first_party_scheme(), "http");
+        assert!(
+            !f.decide("http://cdn.example.test/app.js", ResourceType::Script)
+                .is_block(),
+            "plain-HTTP pages are already downgraded, so this is not mixed content"
+        );
     }
 }

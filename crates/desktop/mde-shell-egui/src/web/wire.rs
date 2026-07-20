@@ -35,6 +35,31 @@ pub(super) fn adfilter_domain_body(domain: &str) -> String {
     serde_json::json!({ "domain": domain.trim() }).to_string()
 }
 
+pub(super) fn browser_site_blocking_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    enabled: bool,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_site_blocking",
+        "policy": "adfilter_site_override",
+        "decision": if enabled { "enable" } else { "disable" },
+        "site_blocking": if enabled { "enabled" } else { "disabled" },
+        "enforcement": "request_filter",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
 pub(super) fn browser_display_target_body(
     tab_index: usize,
     tab: &Tab,
@@ -135,13 +160,45 @@ impl BrowserSendTabTarget {
 
     fn destination(self) -> Option<(String, String)> {
         match self {
-            Self::Node => {
-                let host = local_hostname();
-                Some((host.clone(), host))
-            }
+            Self::Node => browser_node_target_destination(),
             Self::Phone => browser_phone_target_destination(),
         }
     }
+}
+
+fn browser_node_target_destination() -> Option<(String, String)> {
+    std::env::var("MDE_BROWSER_SEND_NODE_TARGET")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            let local = local_hostname();
+            if sanitize_endpoint_id(&id) == sanitize_endpoint_id(&local) {
+                None
+            } else {
+                let label = std::env::var("MDE_BROWSER_SEND_NODE_LABEL")
+                    .ok()
+                    .map(|label| label.trim().to_owned())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                Some((id, label))
+            }
+        })
+}
+
+fn sanitize_endpoint_id(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn browser_phone_target_destination() -> Option<(String, String)> {
@@ -233,13 +290,17 @@ pub(super) fn publish_browser_send_tab(
     engine: BrowserEngine,
     url: &str,
     title: &str,
-) {
+) -> bool {
+    if matches!(target, BrowserSendTabTarget::Node) && target.destination().is_none() {
+        return false;
+    }
     let body = browser_send_tab_body(target, engine, url, title);
     if root.is_some() {
         publish_to_bus(root, ACTION_BROWSER_SEND_TAB, &body);
     } else {
         publish(ACTION_BROWSER_SEND_TAB, &body);
     }
+    true
 }
 
 pub(super) fn browser_permission_prompt_body(
@@ -259,6 +320,398 @@ pub(super) fn browser_permission_prompt_body(
         "url": url,
         "title": title.trim(),
         "site": site,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+fn browser_runtime_permission_wire(kind: u8) -> &'static str {
+    match kind {
+        0 => "geolocation",
+        1 => "notifications",
+        2 => "clipboard",
+        3 => "camera",
+        4 => "microphone",
+        5 => "camera_microphone",
+        _ => "unknown",
+    }
+}
+
+pub(super) fn browser_permission_decision_body(
+    engine: BrowserEngine,
+    origin: &str,
+    kind: u8,
+    allow: bool,
+    enforcement: &str,
+    url: &str,
+    title: &str,
+    decided_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_permission_decision",
+        "permission": browser_runtime_permission_wire(kind),
+        "permission_kind": kind,
+        "decision": if allow { "allow" } else { "deny" },
+        "grant_scope": if allow { "session" } else { "none" },
+        "enforcement": enforcement.trim(),
+        "engine": engine.wire(),
+        "origin": origin.trim(),
+        "origin_host": host_of(origin).unwrap_or_else(|| origin.trim().to_owned()),
+        "url": url.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "decided_ms": decided_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_permission_revoke_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    revoked_grants: usize,
+    cleared_prompt_decisions: usize,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_permission_revoke",
+        "decision": "revoke",
+        "enforcement": "session_permission_store",
+        "permission_policy": "default_deny",
+        "scope": "current_site",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "revoked_grants": revoked_grants,
+        "cleared_prompt_decisions": cleared_prompt_decisions,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_credential_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    decision: &str,
+    trigger: &str,
+    credential_count: usize,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_credential",
+        "decision": decision.trim(),
+        "enforcement": "session_credential_store",
+        "privacy": "redacted",
+        "scope": "session_only",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host.trim(),
+        "title": title.trim(),
+        "credential_count": credential_count,
+        "source": "browser",
+        "node": local_hostname(),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_policy_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    rule: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_policy_block",
+        "policy": "managed_url",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "trigger": trigger,
+        "engine": engine.wire(),
+        "url": url,
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "rule": rule.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_safe_browsing_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    rule: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_safe_browsing_block",
+        "policy": "safe_browsing",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "rule": rule.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn browser_policy_source_status_body(
+    op: &str,
+    policy: &str,
+    source_path: &Path,
+    state: &str,
+    item_count: usize,
+    effective_count: usize,
+    checked_ms: u64,
+    loaded_ms: Option<u64>,
+    error: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "op": op.trim(),
+        "policy": policy.trim(),
+        "state": state.trim(),
+        "source_path": source_path.to_string_lossy(),
+        "item_count": item_count,
+        "effective_count": effective_count,
+        "loaded_ms": loaded_ms,
+        "error": error.map(str::trim),
+        "source": "browser",
+        "node": local_hostname(),
+        "checked_ms": checked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_certificate_error_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    code: i32,
+    message: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_certificate_error",
+        "policy": "tls_certificate",
+        "decision": "block",
+        "enforcement": "engine_certificate_validation",
+        "reason": "certificate_error",
+        "trigger": "top_level_navigation",
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "code": code,
+        "message": message.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_insecure_download_block_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_insecure_download_block",
+        "policy": "insecure_transport",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "reason": "plain_http_download",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_insecure_navigation_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    decision: &str,
+    trigger: &str,
+    enforcement: &str,
+    upgraded_url: Option<&str>,
+    decided_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_insecure_navigation",
+        "policy": "insecure_transport",
+        "decision": decision.trim(),
+        "enforcement": enforcement.trim(),
+        "reason": "plain_http_navigation",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "upgraded_url": upgraded_url.map(str::trim),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "decided_ms": decided_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_mixed_content_block_body(
+    engine: BrowserEngine,
+    page_url: &str,
+    url: &str,
+    title: &str,
+    resource: u8,
+    trigger: &str,
+    blocked_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_mixed_content_block",
+        "policy": "mixed_content",
+        "decision": "block",
+        "enforcement": "pre_network",
+        "reason": "plain_http_subresource",
+        "trigger": trigger.trim(),
+        "engine": engine.wire(),
+        "page_url": page_url.trim(),
+        "page_host": host_of(page_url).unwrap_or_else(|| page_url.trim().to_owned()),
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "title": title.trim(),
+        "resource": browser_resource_type_name(resource),
+        "source": "browser",
+        "node": local_hostname(),
+        "blocked_ms": blocked_ms,
+    })
+    .to_string()
+}
+
+fn browser_resource_type_name(resource: u8) -> &'static str {
+    match mde_web_preview_client::resource_from_wire(resource) {
+        mde_web_preview_client::ResourceType::Document => "document",
+        mde_web_preview_client::ResourceType::Subdocument => "subdocument",
+        mde_web_preview_client::ResourceType::Stylesheet => "stylesheet",
+        mde_web_preview_client::ResourceType::Script => "script",
+        mde_web_preview_client::ResourceType::Image => "image",
+        mde_web_preview_client::ResourceType::Font => "font",
+        mde_web_preview_client::ResourceType::Media => "media",
+        mde_web_preview_client::ResourceType::Object => "object",
+        mde_web_preview_client::ResourceType::XmlHttpRequest => "xmlhttprequest",
+        mde_web_preview_client::ResourceType::Ping => "ping",
+        mde_web_preview_client::ResourceType::WebSocket => "websocket",
+        mde_web_preview_client::ResourceType::Other => "other",
+    }
+}
+
+pub(super) fn browser_site_data_clear_body(
+    engine: BrowserEngine,
+    url: &str,
+    title: &str,
+    host: &str,
+    scope: &str,
+    cleared_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_site_data_clear",
+        "decision": "clear",
+        "enforcement": "session_memory_only",
+        "scope": scope,
+        "engine": engine.wire(),
+        "url": url,
+        "host": host.trim(),
+        "title": title.trim(),
+        "source": "browser",
+        "node": local_hostname(),
+        "cleared_ms": cleared_ms,
+    })
+    .to_string()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct BrowserBrowsingDataClearCounts {
+    pub(super) history_entries: usize,
+    pub(super) downloads: usize,
+    pub(super) reopen_entries: usize,
+    pub(super) saved_logins: usize,
+    pub(super) permission_grants: usize,
+}
+
+pub(super) fn browser_browsing_data_clear_body(
+    engine: BrowserEngine,
+    active_url: &str,
+    active_title: &str,
+    active_host: &str,
+    counts: BrowserBrowsingDataClearCounts,
+    cleared_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_browsing_data_clear",
+        "decision": "clear",
+        "enforcement": "session_memory_only",
+        "scope": "all_session",
+        "engine": engine.wire(),
+        "active_url": active_url.trim(),
+        "active_host": active_host.trim(),
+        "active_title": active_title.trim(),
+        "history_entries": counts.history_entries,
+        "downloads": counts.downloads,
+        "reopen_entries": counts.reopen_entries,
+        "saved_logins": counts.saved_logins,
+        "permission_grants": counts.permission_grants,
+        "source": "browser",
+        "node": local_hostname(),
+        "cleared_ms": cleared_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn browser_download_danger_body(
+    download_id: u64,
+    url: &str,
+    filename: &str,
+    decision: &str,
+    updated_ms: u64,
+) -> String {
+    serde_json::json!({
+        "op": "browser_download_danger",
+        "decision": decision.trim(),
+        "enforcement": "dangerous_file_gate",
+        "reason": "dangerous_extension",
+        "download_id": download_id,
+        "url": url.trim(),
+        "host": host_of(url).unwrap_or_else(|| url.trim().to_owned()),
+        "filename": filename.trim(),
         "source": "browser",
         "node": local_hostname(),
         "updated_ms": updated_ms,
@@ -330,6 +783,31 @@ pub(super) fn browser_passkey_body(
         );
     }
     Ok(body.to_string())
+}
+
+pub(super) fn browser_passkey_shell_approved_body(handoff_body: &str) -> Result<String, String> {
+    let mut body: serde_json::Value = serde_json::from_str(handoff_body)
+        .map_err(|err| format!("invalid passkey handoff JSON: {err}"))?;
+    let Some(obj) = body.as_object_mut() else {
+        return Err("passkey handoff is not an object".to_owned());
+    };
+    obj.insert("user_present".to_owned(), serde_json::json!(true));
+    obj.insert("shell_consent".to_owned(), serde_json::json!(true));
+    obj.insert(
+        "presence_source".to_owned(),
+        serde_json::json!("browser_shell_prompt"),
+    );
+    serde_json::to_string(&body).map_err(|err| format!("passkey handoff encode: {err}"))
+}
+
+pub(super) fn browser_passkey_denied_body(client_request_id: &str, reason: &str) -> String {
+    serde_json::json!({
+        "op": "browser_passkey_denied",
+        "source": "browser",
+        "client_request_id": client_request_id.trim(),
+        "error": reason.trim(),
+    })
+    .to_string()
 }
 
 pub(super) fn passkey_client_request_id(helper_body: &str) -> Option<String> {
@@ -446,6 +924,7 @@ pub(super) fn browser_offline_cache_body(request: &OfflineCacheRequest, text: &s
                         "url": &resource.url,
                         "resource": &resource.resource,
                         "allowed": resource.allowed,
+                        "blocked_by": &resource.blocked_by,
                     })
                 })
                 .collect(),
@@ -534,6 +1013,10 @@ pub(super) fn offline_cache_resource_manifest(
                 url: clamp_chars(url, OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS),
                 resource: offline_cache_resource_type_name(resource.resource).to_owned(),
                 allowed: resource.allowed,
+                blocked_by: resource
+                    .blocked_by
+                    .as_deref()
+                    .map(|rule| clamp_chars(rule.trim(), OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS)),
             })
         })
         .collect::<Vec<_>>()
@@ -609,6 +1092,10 @@ pub(super) fn browser_voice_command_result_topic(host: &str) -> String {
     format!("{EVENT_BROWSER_VOICE_COMMAND_PREFIX}{host}")
 }
 
+pub(super) fn browser_media_control_topic(host: &str) -> String {
+    format!("{ACTION_BROWSER_MEDIA_CONTROL_PREFIX}{host}")
+}
+
 pub(super) fn browser_read_aloud_status_topic(host: &str) -> String {
     format!("{STATE_BROWSER_READ_ALOUD_PREFIX}{host}")
 }
@@ -639,6 +1126,26 @@ pub(super) fn browser_offline_cache_result_topic(host: &str) -> String {
 
 pub(super) fn browser_security_update_status_topic(host: &str) -> String {
     format!("{STATE_BROWSER_SECURITY_UPDATE_PREFIX}{host}")
+}
+
+pub(super) fn browser_media_status_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_MEDIA_PREFIX}{host}")
+}
+
+pub(super) fn browser_safe_browsing_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_SAFE_BROWSING_SOURCE_PREFIX}{host}")
+}
+
+pub(super) fn browser_managed_policy_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_MANAGED_POLICY_SOURCE_PREFIX}{host}")
+}
+
+pub(super) fn browser_custom_filter_rules_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_CUSTOM_FILTER_RULES_SOURCE_PREFIX}{host}")
+}
+
+pub(super) fn browser_filter_list_source_topic(host: &str) -> String {
+    format!("{STATE_BROWSER_FILTER_LIST_SOURCE_PREFIX}{host}")
 }
 
 pub(super) fn cache_url_keys(url: &str) -> Vec<String> {
@@ -1011,10 +1518,17 @@ fn parse_offline_cache_resource(v: &serde_json::Value) -> Result<OfflineCacheRes
         .get("allowed")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "offline-cache resource allowed flag is missing".to_owned())?;
+    let blocked_by = v
+        .get("blocked_by")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| clamp_chars(rule, OFFLINE_CACHE_RESOURCE_URL_MAX_CHARS));
     Ok(OfflineCacheResource {
         url: url.to_owned(),
         resource: resource.to_owned(),
         allowed,
+        blocked_by,
     })
 }
 
@@ -1526,11 +2040,243 @@ fn session_state_wire(state: &SessionState) -> &'static str {
     }
 }
 
+const BROWSER_MEDIA_TEXT_MAX_CHARS: usize = 160;
+const BROWSER_MEDIA_URL_MAX_CHARS: usize = 2048;
+
+fn tab_has_media_metadata(tab: &Tab) -> bool {
+    tab.session.media_metadata().is_some()
+}
+
+fn browser_media_status_tab(state: &WebState) -> Option<(usize, &Tab)> {
+    if let Some(tab) = state
+        .tabs
+        .get(state.active)
+        .filter(|tab| tab_has_media_metadata(tab))
+    {
+        return Some((state.active, tab));
+    }
+    state
+        .tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab_has_media_metadata(tab) && tab.session.audible())
+        .or_else(|| {
+            state
+                .tabs
+                .iter()
+                .enumerate()
+                .find(|(_, tab)| tab_has_media_metadata(tab))
+        })
+}
+
+pub(super) fn browser_media_status_tab_index(state: &WebState) -> Option<usize> {
+    browser_media_status_tab(state).map(|(index, _)| index)
+}
+
+fn media_metadata_string(value: &serde_json::Value, key: &str, max_chars: usize) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| clamp_chars(s, max_chars))
+}
+
+fn media_metadata_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn media_metadata_optional_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn browser_media_metadata_object(body: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(serde_json::json!({
+        "title": media_metadata_string(&value, "title", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "artist": media_metadata_string(&value, "artist", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "album": media_metadata_string(&value, "album", BROWSER_MEDIA_TEXT_MAX_CHARS).unwrap_or_default(),
+        "artwork_url": media_metadata_string(&value, "artwork_url", BROWSER_MEDIA_URL_MAX_CHARS).unwrap_or_default(),
+        "source_url": media_metadata_string(&value, "source_url", BROWSER_MEDIA_URL_MAX_CHARS).unwrap_or_default(),
+        "paused": value
+            .get("paused")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        "duration_ms": media_metadata_u64(&value, "duration_ms"),
+        "position_ms": media_metadata_u64(&value, "position_ms"),
+        "volume_percent": media_metadata_optional_u64(&value, "volume_percent"),
+    }))
+}
+
+pub(super) fn browser_media_status_signature(state: &WebState) -> String {
+    let Some((tab_index, tab)) = browser_media_status_tab(state) else {
+        return "idle".to_owned();
+    };
+    let nav = tab.session.nav();
+    let media_body = tab
+        .session
+        .media_metadata()
+        .map(|metadata| metadata.body.trim())
+        .unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        tab_index,
+        tab.id,
+        tab.engine.wire(),
+        nav.url,
+        tab.session.title(),
+        tab.session.audible(),
+        tab.muted,
+        media_body
+    )
+}
+
+pub(super) fn browser_media_status_body(state: &WebState, updated_ms: u64) -> String {
+    let host = local_hostname();
+    let Some((tab_index, tab)) = browser_media_status_tab(state) else {
+        return serde_json::json!({
+            "op": "browser_media_status",
+            "source": "browser",
+            "node": host,
+            "host": host,
+            "state": "idle",
+            "tab_index": serde_json::Value::Null,
+            "tab_id": serde_json::Value::Null,
+            "engine": serde_json::Value::Null,
+            "active_tab": false,
+            "url": "",
+            "page_title": "",
+            "label": serde_json::Value::Null,
+            "audible": false,
+            "muted": false,
+            "metadata": serde_json::Value::Null,
+            "updated_ms": updated_ms,
+        })
+        .to_string();
+    };
+    let media_body = tab
+        .session
+        .media_metadata()
+        .map(|metadata| metadata.body.as_str())
+        .unwrap_or_default();
+    let metadata = browser_media_metadata_object(media_body);
+    let paused = metadata
+        .as_ref()
+        .and_then(|value| value.get("paused"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| !tab.session.audible());
+    let playback_state = if tab.session.audible() || !paused {
+        "playing"
+    } else {
+        "paused"
+    };
+    let nav = tab.session.nav();
+    serde_json::json!({
+        "op": "browser_media_status",
+        "source": "browser",
+        "node": host,
+        "host": host,
+        "state": playback_state,
+        "tab_index": tab_index,
+        "tab_id": tab.id,
+        "engine": tab.engine.wire(),
+        "active_tab": tab_index == state.active,
+        "url": clamp_chars(nav.url.trim(), BROWSER_MEDIA_URL_MAX_CHARS),
+        "page_title": clamp_chars(tab.session.title().trim(), BROWSER_MEDIA_TEXT_MAX_CHARS),
+        "label": media_metadata_chip_label(media_body),
+        "audible": tab.session.audible(),
+        "muted": tab.muted,
+        "metadata": metadata.unwrap_or(serde_json::Value::Null),
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BrowserMediaControlRequest {
+    pub(super) action: mde_web_preview_client::MediaTransportAction,
+    pub(super) tab_id: Option<u64>,
+}
+
+fn media_transport_action_from_str(
+    action: &str,
+) -> Option<mde_web_preview_client::MediaTransportAction> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "playpause" | "play-pause" | "play_pause" | "toggle" => {
+            Some(mde_web_preview_client::MediaTransportAction::PlayPause)
+        }
+        "play" => Some(mde_web_preview_client::MediaTransportAction::Play),
+        "pause" => Some(mde_web_preview_client::MediaTransportAction::Pause),
+        "stop" => Some(mde_web_preview_client::MediaTransportAction::Stop),
+        "next" => Some(mde_web_preview_client::MediaTransportAction::Next),
+        "previous" | "prev" => Some(mde_web_preview_client::MediaTransportAction::Previous),
+        "volumeup" | "volume-up" | "volume_up" | "volup" | "raisevolume" | "raise-volume" => {
+            Some(mde_web_preview_client::MediaTransportAction::VolumeUp)
+        }
+        "volumedown" | "volume-down" | "volume_down" | "voldown" | "lowervolume"
+        | "lower-volume" => Some(mde_web_preview_client::MediaTransportAction::VolumeDown),
+        _ => None,
+    }
+}
+
+pub(super) fn browser_media_control_body(
+    action: mde_web_preview_client::MediaTransportAction,
+    tab_id: Option<u64>,
+    source: &str,
+    updated_ms: u64,
+) -> String {
+    let action = match action {
+        mde_web_preview_client::MediaTransportAction::PlayPause => "play-pause",
+        mde_web_preview_client::MediaTransportAction::Play => "play",
+        mde_web_preview_client::MediaTransportAction::Pause => "pause",
+        mde_web_preview_client::MediaTransportAction::Stop => "stop",
+        mde_web_preview_client::MediaTransportAction::Next => "next",
+        mde_web_preview_client::MediaTransportAction::Previous => "previous",
+        mde_web_preview_client::MediaTransportAction::VolumeUp => "volume-up",
+        mde_web_preview_client::MediaTransportAction::VolumeDown => "volume-down",
+    };
+    serde_json::json!({
+        "op": "browser_media_control",
+        "source": source.trim(),
+        "action": action,
+        "tab_id": tab_id,
+        "updated_ms": updated_ms,
+    })
+    .to_string()
+}
+
+pub(super) fn parse_browser_media_control_request(
+    body: &str,
+) -> Result<BrowserMediaControlRequest, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("media control JSON: {err}"))?;
+    if value
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|op| op != "browser_media_control")
+    {
+        return Err("unexpected media control op".to_owned());
+    }
+    let action = value
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .and_then(media_transport_action_from_str)
+        .ok_or_else(|| "missing/unsupported media control action".to_owned())?;
+    Ok(BrowserMediaControlRequest {
+        action,
+        tab_id: value.get("tab_id").and_then(serde_json::Value::as_u64),
+    })
+}
+
 pub(super) fn browser_session_sync_body(state: &WebState) -> String {
     let tabs = state
         .tabs
         .iter()
         .enumerate()
+        .filter(|(_, tab)| tab.internal_page.is_none())
         .map(|(index, tab)| {
             let nav = tab.session.nav();
             serde_json::json!({
@@ -1545,6 +2291,7 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
                 "can_back": nav.can_back,
                 "can_forward": nav.can_forward,
                 "muted": tab.muted,
+                "autoplay_blocked": tab.autoplay_blocked,
                 "force_dark": tab.force_dark,
                 "reader_mode": tab.reader_mode,
                 "user_scripts": tab.user_scripts,
@@ -1584,7 +2331,12 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
         "op": "browser_session_sync",
         "source": "browser",
         "host": local_hostname(),
-        "active_index": if state.tabs.is_empty() {
+        "active_index": if state.tabs.is_empty()
+            || state
+                .tabs
+                .get(state.active)
+                .is_some_and(|tab| tab.internal_page.is_some())
+        {
             serde_json::Value::Null
         } else {
             serde_json::json!(state.active.min(state.tabs.len().saturating_sub(1)))
@@ -1924,7 +2676,9 @@ pub(super) fn percent_encode_query(s: &str) -> String {
 }
 
 pub(super) fn is_plain_http(url: &str) -> bool {
-    url.trim_start().starts_with("http://")
+    url.trim_start()
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
 }
 
 pub(super) fn is_new_tab_url(url: &str) -> bool {
@@ -1936,4 +2690,148 @@ pub(super) fn https_upgrade(url: &str) -> String {
     trimmed
         .strip_prefix("http://")
         .map_or_else(|| trimmed.to_owned(), |rest| format!("https://{rest}"))
+}
+
+/// WL-ARCH-003 — shared **wire-contract fixtures** for the mirrored daemon
+/// bodies the shell's Bus readers decode (now off the [`BusReader`] seam). Each
+/// fixture is a *pinned canonical JSON body* in the exact shape the daemon
+/// worker publishes; the test decodes it through the SAME `parse_*` the poller
+/// runs and asserts the projection. If a field is renamed / retyped / dropped on
+/// either side of the wire, the matching fixture stops decoding and the test goes
+/// red — a wire-shape drift is caught here, not on a live seat.
+///
+/// [`BusReader`]: crate::bus_reader::BusReader
+#[cfg(test)]
+mod wire_contract {
+    use super::*;
+
+    /// `state/browser/<node>/passkey/status` — the latest-wins mirror
+    /// `poll_passkey_status` reads via `BusReader::latest`.
+    const PASSKEY_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "asserted",
+        "last_request_id": "req-7",
+        "last_host": "example.test",
+        "last_ceremony": "get",
+        "last_rp_id": "example.test",
+        "mirrored": true,
+        "accepted": 3,
+        "rejected": 1,
+        "hardware_state": "ready",
+        "hardware_key_count": 1,
+        "hardware_ctaphid_state": "unknown",
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/security/update` — the mirror
+    /// `refresh_security_update_status` reads via `BusReader::latest`.
+    const SECURITY_UPDATE_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "current",
+        "expected_cef_version": "127.0.0",
+        "installed_version": "127.0.0",
+        "libcef_present": true,
+        "updater_state": "idle",
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/read_aloud/status` — read by `poll_speech_statuses`.
+    const READ_ALOUD_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "speaking",
+        "last_title": "A Document",
+        "last_url": "https://page.example/a",
+        "accepted": 2,
+        "spoken": 1,
+        "rejected": 0,
+        "updated_ms": 1000
+    }"#;
+
+    /// `state/browser/<node>/voice/status` — read by `poll_speech_statuses`.
+    const VOICE_COMMAND_STATUS: &str = r#"{
+        "node": "alpha",
+        "state": "listening",
+        "last_mode": "command",
+        "accepted": 1,
+        "transcribed": 0,
+        "rejected": 0,
+        "updated_ms": 1000
+    }"#;
+
+    /// `event/browser/<node>/passkey` — the completion `poll_passkey_results`
+    /// drains via `BusReader::open` + `list_since`.
+    const PASSKEY_COMPLETION: &str = r#"{
+        "source": "browser_passkeys",
+        "op": "browser_passkey_created",
+        "client_request_id": "req-7"
+    }"#;
+
+    #[test]
+    fn passkey_status_wire_shape_decodes() {
+        let status = parse_passkey_status(PASSKEY_STATUS).expect("passkey status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "asserted");
+        assert_eq!(status.accepted, 3);
+        assert!(status.mirrored);
+    }
+
+    #[test]
+    fn security_update_status_wire_shape_decodes() {
+        let status =
+            parse_security_update_status(SECURITY_UPDATE_STATUS).expect("security status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "current");
+        assert!(status.libcef_present);
+    }
+
+    #[test]
+    fn read_aloud_status_wire_shape_decodes() {
+        let status = parse_read_aloud_status(READ_ALOUD_STATUS).expect("read-aloud status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "speaking");
+        assert_eq!(status.accepted, 2);
+    }
+
+    #[test]
+    fn voice_command_status_wire_shape_decodes() {
+        let status =
+            parse_voice_command_status(VOICE_COMMAND_STATUS).expect("voice status decodes");
+        assert_eq!(status.node, "alpha");
+        assert_eq!(status.state, "listening");
+        assert_eq!(status.last_mode.as_deref(), Some("command"));
+    }
+
+    #[test]
+    fn passkey_completion_wire_shape_decodes() {
+        let completion =
+            parse_passkey_completion(PASSKEY_COMPLETION).expect("passkey completion decodes");
+        assert_eq!(completion.client_request_id, "req-7");
+    }
+
+    #[test]
+    fn media_control_body_round_trips_through_its_parser() {
+        // The one mirror with an in-crate producer: build with the daemon-facing
+        // `*_body` and decode with the poller's parser — the two ends must agree.
+        let body = browser_media_control_body(
+            mde_web_preview_client::MediaTransportAction::Pause,
+            Some(7),
+            "mpris",
+            5,
+        );
+        let request = parse_browser_media_control_request(&body).expect("media control decodes");
+        assert_eq!(
+            request.action,
+            mde_web_preview_client::MediaTransportAction::Pause
+        );
+        assert_eq!(request.tab_id, Some(7));
+    }
+
+    #[test]
+    fn a_dropped_required_field_is_caught_as_drift() {
+        // The contract guard: a body missing a REQUIRED field (here `node`) must
+        // fail the parser rather than decode to a silent default — so a producer
+        // that drops the field is caught by this test.
+        let drifted = r#"{ "state": "asserted", "updated_ms": 1 }"#;
+        assert!(parse_passkey_status(drifted).is_err());
+    }
 }

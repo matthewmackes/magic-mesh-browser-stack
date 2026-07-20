@@ -133,9 +133,9 @@ pub(super) fn cups_job_title(url: &str, title: &str, unix_ms: u64) -> String {
     }
     let out = out.trim();
     if out.is_empty() {
-        format!("Magic Mesh Browser {unix_ms}")
+        format!("{} {unix_ms}", browser_product_label())
     } else {
-        format!("Magic Mesh Browser - {out}")
+        format!("{} - {out}", browser_product_label())
     }
 }
 
@@ -272,6 +272,35 @@ pub(super) fn submit_pdf_to_cups_with_runner(
             Err(err.to_owned())
         }
     }
+}
+
+pub(super) fn printer_error_label(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("no default destination") || lower.contains("no default printer") {
+        return Some("No default printer is available".to_owned());
+    }
+    if lower.contains("not a file") || lower.contains("pdf write failed") {
+        return Some("Print output was not found".to_owned());
+    }
+    if lower.contains("lp failed without an error message") {
+        return Some("Printer did not accept the job".to_owned());
+    }
+    if lower.contains("cups") && lower.contains("unavailable") {
+        return Some("Printer service unavailable".to_owned());
+    }
+    if lower.contains("lpstat") || lower.contains("scheduler") {
+        return Some("Printer list unavailable".to_owned());
+    }
+    if lower.starts_with("lp:") {
+        return Some("Printer did not accept the job".to_owned());
+    }
+
+    Some(sentence_case_ascii(trimmed))
 }
 
 /// CUPS print actions on the Browser surface state — kept beside the printing
