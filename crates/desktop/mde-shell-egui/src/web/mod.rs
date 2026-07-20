@@ -23138,6 +23138,40 @@ mod tests {
     }
 
     #[test]
+    fn omnibox_web_suggestion_stays_on_mesh_local_search_endpoint() {
+        // Local-only search privacy (WL-FUNC-005): producing the omnibox rows for
+        // a typed query performs no network egress, and the one egress-capable row
+        // — the explicit "Search web for …" suggestion — targets the mesh-local
+        // search endpoint, never an external provider. The query only leaves the
+        // node if the user explicitly activates that row.
+        let state = WebState::default();
+        let items = state.search_omnibox_items("secret internal codename");
+        let web: Vec<&SearchItem<String>> = items
+            .iter()
+            .filter(|item| item.domain == SearchDomain::WebSuggestion)
+            .collect();
+        assert!(
+            !web.is_empty(),
+            "a non-empty query should still yield a web-search suggestion row"
+        );
+        for item in web {
+            let target = item.target.to_ascii_lowercase();
+            assert!(
+                target.starts_with("https://search.mesh/"),
+                "the omnibox web-search row must target the mesh-local endpoint, \
+                 never an external provider — got {target:?}"
+            );
+            assert!(
+                !(target.contains("google.com")
+                    || target.contains("bing.com")
+                    || target.contains("duckduckgo.com")
+                    || target.contains("yahoo.com")),
+                "the omnibox query must never egress to an external search provider: {target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn browser_omnibox_accepts_file_candidates_from_the_files_model() {
         let temp = tempfile::tempdir().expect("file suggestion dir");
         let file = temp.path().join("home-notes.md");
