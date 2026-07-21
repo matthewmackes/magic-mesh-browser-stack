@@ -360,7 +360,11 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         | ControlMsg::SavePdf { .. }
         // No-ops on the Servo fallback: EditCommand (in-page edit menu),
         // PermissionDecision/BeforeUnloadDecision (Servo has no prompt round-trip),
-        // and the IME preedit controls (IME is wired for CEF only) all have no Servo path.
+        // the IME preedit controls (IME is wired for CEF only), and SetHidden — the
+        // CEF `WasHidden` occlusion lever that suspends offscreen paint for a
+        // backgrounded tab. Servo exposes no equivalent paint-suspension hook here,
+        // so a hidden tab simply keeps rendering (the many-background-media-tabs
+        // optimization lives on the CEF path); all have no Servo path.
         // Listed explicitly rather than `_ =>` so a NEW wire control forces a
         // conscious Servo decision instead of silently no-op'ing.
         | ControlMsg::EditCommand { .. }
@@ -369,6 +373,7 @@ fn apply_control(engine: &Engine, socket: &UnixStream, msg: &ControlMsg) {
         | ControlMsg::ImeSetComposition { .. }
         | ControlMsg::ImeCommitText { .. }
         | ControlMsg::ImeFinishComposition
+        | ControlMsg::SetHidden { .. }
         | ControlMsg::FillLogin { .. } => {}
     }
 }
