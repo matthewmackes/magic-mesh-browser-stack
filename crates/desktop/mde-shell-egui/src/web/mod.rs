@@ -2522,7 +2522,7 @@ impl WebState {
 
     /// Keep the shell's bottom navigation progress cell current even when the
     /// Browser workspace is not the active surface. The same cadenced local ledger
-    /// read backs the downloads drawer, so the taskbar does not own a second model.
+    /// read backs the downloads drawer, so shell chrome does not own a second model.
     pub(crate) fn pump_downloads_for_shell_chrome(&mut self) {
         self.poll_downloads();
     }
@@ -9502,8 +9502,8 @@ mod tests {
         ctx: &egui::Context,
         state: &mut WebState,
         input: egui::RawInput,
-        left_gutter: f32,
-        bottom_strut: f32,
+        left_inset: f32,
+        bottom_inset: f32,
     ) -> Option<egui::Rect> {
         let texture_id = state
             .tabs
@@ -9511,15 +9511,15 @@ mod tests {
             .and_then(|tab| tab.texture.as_ref())
             .map(|texture| texture.id())?;
         let out = ctx.run(input, |ctx| {
-            if bottom_strut > 0.0 {
-                egui::TopBottomPanel::bottom("browser-test-taskbar-strut")
-                    .exact_height(bottom_strut)
+            if bottom_inset > 0.0 {
+                egui::TopBottomPanel::bottom("browser-test-bottom-inset")
+                    .exact_height(bottom_inset)
                     .show_separator_line(false)
                     .show(ctx, |_| {});
             }
-            if left_gutter > 0.0 {
-                egui::SidePanel::left("browser-test-dock-gutter")
-                    .exact_width(left_gutter)
+            if left_inset > 0.0 {
+                egui::SidePanel::left("browser-test-left-inset")
+                    .exact_width(left_inset)
                     .resizable(false)
                     .show_separator_line(false)
                     .show(ctx, |_| {});
@@ -15034,7 +15034,7 @@ mod tests {
             shell_rect.left() >= 47.5
                 && shell_rect.right() <= 960.5
                 && shell_rect.bottom() <= 592.5,
-            "horizontal Browser body must stay inside the central workspace after shell gutters/struts: {shell_rect:?}"
+            "horizontal Browser body must stay inside the central workspace after shell insets: {shell_rect:?}"
         );
         assert!(
             shell_rect.width() > 840.0 && shell_rect.height() > 470.0,
