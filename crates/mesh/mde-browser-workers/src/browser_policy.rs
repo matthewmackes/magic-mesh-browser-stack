@@ -68,6 +68,334 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+/// The browser workers are a leaf crate and therefore cannot depend back on
+/// `mackesd` just to reach its privileged-action verifier. Keep the exact same
+/// wire contract here: schema v1, an exact-body-bound HMAC token, a narrow
+/// lifetime, and a host-local single-use nonce ledger. The other browser
+/// workers share this crate-internal seam through `crate::browser_policy::ipc`.
+pub(crate) mod ipc {
+    pub(crate) mod action_auth {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        use mackes_mesh_types::cloud::{
+            cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
+            CLOUD_ARM_CREDENTIAL,
+        };
+
+        /// Current privileged browser-action envelope schema.
+        pub(crate) const ACTION_SCHEMA_VERSION: u64 = 1;
+        /// Capabilities are intentionally short-lived and cannot outlive the
+        /// shared action-auth contract.
+        const MAX_AUTH_TTL_MS: i64 = 30_000;
+        /// Host-local replay ledger shared with the privileged daemon.
+        const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
+        const TOKEN_NONCE_MIN_LEN: usize = 8;
+
+        /// Exact semantic context bound into every browser mutation capability.
+        #[derive(Debug, Clone, Copy)]
+        pub(crate) struct MutationContext<'a> {
+            pub(crate) verb: &'a str,
+            pub(crate) node: &'a str,
+            pub(crate) target: &'a str,
+        }
+
+        type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+        /// Shared verifier/mint seam for browser workers and their internally
+        /// generated `action/connect/share` handoffs.
+        pub(crate) struct ActionAuthorizer {
+            signer: Option<CloudArmSigner>,
+            auth_root: PathBuf,
+            now: NowFn,
+        }
+
+        impl ActionAuthorizer {
+            /// Production authority is root-only and credential-only. Missing
+            /// credentials deliberately install a rejecting verifier.
+            pub(crate) fn production() -> Self {
+                let signer = production_signer().ok();
+                if signer.is_none() {
+                    tracing::error!(
+                        target: "mde_browser_workers::action_auth",
+                        "privileged browser Bus authorization unavailable; mutations are disabled"
+                    );
+                }
+                Self {
+                    signer,
+                    auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
+                    now: Arc::new(wall_now_ms),
+                }
+            }
+
+            /// Verify schema, exact-body binding, context, freshness, signature,
+            /// and consume the nonce before the caller performs any effect.
+            pub(crate) fn authorize(
+                &self,
+                body: &str,
+                context: MutationContext<'_>,
+            ) -> Result<(), String> {
+                if body.len() > 64 * 1024 {
+                    return Err("request body exceeds the 64 KiB cap".to_owned());
+                }
+                let envelope: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|_| "request body is not a JSON object".to_owned())?;
+                let object = envelope
+                    .as_object()
+                    .ok_or_else(|| "request body is not a JSON object".to_owned())?;
+                if object
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(ACTION_SCHEMA_VERSION)
+                {
+                    return Err(format!(
+                        "privileged browser action requires schema_version {ACTION_SCHEMA_VERSION}"
+                    ));
+                }
+                let raw_token = object
+                    .get("armed_token")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|token| !token.trim().is_empty())
+                    .ok_or_else(|| "no armed token supplied".to_owned())?;
+                let token = CloudArmedToken::parse(raw_token)
+                    .ok_or_else(|| "armed token is malformed".to_owned())?;
+                if token.nonce.len() < TOKEN_NONCE_MIN_LEN {
+                    return Err("armed token nonce is malformed".to_owned());
+                }
+                if token.verb != context.verb
+                    || token.node != context.node
+                    || token.target != context.target
+                {
+                    return Err("armed token does not authorize this verb/node/target".to_owned());
+                }
+                let request_digest = cloud_request_digest(body)
+                    .map_err(|_| "request body is not valid canonical JSON".to_owned())?;
+                if token.request_sha256 != request_digest {
+                    return Err("armed token does not authorize this request body".to_owned());
+                }
+                let now = (self.now)();
+                if now > token.expires_at_ms {
+                    return Err("armed token has expired".to_owned());
+                }
+                if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+                    return Err("armed token exceeds the 30-second lifetime".to_owned());
+                }
+                let Some(signer) = self.signer.as_ref() else {
+                    return Err("browser action authorization is unavailable".to_owned());
+                };
+                if !signer.verify_payload(&token.signing_payload(), &token.signature) {
+                    return Err("armed token signature did not verify".to_owned());
+                }
+                if !claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now)? {
+                    return Err("armed token was already used".to_owned());
+                }
+                Ok(())
+            }
+
+            /// Sign a new exact-body handoff using the root/systemd credential.
+            /// This is intentionally narrow: callers choose the verb and target,
+            /// but cannot obtain the raw key or bypass the schema envelope.
+            pub(crate) fn sign_body(
+                &self,
+                unsigned_body: &str,
+                context: MutationContext<'_>,
+            ) -> Result<String, String> {
+                let signer = self
+                    .signer
+                    .as_ref()
+                    .ok_or_else(|| "browser action signing is unavailable".to_owned())?;
+                let mut body: serde_json::Value = serde_json::from_str(unsigned_body)
+                    .map_err(|_| "unsigned handoff body is not a JSON object".to_owned())?;
+                let object = body
+                    .as_object_mut()
+                    .ok_or_else(|| "unsigned handoff body is not a JSON object".to_owned())?;
+                object.insert(
+                    "schema_version".to_owned(),
+                    serde_json::Value::from(ACTION_SCHEMA_VERSION),
+                );
+                object.remove("armed_token");
+                let unsigned_body = serde_json::to_string(&body)
+                    .map_err(|_| "unsigned handoff body cannot be serialized".to_owned())?;
+                let now = (self.now)();
+                let nonce = fresh_nonce();
+                let token = CloudArmedToken::mint(
+                    signer,
+                    &nonce,
+                    now.saturating_add(MAX_AUTH_TTL_MS),
+                    context.verb,
+                    context.node,
+                    context.target,
+                    &cloud_request_digest(&unsigned_body)
+                        .map_err(|_| "unsigned handoff body is not valid JSON".to_owned())?,
+                );
+                let mut signed = body;
+                signed.as_object_mut().expect("object above").insert(
+                    "armed_token".to_owned(),
+                    serde_json::Value::String(token.encode()),
+                );
+                serde_json::to_string(&signed)
+                    .map_err(|_| "signed handoff body cannot be serialized".to_owned())
+            }
+
+            #[cfg(test)]
+            pub(crate) fn for_test(key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
+                Self {
+                    signer: Some(CloudArmSigner::new(key.to_vec()).expect("test key")),
+                    auth_root,
+                    now: Arc::new(move || now_ms),
+                }
+            }
+        }
+
+        fn production_signer() -> Result<CloudArmSigner, String> {
+            if !running_as_root() {
+                return Err("privileged browser action signing requires root".to_owned());
+            }
+            let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| "systemd action credential is unavailable".to_owned())?;
+            let raw = std::fs::read(directory.join(CLOUD_ARM_CREDENTIAL))
+                .map_err(|e| format!("read systemd action credential: {e}"))?;
+            let key = decode_cloud_arm_credential(&raw).map_err(str::to_owned)?;
+            CloudArmSigner::new(key).map_err(str::to_owned)
+        }
+
+        fn running_as_root() -> bool {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status.lines().find_map(|line| {
+                        let value = line.strip_prefix("Uid:")?.split_whitespace().next()?;
+                        value.parse::<u32>().ok()
+                    })
+                })
+                == Some(0)
+        }
+
+        fn wall_now_ms() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0)
+        }
+
+        fn fresh_nonce() -> String {
+            let mut bytes = [0_u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        fn nonce_digest(nonce: &str) -> String {
+            use sha2::{Digest as _, Sha256};
+            Sha256::digest(nonce.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        fn claim_nonce(
+            root: &Path,
+            nonce: &str,
+            expires_at_ms: i64,
+            now_ms: i64,
+        ) -> Result<bool, String> {
+            fn sync_directory(dir: &Path) -> Result<(), String> {
+                std::fs::File::open(dir)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| format!("sync replay store: {error}"))
+            }
+
+            let dir = root.join("spent-nonces");
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("create replay store: {error}"))?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("secure replay store: {error}"))?;
+            for entry in std::fs::read_dir(&dir)
+                .map_err(|error| format!("read replay store: {error}"))?
+                .flatten()
+            {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.len() != 64
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let expired = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+                    .is_some_and(|expiry| expiry < now_ms);
+                if expired {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            let path = dir.join(nonce_digest(nonce));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(false)
+                }
+                Err(error) => return Err(format!("claim replay nonce: {error}")),
+            };
+            if let Err(error) = file
+                .write_all(expires_at_ms.to_string().as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(format!("persist replay nonce: {error}"));
+            }
+            sync_directory(&dir)?;
+            Ok(true)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn authorize_test_body(
+            key: &[u8],
+            unsigned_body: &str,
+            context: MutationContext<'_>,
+            nonce: &str,
+            expires_at_ms: i64,
+        ) -> String {
+            let mut body: serde_json::Value = serde_json::from_str(unsigned_body).unwrap();
+            body.as_object_mut().unwrap().insert(
+                "schema_version".to_owned(),
+                serde_json::Value::from(ACTION_SCHEMA_VERSION),
+            );
+            body.as_object_mut().unwrap().remove("armed_token");
+            let unsigned_body = serde_json::to_string(&body).unwrap();
+            let signer = CloudArmSigner::new(key.to_vec()).unwrap();
+            let token = CloudArmedToken::mint(
+                &signer,
+                &format!("{nonce}-0123456789abcdef0123456789abcdef"),
+                expires_at_ms,
+                context.verb,
+                context.node,
+                context.target,
+                &cloud_request_digest(&unsigned_body).unwrap(),
+            );
+            body.as_object_mut().unwrap().insert(
+                "armed_token".to_owned(),
+                serde_json::Value::String(token.encode()),
+            );
+            serde_json::to_string(&body).unwrap()
+        }
+    }
+}
+
 /// Retained-latest topic prefix carrying this node's [`BrowserPolicyStatus`]
 /// (`state/browser-policy/<node>`).
 pub const STATE_PREFIX: &str = "state/browser-policy/";
@@ -94,6 +422,10 @@ pub const DATA_MANIFEST_FILE: &str = "browser-data.manifest";
 /// Default poll/flush cadence. A fleet policy changes rarely (an operator edit);
 /// a 30 s tick keeps convergence prompt without polling storms — same as adfilter.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(30);
+
+const POLICY_AUTH_VERB: &str = "browser-policy-set";
+const POLICY_AUTH_TARGET: &str = "browser-policy";
+const BROWSER_AUTH_TARGET: &str = "browser";
 
 /// A wall-clock source (ms since the Unix epoch). Injected so the model stays pure
 /// and tests drive a deterministic fake clock.
@@ -549,6 +881,8 @@ pub struct BrowserPolicyWorker {
     share_gate: Option<Arc<AtomicBool>>,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for every mutable browser action.
+    authorizer: Arc<ipc::action_auth::ActionAuthorizer>,
 }
 
 impl BrowserPolicyWorker {
@@ -578,6 +912,7 @@ impl BrowserPolicyWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ipc::action_auth::ActionAuthorizer::production()),
         }
     }
 
@@ -613,6 +948,17 @@ impl BrowserPolicyWorker {
     #[must_use]
     pub fn with_browser_data_root(mut self, root: PathBuf) -> Self {
         self.browser_data_root = root;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(
+        mut self,
+        authorizer: Arc<ipc::action_auth::ActionAuthorizer>,
+    ) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -865,6 +1211,21 @@ impl BrowserPolicyWorker {
                     continue;
                 }
                 for body in self.drain_topic(persist, &topic) {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        ipc::action_auth::MutationContext {
+                            verb: POLICY_AUTH_VERB,
+                            node: &self.node,
+                            target: POLICY_AUTH_TARGET,
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "mackesd::browser_policy",
+                            error = %e,
+                            "refused unauthorized browser-policy mutation"
+                        );
+                        continue;
+                    }
                     if verb == "set" {
                         match parse_policy_set(&body) {
                             Ok(doc) => {
@@ -887,6 +1248,23 @@ impl BrowserPolicyWorker {
                 for body in self.drain_topic(persist, &topic) {
                     match parse_browser_action(&verb, &body) {
                         Ok(action) => {
+                            let auth_verb = format!("browser-{verb}");
+                            if let Err(e) = self.authorizer.authorize(
+                                &body,
+                                ipc::action_auth::MutationContext {
+                                    verb: &auth_verb,
+                                    node: &self.node,
+                                    target: BROWSER_AUTH_TARGET,
+                                },
+                            ) {
+                                tracing::warn!(
+                                    target: "mackesd::browser_policy",
+                                    verb = %verb,
+                                    error = %e,
+                                    "refused unauthorized browser enforcement action"
+                                );
+                                continue;
+                            }
                             let _ = self.enforce(action);
                             enforced_any = true;
                         }
@@ -1399,6 +1777,38 @@ mod tests {
     }
 
     // ── typed action parsing ──
+
+    #[test]
+    fn browser_policy_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-policy-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-policy-set",
+            node: "node-a",
+            target: "browser-policy",
+        };
+        let unsigned = r#"{"browser_enabled":true}"#;
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(
+            gate.authorize(unsigned, context).is_err(),
+            "unsigned policy must be refused"
+        );
+        let armed = authorize_test_body(
+            key,
+            unsigned,
+            context,
+            "browser-policy-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(
+            gate.authorize(&armed, context).is_err(),
+            "policy token replay must be refused"
+        );
+    }
 
     #[test]
     fn parse_browser_action_covers_the_verbs_and_rejects_bad_input() {

@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::browser_policy::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::RetainedStatusPublisher;
 
 /// Browser-owned offline cache action topic.
@@ -92,6 +93,8 @@ pub struct BrowserOfflineCacheWorker {
     now_fn: NowFn,
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for cache writes.
+    authorizer: Arc<ActionAuthorizer>,
     status_publisher: RetainedStatusPublisher,
 }
 
@@ -114,6 +117,7 @@ impl BrowserOfflineCacheWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status_publisher: RetainedStatusPublisher::new(),
         }
     }
@@ -146,6 +150,14 @@ impl BrowserOfflineCacheWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -169,7 +181,24 @@ impl BrowserOfflineCacheWorker {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_snapshot(&body, self.now_ms()) {
-                Ok(snapshot) => self.apply_snapshot(snapshot, persist),
+                Ok(snapshot) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-offline-cache",
+                            node: &self.node,
+                            target: "browser-offline-cache",
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "mackesd::browser_offline_cache",
+                            error = %e,
+                            "refused unauthorized browser offline-cache snapshot"
+                        );
+                        continue;
+                    }
+                    self.apply_snapshot(snapshot, persist)
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "mackesd::browser_offline_cache",
@@ -905,6 +934,32 @@ mod tests {
 
     fn pdf_b64() -> String {
         base64::engine::general_purpose::STANDARD.encode(pdf_bytes())
+    }
+
+    #[test]
+    fn offline_cache_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-cache-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-offline-cache",
+            node: "node-a",
+            target: "browser-offline-cache",
+        };
+        let unsigned = r#"{"op":"browser_offline_cache","source":"browser"}"#;
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(gate.authorize(unsigned, context).is_err());
+        let armed = authorize_test_body(
+            key,
+            unsigned,
+            context,
+            "browser-cache-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(gate.authorize(&armed, context).is_err());
     }
 
     #[test]

@@ -2366,7 +2366,15 @@ impl WebState {
         if self.last_session_sync_body.as_deref() == Some(body.as_str()) {
             return;
         }
-        publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_SESSION_SYNC, &body);
+        if !publish_authorized_browser_mutation(
+            self.bus_root.as_deref(),
+            ACTION_BROWSER_SESSION_SYNC,
+            &body,
+            "browser-session-sync",
+            "browser-session-sync",
+        ) {
+            return;
+        }
         self.last_session_sync_body = Some(body);
     }
 
@@ -5626,12 +5634,18 @@ impl WebState {
             &self.address,
             tab.page_focused,
         );
-        publish_to_bus(
+        let authorized = publish_authorized_browser_mutation(
             self.bus_root.as_deref(),
             ACTION_BROWSER_VOICE_COMMAND,
             &body,
+            "browser-voice-command",
+            "browser-voice-command",
         );
-        self.capture_notice = Some(format!("{}: sent voice input request", mode.label()));
+        self.capture_notice = Some(if authorized {
+            format!("{}: sent voice input request", mode.label())
+        } else {
+            format!("{} unavailable: authorization is not ready", mode.label())
+        });
     }
 
     fn handle_page_text_event(&mut self, id: u64, text: String) {
@@ -5650,7 +5664,17 @@ impl WebState {
                 return;
             }
             let body = browser_read_aloud_body(&request, &text);
-            publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_READ_ALOUD, &body);
+            if !publish_authorized_browser_mutation(
+                self.bus_root.as_deref(),
+                ACTION_BROWSER_READ_ALOUD,
+                &body,
+                "browser-read-aloud",
+                "browser-read-aloud",
+            ) {
+                self.capture_notice =
+                    Some("Read aloud unavailable: authorization is not ready".to_owned());
+                return;
+            }
             self.capture_notice =
                 Some("Read aloud: sent page text to the speech service".to_owned());
             return;
@@ -5661,7 +5685,17 @@ impl WebState {
                 return;
             }
             let body = browser_translate_body(&request, &text);
-            publish_to_bus(self.bus_root.as_deref(), ACTION_BROWSER_TRANSLATE, &body);
+            if !publish_authorized_browser_mutation(
+                self.bus_root.as_deref(),
+                ACTION_BROWSER_TRANSLATE,
+                &body,
+                "browser-translate",
+                "browser-translate",
+            ) {
+                self.capture_notice =
+                    Some("Translate unavailable: authorization is not ready".to_owned());
+                return;
+            }
             self.capture_notice = Some("Translate: sent page text to translation".to_owned());
             return;
         }
@@ -5671,11 +5705,17 @@ impl WebState {
                 return;
             }
             let body = browser_offline_cache_body(&request, &text);
-            publish_to_bus(
+            if !publish_authorized_browser_mutation(
                 self.bus_root.as_deref(),
                 ACTION_BROWSER_OFFLINE_CACHE,
                 &body,
-            );
+                "browser-offline-cache",
+                "browser-offline-cache",
+            ) {
+                self.capture_notice =
+                    Some("Offline cache unavailable: authorization is not ready".to_owned());
+                return;
+            }
             self.capture_notice = Some("Offline cache: saved page snapshot".to_owned());
         }
     }
@@ -5714,8 +5754,8 @@ impl WebState {
                     }
                 }
             }
-            Err(err) => {
-                self.capture_notice = Some(passkey_page_request_notice(&err));
+            Err(error) => {
+                self.capture_notice = Some(passkey_page_request_notice(&error));
             }
         }
     }
@@ -5748,14 +5788,20 @@ impl WebState {
         }
         match browser_passkey_shell_approved_body(&pending.handoff_body) {
             Ok(handoff_body) => {
-                publish_to_bus(
+                if publish_authorized_browser_mutation(
                     self.bus_root.as_deref(),
                     ACTION_BROWSER_PASSKEY,
                     &handoff_body,
-                );
-                self.pending_passkey_requests
-                    .insert(pending.client_request_id.clone(), pending.tab_id);
-                self.capture_notice = Some(format!("Passkey: approved for {}", pending.rp_id));
+                    "browser-passkey",
+                    "browser-passkey",
+                ) {
+                    self.pending_passkey_requests
+                        .insert(pending.client_request_id.clone(), pending.tab_id);
+                    self.capture_notice = Some(format!("Passkey: approved for {}", pending.rp_id));
+                } else {
+                    self.capture_notice =
+                        Some("Passkey unavailable: authorization is not ready".to_owned());
+                }
             }
             Err(_err) => {
                 self.complete_passkey_denial(
@@ -6550,11 +6596,25 @@ impl WebState {
         if enabled {
             self.adfilter_store
                 .block_site(&host, &local_hostname(), now);
-            publish(ACTION_ADFILTER_BLOCK, &adfilter_domain_body(&host));
+            let body = adfilter_domain_body(&host);
+            let target = host.trim().to_ascii_lowercase();
+            let _ = publish_authorized_mutation(
+                ACTION_ADFILTER_BLOCK,
+                &body,
+                "adfilter-block",
+                &target,
+            );
         } else {
             self.adfilter_store
                 .allow_site(&host, &local_hostname(), now);
-            publish(ACTION_ADFILTER_ALLOW, &adfilter_domain_body(&host));
+            let body = adfilter_domain_body(&host);
+            let target = host.trim().to_ascii_lowercase();
+            let _ = publish_authorized_mutation(
+                ACTION_ADFILTER_ALLOW,
+                &body,
+                "adfilter-allow",
+                &target,
+            );
         }
         self.apply_adfilter_to_open_tabs();
         self.publish_site_blocking(engine, &url, &title, &host, enabled, now);
@@ -9240,7 +9300,67 @@ fn enqueue_browser_output_batch(
 /// node / a transient open failure is a silent no-op — the honest solo-host
 /// state, never a panic.
 fn publish(topic: &str, body: &str) {
-    publish_to_bus(mde_bus::client_data_dir().as_deref(), topic, body);
+    if topic == ACTION_CHAT_SEND {
+        let Some(body) = authorize_chat_send_body(body) else {
+            return;
+        };
+        publish_to_bus(mde_bus::client_data_dir().as_deref(), topic, &body);
+    } else if topic == ACTION_BOOKMARKS_ADD {
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(body) else {
+            tracing::warn!("Browser bookmark request is not valid JSON");
+            return;
+        };
+        let Some(target) = document
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        else {
+            tracing::warn!("Browser bookmark request has no URL");
+            return;
+        };
+        let Ok(body) = crate::iac::authorize_root_mutation_body(
+            body,
+            "bookmarks-add",
+            &local_hostname(),
+            target,
+        ) else {
+            tracing::warn!("Browser bookmark authorization unavailable");
+            return;
+        };
+        publish_to_bus(mde_bus::client_data_dir().as_deref(), topic, &body);
+    } else {
+        publish_to_bus(mde_bus::client_data_dir().as_deref(), topic, body);
+    }
+}
+
+/// Browser share producers run inside the root shell, but still cross the
+/// world-writable Bus spool. Add the same short-lived exact-body capability
+/// the chat worker requires before publishing the message request.
+fn authorize_chat_send_body(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let object = value.as_object()?;
+    let scope = object
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("peer");
+    let to = object.get("to").and_then(serde_json::Value::as_str)?.trim();
+    if to.is_empty() || !matches!(scope, "peer" | "room") {
+        tracing::warn!(scope, "refusing malformed Browser Chat share");
+        return None;
+    }
+    match crate::iac::authorize_root_mutation_body(
+        body,
+        "chat-send",
+        &local_hostname(),
+        &format!("{scope}:{to}"),
+    ) {
+        Ok(body) => Some(body),
+        Err(error) => {
+            tracing::warn!(error = %error, "Browser Chat share authorization unavailable");
+            None
+        }
+    }
 }
 
 fn publish_to_bus(root: Option<&Path>, topic: &str, body: &str) {
@@ -9249,6 +9369,25 @@ fn publish_to_bus(root: Option<&Path>, topic: &str, body: &str) {
         return;
     };
     let _ = persist.write(topic, Priority::Default, None, Some(body));
+}
+
+fn publish_authorized_browser_mutation(
+    root: Option<&Path>,
+    topic: &str,
+    body: &str,
+    verb: &str,
+    target: &str,
+) -> bool {
+    match crate::iac::authorize_root_mutation_body(body, verb, &local_hostname(), target) {
+        Ok(body) => {
+            publish_to_bus(root, topic, &body);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(topic, verb, error = %error, "Browser mutation authorization unavailable");
+            false
+        }
+    }
 }
 
 /// The local hostname — the mesh identity a Send-in-Chat addresses (lock 2/21:

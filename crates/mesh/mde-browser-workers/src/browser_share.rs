@@ -17,6 +17,7 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::browser_policy::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::RetainedStatusPublisher;
 
 /// Browser-owned platform-share handoff topic.
@@ -97,6 +98,8 @@ pub struct BrowserShareWorker {
     tick: Duration,
     now_fn: NowFn,
     bus_root_override: Option<std::path::PathBuf>,
+    /// Exact-body capability verifier for share routing and handoff minting.
+    authorizer: Arc<ActionAuthorizer>,
     status: ShareStatus,
     status_publisher: RetainedStatusPublisher,
 }
@@ -113,6 +116,7 @@ impl BrowserShareWorker {
             tick: DEFAULT_TICK,
             now_fn,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status: ShareStatus {
                 node,
                 last_request_id: None,
@@ -153,6 +157,14 @@ impl BrowserShareWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -169,7 +181,24 @@ impl BrowserShareWorker {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_request(&body, &msg.ulid) {
-                Ok(request) => self.apply_request(persist, request),
+                Ok(request) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-share",
+                            node: &self.node,
+                            target: "browser-share",
+                        },
+                    ) {
+                        self.status.rejected = self.status.rejected.saturating_add(1);
+                        self.status.state = "error".to_owned();
+                        self.status.last_error = Some(format!("unauthorized request: {e}"));
+                        self.status.updated_ms = self.now_ms();
+                        self.publish_status(persist);
+                        continue;
+                    }
+                    self.apply_request(persist, request)
+                }
                 Err(e) => {
                     self.status.rejected = self.status.rejected.saturating_add(1);
                     self.status.state = "error".to_owned();
@@ -234,7 +263,7 @@ impl BrowserShareWorker {
         let Some(device_id) = request.target_id.as_deref() else {
             return;
         };
-        let body = serde_json::json!({
+        let unsigned_body = serde_json::json!({
             "device_id": device_id,
             "url": request.url,
             "open": true,
@@ -243,6 +272,24 @@ impl BrowserShareWorker {
             "handoff_id": request.id,
         })
         .to_string();
+        let body = match self.authorizer.sign_body(
+            &unsigned_body,
+            MutationContext {
+                verb: "connect-share",
+                node: &self.node,
+                target: &format!("device:{device_id}"),
+            },
+        ) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::browser_share",
+                    error = %e,
+                    "refused to publish unsigned phone browser share handoff"
+                );
+                return;
+            }
+        };
         if let Err(e) = persist.write(ACTION_CONNECT_SHARE, Priority::Default, None, Some(&body)) {
             tracing::warn!(
                 target: "mackesd::browser_share",
@@ -422,6 +469,32 @@ mod tests {
     }
 
     #[test]
+    fn share_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-share-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-share",
+            node: "node-a",
+            target: "browser-share",
+        };
+        let unsigned = share_body("email");
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(gate.authorize(&unsigned, context).is_err());
+        let armed = authorize_test_body(
+            key,
+            &unsigned,
+            context,
+            "browser-share-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(gate.authorize(&armed, context).is_err());
+    }
+
+    #[test]
     fn parse_request_accepts_browser_platform_share_targets() {
         for target in ["peer", "email", "qr"] {
             let request = parse_request(&share_body(target), "01H").expect("valid share");
@@ -498,11 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn phone_share_publishes_the_existing_kde_connect_share_verb() {
+    fn phone_share_publishes_a_device_scoped_kde_connect_share_handoff() {
+        use crate::browser_policy::ipc::action_auth::ActionAuthorizer;
+        use mackes_mesh_types::cloud::CloudArmedToken;
         let bus = tempfile::tempdir().expect("bus");
+        let auth = tempfile::tempdir().expect("auth");
+        let mismatch_auth = tempfile::tempdir().expect("mismatch auth");
+        let auth_key = b"browser-share-phone-test-key";
         let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
-        let mut worker =
-            BrowserShareWorker::new("node-a".to_owned()).with_now_fn(Arc::new(|| 123_456));
+        let mut worker = BrowserShareWorker::new("node-a".to_owned())
+            .with_now_fn(Arc::new(|| 123_456))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                auth_key,
+                auth.path().to_path_buf(),
+                123_456,
+            )));
         let request = parse_request(
             &share_body_with_target_id("phone", Some("pixel-8")),
             "req-phone",
@@ -521,11 +604,45 @@ mod tests {
         assert_eq!(v["source"], "browser_share");
         assert_eq!(v["source_host"], "mesh-node-1");
         assert_eq!(v["handoff_id"], "req-phone");
+
+        let token = CloudArmedToken::parse(v["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, "connect-share");
+        assert_eq!(token.node, "node-a");
+        assert_eq!(token.target, "device:pixel-8");
+
+        let authorized = ActionAuthorizer::for_test(auth_key, auth.path().to_path_buf(), 123_456);
+        assert!(authorized
+            .authorize(
+                body,
+                MutationContext {
+                    verb: "connect-share",
+                    node: "node-a",
+                    target: "device:pixel-8",
+                },
+            )
+            .is_ok());
+
+        let mismatch =
+            ActionAuthorizer::for_test(auth_key, mismatch_auth.path().to_path_buf(), 123_456);
+        assert!(mismatch
+            .authorize(
+                body,
+                MutationContext {
+                    verb: "connect-share",
+                    node: "node-a",
+                    target: "device:other-phone",
+                },
+            )
+            .is_err());
     }
 
     #[test]
     fn drain_requests_tracks_rejections_and_does_not_replay() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
         let bus = tempfile::tempdir().expect("bus");
+        let auth = tempfile::tempdir().expect("auth");
         let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         persist
             .write(
@@ -535,15 +652,30 @@ mod tests {
                 Some(r#"{"op":"wrong"}"#),
             )
             .expect("write bad");
+        let unsigned = share_body("qr");
+        let auth_key = b"browser-share-drain-test-key";
+        let auth_context = MutationContext {
+            verb: "browser-share",
+            node: "node-a",
+            target: "browser-share",
+        };
+        let authorized = authorize_test_body(
+            auth_key,
+            &unsigned,
+            auth_context,
+            "browser-share-drain-once",
+            1_700_000_030_000,
+        );
         persist
-            .write(
-                ACTION_TOPIC,
-                Priority::Default,
-                None,
-                Some(&share_body("qr")),
-            )
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&authorized))
             .expect("write good");
-        let mut worker = BrowserShareWorker::new("node-a".to_owned()).with_now_fn(Arc::new(|| 777));
+        let mut worker = BrowserShareWorker::new("node-a".to_owned())
+            .with_now_fn(Arc::new(|| 777))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                auth_key,
+                auth.path().to_path_buf(),
+                1_700_000_000_000,
+            )));
 
         worker.drain_requests(&persist);
         worker.drain_requests(&persist);

@@ -21,6 +21,8 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::browser_policy::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 /// Browser-owned translate request topic.
 pub const ACTION_TOPIC: &str = "action/browser/translate";
 
@@ -108,6 +110,8 @@ pub struct BrowserTranslateWorker {
     now_fn: NowFn,
     backend: TranslateBackend,
     bus_root_override: Option<std::path::PathBuf>,
+    /// Exact-body capability verifier for translation command execution.
+    authorizer: Arc<ActionAuthorizer>,
     status: TranslateStatus,
 }
 
@@ -127,6 +131,7 @@ impl BrowserTranslateWorker {
                 Arc::new(move |request| backend.translate(request))
             },
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status: TranslateStatus {
                 node,
                 last_request_id: None,
@@ -174,6 +179,14 @@ impl BrowserTranslateWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -191,7 +204,24 @@ impl BrowserTranslateWorker {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_request(&body, &msg.ulid) {
-                Ok(request) => requests.push(request),
+                Ok(request) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-translate",
+                            node: &self.node,
+                            target: "browser-translate",
+                        },
+                    ) {
+                        self.status.rejected = self.status.rejected.saturating_add(1);
+                        self.status.state = "error".to_owned();
+                        self.status.last_error = Some(format!("unauthorized request: {e}"));
+                        self.status.updated_ms = self.now_ms();
+                        self.publish_status(persist);
+                        continue;
+                    }
+                    requests.push(request)
+                }
                 Err(e) => {
                     self.status.rejected = self.status.rejected.saturating_add(1);
                     self.status.state = "error".to_owned();
@@ -581,6 +611,32 @@ mod tests {
             "truncated": false,
         })
         .to_string()
+    }
+
+    #[test]
+    fn translate_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-translate-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-translate",
+            node: "node-a",
+            target: "browser-translate",
+        };
+        let unsigned = request("Translate this page.");
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(gate.authorize(&unsigned, context).is_err());
+        let armed = authorize_test_body(
+            key,
+            &unsigned,
+            context,
+            "browser-translate-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(gate.authorize(&armed, context).is_err());
     }
 
     #[test]

@@ -10,11 +10,12 @@
 use super::media_metadata_chip_label;
 use super::{
     bookmark_add_body, chat_share_body, local_hostname, pdf_file_looks_readable, publish,
-    publish_browser_send_tab, publish_browser_share, BrowserEngine, BrowserPasskeyStatus,
-    BrowserReadAloudStatus, BrowserSecurityUpdateStatus, BrowserSendTabTarget, BrowserShareTarget,
-    BrowserVoiceCommandStatus, ContainerProfile, CupsPrintSettings, DevicePermissionKind,
-    DeviceProfile, DisplayTarget, PaperSize, PrintOrientation, UserAgentOverride, WebState,
-    ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND, CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
+    publish_authorized_mutation, publish_browser_send_tab, publish_browser_share, BrowserEngine,
+    BrowserPasskeyStatus, BrowserReadAloudStatus, BrowserSecurityUpdateStatus,
+    BrowserSendTabTarget, BrowserShareTarget, BrowserVoiceCommandStatus, ContainerProfile,
+    CupsPrintSettings, DevicePermissionKind, DeviceProfile, DisplayTarget, PaperSize,
+    PrintOrientation, UserAgentOverride, WebState, ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND,
+    CURATED_USERSCRIPT_COUNT, DEFAULT_DENIED_PERMISSIONS,
 };
 use mde_egui::egui;
 use mde_egui::menubar::{Entry, Item, Menu};
@@ -1315,7 +1316,13 @@ pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuActio
         MenuAction::AddBookmark => {
             let (url, title) = page_url_title(state);
             if !url.trim().is_empty() {
-                publish(ACTION_BOOKMARKS_ADD, &bookmark_add_body(&url, &title));
+                let body = bookmark_add_body(&url, &title);
+                let _ = publish_authorized_mutation(
+                    ACTION_BOOKMARKS_ADD,
+                    &body,
+                    "bookmarks-add",
+                    url.trim(),
+                );
             }
         }
         MenuAction::OpenBookmarksManager => state.request_bookmarks_manager(),

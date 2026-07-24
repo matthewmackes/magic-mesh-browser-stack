@@ -37,7 +37,9 @@
 [package]
 name        = "mde-web-preview"
 description = "BOOKMARKS-5 — the out-of-process, OS-sandboxed Servo browser helper: an interactive Servo web engine (JS on, tabs, links, back/forward, address bar, media best-effort) confined by a user namespace + seccomp-bpf + minimal caps + no-new-privs + cgroup v2 memory/CPU caps + a read-only rootfs/tmpfs with NO home/keys/data. Zero telemetry, system-CA TLS with honest cert warnings, deny-all sensitive perms, first-party session cookies cleared on close, no persistent history, a generic UA. Renders offscreen into a shared-memory frame (the shm seam BOOKMARKS-6 consumes); ships a headless about:blank -> frame-arrives test."
-version      = "12.0.0"
+# Standalone Cargo workspace: keep synchronized with the root
+# [workspace.package].version (Cargo cannot inherit across workspace roots).
+version      = "12.1.0"
 edition      = "2021"
 rust-version = "1.88"
 license      = "GPL-3.0-or-later"

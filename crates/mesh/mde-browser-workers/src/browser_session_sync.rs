@@ -22,6 +22,7 @@ use mde_bus::persist::Persist;
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::browser_policy::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::RetainedStatusPublisher;
 
 /// Browser-owned session snapshot action topic.
@@ -83,6 +84,8 @@ pub struct BrowserSessionSyncWorker {
     now_fn: NowFn,
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for session mutations and handoff minting.
+    authorizer: Arc<ActionAuthorizer>,
     status_publisher: RetainedStatusPublisher,
 }
 
@@ -104,6 +107,7 @@ impl BrowserSessionSyncWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status_publisher: RetainedStatusPublisher::new(),
         }
     }
@@ -136,6 +140,14 @@ impl BrowserSessionSyncWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -159,7 +171,24 @@ impl BrowserSessionSyncWorker {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_snapshot(&body) {
-                Ok(snapshot) => self.apply_snapshot(snapshot, persist),
+                Ok(snapshot) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-session-sync",
+                            node: &self.node,
+                            target: "browser-session-sync",
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "mackesd::browser_session_sync",
+                            error = %e,
+                            "refused unauthorized browser session snapshot"
+                        );
+                        continue;
+                    }
+                    self.apply_snapshot(snapshot, persist)
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "mackesd::browser_session_sync",
@@ -184,7 +213,24 @@ impl BrowserSessionSyncWorker {
             self.send_tab_cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_send_tab(&body, &msg.ulid) {
-                Ok(handoff) => self.apply_send_tab(handoff, persist),
+                Ok(handoff) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-send-tab",
+                            node: &self.node,
+                            target: "browser-send-tab",
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "mackesd::browser_session_sync",
+                            error = %e,
+                            "refused unauthorized browser send-tab handoff"
+                        );
+                        continue;
+                    }
+                    self.apply_send_tab(handoff, persist)
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "mackesd::browser_session_sync",
@@ -270,7 +316,7 @@ impl BrowserSessionSyncWorker {
         if handoff.target != "phone" {
             return;
         }
-        let body = serde_json::json!({
+        let unsigned_body = serde_json::json!({
             "device_id": handoff.target_id,
             "url": handoff.url,
             "open": true,
@@ -279,6 +325,24 @@ impl BrowserSessionSyncWorker {
             "handoff_id": handoff.id,
         })
         .to_string();
+        let body = match self.authorizer.sign_body(
+            &unsigned_body,
+            MutationContext {
+                verb: "connect-share",
+                node: &self.node,
+                target: &format!("device:{}", handoff.target_id),
+            },
+        ) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::browser_session_sync",
+                    error = %e,
+                    "refused to publish unsigned phone browser send-tab handoff"
+                );
+                return;
+            }
+        };
         if let Err(e) = persist.write(ACTION_CONNECT_SHARE, Priority::Default, None, Some(&body)) {
             tracing::warn!(
                 target: "mackesd::browser_session_sync",
@@ -640,6 +704,32 @@ mod tests {
     }
 
     #[test]
+    fn session_sync_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-session-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-session-sync",
+            node: "node-a",
+            target: "browser-session-sync",
+        };
+        let unsigned = snapshot("node-a", "https://mesh.test/");
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(gate.authorize(&unsigned, context).is_err());
+        let armed = authorize_test_body(
+            key,
+            &unsigned,
+            context,
+            "browser-session-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(gate.authorize(&armed, context).is_err());
+    }
+
+    #[test]
     fn parse_snapshot_preserves_the_startup_restore_shape() {
         let parsed = parse_snapshot(&snapshot("work station/1", "https://example.test/")).unwrap();
         assert_eq!(parsed.host, "work-station1");
@@ -854,16 +944,26 @@ mod tests {
     }
 
     #[test]
-    fn phone_send_tab_publishes_the_existing_kde_connect_share_verb() {
+    fn phone_send_tab_publishes_a_device_scoped_kde_connect_share_handoff() {
+        use crate::browser_policy::ipc::action_auth::ActionAuthorizer;
+        use mackes_mesh_types::cloud::CloudArmedToken;
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         let bus = tempfile::tempdir().unwrap();
+        let auth = tempfile::tempdir().unwrap();
+        let mismatch_auth = tempfile::tempdir().unwrap();
+        let auth_key = b"browser-session-phone-test-key";
         let persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let mut worker = BrowserSessionSyncWorker::new(
             "node-a".to_owned(),
             local.path().to_path_buf(),
             share.path().to_path_buf(),
-        );
+        )
+        .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            auth_key,
+            auth.path().to_path_buf(),
+            1_700_000_000_000,
+        )));
         let handoff = parse_send_tab(
             &send_tab_with_target_id("phone", "pixel-8", "node-a", "https://mesh.test/"),
             "01Phone",
@@ -882,6 +982,40 @@ mod tests {
         assert_eq!(v["source"], "browser_send_tab");
         assert_eq!(v["source_host"], "node-a");
         assert_eq!(v["handoff_id"], "01Phone");
+
+        let token = CloudArmedToken::parse(v["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, "connect-share");
+        assert_eq!(token.node, "node-a");
+        assert_eq!(token.target, "device:pixel-8");
+
+        let authorized =
+            ActionAuthorizer::for_test(auth_key, auth.path().to_path_buf(), 1_700_000_000_000);
+        assert!(authorized
+            .authorize(
+                body,
+                MutationContext {
+                    verb: "connect-share",
+                    node: "node-a",
+                    target: "device:pixel-8",
+                },
+            )
+            .is_ok());
+
+        let mismatch = ActionAuthorizer::for_test(
+            auth_key,
+            mismatch_auth.path().to_path_buf(),
+            1_700_000_000_000,
+        );
+        assert!(mismatch
+            .authorize(
+                body,
+                MutationContext {
+                    verb: "connect-share",
+                    node: "node-a",
+                    target: "device:other-phone",
+                },
+            )
+            .is_err());
     }
 
     // ----------------------------------------------------------------------

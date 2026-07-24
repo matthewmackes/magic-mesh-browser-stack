@@ -49,7 +49,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "mde-web-cef"
-version = "12.0.0"
+version = "12.1.0"
 dependencies = [
  "libc",
  "mde-web-sandbox",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "mde-web-sandbox"
-version = "12.0.0"
+version = "12.1.0"
 dependencies = [
  "anyhow",
  "caps",

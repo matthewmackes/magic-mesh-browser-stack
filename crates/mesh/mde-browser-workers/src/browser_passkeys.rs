@@ -42,6 +42,7 @@ use sha2::{Digest as _, Sha256};
 
 use mde_worker_core::{ShutdownToken, Worker};
 
+use crate::browser_policy::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::RetainedStatusPublisher;
 
 /// Browser-owned WebAuthn/passkey ceremony handoff topic.
@@ -247,6 +248,8 @@ pub struct BrowserPasskeysWorker {
     now_fn: NowFn,
     share_gate: Option<Arc<AtomicBool>>,
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for passkey ceremonies.
+    authorizer: Arc<ActionAuthorizer>,
     status: PasskeyStatus,
     status_publisher: RetainedStatusPublisher,
 }
@@ -267,6 +270,7 @@ impl BrowserPasskeysWorker {
             now_fn,
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status: PasskeyStatus {
                 node,
                 last_request_id: None,
@@ -332,6 +336,14 @@ impl BrowserPasskeysWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -355,7 +367,24 @@ impl BrowserPasskeysWorker {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_request(&body, &msg.ulid) {
-                Ok(request) => self.apply_request(persist, request),
+                Ok(request) => {
+                    if let Err(e) = self.authorizer.authorize(
+                        &body,
+                        MutationContext {
+                            verb: "browser-passkey",
+                            node: &self.node,
+                            target: "browser-passkey",
+                        },
+                    ) {
+                        self.status.rejected = self.status.rejected.saturating_add(1);
+                        self.status.state = "error".to_owned();
+                        self.status.last_error = Some(format!("unauthorized request: {e}"));
+                        self.status.updated_ms = self.now_ms();
+                        self.publish_status(persist);
+                        continue;
+                    }
+                    self.apply_request(persist, request)
+                }
                 Err(e) => {
                     self.status.rejected = self.status.rejected.saturating_add(1);
                     self.status.state = "error".to_owned();
@@ -2260,6 +2289,32 @@ mod tests {
     }
 
     #[test]
+    fn passkey_mutations_require_authorization_and_replay_is_rejected() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let key = b"browser-passkey-auth-test-key";
+        let context = MutationContext {
+            verb: "browser-passkey",
+            node: "node-a",
+            target: "browser-passkey",
+        };
+        let unsigned = r#"{"op":"browser_passkey","source":"browser"}"#;
+        let gate = ActionAuthorizer::for_test(key, tmp.path().join("auth"), 1_700_000_000_000);
+        assert!(gate.authorize(unsigned, context).is_err());
+        let armed = authorize_test_body(
+            key,
+            unsigned,
+            context,
+            "browser-passkey-once",
+            1_700_000_030_000,
+        );
+        assert!(gate.authorize(&armed, context).is_ok());
+        assert!(gate.authorize(&armed, context).is_err());
+    }
+
+    #[test]
     fn parse_request_accepts_create_and_get_ceremonies() {
         let create = parse_request(&create_body(), "01REQ").expect("create request");
         assert_eq!(create.id, "01REQ");
@@ -2655,6 +2710,9 @@ mod tests {
 
     #[test]
     fn drain_requests_tracks_rejections_and_does_not_replay() {
+        use crate::browser_policy::ipc::action_auth::{
+            authorize_test_body, ActionAuthorizer, MutationContext,
+        };
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         let bus = tempfile::tempdir().unwrap();
@@ -2668,8 +2726,22 @@ mod tests {
                 Some(r#"{"op":"wrong"}"#),
             )
             .expect("bad write");
+        let unsigned = create_body();
+        let auth_key = b"browser-passkey-drain-test-key";
+        let auth_context = MutationContext {
+            verb: "browser-passkey",
+            node: "node-a",
+            target: "browser-passkey",
+        };
+        let authorized = authorize_test_body(
+            auth_key,
+            &unsigned,
+            auth_context,
+            "browser-passkey-drain-once",
+            1_700_000_030_000,
+        );
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(&create_body()))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&authorized))
             .expect("good write");
         let mut worker = BrowserPasskeysWorker::new(
             "node-a".to_owned(),
@@ -2677,7 +2749,12 @@ mod tests {
             share.path().to_path_buf(),
         )
         .with_key_path(key_path)
-        .with_share_gate(Arc::new(AtomicBool::new(true)));
+        .with_share_gate(Arc::new(AtomicBool::new(true)))
+        .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            auth_key,
+            local.path().join("auth"),
+            1_700_000_000_000,
+        )));
 
         worker.drain_requests(&persist);
         assert_eq!(worker.status.rejected, 1);

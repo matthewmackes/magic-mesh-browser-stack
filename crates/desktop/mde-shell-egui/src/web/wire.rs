@@ -28,11 +28,53 @@ use super::*;
 /// is asserted headless. `source` is omitted, so the worker mints the default
 /// `Source::Manual` (a page the user bookmarked in-app).
 pub(super) fn bookmark_add_body(url: &str, title: &str) -> String {
-    serde_json::json!({ "url": url, "title": title }).to_string()
+    serde_json::json!({
+        "url": url,
+        "title": title,
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+    })
+    .to_string()
 }
 
 pub(super) fn adfilter_domain_body(domain: &str) -> String {
-    serde_json::json!({ "domain": domain.trim() }).to_string()
+    serde_json::json!({
+        "domain": domain.trim(),
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+    })
+    .to_string()
+}
+
+/// Publish a root-owned Browser mutation only after minting the short-lived,
+/// exact-body capability consumed by its mackesd worker. The shell must fail
+/// closed when it is not the root DRM shell or lacks the systemd credential;
+/// an unsigned request on the shared Bus is never an authorization fallback.
+pub(super) fn publish_authorized_mutation(
+    topic: &str,
+    unsigned_body: &str,
+    verb: &str,
+    target: &str,
+) -> bool {
+    let node = local_hostname();
+    match crate::iac::authorize_root_mutation_body(unsigned_body, verb, &node, target) {
+        Ok(body) => {
+            publish(topic, &body);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(topic, verb, error = %error, "Browser mutation authorization unavailable");
+            false
+        }
+    }
+}
+
+fn authorized_browser_body(unsigned_body: &str, verb: &str, target: &str) -> Option<String> {
+    match crate::iac::authorize_root_mutation_body(unsigned_body, verb, &local_hostname(), target) {
+        Ok(body) => Some(body),
+        Err(error) => {
+            tracing::warn!(verb, error = %error, "Browser mutation authorization unavailable");
+            None
+        }
+    }
 }
 
 pub(super) fn browser_site_blocking_body(
@@ -89,7 +131,13 @@ pub(super) fn chat_share_body(to: &str, url: &str, title: &str) -> String {
         full: url.to_string(),
     };
     let kind_val = serde_json::to_value(&kind).unwrap_or(serde_json::Value::Null);
-    serde_json::json!({ "scope": "peer", "to": to, "kind": kind_val }).to_string()
+    serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+        "scope": "peer",
+        "to": to,
+        "kind": kind_val,
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +271,7 @@ pub(super) fn browser_share_body(target: BrowserShareTarget, url: &str, title: &
     let title = title.trim();
     let preview = if title.is_empty() { url } else { title };
     let mut body = serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "op": "browser_share",
         "target": target.wire(),
         "url": url,
@@ -246,11 +295,13 @@ pub(super) fn publish_browser_share(
     url: &str,
     title: &str,
 ) {
-    let body = browser_share_body(target, url, title);
-    if root.is_some() {
-        publish_to_bus(root, ACTION_BROWSER_SHARE, &body);
-    } else {
-        publish(ACTION_BROWSER_SHARE, &body);
+    let unsigned = browser_share_body(target, url, title);
+    if let Some(body) = authorized_browser_body(&unsigned, "browser-share", "browser-share") {
+        if root.is_some() {
+            publish_to_bus(root, ACTION_BROWSER_SHARE, &body);
+        } else {
+            publish(ACTION_BROWSER_SHARE, &body);
+        }
     }
 }
 
@@ -266,6 +317,7 @@ pub(super) fn browser_send_tab_body(
     let title = title.trim();
     let preview = if title.is_empty() { url } else { title };
     let mut body = serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "op": "browser_send_tab",
         "target": target.wire(),
         "engine": engine.wire(),
@@ -294,11 +346,13 @@ pub(super) fn publish_browser_send_tab(
     if matches!(target, BrowserSendTabTarget::Node) && target.destination().is_none() {
         return false;
     }
-    let body = browser_send_tab_body(target, engine, url, title);
-    if root.is_some() {
-        publish_to_bus(root, ACTION_BROWSER_SEND_TAB, &body);
-    } else {
-        publish(ACTION_BROWSER_SEND_TAB, &body);
+    let unsigned = browser_send_tab_body(target, engine, url, title);
+    if let Some(body) = authorized_browser_body(&unsigned, "browser-send-tab", "browser-send-tab") {
+        if root.is_some() {
+            publish_to_bus(root, ACTION_BROWSER_SEND_TAB, &body);
+        } else {
+            publish(ACTION_BROWSER_SEND_TAB, &body);
+        }
     }
     true
 }
@@ -736,6 +790,7 @@ pub(super) fn browser_passkey_body(
 
     let mut body = serde_json::json!({
         "op": "browser_passkey",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "engine": engine.wire(),
@@ -841,6 +896,7 @@ pub(super) fn browser_read_aloud_body(request: &ReadAloudRequest, text: &str) ->
     let text_chars = text.chars().count();
     serde_json::json!({
         "op": "browser_read_aloud",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "tab_index": request.tab_index,
@@ -872,6 +928,7 @@ pub(super) fn browser_translate_body(request: &TranslateRequest, text: &str) -> 
     let text_chars = text.chars().count();
     serde_json::json!({
         "op": "browser_translate",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "privacy": "offline_or_mesh_only",
@@ -895,6 +952,7 @@ pub(super) fn browser_offline_cache_body(request: &OfflineCacheRequest, text: &s
     let text_chars = text.chars().count();
     let mut body = serde_json::json!({
         "op": "browser_offline_cache",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "privacy": "offline_or_mesh_only",
@@ -1074,6 +1132,7 @@ pub(super) fn browser_voice_command_body(
 ) -> String {
     serde_json::json!({
         "op": "browser_voice_command",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "mode": mode.wire(),
@@ -2329,6 +2388,7 @@ pub(super) fn browser_session_sync_body(state: &WebState) -> String {
         .collect::<Vec<_>>();
     serde_json::json!({
         "op": "browser_session_sync",
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "source": "browser",
         "host": local_hostname(),
         "active_index": if state.tabs.is_empty()
