@@ -914,8 +914,9 @@ mod tests {
 
         let entries = local_outbox_entries(tmp.path());
         assert_eq!(entries.len(), 2, "hostile rows are skipped fail-soft");
-        assert_eq!(entries[0].0, first.strip_prefix(tmp.path()).unwrap());
-        assert_eq!(entries[1].0, second.strip_prefix(tmp.path()).unwrap());
+        let outbox_root = tmp.path().join(SEND_TAB_OUTBOX_SUBDIR);
+        assert_eq!(entries[0].0, first.strip_prefix(&outbox_root).unwrap());
+        assert_eq!(entries[1].0, second.strip_prefix(&outbox_root).unwrap());
         assert!(entries[0].2.contains("https://one.test/"));
         assert!(entries[1].2.contains("https://two.test/"));
     }

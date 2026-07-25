@@ -52,6 +52,7 @@ const MAX_MHTML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESOURCE_MANIFEST_ENTRIES: usize = 128;
 const MAX_RESOURCE_URL_CHARS: usize = 2_048;
+const MAX_PERSISTED_CACHE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -852,7 +853,7 @@ fn local_cache_entries(root: &Path) -> Vec<(String, String)> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_cache_record(&path) else {
             continue;
         };
         out.push((stem.to_owned(), body));
@@ -870,8 +871,78 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Read one persisted cache record through the descriptor that will be
+/// consumed. The final path component is opened without following a symlink
+/// and with non-blocking semantics, so a FIFO or another special file cannot
+/// stall the mirroring worker. Descriptor metadata admits only regular files;
+/// reading one byte beyond the cap and comparing descriptor size before and
+/// after consumption rejects oversized records and growth races. UTF-8 is
+/// checked before the record is compared or materialized.
+fn read_bounded_cache_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_PERSISTED_CACHE_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_PERSISTED_CACHE_RECORD_BYTES)
+        .min(MAX_PERSISTED_CACHE_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_PERSISTED_CACHE_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_PERSISTED_CACHE_RECORD_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn write_atomic_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
-    if matches!(std::fs::read_to_string(path), Ok(current) if current == body) {
+    if matches!(read_bounded_cache_record(path), Some(current) if current == body) {
         return Ok(false);
     }
     write_atomic(path, body)?;
@@ -1238,6 +1309,44 @@ mod tests {
         assert_eq!(
             v["text_chars"],
             u64::try_from(MAX_TEXT_CHARS).expect("fits")
+        );
+    }
+
+    #[test]
+    fn local_cache_entries_skips_hostile_persisted_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pages = tmp.path().join(CACHE_SUBDIR).join(PAGES_DIR);
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(pages.join("valid.json"), "{\"cached\":true}").unwrap();
+        std::fs::write(pages.join("invalid-utf8.json"), [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            pages.join("oversized.json"),
+            vec![b'x'; MAX_PERSISTED_CACHE_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::create_dir(pages.join("directory.json")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            symlink(pages.join("valid.json"), pages.join("symlink.json")).unwrap();
+            let fifo = pages.join("fifo.json");
+            if Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+            {
+                assert!(fifo.exists());
+            }
+        }
+
+        let entries = local_cache_entries(tmp.path());
+        assert_eq!(
+            entries,
+            vec![("valid".to_owned(), "{\"cached\":true}".to_owned())]
         );
     }
 

@@ -41,6 +41,10 @@ pub const DEFAULT_UPDATER_COMMAND: &str = "/usr/libexec/mackesd/install-cef-runt
 /// updater/provisioning path promotes a new runtime.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(300);
 
+/// The packaged and installed CEF manifests are compact key/value records.
+/// Bound them before parsing while leaving room for future archive metadata.
+const MAX_SECURITY_UPDATE_MANIFEST_BYTES: usize = 64 * 1024;
+
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Published browser runtime update posture for one node.
@@ -324,7 +328,7 @@ fn inspect_runtime(
         updated_ms,
     };
 
-    let manifest_text = match std::fs::read_to_string(manifest_path) {
+    let manifest_text = match read_bounded_security_update_text(manifest_path) {
         Ok(text) => text,
         Err(e) => {
             status.last_error = Some(format!("expected CEF manifest unreadable: {e}"));
@@ -365,7 +369,7 @@ fn inspect_runtime(
     }
 
     let installed_manifest = active_runtime.join(INSTALLED_MANIFEST_FILE);
-    let installed_text = match std::fs::read_to_string(&installed_manifest) {
+    let installed_text = match read_bounded_security_update_text(&installed_manifest) {
         Ok(text) => text,
         Err(e) => {
             status.state = "mismatch".to_owned();
@@ -392,6 +396,100 @@ fn inspect_runtime(
         status.last_error = Some("active CEF runtime does not match packaged manifest".to_owned());
     }
     status
+}
+
+/// Read one persisted CEF security-update manifest through the descriptor that
+/// will be parsed. The final path component is opened without following a
+/// symlink and with non-blocking semantics, so a FIFO or another special file
+/// cannot stall the worker. Descriptor metadata admits only regular files;
+/// reading one byte beyond the cap and checking the descriptor again rejects
+/// growth, shrinkage, or replacement while the manifest is materialized.
+fn read_bounded_security_update_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose the platform flags above.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CEF security-update manifest is not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CEF security-update manifest is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CEF security-update manifest is not a regular file",
+        ));
+    }
+    if before.len() > MAX_SECURITY_UPDATE_MANIFEST_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "CEF security-update manifest exceeds {MAX_SECURITY_UPDATE_MANIFEST_BYTES}-byte limit"
+            ),
+        ));
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_SECURITY_UPDATE_MANIFEST_BYTES)
+        .min(MAX_SECURITY_UPDATE_MANIFEST_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_SECURITY_UPDATE_MANIFEST_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_SECURITY_UPDATE_MANIFEST_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CEF security-update manifest changed or exceeds its byte limit",
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("CEF security-update manifest is not UTF-8: {error}"),
+        )
+    })
 }
 
 fn should_attempt_update(state: &str) -> bool {
@@ -629,6 +727,55 @@ ln -sfn "$runtime" "$MDE_CEF_ACTIVE_LINK"
         assert_eq!(status.state, "manifest_missing");
         assert!(status.expected_cef_version.is_none());
         assert!(status.last_error.unwrap().contains("manifest unreadable"));
+    }
+
+    #[test]
+    fn security_update_manifest_reader_rejects_hostile_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cef.env");
+
+        std::fs::write(&path, vec![b'x'; MAX_SECURITY_UPDATE_MANIFEST_BYTES + 1]).unwrap();
+        assert!(
+            read_bounded_security_update_text(&path).is_err(),
+            "oversized manifests must be rejected before parsing"
+        );
+
+        std::fs::write(&path, [b'C', b'=', 0xff]).unwrap();
+        assert!(
+            read_bounded_security_update_text(&path).is_err(),
+            "invalid UTF-8 must be rejected before key/value materialization"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            read_bounded_security_update_text(&path).is_err(),
+            "directories must not be consumed as manifests"
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&path).unwrap();
+            let target = dir.path().join("target.env");
+            std::fs::write(&target, "CEF_VERSION=stable\n").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(
+                read_bounded_security_update_text(&path).is_err(),
+                "final symlinks must not be followed"
+            );
+
+            std::fs::remove_file(&path).unwrap();
+            if std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                assert!(
+                    read_bounded_security_update_text(&path).is_err(),
+                    "special files must not be consumed or block the worker"
+                );
+            }
+        }
     }
 
     #[test]
