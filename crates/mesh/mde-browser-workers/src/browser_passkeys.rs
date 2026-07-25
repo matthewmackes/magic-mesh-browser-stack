@@ -84,6 +84,18 @@ const MAX_USER_NAME_CHARS: usize = 256;
 const MAX_CHALLENGE_CHARS: usize = 2048;
 const MAX_CREDENTIAL_ID_CHARS: usize = 2048;
 const MAX_CREDENTIAL_IDS: usize = 64;
+/// Persisted credential metadata is local/share-managed input. Keep the JSON
+/// parser from materializing an unbounded or replacement-raced record.
+const MAX_CREDENTIAL_RECORD_BYTES: usize = 256 * 1024;
+/// A sealed platform key contains one small seed, but keep room for envelope
+/// format growth without allowing a peer-controlled blob to grow unchecked.
+const MAX_SEALED_CREDENTIAL_BYTES: usize = 64 * 1024;
+/// The local age identity is normally a short text file; it is still an input
+/// boundary because its path is environment-overridable for tests/deployments.
+const MAX_LOCAL_KEY_BYTES: usize = 64 * 1024;
+/// sysfs descriptors are tiny text records. A cap also keeps malformed device
+/// metadata from becoming a large allocation during periodic status polling.
+const MAX_HARDWARE_DESCRIPTOR_BYTES: usize = 16 * 1024;
 const CTAPHID_REPORT_SIZE: usize = 64;
 const CTAPHID_INIT_HEADER_SIZE: usize = 7;
 const CTAPHID_CONT_HEADER_SIZE: usize = 5;
@@ -1186,6 +1198,100 @@ fn credential_sealed_path(root: &Path, credential_id: &str) -> PathBuf {
         .join(format!("{}.age", safe_component(credential_id)))
 }
 
+/// Read a managed file through the descriptor that will actually be consumed.
+///
+/// The final path component is opened without following a symlink and with
+/// non-blocking semantics, so a replaced credential record, FIFO, or other
+/// special file cannot redirect or stall this worker. Descriptor metadata
+/// admits only regular files. Reading one byte beyond the limit and checking
+/// the descriptor again rejects growth or replacement during consumption.
+fn read_bounded_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "managed passkey input is not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed passkey input is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed passkey input is not a regular file",
+        ));
+    }
+    if before.len() > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed passkey input exceeds {max_bytes}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > max_bytes
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed passkey input changed while it was being read",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    String::from_utf8(read_bounded_file(path, max_bytes)?).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed passkey input is not UTF-8: {error}"),
+        )
+    })
+}
+
 fn write_credential_record(root: &Path, record: &PlatformCredentialRecord) -> Result<(), String> {
     let body = serde_json::to_string_pretty(record)
         .map_err(|e| format!("could not encode platform passkey credential: {e}"))?;
@@ -1197,7 +1303,7 @@ fn write_credential_record(root: &Path, record: &PlatformCredentialRecord) -> Re
 }
 
 fn read_credential_record(path: &Path) -> Result<PlatformCredentialRecord, String> {
-    let body = std::fs::read_to_string(path).map_err(|e| {
+    let body = read_bounded_text(path, MAX_CREDENTIAL_RECORD_BYTES).map_err(|e| {
         format!(
             "could not read platform passkey credential {}: {e}",
             path.display()
@@ -1274,7 +1380,7 @@ fn seal_private_key(
 
 fn unseal_private_key(root: &Path, key_path: &Path, credential_id: &str) -> Result<String, String> {
     let path = credential_sealed_path(root, credential_id);
-    let sealed = std::fs::read(&path)
+    let sealed = read_bounded_file(&path, MAX_SEALED_CREDENTIAL_BYTES)
         .map_err(|e| format!("platform passkey private key read {}: {e}", path.display()))?;
     let passphrase = local_passphrase(key_path)?;
     let plain = mde_seal::unseal_bytes(&passphrase, &sealed).map_err(|e| {
@@ -1288,7 +1394,7 @@ fn unseal_private_key(root: &Path, key_path: &Path, credential_id: &str) -> Resu
 
 fn local_passphrase(key_path: &Path) -> Result<String, String> {
     use std::fmt::Write as _;
-    let bytes = std::fs::read(key_path).map_err(|e| {
+    let bytes = read_bounded_file(key_path, MAX_LOCAL_KEY_BYTES).map_err(|e| {
         format!(
             "platform passkey seal key {} unreadable: {e}",
             key_path.display()
@@ -1382,9 +1488,17 @@ fn probe_hardware_key_status_with_live_probe(
         if !name.starts_with("hidraw") {
             continue;
         }
-        let descriptor = std::fs::read_to_string(entry.path().join("device").join("uevent"))
-            .or_else(|_| std::fs::read_to_string(entry.path().join("device").join("name")))
-            .unwrap_or_default();
+        let descriptor = read_bounded_text(
+            &entry.path().join("device").join("uevent"),
+            MAX_HARDWARE_DESCRIPTOR_BYTES,
+        )
+        .or_else(|_| {
+            read_bounded_text(
+                &entry.path().join("device").join("name"),
+                MAX_HARDWARE_DESCRIPTOR_BYTES,
+            )
+        })
+        .unwrap_or_default();
         if !looks_like_fido_hid(&descriptor) {
             continue;
         }
@@ -1905,6 +2019,88 @@ mod tests {
     }
 
     #[test]
+    fn managed_passkey_readers_reject_hostile_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = PlatformCredentialRecord {
+            credential_id_b64url: "credential-id".to_owned(),
+            rp_id: "example.test".to_owned(),
+            user_handle_b64url: "user-handle".to_owned(),
+            user_name: "alice@example.test".to_owned(),
+            public_key_sec1_b64url: "public-key".to_owned(),
+            cose_alg: -7,
+            sign_count: 0,
+            created_ms: 1,
+            updated_ms: 1,
+            mirrored_ms: None,
+        };
+        let valid_record = tmp.path().join("credential.json");
+        std::fs::write(&valid_record, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(read_credential_record(&valid_record).unwrap(), record);
+
+        let oversized_record = tmp.path().join("oversized-credential.json");
+        std::fs::write(
+            &oversized_record,
+            vec![b'x'; MAX_CREDENTIAL_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_credential_record(&oversized_record).is_err());
+
+        let invalid_record = tmp.path().join("invalid-credential.json");
+        std::fs::write(&invalid_record, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_credential_record(&invalid_record).is_err());
+
+        let non_regular = tmp.path().join("credential-directory.json");
+        std::fs::create_dir(&non_regular).unwrap();
+        assert!(read_credential_record(&non_regular).is_err());
+
+        let root = tmp.path().join("root");
+        let sealed_path = credential_sealed_path(&root, "credential-id");
+        std::fs::create_dir_all(sealed_path.parent().unwrap()).unwrap();
+        std::fs::write(&sealed_path, vec![b'x'; MAX_SEALED_CREDENTIAL_BYTES + 1]).unwrap();
+        assert!(unseal_private_key(&root, &key_path(&tmp), "credential-id").is_err());
+
+        let oversized_key = tmp.path().join("oversized-age.key");
+        std::fs::write(&oversized_key, vec![b'k'; MAX_LOCAL_KEY_BYTES + 1]).unwrap();
+        assert!(local_passphrase(&oversized_key).is_err());
+
+        let descriptor = tmp.path().join("descriptor");
+        std::fs::write(&descriptor, b"HID_NAME=Yubico FIDO\n").unwrap();
+        assert!(
+            read_bounded_text(&descriptor, MAX_HARDWARE_DESCRIPTOR_BYTES)
+                .unwrap()
+                .contains("FIDO")
+        );
+
+        let oversized_descriptor = tmp.path().join("oversized-descriptor");
+        std::fs::write(
+            &oversized_descriptor,
+            vec![b'F'; MAX_HARDWARE_DESCRIPTOR_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_text(&oversized_descriptor, MAX_HARDWARE_DESCRIPTOR_BYTES).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let outside = tmp.path().join("outside");
+            std::fs::write(&outside, b"outside").unwrap();
+            let link = tmp.path().join("credential-link.json");
+            symlink(&outside, &link).unwrap();
+            assert!(read_credential_record(&link).is_err());
+
+            let fifo = tmp.path().join("credential.fifo");
+            assert!(Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(read_bounded_file(&fifo, MAX_CREDENTIAL_RECORD_BYTES).is_err());
+        }
+    }
+
+    #[test]
     fn hardware_key_probe_reports_ready_permission_denied_unavailable_and_unknown() {
         let sys = tempfile::tempdir().unwrap();
         let dev = tempfile::tempdir().unwrap();
@@ -1966,6 +2162,13 @@ mod tests {
             dev.path(),
             "hidraw2",
             "HID_NAME=Generic Keyboard\n",
+            true,
+        );
+        write_hidraw(
+            sys.path(),
+            dev.path(),
+            "hidraw3",
+            &"FIDO".repeat(MAX_HARDWARE_DESCRIPTOR_BYTES / 4 + 1),
             true,
         );
         assert_eq!(
