@@ -46,6 +46,12 @@ pub const LATEST_FILE: &str = "latest.json";
 /// Share/local subdirectory holding durable send-tab handoff outbox records.
 pub const SEND_TAB_OUTBOX_SUBDIR: &str = "browser-send-tab";
 
+/// Keep peer-controlled persisted Browser records bounded before their JSON
+/// bodies are materialized. This leaves room for a useful multi-tab snapshot
+/// while keeping a corrupt or hostile local/shared leaf from allocating
+/// without limit.
+const MAX_PERSISTED_BROWSER_RECORD_BYTES: usize = 1024 * 1024;
+
 /// Default poll cadence. The Browser dedupes snapshots before publish; the worker
 /// can poll frequently without a file-write storm.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(2);
@@ -269,7 +275,7 @@ impl BrowserSessionSyncWorker {
             return;
         };
         let src = latest_path(&self.local_root, &host);
-        let Ok(body) = std::fs::read_to_string(&src) else {
+        let Some(body) = read_bounded_browser_record(&src) else {
             return;
         };
         let dst = latest_path(&self.share_root, &host);
@@ -614,7 +620,7 @@ fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, PathBuf, String)> {
                     if path.extension().is_none_or(|ext| ext != "json") {
                         continue;
                     }
-                    let Ok(body) = std::fs::read_to_string(&path) else {
+                    let Some(body) = read_bounded_browser_record(&path) else {
                         continue;
                     };
                     if let Ok(rel) = path.strip_prefix(&base) {
@@ -624,7 +630,74 @@ fn local_outbox_entries(root: &Path) -> Vec<(PathBuf, PathBuf, String)> {
             }
         }
     }
+    // Directory iteration order is filesystem-dependent. A stable relative
+    // path order keeps retries and cross-node mirroring deterministic.
+    out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     out
+}
+
+/// Read one persisted Browser record through the descriptor that will be
+/// consumed. The final path component is opened without following a symlink
+/// and with non-blocking semantics, so a FIFO or another special file cannot
+/// stall the worker. Descriptor metadata admits only regular files; reading
+/// one byte beyond the cap rejects a file that grows during consumption, and
+/// UTF-8 is checked before any JSON or route materialization.
+fn read_bounded_browser_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PERSISTED_BROWSER_RECORD_BYTES as u64
+    {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_PERSISTED_BROWSER_RECORD_BYTES)
+        .min(MAX_PERSISTED_BROWSER_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_PERSISTED_BROWSER_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PERSISTED_BROWSER_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
@@ -637,7 +710,7 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
 }
 
 fn write_atomic_if_changed(path: &Path, body: &str) -> std::io::Result<bool> {
-    if matches!(std::fs::read_to_string(path), Ok(current) if current == body) {
+    if read_bounded_browser_record(path).is_some_and(|current| current == body) {
         return Ok(false);
     }
     write_atomic(path, body)?;
@@ -749,6 +822,115 @@ mod tests {
         assert!(
             parse_snapshot(r#"{"op":"browser_session_sync","settings":{},"host":"h"}"#).is_err()
         );
+    }
+
+    #[test]
+    fn persisted_browser_record_reader_accepts_valid_utf8_and_rejects_hostile_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.json");
+        std::fs::write(&valid, "{\"ok\":true}").unwrap();
+        assert_eq!(
+            read_bounded_browser_record(&valid).as_deref(),
+            Some("{\"ok\":true}")
+        );
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_bounded_browser_record(&invalid_utf8).is_none());
+
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; MAX_PERSISTED_BROWSER_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_browser_record(&oversized).is_none());
+
+        let non_regular = tmp.path().join("directory.json");
+        std::fs::create_dir(&non_regular).unwrap();
+        assert!(read_bounded_browser_record(&non_regular).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_browser_record_reader_rejects_final_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, "{\"outside\":true}").unwrap();
+
+        let symlinked = tmp.path().join("linked.json");
+        symlink(&outside, &symlinked).unwrap();
+        assert!(read_bounded_browser_record(&symlinked).is_none());
+
+        let fifo = tmp.path().join("handoff.json");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success(),
+            "mkfifo must create the special-file fixture"
+        );
+        assert!(read_bounded_browser_record(&fifo).is_none());
+    }
+
+    #[test]
+    fn send_tab_outbox_scan_skips_hostile_rows_and_sorts_valid_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = send_tab_path(tmp.path(), "node", "node-b", "node-a", "01");
+        let second = send_tab_path(tmp.path(), "node", "node-b", "node-a", "02");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::write(&second, send_tab("node", "node-a", "https://two.test/")).unwrap();
+        std::fs::write(&first, send_tab("node", "node-a", "https://one.test/")).unwrap();
+
+        let invalid_utf8 = send_tab_path(tmp.path(), "node", "node-b", "node-a", "03");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        let oversized = send_tab_path(tmp.path(), "node", "node-b", "node-a", "04");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; MAX_PERSISTED_BROWSER_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        let non_regular = send_tab_path(tmp.path(), "node", "node-b", "node-a", "05");
+        std::fs::create_dir(&non_regular).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let symlinked = send_tab_path(tmp.path(), "node", "node-b", "node-a", "06");
+            symlink(&first, &symlinked).unwrap();
+            let fifo = send_tab_path(tmp.path(), "node", "node-b", "node-a", "07");
+            assert!(Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let entries = local_outbox_entries(tmp.path());
+        assert_eq!(entries.len(), 2, "hostile rows are skipped fail-soft");
+        assert_eq!(entries[0].0, first.strip_prefix(tmp.path()).unwrap());
+        assert_eq!(entries[1].0, second.strip_prefix(tmp.path()).unwrap());
+        assert!(entries[0].2.contains("https://one.test/"));
+        assert!(entries[1].2.contains("https://two.test/"));
+    }
+
+    #[test]
+    fn latest_snapshot_equality_uses_the_bounded_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latest.json");
+        let body = "{\"snapshot\":true}";
+        std::fs::write(&path, body).unwrap();
+        assert!(!write_atomic_if_changed(&path, body).unwrap());
+
+        std::fs::write(&path, vec![b'x'; MAX_PERSISTED_BROWSER_RECORD_BYTES + 1]).unwrap();
+        assert!(write_atomic_if_changed(&path, body).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
     }
 
     #[test]
