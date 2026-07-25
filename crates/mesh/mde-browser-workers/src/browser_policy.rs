@@ -419,6 +419,11 @@ pub const DOC_FILE: &str = "doc.json";
 /// enabled (removed while disabled — the "stop sync" half of a disable).
 pub const DATA_MANIFEST_FILE: &str = "browser-data.manifest";
 
+/// Bound peer- and disk-controlled policy material before it is parsed into a
+/// potentially large JSON document. A policy can carry role rules and filter
+/// list metadata, but it is not a browser data store.
+const MAX_PERSISTED_POLICY_BYTES: usize = 256 * 1024;
+
 /// Default poll/flush cadence. A fleet policy changes rarely (an operator edit);
 /// a 30 s tick keeps convergence prompt without polling storms — same as adfilter.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(30);
@@ -835,10 +840,80 @@ fn data_manifest_path(root: &Path, node: &str) -> PathBuf {
     node_dir(root, node).join(DATA_MANIFEST_FILE)
 }
 
+/// Read one managed Browser policy document through the descriptor that is
+/// consumed. The final path component is opened without following a symlink and
+/// with non-blocking semantics, so a FIFO or another special file cannot stall
+/// policy convergence. Descriptor metadata admits only regular files; reading
+/// one byte beyond the cap and checking the descriptor again rejects growth or
+/// shrinkage during consumption. UTF-8 is validated before JSON parsing.
+fn read_bounded_policy_text(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_PERSISTED_POLICY_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_PERSISTED_POLICY_BYTES)
+        .min(MAX_PERSISTED_POLICY_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_PERSISTED_POLICY_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_PERSISTED_POLICY_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Load a policy doc from `path`, or `None` when absent / corrupt (a peer-supplied
-/// file never panics the reader).
+/// file never panics the reader). Callers retain their current last-good policy
+/// when this returns `None`.
 fn load_doc(path: &Path) -> Option<BrowserPolicyDoc> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_bounded_policy_text(path)?;
     BrowserPolicyDoc::from_json(&text).ok()
 }
 
@@ -984,7 +1059,12 @@ impl BrowserPolicyWorker {
     /// Restore this node's authoritative own doc from `local_root` (offline-proof),
     /// else the default baseline, then rebuild the converged view.
     fn load(&mut self) {
-        self.own = load_doc(&doc_path(&self.local_root, &self.node)).unwrap_or_default();
+        // A transient unreadable/hostile file must not erase an already loaded
+        // policy. A fresh worker still starts from the default baseline because
+        // `own` is initialized to `Default`.
+        if let Some(doc) = load_doc(&doc_path(&self.local_root, &self.node)) {
+            self.own = doc;
+        }
         self.rebuild_converged();
     }
 
@@ -996,7 +1076,11 @@ impl BrowserPolicyWorker {
         if let Ok(rd) = std::fs::read_dir(policy_dir(&self.share_root)) {
             for entry in rd.flatten() {
                 let path = entry.path();
-                if !path.is_dir() {
+                if !entry
+                    .file_type()
+                    .ok()
+                    .is_some_and(|file_type| file_type.is_dir())
+                {
                     continue;
                 }
                 let name = entry.file_name();
@@ -1654,6 +1738,87 @@ mod tests {
         assert_eq!(ws.navigations_rejected, 1);
         ws.enforce(BrowserAction::SetAdblock { on: false });
         assert_eq!(ws.adblock_toggles_rejected, 1);
+    }
+
+    #[test]
+    fn policy_reader_rejects_invalid_utf8_oversized_and_non_regular_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.json");
+        std::fs::write(&valid, governed_doc().to_json().unwrap()).unwrap();
+        assert!(load_doc(&valid).is_some(), "a valid policy still loads");
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(load_doc(&invalid_utf8).is_none());
+
+        let invalid_json = tmp.path().join("invalid-json.json");
+        std::fs::write(&invalid_json, b"{ not a policy").unwrap();
+        assert!(load_doc(&invalid_json).is_none());
+
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_PERSISTED_POLICY_BYTES + 1]).unwrap();
+        assert!(load_doc(&oversized).is_none());
+
+        let directory = tmp.path().join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(load_doc(&directory).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_reader_rejects_final_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, governed_doc().to_json().unwrap()).unwrap();
+
+        let symlinked = tmp.path().join("linked.json");
+        symlink(&outside, &symlinked).unwrap();
+        assert!(
+            load_doc(&symlinked).is_none(),
+            "policy reads must not follow a final symlink"
+        );
+
+        let fifo = tmp.path().join("policy.json");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success(),
+            "mkfifo must create the special-file fixture"
+        );
+        assert!(
+            load_doc(&fifo).is_none(),
+            "a special file must not block policy convergence"
+        );
+    }
+
+    #[test]
+    fn load_retains_the_last_good_policy_when_persisted_input_becomes_invalid() {
+        let (_clock, now) = fake_clock(1_000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let mut worker = worker("node-a", "workstation", local.path(), share.path(), now);
+        worker.author_policy(governed_doc());
+        worker.persist_own_local();
+        let expected = worker.own.clone();
+
+        std::fs::write(
+            doc_path(local.path(), "node-a"),
+            vec![b'x'; MAX_PERSISTED_POLICY_BYTES + 1],
+        )
+        .unwrap();
+        worker.load();
+
+        assert_eq!(
+            worker.own, expected,
+            "invalid input keeps the last-good doc"
+        );
+        assert_eq!(worker.converged, expected);
+        assert!(worker.enforced().force_adblock);
     }
 
     // ── two nodes converge on the newest-authored policy ──
