@@ -93,6 +93,14 @@ pub(crate) mod ipc {
         /// Host-local replay ledger shared with the privileged daemon.
         const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
         const TOKEN_NONCE_MIN_LEN: usize = 8;
+        /// The credential is 64 hexadecimal characters plus optional
+        /// surrounding whitespace. Keep a replaced credential path from
+        /// becoming an unbounded allocation while preserving the decoder's
+        /// existing whitespace-tolerant contract.
+        const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
+        /// Replay records are decimal i64 expiry timestamps, with surrounding
+        /// whitespace accepted by the existing `trim().parse()` behavior.
+        const MAX_REPLAY_NONCE_EXPIRY_BYTES: usize = 128;
 
         /// Exact semantic context bound into every browser mutation capability.
         #[derive(Debug, Clone, Copy)]
@@ -257,10 +265,83 @@ pub(crate) mod ipc {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .ok_or_else(|| "systemd action credential is unavailable".to_owned())?;
-            let raw = std::fs::read(directory.join(CLOUD_ARM_CREDENTIAL))
+            let path = directory.join(CLOUD_ARM_CREDENTIAL);
+            let raw = read_bounded_utf8(&path, MAX_CLOUD_ARM_CREDENTIAL_BYTES)
                 .map_err(|e| format!("read systemd action credential: {e}"))?;
-            let key = decode_cloud_arm_credential(&raw).map_err(str::to_owned)?;
+            let key = decode_cloud_arm_credential(raw.as_bytes()).map_err(str::to_owned)?;
             CloudArmSigner::new(key).map_err(str::to_owned)
+        }
+
+        /// Read one hostile-path-controlled persisted record through the
+        /// descriptor that is consumed. The final component is opened without
+        /// following a symlink and with non-blocking semantics, descriptor
+        /// metadata admits only regular files, and a sentinel byte plus a
+        /// second metadata check rejects growth or shrinkage during the read.
+        fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+            use std::io::Read as _;
+
+            let inspected = std::fs::symlink_metadata(path)?;
+            if !inspected.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "persisted record is not a regular file",
+                ));
+            }
+
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+                // Unsupported Unix targets still fail closed for a final
+                // symlink via the metadata check above.
+            }
+
+            let file = options.open(path)?;
+            let before = file.metadata()?;
+            let limit = max_bytes as u64;
+            if !before.file_type().is_file() || before.len() > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persisted record is oversized or not a regular file",
+                ));
+            }
+
+            let capacity = usize::try_from(before.len())
+                .unwrap_or(max_bytes)
+                .min(max_bytes)
+                .saturating_add(1);
+            let mut bytes = Vec::with_capacity(capacity);
+            (&file)
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            let after = file.metadata()?;
+            if !after.file_type().is_file()
+                || after.len() != before.len()
+                || bytes.len() > max_bytes
+                || bytes.len() as u64 != before.len()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persisted record changed while being read",
+                ));
+            }
+            Ok(bytes)
+        }
+
+        fn read_bounded_utf8(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+            String::from_utf8(read_bounded_regular_file(path, max_bytes)?).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persisted record is not valid UTF-8",
+                )
+            })
         }
 
         fn running_as_root() -> bool {
@@ -329,7 +410,7 @@ pub(crate) mod ipc {
                     continue;
                 }
                 let path = entry.path();
-                let expired = std::fs::read_to_string(&path)
+                let expired = read_bounded_utf8(&path, MAX_REPLAY_NONCE_EXPIRY_BYTES)
                     .ok()
                     .and_then(|raw| raw.trim().parse::<i64>().ok())
                     .is_some_and(|expiry| expiry < now_ms);
@@ -360,6 +441,92 @@ pub(crate) mod ipc {
             }
             sync_directory(&dir)?;
             Ok(true)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            const VALID_CREDENTIAL: &[u8] =
+                b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+
+            #[test]
+            fn credential_reader_preserves_valid_text_and_rejects_hostile_inputs() {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join(CLOUD_ARM_CREDENTIAL);
+                std::fs::write(&path, VALID_CREDENTIAL).unwrap();
+                assert_eq!(
+                    read_bounded_utf8(&path, MAX_CLOUD_ARM_CREDENTIAL_BYTES).unwrap(),
+                    String::from_utf8(VALID_CREDENTIAL.to_vec()).unwrap()
+                );
+
+                std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+                assert!(read_bounded_utf8(&path, MAX_CLOUD_ARM_CREDENTIAL_BYTES).is_err());
+
+                std::fs::write(
+                    &path,
+                    vec![b'x'; MAX_CLOUD_ARM_CREDENTIAL_BYTES.saturating_add(1)],
+                )
+                .unwrap();
+                assert!(read_bounded_utf8(&path, MAX_CLOUD_ARM_CREDENTIAL_BYTES).is_err());
+
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                assert!(read_bounded_utf8(&path, MAX_CLOUD_ARM_CREDENTIAL_BYTES).is_err());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn bounded_record_reader_rejects_final_symlinks_and_special_files() {
+                use std::os::unix::fs::symlink;
+                use std::process::Command;
+
+                let tmp = tempfile::tempdir().unwrap();
+                let target = tmp.path().join("target");
+                let symlinked = tmp.path().join("symlinked");
+                std::fs::write(&target, b"1700000000000\n").unwrap();
+                symlink(&target, &symlinked).unwrap();
+                assert!(
+                    read_bounded_utf8(&symlinked, MAX_REPLAY_NONCE_EXPIRY_BYTES).is_err(),
+                    "persisted readers must not follow final symlinks"
+                );
+
+                let fifo = tmp.path().join("fifo");
+                assert!(Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(
+                    read_bounded_utf8(&fifo, MAX_REPLAY_NONCE_EXPIRY_BYTES).is_err(),
+                    "special files must fail without blocking"
+                );
+            }
+
+            #[test]
+            fn replay_expiry_reader_preserves_trimmed_parse_behavior_and_fails_soft() {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("expiry");
+                std::fs::write(&path, b"  1700000000000\n").unwrap();
+                assert_eq!(
+                    read_bounded_utf8(&path, MAX_REPLAY_NONCE_EXPIRY_BYTES)
+                        .unwrap()
+                        .trim()
+                        .parse::<i64>()
+                        .unwrap(),
+                    1_700_000_000_000
+                );
+
+                std::fs::write(&path, [0xff, 0xfe]).unwrap();
+                assert!(read_bounded_utf8(&path, MAX_REPLAY_NONCE_EXPIRY_BYTES).is_err());
+
+                std::fs::write(
+                    &path,
+                    vec![b'9'; MAX_REPLAY_NONCE_EXPIRY_BYTES.saturating_add(1)],
+                )
+                .unwrap();
+                assert!(read_bounded_utf8(&path, MAX_REPLAY_NONCE_EXPIRY_BYTES).is_err());
+            }
         }
 
         #[cfg(test)]
