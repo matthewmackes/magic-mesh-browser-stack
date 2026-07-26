@@ -148,9 +148,9 @@ pub(super) fn handle_tab_keyboard(ctx: &egui::Context, state: &mut WebState) {
     }
 }
 
-/// Browser chrome uses the same Inter proportional UI face as the rest of
-/// Construct. Chrome-inspired colour and layout stay local to this module; the font
-/// is no longer a Roboto-only exception.
+/// Browser chrome uses the same Kdam Thmor Pro proportional UI face as the rest
+/// of Construct. Chrome-inspired colour and layout stay local to this module;
+/// the font is no longer a Roboto-only exception.
 pub(super) fn chrome_font_family() -> FontFamily {
     FontFamily::Proportional
 }
