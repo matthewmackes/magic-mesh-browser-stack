@@ -635,7 +635,7 @@ const fn chrome_icon_yamis_id(icon: ChromeIcon) -> Option<IconId> {
         ChromeIcon::Options => Some(IconId::Menu),
         ChromeIcon::Downloads => Some(IconId::Downloads),
         ChromeIcon::Capture => Some(IconId::Capture),
-        ChromeIcon::Bookmark => Some(IconId::Bookmarks),
+        ChromeIcon::Bookmark => Some(IconId::Pin),
         ChromeIcon::Security | ChromeIcon::Privacy => Some(IconId::Security),
         ChromeIcon::Warning => Some(IconId::Warning),
         ChromeIcon::Search | ChromeIcon::Find => Some(IconId::Search),
@@ -12298,14 +12298,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_chrome_icons_prefer_yamis_assets_when_available() {
+    fn browser_chrome_icons_prefer_mono_assets_when_available() {
         let mapped = [
             (ChromeIcon::Back, IconId::ArrowLeft),
             (ChromeIcon::Forward, IconId::ArrowRight),
             (ChromeIcon::Options, IconId::Menu),
             (ChromeIcon::Downloads, IconId::Downloads),
             (ChromeIcon::Capture, IconId::Capture),
-            (ChromeIcon::Bookmark, IconId::Bookmarks),
+            (ChromeIcon::Bookmark, IconId::Pin),
             (ChromeIcon::Security, IconId::Security),
             (ChromeIcon::Privacy, IconId::Security),
             (ChromeIcon::Warning, IconId::Warning),
@@ -12349,7 +12349,7 @@ mod tests {
             assert_eq!(
                 chrome_icon_yamis_id(chrome),
                 Some(yamis),
-                "{chrome:?} should resolve through the YAMIS icon catalog"
+                "{chrome:?} should resolve through the mono icon catalog"
             );
         }
         // Recommend has no YAMIS glyph and always paints its local star fallback.
