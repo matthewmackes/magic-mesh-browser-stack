@@ -15203,6 +15203,41 @@ mod tests {
     }
 
     #[test]
+    fn omnibox_suggestions_do_not_reflow_the_live_page_body() {
+        let (session, _helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.set_vertical_tabs(false);
+        state.push_session(session);
+        assert!(run_until_texture(&mut state));
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let baseline = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("Browser body should paint without suggestions");
+
+        state.address = "exa".to_owned();
+        state.omnibox_focused = true;
+        state.suggestions.draft = state.address.clone();
+        state.suggestions.history = vec!["https://example.test/history".to_owned()];
+        state.suggestions.items = vec![
+            "example search".to_owned(),
+            "https://example.test/history".to_owned(),
+        ];
+        state.suggestions.selected = Some(0);
+        ctx.memory_mut(|mem| mem.request_focus(omnibox_widget_id()));
+
+        let with_suggestions = run_panel_page_image_rect(&ctx, &mut state, body_input())
+            .expect("Browser body should still paint with suggestions open");
+
+        assert!(
+            (with_suggestions.top() - baseline.top()).abs() < 0.5
+                && (with_suggestions.bottom() - baseline.bottom()).abs() < 0.5
+                && (with_suggestions.height() - baseline.height()).abs() < 0.5,
+            "omnibox suggestions must float above the page instead of shifting it: baseline={baseline:?} with_suggestions={with_suggestions:?}"
+        );
+    }
+
+    #[test]
     fn vertical_tabs_page_body_stays_bounded_and_uses_remaining_workspace() {
         let (session, _helper, _writer) = live_page_session();
         let mut state = WebState::default();

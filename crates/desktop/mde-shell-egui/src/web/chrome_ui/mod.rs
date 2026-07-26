@@ -241,6 +241,8 @@ const TAB_SEARCH_PANEL_W: f32 = 320.0;
 const TAB_SEARCH_PANEL_MIN_W: f32 = 220.0;
 const TAB_SEARCH_EDIT_MIN_W: f32 = 72.0;
 const SUGGESTIONS_LEADING_INSET: f32 = CHROME_BUTTON + CHROME_GAP;
+const OMNIBOX_SUGGESTIONS_POPUP_MIN_W: f32 = 320.0;
+const OMNIBOX_SUGGESTIONS_POPUP_MAX_H: f32 = 180.0;
 const MEDIA_CLUSTER_LABEL_W: f32 = 132.0;
 const MEDIA_CLUSTER_COMPACT_LABEL_W: f32 = 84.0;
 const MEDIA_PIP_W: f32 = 272.0;
@@ -6693,6 +6695,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let has_media_toolbar = browser_media_toolbar_model(state).is_some();
 
     let mut accepted_suggestion: Option<String> = None;
+    let mut omnibox_rect: Option<egui::Rect> = None;
     let was_omnibox_focused = state.omnibox_focused;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = CHROME_GAP;
@@ -6773,6 +6776,7 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             },
             permission_summary.as_ref(),
         );
+        omnibox_rect = Some(resp.rect);
         if omnibox_should_clear_on_edit_start(
             was_omnibox_focused,
             resp.has_focus(),
@@ -6972,7 +6976,9 @@ pub(super) fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         }
     });
     if has_tab && !crashed {
-        accepted_suggestion = suggestions_panel(ui, state);
+        if let Some(rect) = omnibox_rect {
+            accepted_suggestion = suggestions_overlay(ui, rect, state);
+        }
     }
     if let Some(suggestion) = accepted_suggestion {
         state.accept_suggestion(suggestion);
@@ -7699,6 +7705,51 @@ fn omnibox_security_button(
 /// repeats). Pure and paint-free so it's directly unit-testable.
 pub(super) fn dedup_search_items<'a>(items: &'a [String], history: &[String]) -> Vec<&'a String> {
     items.iter().filter(|s| !history.contains(s)).collect()
+}
+
+fn suggestions_has_content(state: &WebState) -> bool {
+    let history = &state.suggestions.history;
+    !state.suggestions.bookmarks.is_empty()
+        || !state.suggestions.files.is_empty()
+        || !history.is_empty()
+        || !dedup_search_items(&state.suggestions.items, history).is_empty()
+        || state.suggestions.notice.is_some()
+}
+
+fn suggestions_overlay(ui: &mut egui::Ui, anchor: egui::Rect, state: &WebState) -> Option<String> {
+    if !suggestions_has_content(state) {
+        return None;
+    }
+
+    let screen = ui.ctx().screen_rect();
+    let max_width = (screen.width() - CHROME_GAP * 2.0).max(1.0);
+    let width = anchor
+        .width()
+        .max(OMNIBOX_SUGGESTIONS_POPUP_MIN_W)
+        .min(max_width);
+    let min_x = screen.left() + CHROME_GAP;
+    let max_x = (screen.right() - CHROME_GAP - width).max(min_x);
+    let x = anchor.left().clamp(min_x, max_x);
+    let y = (anchor.bottom() + CHROME_GAP).min(screen.bottom() - CHROME_BUTTON);
+    let pos = egui::pos2(x, y.max(screen.top() + CHROME_GAP));
+    let max_height = (screen.bottom() - pos.y - CHROME_GAP)
+        .max(CHROME_BUTTON)
+        .min(OMNIBOX_SUGGESTIONS_POPUP_MAX_H);
+
+    let mut accepted = None;
+    egui::Area::new(egui::Id::new("mde-web-omnibox-suggestions-overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            chrome_popup_frame(ui, width, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        accepted = suggestions_panel(ui, state);
+                    });
+            });
+        });
+    accepted
 }
 
 fn suggestion_chip(
