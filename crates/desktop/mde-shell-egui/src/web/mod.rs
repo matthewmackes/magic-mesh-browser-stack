@@ -11311,29 +11311,28 @@ mod tests {
             state.tabs[0].page_focused,
             "clicking the rendered page must latch page keyboard focus"
         );
-        let mut key_input = body_input();
-        key_input.events = vec![
-            egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::default(),
-            },
-            egui::Event::Text("mesh".to_owned()),
-        ];
-        assert!(run_panel_on_ctx(&ctx, &mut state, key_input));
-
-        let controls = drain_control_messages(&helper);
+        let click_controls = drain_control_messages(&helper);
         assert!(
-            controls.iter().any(|msg| matches!(
+            click_controls.iter().any(|msg| matches!(
                 msg,
                 mde_web_preview_client::ControlMsg::Input(
                     mde_web_preview_client::InputEvent::PointerButton { pressed: true, .. }
                 )
             )),
-            "clicking the Browser body must send a page pointer press: {controls:?}"
+            "clicking the Browser body must send a page pointer press: {click_controls:?}"
         );
+
+        let mut key_input = body_input();
+        key_input.events = vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        assert!(run_panel_on_ctx(&ctx, &mut state, key_input));
+
+        let controls = drain_control_messages(&helper);
         assert!(
             controls.iter().any(|msg| matches!(
                 msg,
@@ -11345,7 +11344,34 @@ mod tests {
                     }
                 )
             )),
-            "a focused Browser body must forward key input: {controls:?}"
+            "a focused Browser body must forward bare key input when no committed text event accompanies it: {controls:?}"
+        );
+
+        let mut text_input = body_input();
+        text_input.events = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::Text("mesh".to_owned()),
+        ];
+        assert!(run_panel_on_ctx(&ctx, &mut state, text_input));
+
+        let controls = drain_control_messages(&helper);
+        assert!(
+            controls.iter().all(|msg| !matches!(
+                msg,
+                mde_web_preview_client::ControlMsg::Input(
+                    mde_web_preview_client::InputEvent::Key {
+                        key: mde_web_preview_client::wire::KeyCode::A,
+                        ..
+                    }
+                )
+            )),
+            "a focused Browser body must not forward plain printable Key(A) when the same frame also has committed text; otherwise text fields type twice: {controls:?}"
         );
         assert!(
             controls.iter().any(|msg| matches!(

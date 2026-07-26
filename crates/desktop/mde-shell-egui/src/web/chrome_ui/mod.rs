@@ -9155,7 +9155,9 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
         || resp.has_focus()
         || resp.clicked()
         || resp.dragged();
-    for event in ui.input(|i| i.events.clone()) {
+    let input_events = ui.input(|i| i.events.clone());
+    let suppress_printable_keys = input_events.iter().any(event_commits_browser_text);
+    for event in input_events {
         if let egui::Event::PointerButton { pos, pressed, .. } = &event {
             if *pressed {
                 if image_rect.contains(*pos) {
@@ -9185,6 +9187,9 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
                 continue;
             }
         }
+        if page_focused && suppress_printable_keys && is_plain_printable_key_event(&event) {
+            continue;
+        }
         let dragging_page = resp.dragged() || resp.drag_stopped();
         if let Some(event) =
             browser_input_event(&event, image_rect, frame_size, page_focused, dragging_page)
@@ -9213,6 +9218,67 @@ pub(super) fn paint_body(ui: &mut egui::Ui, state: &mut WebState, active: usize)
     if let Some(tab) = state.tabs.get(active) {
         install_browser_page_accessibility(ui.ctx(), image_rect, tab, page_focused);
     }
+}
+
+fn event_commits_browser_text(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Text(text) => !text.is_empty(),
+        egui::Event::Ime(egui::ImeEvent::Commit(text)) => !text.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_plain_printable_key_event(event: &egui::Event) -> bool {
+    let egui::Event::Key { key, modifiers, .. } = event else {
+        return false;
+    };
+    if modifiers.ctrl || modifiers.command || modifiers.mac_cmd || modifiers.alt {
+        return false;
+    }
+    is_printable_browser_key(*key)
+}
+
+const fn is_printable_browser_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::Space
+            | egui::Key::Num0
+            | egui::Key::Num1
+            | egui::Key::Num2
+            | egui::Key::Num3
+            | egui::Key::Num4
+            | egui::Key::Num5
+            | egui::Key::Num6
+            | egui::Key::Num7
+            | egui::Key::Num8
+            | egui::Key::Num9
+            | egui::Key::A
+            | egui::Key::B
+            | egui::Key::C
+            | egui::Key::D
+            | egui::Key::E
+            | egui::Key::F
+            | egui::Key::G
+            | egui::Key::H
+            | egui::Key::I
+            | egui::Key::J
+            | egui::Key::K
+            | egui::Key::L
+            | egui::Key::M
+            | egui::Key::N
+            | egui::Key::O
+            | egui::Key::P
+            | egui::Key::Q
+            | egui::Key::R
+            | egui::Key::S
+            | egui::Key::T
+            | egui::Key::U
+            | egui::Key::V
+            | egui::Key::W
+            | egui::Key::X
+            | egui::Key::Y
+            | egui::Key::Z
+    )
 }
 
 fn handle_region_capture_drag(
