@@ -6095,6 +6095,7 @@ pub(super) enum PageContextAction {
     Forward,
     Reload,
     Edit(EditCommand),
+    CopyPageUrl,
 }
 
 fn page_context_edit_icon(command: EditCommand) -> ChromeIcon {
@@ -6282,7 +6283,7 @@ pub(super) fn page_context_menu(
         if page_context_row(ui, "Copy page URL", ChromeIcon::Share, !url.is_empty()).clicked()
             && !url.is_empty()
         {
-            ui.ctx().copy_text(url.to_owned());
+            action = Some(PageContextAction::CopyPageUrl);
             ui.close_menu();
         }
     });

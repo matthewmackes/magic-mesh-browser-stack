@@ -40,9 +40,9 @@ use mde_files_egui::transfers::{
 };
 
 use mde_web_preview_client::{
-    host_of, BeforeUnloadDialog, CertError, FilterListSource, FilterListStore, JsDialog,
-    LoginCaptureStatus, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist, SessionState,
-    WebSession,
+    host_of, BeforeUnloadDialog, CertError, EditCommand, FilterListSource, FilterListStore,
+    JsDialog, LoginCaptureStatus, ManagedUrlPolicy, RequestFilter, SafeBrowsingBlocklist,
+    SessionState, WebSession,
 };
 use qrcode::QrCode;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
@@ -230,6 +230,107 @@ impl BrowserInternalPage {
         url.trim()
             .eq_ignore_ascii_case(BROWSER_OPTIONS_URL)
             .then_some(Self::Options)
+    }
+}
+
+const BROWSER_CLIPBOARD_LANE: &str = "event/clipboard/clip";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserClipboardOperation {
+    Cut,
+    Copy,
+    Paste,
+    CopyPageUrl,
+}
+
+impl BrowserClipboardOperation {
+    const fn from_edit_command(command: EditCommand) -> Option<Self> {
+        match command {
+            EditCommand::Cut => Some(Self::Cut),
+            EditCommand::Copy => Some(Self::Copy),
+            EditCommand::Paste => Some(Self::Paste),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cut => "cut",
+            Self::Copy => "copy",
+            Self::Paste => "paste",
+            Self::CopyPageUrl => "copy-page-url",
+        }
+    }
+
+    const fn display_label(self) -> &'static str {
+        match self {
+            Self::Cut => "Cut",
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
+            Self::CopyPageUrl => "Copy page URL",
+        }
+    }
+
+    const fn lane_direction(self) -> &'static str {
+        match self {
+            Self::Paste => "consume",
+            Self::Cut | Self::Copy | Self::CopyPageUrl => "publish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserClipboardMediationStatus {
+    Published {
+        operation: BrowserClipboardOperation,
+        lane: &'static str,
+        id: String,
+    },
+    Unsupported {
+        operation: BrowserClipboardOperation,
+        lane: &'static str,
+        reason: &'static str,
+    },
+}
+
+impl BrowserClipboardMediationStatus {
+    fn published(operation: BrowserClipboardOperation, id: String) -> Self {
+        Self::Published {
+            operation,
+            lane: BROWSER_CLIPBOARD_LANE,
+            id,
+        }
+    }
+
+    const fn unsupported(operation: BrowserClipboardOperation, reason: &'static str) -> Self {
+        Self::Unsupported {
+            operation,
+            lane: BROWSER_CLIPBOARD_LANE,
+            reason,
+        }
+    }
+
+    fn notice(&self) -> String {
+        match self {
+            Self::Published { operation, .. } => {
+                format!(
+                    "{} copied through the mesh clipboard lane",
+                    operation.display_label()
+                )
+            }
+            Self::Unsupported {
+                operation,
+                lane,
+                reason,
+            } => {
+                format!(
+                    "Browser clipboard {} unsupported: {} must {} through {lane}, not direct host clipboard",
+                    operation.label(),
+                    reason,
+                    operation.lane_direction()
+                )
+            }
+        }
     }
 }
 
@@ -5893,16 +5994,79 @@ impl WebState {
     }
 
     /// Apply an in-page context-menu action to the tab at `index`.
-    fn apply_page_context_action(&mut self, index: usize, action: chrome_ui::PageContextAction) {
+    fn apply_page_context_action(
+        &mut self,
+        index: usize,
+        action: chrome_ui::PageContextAction,
+    ) -> Option<BrowserClipboardMediationStatus> {
+        if let chrome_ui::PageContextAction::Edit(command) = action {
+            if let Some(operation) = BrowserClipboardOperation::from_edit_command(command) {
+                if self.tabs.get(index).is_none() {
+                    return None;
+                }
+                return Some(self.unsupported_browser_clipboard(operation, "page selection"));
+            }
+        }
+        if matches!(action, chrome_ui::PageContextAction::CopyPageUrl) {
+            return self.copy_page_url_to_mesh_clipboard(index);
+        }
         let Some(tab) = self.tabs.get_mut(index) else {
-            return;
+            return None;
         };
         match action {
             chrome_ui::PageContextAction::Back => tab.session.go_back(),
             chrome_ui::PageContextAction::Forward => tab.session.go_forward(),
             chrome_ui::PageContextAction::Reload => tab.session.reload(),
             chrome_ui::PageContextAction::Edit(command) => tab.session.edit_command(command),
+            chrome_ui::PageContextAction::CopyPageUrl => {}
         }
+        None
+    }
+
+    fn unsupported_browser_clipboard(
+        &mut self,
+        operation: BrowserClipboardOperation,
+        reason: &'static str,
+    ) -> BrowserClipboardMediationStatus {
+        let status = BrowserClipboardMediationStatus::unsupported(operation, reason);
+        self.capture_notice = Some(status.notice());
+        status
+    }
+
+    fn copy_page_url_to_mesh_clipboard(
+        &mut self,
+        index: usize,
+    ) -> Option<BrowserClipboardMediationStatus> {
+        let url = self
+            .tabs
+            .get(index)
+            .map(|tab| tab.session.nav().url.trim().to_owned())
+            .unwrap_or_default();
+        if url.is_empty() {
+            return None;
+        }
+        Some(self.publish_browser_clipboard_text(BrowserClipboardOperation::CopyPageUrl, &url))
+    }
+
+    fn publish_browser_clipboard_text(
+        &mut self,
+        operation: BrowserClipboardOperation,
+        text: &str,
+    ) -> BrowserClipboardMediationStatus {
+        let id = browser_clipboard_clip_id(text);
+        let body = browser_clipboard_clip_body(
+            text,
+            &format!("browser:{}", local_hostname()),
+            &browser_clipboard_now_rfc3339(),
+        );
+        let status =
+            if publish_to_bus_checked(self.bus_root.as_deref(), BROWSER_CLIPBOARD_LANE, &body) {
+                BrowserClipboardMediationStatus::published(operation, id)
+            } else {
+                BrowserClipboardMediationStatus::unsupported(operation, "bus writer")
+            };
+        self.capture_notice = Some(status.notice());
+        status
     }
 
     fn submit_find(&mut self, backwards: bool) {
@@ -9371,6 +9535,37 @@ fn publish_to_bus(root: Option<&Path>, topic: &str, body: &str) {
     let _ = persist.write(topic, Priority::Default, None, Some(body));
 }
 
+fn publish_to_bus_checked(root: Option<&Path>, topic: &str, body: &str) -> bool {
+    let Some(root) = root else { return false };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return false;
+    };
+    persist
+        .write(topic, Priority::Default, None, Some(body))
+        .is_ok()
+}
+
+fn browser_clipboard_clip_id(text: &str) -> String {
+    mde_collab_types::value::sha256_hex(text.as_bytes())
+        .chars()
+        .take(16)
+        .collect()
+}
+
+fn browser_clipboard_clip_body(text: &str, source: &str, time: &str) -> String {
+    serde_json::json!({
+        "id": browser_clipboard_clip_id(text),
+        "text": text,
+        "source": source,
+        "time": time,
+    })
+    .to_string()
+}
+
+fn browser_clipboard_now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
 fn publish_authorized_browser_mutation(
     root: Option<&Path>,
     topic: &str,
@@ -11758,7 +11953,7 @@ mod tests {
         state.push_session(session);
 
         state.apply_page_context_action(state.active, chrome_ui::PageContextAction::Reload);
-        state.apply_page_context_action(
+        let copy_status = state.apply_page_context_action(
             state.active,
             chrome_ui::PageContextAction::Edit(EditCommand::Copy),
         );
@@ -11775,13 +11970,24 @@ mod tests {
             "context-menu Reload must reach the helper: {controls:?}"
         );
         assert!(
-            controls.iter().any(|msg| matches!(
+            !controls.iter().any(|msg| matches!(
                 msg,
                 mde_web_preview_client::ControlMsg::EditCommand {
                     command: EditCommand::Copy
                 }
             )),
-            "context-menu Copy must send a native edit command: {controls:?}"
+            "context-menu Copy must stay shell-mediated, not direct helper clipboard: {controls:?}"
+        );
+        assert!(
+            matches!(
+                copy_status,
+                Some(BrowserClipboardMediationStatus::Unsupported {
+                    operation: BrowserClipboardOperation::Copy,
+                    lane: BROWSER_CLIPBOARD_LANE,
+                    reason: "page selection"
+                })
+            ),
+            "context-menu Copy must report the explicit shell-mediated clipboard status: {copy_status:?}"
         );
         assert!(
             controls.iter().any(|msg| matches!(
@@ -11791,6 +11997,55 @@ mod tests {
                 }
             )),
             "context-menu Select-all must send a native edit command: {controls:?}"
+        );
+    }
+
+    #[test]
+    fn page_context_copy_page_url_publishes_the_mesh_clipboard_lane() {
+        let (session, _helper, _writer) = live_page_session();
+        let bus = tempfile::tempdir().expect("temp bus");
+        let mut state = WebState::default().with_bus_root(Some(bus.path().to_path_buf()));
+        state.push_session(session);
+        state.tabs[state.active].session.poll();
+
+        let status = state
+            .apply_page_context_action(state.active, chrome_ui::PageContextAction::CopyPageUrl);
+
+        let expected_url = "https://example.test/";
+        let expected_id = browser_clipboard_clip_id(expected_url);
+        assert!(
+            matches!(
+                status,
+                Some(BrowserClipboardMediationStatus::Published {
+                    operation: BrowserClipboardOperation::CopyPageUrl,
+                    lane: BROWSER_CLIPBOARD_LANE,
+                    ref id
+                }) if id == &expected_id
+            ),
+            "Copy page URL must publish through the canonical Browser clipboard lane: {status:?}"
+        );
+        assert_eq!(
+            state.capture_notice.as_deref(),
+            Some("Copy page URL copied through the mesh clipboard lane")
+        );
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let msgs = persist
+            .list_since(BROWSER_CLIPBOARD_LANE, None)
+            .expect("clipboard lane messages");
+        assert_eq!(msgs.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(msgs[0].body.as_deref().expect("clipboard body"))
+                .expect("clipboard json");
+        assert_eq!(body["id"], expected_id);
+        assert_eq!(body["text"], expected_url);
+        assert_eq!(body["source"], format!("browser:{}", local_hostname()));
+        assert!(
+            body["time"]
+                .as_str()
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+                .is_some(),
+            "clipboard time must be RFC3339: {body:?}"
         );
     }
 
