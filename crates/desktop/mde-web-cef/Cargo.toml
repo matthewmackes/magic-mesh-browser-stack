@@ -12,7 +12,7 @@ name = "mde-web-cef"
 description = "BROWSER-DD-1 — Chromium/CEF helper scaffold for the first-class platform browser."
 # Standalone Cargo workspace: keep synchronized with the root
 # [workspace.package].version (Cargo cannot inherit across workspace roots).
-version = "12.1.0"
+version = "12.1.1"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"

@@ -29,7 +29,7 @@ name = "mde-web-sandbox"
 description = "security-1 — the shared OS sandbox (userns + seccomp-bpf + dropped caps + no-new-privs + pivot_root RO rootfs with NO home/keys + cgroup v2 caps) for MCNF's out-of-process web engine helpers (Servo `mde-web-preview` + Chromium/CEF `mde-web-cef`)."
 # Standalone Cargo workspace: keep synchronized with the root
 # [workspace.package].version (Cargo cannot inherit across workspace roots).
-version = "12.1.0"
+version = "12.1.1"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
