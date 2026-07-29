@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=02bc94392de793b4b7ee5661eaa90cd7b49ff638
-# source_commit_date=2026-07-29T18:34:06-04:00
+# source_commit=009804c8b3dca148eda3f147621608ec4f12fd17
+# source_commit_date=2026-07-29T18:45:12-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -19,7 +19,7 @@ mixed-purpose	crates/desktop/mde-shell-egui/Cargo.toml	split-in-magic-mesh-brows
 mixed-purpose	crates/desktop/mde-shell-egui/src/console/custom_sync.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/console/custom_sync.rs#browser-sections	shell-route-or-shared-state	e65d7e6aa3331859a38f2d2d527389fefa949498	e65d7e6aa3331859a38f2d2d527389fefa949498	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/datacenter.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/datacenter.rs#browser-sections	shell-route-or-shared-state	a35f5110e5603293ae1d2701eade197bf882215b	a35f5110e5603293ae1d2701eade197bf882215b	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/front_door.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/front_door.rs#browser-sections	shell-route-or-shared-state	300e442a085f87a33471427012716e7a4f98ce4f	300e442a085f87a33471427012716e7a4f98ce4f	clean
-mixed-purpose	crates/desktop/mde-shell-egui/src/main.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/main.rs#browser-sections	shell-route-or-shared-state	364366d49e83d6c7060171706499c4fce687d231	5cb1d4b8ec2199424c4259b286fdf3c036058609	dirty
+mixed-purpose	crates/desktop/mde-shell-egui/src/main.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/main.rs#browser-sections	shell-route-or-shared-state	5cb1d4b8ec2199424c4259b286fdf3c036058609	5cb1d4b8ec2199424c4259b286fdf3c036058609	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/nav_bar.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/nav_bar.rs#browser-sections	shell-route-or-shared-state	93ec397c2e47e6893667d95ac052cc7557c6471f	93ec397c2e47e6893667d95ac052cc7557c6471f	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/storage/tests.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/storage/tests.rs#browser-sections	shell-route-or-shared-state	49228c0ee1f55b86767af494b84fce002f699525	49228c0ee1f55b86767af494b84fce002f699525	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/surfaces.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/surfaces.rs#browser-sections	shell-route-or-shared-state	116c32f00babd7361578ad36deb51b1e6fe1f96e	116c32f00babd7361578ad36deb51b1e6fe1f96e	clean
