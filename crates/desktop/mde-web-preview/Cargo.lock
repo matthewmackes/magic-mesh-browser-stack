@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "mde-web-preview"
-version = "12.1.1"
+version = "12.1.6"
 dependencies = [
  "anyhow",
  "caps",
@@ -3337,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "mde-web-wire"
-version = "12.1.1"
+version = "12.1.6"
 
 [[package]]
 name = "memchr"
