@@ -1,0 +1,9 @@
+# The standalone root currently builds the pure-std wire contract. Keep the
+# same development ceiling as the source workspace while the heavier helper
+# workspaces retain their own manifest/toolchain requirements.
+
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu"]
+profile = "minimal"

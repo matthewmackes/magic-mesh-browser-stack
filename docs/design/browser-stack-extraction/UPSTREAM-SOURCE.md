@@ -40,6 +40,24 @@ or a changed source blob fails closed. Dirty `browser-owned` paths fail closed;
 dirty `mixed-purpose`/`shared` paths are recorded as `worktree_state=dirty` and
 must be committed/reconciled before extraction.
 
+## Standalone root status — 2026-08-01
+
+Root workspace metadata now exists, but it deliberately contains only the
+dependency-complete `crates/desktop/mde-web-wire` contract. Its locked test is
+therefore a narrow provenance/build sanity check, not full Browser-stack
+acceptance:
+
+```text
+cargo test --workspace --locked
+```
+
+The remaining extracted manifests are not admitted to the root workspace
+because they still reference shared crates absent from this repository:
+`mde-egui`, `mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`.
+No placeholder implementations were added. Full workspace metadata, CI, and
+publication remain blocked until those dependencies are extracted or replaced
+with explicit standalone contracts.
+
 ## Current workspace, package, and process inventory
 
 The inventory is derived from the current tree rather than a hand-maintained
