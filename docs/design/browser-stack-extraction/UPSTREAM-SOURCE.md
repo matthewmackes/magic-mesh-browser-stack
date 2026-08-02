@@ -41,25 +41,35 @@ or a changed source blob fails closed. Dirty `browser-owned` paths fail closed;
 dirty `mixed-purpose`/`shared` paths are recorded as `worktree_state=dirty` and
 must be committed/reconciled before extraction.
 
-## Standalone root status — 2026-08-02
+## Standalone root and helper status — 2026-08-02
 
 Root workspace metadata now contains the dependency-complete
-`crates/desktop/mde-web-wire` contract and the already-present pure
-`crates/services/mde-adblock` engine. Its locked test is therefore a narrow
-provenance/build sanity check, not full Browser-stack acceptance:
+`crates/desktop/mde-web-wire` contract, the pure
+`crates/services/mde-adblock` engine, and the standalone
+`crates/desktop/mde-web-preview-client` IPC/frame/input bridge:
 
 ```text
 cargo test --workspace --locked
 ```
 
-The remaining extracted manifests are not admitted to the root workspace
-because they still reference shared crates absent from this repository:
-`mde-egui`, `mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`.
-No placeholder implementations were added. The admitted root workspace has
-locked test/clippy CI and is published at
-`matthewmackes/magic-mesh-browser-stack` (publication commit `25c9e5bc`). Full
-workspace buildability remains open until the omitted dependencies are
-extracted or replaced with explicit standalone contracts.
+The Servo, CEF, and sandbox helper roots are separately locked and independently
+checked because their native dependency graphs must not be joined to the root
+workspace. BigBoy farm evidence for the current publication is:
+
+```text
+cargo test --workspace --locked                         # 135 tests
+cargo clippy --workspace --all-targets --locked ...     # root + client
+cargo check --manifest-path .../mde-web-sandbox/...     # passed
+cargo check --manifest-path .../mde-web-cef/...         # passed
+cargo check --manifest-path .../mde-web-preview/...    # passed
+cargo clippy --manifest-path .../mde-web-preview-client/... # passed
+```
+
+The worker family remains outside the standalone workspace because it still
+needs `mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`. No
+placeholder implementations were added. The publication commit is
+`db37bc4a`; these are build-boundary checks, not live guest Chromium or seat
+acceptance.
 
 ## Current workspace, package, and process inventory
 
@@ -139,7 +149,8 @@ that extraction auditable.
 2. Complete the history-preserving extraction in this repository, including
    the omitted helper/worker/package dependencies, while preserving
    `LICENSE`/`NOTICE` and updating this provenance record.
-3. Build/test the complete standalone repository from a clean clone, then
-   remove the corresponding host Browser source from `magic-mesh`.
+3. Extract the worker family's shared platform contracts, build/test the
+   complete standalone repository from a clean clone, then remove the
+   corresponding host Browser source from `magic-mesh`.
 4. Finish the live Browser VM image, VDI attachment, guest Chromium rendering,
    input, audio/video, reconnect, performance, and six-node acceptance gates.
