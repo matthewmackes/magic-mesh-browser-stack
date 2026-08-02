@@ -114,3 +114,10 @@ nursery     = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 panic       = "warn"
 todo        = "deny"
+# The bridge's event fold is intentionally centralized so every wire event is
+# handled against one session state machine. Keep the extracted crate's strict
+# correctness lints while allowing documentation/layout noise that does not
+# affect the IPC, shm, or input contracts.
+too_many_lines = "allow"
+too_long_first_doc_paragraph = "allow"
+doc_markdown = "allow"

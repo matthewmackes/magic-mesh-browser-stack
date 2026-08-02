@@ -41,7 +41,7 @@ pub struct SafeBrowsingBlocklist {
 impl SafeBrowsingBlocklist {
     /// Build an empty blocklist.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             hosts: BTreeSet::new(),
         }
@@ -102,7 +102,7 @@ enum ManagedUrlRule {
 impl ManagedUrlPolicy {
     /// Build an empty managed policy.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             rules: BTreeSet::new(),
         }
@@ -197,7 +197,7 @@ fn normalize_default_http_port(lowered_url: &str) -> Option<String> {
         return None;
     }
     let authority_end = rest
-        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let (authority, suffix) = rest.split_at(authority_end);
     let authority = normalize_policy_authority(scheme, authority)?;
@@ -222,9 +222,8 @@ fn normalize_policy_authority(scheme: &str, authority: &str) -> Option<String> {
             Some(port) if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
                 Some(format!("[{host}]:{port}"))
             }
-            Some(_) => None,
             None if after_host.is_empty() => Some(format!("[{host}]")),
-            None => None,
+            Some(_) | None => None,
         };
     }
     let (host, port) = authority

@@ -608,7 +608,7 @@ impl WebSession {
                 self.send(&ControlMsg::ResourceVerdict { id, allow: allowed });
             }
             EventMsg::PdfSaved { path, ok } => {
-                self.pdf_events.push_back(PdfSaveStatus { path, ok })
+                self.pdf_events.push_back(PdfSaveStatus { path, ok });
             }
             EventMsg::PageText { id, text } => {
                 self.page_text_events.push_back(PageTextStatus { id, text });
@@ -1051,7 +1051,7 @@ impl WebSession {
     /// frame or when no frame region is mapped.
     #[must_use]
     pub fn published_frame_seq(&self) -> u64 {
-        self.reader.as_ref().map_or(0, |reader| reader.sequence())
+        self.reader.as_ref().map_or(0, FrameReader::sequence)
     }
 
     /// Ask the helper to toggle media playback on the active page.
@@ -2773,6 +2773,7 @@ mod tests {
     /// already-cleared answer must be silent. Flips the peer non-blocking, reads,
     /// and requires an empty socket (`WouldBlock`); any buffered bytes are a stray
     /// frame the caller did not expect.
+    #[allow(clippy::panic)]
     fn assert_no_control_pending(peer: &UnixStream) {
         peer.set_nonblocking(true).expect("peer non-blocking");
         let mut s: &UnixStream = peer;
