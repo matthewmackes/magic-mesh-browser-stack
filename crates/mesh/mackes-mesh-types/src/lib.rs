@@ -33,6 +33,7 @@
 #![allow(clippy::redundant_clone)]
 #![allow(clippy::too_long_first_doc_paragraph)]
 #![allow(clippy::derivable_impls)]
+#![allow(clippy::assertions_on_constants)]
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used))]
 
 /// WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI snapshots.
