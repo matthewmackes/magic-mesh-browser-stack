@@ -252,11 +252,11 @@ mod tests {
     #[test]
     fn parse_role_and_scope_selectors() {
         assert_eq!(
-            SealScope::parse("role:lighthouse").unwrap(),
+            SealScope::parse("role:lighthouse").expect("role selector"),
             SealScope::Role("lighthouse".into())
         );
         assert_eq!(
-            SealScope::parse("scope:media").unwrap(),
+            SealScope::parse("scope:media").expect("capability selector"),
             SealScope::Capability("media".into())
         );
     }
@@ -264,18 +264,21 @@ mod tests {
     #[test]
     fn parse_canonicalizes_case_and_whitespace() {
         assert_eq!(
-            SealScope::parse("  role:Lighthouse ").unwrap(),
+            SealScope::parse("  role:Lighthouse ").expect("canonical role selector"),
             SealScope::Role("lighthouse".into())
         );
         assert_eq!(
-            SealScope::parse("scope:MEDIA").unwrap(),
+            SealScope::parse("scope:MEDIA").expect("canonical capability selector"),
             SealScope::Capability("media".into())
         );
     }
 
     #[test]
     fn parse_opt_none_is_whole_mesh() {
-        assert_eq!(SealScope::parse_opt(None).unwrap(), SealScope::WholeMesh);
+        assert_eq!(
+            SealScope::parse_opt(None).expect("missing selector is whole mesh"),
+            SealScope::WholeMesh
+        );
     }
 
     #[test]
@@ -301,10 +304,11 @@ mod tests {
     #[test]
     fn selector_round_trips() {
         for sel in ["role:lighthouse", "scope:media", "role:workstation"] {
-            let scope = SealScope::parse(sel).unwrap();
+            let scope = SealScope::parse(sel).expect("round-trip selector");
             assert_eq!(scope.selector().as_deref(), Some(sel));
             // And re-parsing the emitted selector is a fixed point.
-            assert_eq!(SealScope::parse(&scope.selector().unwrap()).unwrap(), scope);
+            let emitted = scope.selector().expect("non-whole scope has selector");
+            assert_eq!(SealScope::parse(&emitted).expect("emitted selector"), scope);
         }
         assert_eq!(SealScope::WholeMesh.selector(), None);
     }

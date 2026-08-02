@@ -305,20 +305,20 @@ mod tests {
 
     #[test]
     fn unseal_rejects_truncated_bundle() {
-        match unseal_bytes("any", &[0u8; 10]) {
-            Err(BackupError::Format(msg)) => assert!(msg.contains("too short")),
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert!(matches!(
+            unseal_bytes("any", &[0u8; 10]),
+            Err(BackupError::Format(msg)) if msg.contains("too short")
+        ));
     }
 
     #[test]
     fn unseal_rejects_bad_magic() {
         let mut bad = vec![0u8; HEADER_LEN + 10];
         bad[..4].copy_from_slice(b"NOPE");
-        match unseal_bytes("any", &bad) {
-            Err(BackupError::Format(msg)) => assert!(msg.contains("magic mismatch")),
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert!(matches!(
+            unseal_bytes("any", &bad),
+            Err(BackupError::Format(msg)) if msg.contains("magic mismatch")
+        ));
     }
 
     #[test]
@@ -326,10 +326,10 @@ mod tests {
         let mut bad = vec![0u8; HEADER_LEN + 10];
         bad[..4].copy_from_slice(BUNDLE_MAGIC);
         bad[4] = 0xFF;
-        match unseal_bytes("any", &bad) {
-            Err(BackupError::Format(msg)) => assert!(msg.contains("unknown version")),
-            other => panic!("expected Format, got {other:?}"),
-        }
+        assert!(matches!(
+            unseal_bytes("any", &bad),
+            Err(BackupError::Format(msg)) if msg.contains("unknown version")
+        ));
     }
 
     #[test]
