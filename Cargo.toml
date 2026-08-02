@@ -11,6 +11,11 @@ resolver = "2"
 members = [
     "crates/desktop/mde-web-wire",
     "crates/desktop/mde-web-preview-client",
+    "crates/mesh/mde-worker-core",
+    "crates/platform/mde-bus",
+    "crates/mesh/mackes-mesh-types",
+    "crates/mesh/mde-seal",
+    "crates/mesh/mde-browser-workers",
     "crates/services/mde-adblock",
 ]
 

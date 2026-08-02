@@ -1,0 +1,39 @@
+# arch-7 (2026-07-11) — the passphrase-sealed crypto envelope extracted out of
+# `mackesd`'s `ca::backup` module into a leaf crate so all three consumers share
+# ONE audited Argon2id + XChaCha20-Poly1305 path without depending back on the
+# daemon:
+#
+#   * CA disaster-recovery bundles (`nebula_ca_backup` worker + `mackesd ca
+#     export/import`) — the original home of this envelope.
+#   * The VPN secret store's local-AEAD fallback (`ipc::secret_store`).
+#   * `browser_passkeys` (the per-seat passkey seed seal) — the consumer that
+#     could not leave `mackesd` while the primitive lived inside it (arch-7).
+#
+# PURE RELOCATION: the seal/unseal bytes, the KDF params, the nonce handling and
+# the on-wire framing are byte-identical to the pre-extraction `ca::backup` code.
+# `mackesd` re-exports every moved item so existing callers compile unchanged.
+
+[package]
+name         = "mde-seal"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Passphrase-sealed byte envelope (Argon2id + XChaCha20-Poly1305) shared by CA disaster-recovery, the VPN secret store, and browser passkeys"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# KDF: Argon2id. AEAD: XChaCha20-Poly1305 (24-byte nonce). Random salt/nonce
+# per seal. thiserror for the operator-actionable BackupError copy. Versions
+# match the pre-extraction `mackesd` declarations exactly (no crypto bump).
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+thiserror = "1"
+
+[lints]
+workspace = true

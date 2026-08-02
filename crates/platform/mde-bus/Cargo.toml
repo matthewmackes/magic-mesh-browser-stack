@@ -1,0 +1,111 @@
+[package]
+name        = "mde-bus"
+description = "Mackes Bus — mesh-wide notification + clipboard pub/sub bus on self-hosted ntfy over Nebula. v6.x BUS-1..7 epic."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_bus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-bus"
+path = "src/main.rs"
+
+[dependencies]
+# Match mackesd's canonical versions (workspace lint forbids drift).
+anyhow             = "1"
+clap               = { version = "4.5", features = ["derive"] }
+tokio              = { version = "1", features = ["full"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Tera is the locked templating engine (BUS-1.10, Round 10 of the 104-Q
+# poll). Jinja2-style syntax, Rust-native, no extra runtime.
+tera = { version = "1.20", default-features = false }
+
+# Serde + serde_json for topic + message + manifest serialisation.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# UTC timestamps for the curated `time.*` template variables.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# XDG paths (~/.local/share/mde/bus/...) match the rest of the workspace.
+dirs = "5"
+
+# BUS-1.3 — zeroconf discovery. Same version mackesd uses for its
+# LAN-discovery worker so the workspace lint doesn't flip on
+# multiple-version drift.
+mdns-sd = "0.11"
+
+# BUS-1.7 — subscription manifest parsing. serde_yaml 0.9 is the
+# long-stable version (the 0.10 line ended in deprecation/yank
+# churn upstream).
+serde_yaml = "0.9"
+
+# Error enums — matches mackesd + mackes-nebula-https-tunnel versions.
+thiserror = "1"
+
+# BUS-3.1 + BUS-3.2 — webhook ingress HTTP server. `axum` 0.7 with
+# minimal features (http1 + tokio + JSON extractor); no tower-http
+# middleware needed since we route exactly one POST per adapter
+# and the listener binds to the Nebula overlay IP (the security
+# boundary is bind-scope, not in-process middleware).
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+
+# BUS-3.2 — outbound HTTP to the local ntfy broker. Plain HTTP per
+# `docs/design/v6.x-mackes-bus.md` line 210 lock (no TLS — Nebula
+# is the transport encryption boundary); `default-features = false`
+# strips the entire TLS stack so we don't pull rustls/native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# BUS-3.2 — request body bytes type (extractor + tests).
+bytes = "1"
+
+# BUS-1.4 — local-peer queryable index. Version 0.32 matches the
+# workspace lock (mackesd already pulls this version); `bundled`
+# would clash with mackesd's libsqlite3-sys link if we forked, so
+# we accept whatever feature set the workspace agreed on.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# BUS-1.4 — message identifiers. ULIDs are sortable +
+# timestamp-prefixed, so list_since(topic, ulid) is an
+# index-range scan rather than a sort.
+ulid = { version = "1", features = ["serde"] }
+
+[features]
+default = []
+# Registers the Tera `exec(cmd="…")` template function, which shells out
+# via `sh -c <arg>` and captures stdout. This is a FLAT-TRUST, fleet-wide
+# arbitrary-command (RCE) primitive: any peer holding the shared mesh
+# passcode could publish a template that runs commands on every
+# render-target peer. It is OFF by default so the primitive is not even
+# compiled into the default build; enable it only for a specific consumer
+# with an audited, legitimate need (currently: none). See
+# `crates/platform/mde-bus/src/template.rs` and
+# `docs/design/v6.x-mackes-bus.md` § 10.
+template-exec = []
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code     = "forbid"
+unused_must_use = "deny"
+missing_docs    = "allow"
+
+[lints.clippy]
+pedantic                = { level = "allow", priority = -1 }
+nursery                 = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+unwrap_used             = "warn"
+panic                   = "warn"
+todo                    = "warn"

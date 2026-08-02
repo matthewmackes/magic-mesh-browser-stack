@@ -1,0 +1,32 @@
+# arch-7 (2026-07-11) — the shared worker-pool contract extracted out of the
+# `mackesd` bin crate so worker IMPLEMENTATIONS can live in their own crates
+# (e.g. `mde-browser-workers`, the per-seat browser workers) without depending
+# back on the daemon. Holds exactly two types every supervised worker touches:
+# the async `Worker` trait the supervisor stores as `Box<dyn Worker>`, and the
+# `ShutdownToken` handed to each worker body.
+
+[package]
+name         = "mde-worker-core"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+description  = "Shared worker-pool contract (async Worker trait + ShutdownToken) for the mackesd control-plane daemon and its factored-out worker crates"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# The `#[tokio::test]` harness for the token/trait unit tests needs the macro +
+# a runtime; the library itself only needs `sync` (the watch channel).
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true
