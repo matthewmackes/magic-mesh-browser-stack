@@ -20,7 +20,7 @@
 #![allow(clippy::branches_sharing_code)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::doc_link_code)]
-#![allow(clippy::excessive_bools)]
+#![allow(clippy::fn_params_excessive_bools)]
 #![allow(clippy::format_push_string)]
 #![allow(clippy::literal_string_with_formatting_args)]
 #![allow(clippy::match_same_arms)]
