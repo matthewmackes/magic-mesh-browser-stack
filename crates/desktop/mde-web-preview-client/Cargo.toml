@@ -77,11 +77,10 @@ live-helper = []
 # share ONE type identity instead of `#[path]`-including the same source thrice.
 mde-web-wire = { path = "../mde-web-wire" }
 
-# The §4/§5 egui harness — the ONE toolkit resolution. This crate uses only the
-# egui types (ColorImage / TextureHandle / Event / Key / Color32); eframe/wgpu are
-# pulled transitively by the harness but unused here, exactly as the VDI decoder
-# crates consume it.
-mde-egui = { path = "../../shared/mde-egui" }
+# The client is independently buildable in the extracted repository. It uses
+# only egui's data types (ColorImage / TextureHandle / Event / Key / Color32);
+# the host shell owns the single toolkit resolution when it embeds this crate.
+egui = "0.31"
 
 # BOOKMARKS-7 — the pure ad-filter engine (services tier). This crate holds the
 # compiled `Engine` shell-side: it judges each helper subresource query over the

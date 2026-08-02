@@ -41,9 +41,9 @@
 //! socket — the BOOKMARKS-5 follow-up), exactly as the VDI decoder crates gate
 //! their live connect.
 
-// Re-export the toolkit through the harness so the shell and this bridge resolve
-// to exactly one egui (no cross-surface version skew, §4).
-pub use mde_egui::egui;
+// Re-export the data-only egui dependency so callers use the same types as the
+// frame/input bridge without depending on the host shell's harness.
+pub use egui;
 
 pub mod filter;
 pub mod frame;

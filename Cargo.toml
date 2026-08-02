@@ -10,6 +10,7 @@
 resolver = "2"
 members = [
     "crates/desktop/mde-web-wire",
+    "crates/desktop/mde-web-preview-client",
     "crates/services/mde-adblock",
 ]
 
