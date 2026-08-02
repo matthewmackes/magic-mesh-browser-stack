@@ -113,10 +113,7 @@ impl SealScope {
     ///
     /// Per [`SealScope::parse`] when `selector` is `Some` and malformed.
     pub fn parse_opt(selector: Option<&str>) -> Result<Self, ScopeError> {
-        match selector {
-            None => Ok(Self::WholeMesh),
-            Some(s) => Self::parse(s),
-        }
+        selector.map_or(Ok(Self::WholeMesh), Self::parse)
     }
 
     /// The canonical selector string this scope round-trips through
@@ -196,14 +193,14 @@ impl NodeRecipient {
     #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
         let want = role.trim().to_ascii_lowercase();
-        self.roles.iter().any(|r| *r == want)
+        self.roles.contains(&want)
     }
 
     /// Whether this node carries capability/scope `scope` (case-insensitive).
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
         let want = scope.trim().to_ascii_lowercase();
-        self.scopes.iter().any(|s| *s == want)
+        self.scopes.contains(&want)
     }
 }
 

@@ -174,8 +174,9 @@ pub fn unseal_bytes(passphrase: &str, sealed: &[u8]) -> Result<Vec<u8>, BackupEr
     aead_unseal(&key, &nonce, ciphertext)
 }
 
-/// The mesh age identity path (`MCNF_AGE_KEY` env, else [`DEFAULT_AGE_KEY`]) —
-/// matches the script's own default so both secret-store backends key off the
+/// The mesh age identity path (`MCNF_AGE_KEY` env, else [`DEFAULT_AGE_KEY`]).
+///
+/// This matches the script's own default so both secret-store backends key off the
 /// same artifact. Lives here so consumers that seal against the mesh age
 /// identity (the VPN local-AEAD store, browser passkeys) reach it without
 /// depending on `mackesd`.

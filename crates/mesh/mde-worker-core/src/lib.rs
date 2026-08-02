@@ -21,7 +21,9 @@
 
 use tokio::sync::watch;
 
-/// Shutdown signal handed to every worker. Workers should `select!`
+/// Shutdown signal handed to every worker.
+///
+/// Workers should `select!`
 /// on the underlying `watch::Receiver` so they exit promptly when
 /// the supervisor requests stop. Cloning is cheap (it's a watch
 /// receiver under the hood).
