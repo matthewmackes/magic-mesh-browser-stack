@@ -29,6 +29,8 @@
 #![allow(clippy::no_effect_underscore_binding)]
 #![allow(clippy::or_fun_call)]
 #![allow(clippy::option_if_let_else)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::semicolon_if_nothing_returned)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::string_lit_as_bytes)]
