@@ -27,7 +27,8 @@ The native helper roots are also checked independently on the build farm:
 cargo check --manifest-path crates/desktop/mde-web-sandbox/Cargo.toml --locked --offline
 cargo check --manifest-path crates/desktop/mde-web-cef/Cargo.toml --locked --offline
 cargo check --manifest-path crates/desktop/mde-web-preview/Cargo.toml --locked --offline
-cargo clippy --manifest-path crates/desktop/mde-web-preview-client/Cargo.toml --all-targets --locked --offline -- -D warnings
+cargo clippy --workspace --lib --locked --offline -- -D warnings
+cargo clippy -p mde-web-preview-client --all-targets --locked --offline -- -D warnings
 ```
 
 Those checks cover the preserved Servo, CEF, sandbox, and shell-side bridge
