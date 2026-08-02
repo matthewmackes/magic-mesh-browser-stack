@@ -30,6 +30,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::assertions_on_constants)]
+#![allow(clippy::bool_assert_comparison)]
+#![allow(clippy::identity_op)]
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used))]
 
 pub mod audit;

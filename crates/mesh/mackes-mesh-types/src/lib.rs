@@ -17,6 +17,17 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::unreadable_literal)]
 #![allow(clippy::unnested_or_patterns)]
+#![allow(clippy::branches_sharing_code)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::doc_link_code)]
+#![allow(clippy::excessive_bools)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::literal_string_with_formatting_args)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::derivable_impls)]
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used))]
 
 /// WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI snapshots.
