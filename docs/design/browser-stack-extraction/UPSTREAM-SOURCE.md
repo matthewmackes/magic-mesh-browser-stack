@@ -55,7 +55,7 @@ cargo test --workspace --locked
 
 The Servo, CEF, and sandbox helper roots are separately locked and independently
 checked because their native dependency graphs must not be joined to the root
-workspace. BigBoy farm evidence for the current publication at `3b06da0d` is:
+workspace. BigBoy farm evidence for the current publication at `dca38960e65292a49669c82408b1eed32916e7b4` is:
 
 ```text
 cargo test --workspace --locked
