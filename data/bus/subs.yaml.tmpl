@@ -1,0 +1,21 @@
+# mde-bus subscription manifest template.
+#
+# Shipped to /usr/share/mde/bus/subs.yaml.tmpl as the starting point an
+# operator copies to tune what a node surfaces. The default subscribes to
+# EVERYTHING (`#` is the multi-level wildcard) and mutes nothing — a node
+# sees the whole Bus until the operator narrows it.
+#
+# Parsed by `mde_bus::subs::SubsManifest::parse_yaml`.
+
+# Topics this node subscribes to. MQTT-style wildcards:
+#   `+` matches one level, `#` matches the rest. `#` alone = everything.
+topics:
+  - "#"
+
+# Topics to drop even when a `topics` entry would match them.
+mute: []
+
+# Optional quiet-hours window (omitted = always deliver). Example:
+# quiet_hours:
+#   start: "22:00"
+#   end: "07:00"

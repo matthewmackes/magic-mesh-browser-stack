@@ -1,0 +1,18 @@
+# ntfy server config template (mde-bus broker).
+#
+# Rendered by `mde_bus::broker::render_config` (Tera) with two variables:
+#   {{ overlay_ip }} — this node's Nebula overlay IP
+#   {{ cache_dir }}  — the broker's cache directory
+#
+# Design lock: the broker listens ONLY on the overlay (Nebula already
+# provides the transport encryption + the cert-gated trust envelope), so
+# NO TLS block is configured here — plain HTTP on the overlay only.
+# Binding to the overlay IP keeps the broker off the underlay entirely.
+listen-http: "{{ overlay_ip }}:8443"
+cache-file: "{{ cache_dir }}/ntfy.db"
+# Keep messages briefly so a peer that reconnects after a short partition
+# still sees recent traffic; the mesh is the durable store, not ntfy.
+cache-duration: "12h"
+# The overlay is the trust boundary — no per-user auth inside it.
+auth-default-access: "read-write"
+behind-proxy: false

@@ -1,0 +1,61 @@
+# mde-bus correlation rules template.
+#
+# Shipped to /usr/share/mde/bus/correlate.yaml.tmpl as five worked
+# examples an operator copies + tunes. Each rule fires a synthesized
+# `incident/*` publish when ALL of its source topics have been seen
+# within `window_seconds` — turning a flurry of low-level events into one
+# actionable incident.
+#
+# Parsed by `mde_bus::correlate::CorrelateConfig` (serde, deny_unknown_fields).
+# Every rule must: name be unique + non-empty, list ≥2 sources, set a
+# non-zero window, and emit under `incident/`.
+rules:
+  # Mains power lost AND the UPS is reporting low battery → a real outage,
+  # not a transient flap on either signal alone.
+  - name: power-outage
+    sources:
+      - "peer/+/power/on-battery"
+      - "fleet/ups/low-battery"
+    window_seconds: 120
+    emits: "incident/power-outage"
+    priority: high
+
+  # A filesystem alarm AND the LizardFS quota nearing its cap → the box is
+  # about to wedge on writes, not just a noisy single threshold.
+  - name: disk-pressure
+    sources:
+      - "peer/+/netdata/disk-usage-critical"
+      - "fleet/meshfs/quota-90pct"
+    window_seconds: 300
+    emits: "incident/disk-pressure"
+    priority: high
+
+  # Overlay reachability failing AND a lighthouse heartbeat gap → the mesh
+  # control plane is degrading, distinct from one peer being offline.
+  - name: mesh-degraded
+    sources:
+      - "fleet/validation/reachability-failed"
+      - "fleet/lighthouse/heartbeat-missed"
+    window_seconds: 180
+    emits: "incident/mesh-degraded"
+    priority: high
+
+  # A tunnel dropping AND re-establishing repeatedly → a flapping path the
+  # operator should look at, vs a single clean reconnect.
+  - name: vpn-flap
+    sources:
+      - "peer/+/nebula/tunnel-down"
+      - "peer/+/nebula/tunnel-up"
+    window_seconds: 60
+    emits: "incident/vpn-flap"
+    priority: default
+
+  # Quota climbing on multiple peers in the same window → fleet-wide growth
+  # trending toward the cap, worth a heads-up before it's an outage.
+  - name: meshfs-quota-trending
+    sources:
+      - "fleet/meshfs/quota-70pct"
+      - "fleet/meshfs/quota-80pct"
+    window_seconds: 3600
+    emits: "incident/meshfs-quota-trending"
+    priority: default
