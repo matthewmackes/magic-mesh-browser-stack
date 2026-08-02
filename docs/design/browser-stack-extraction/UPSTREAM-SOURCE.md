@@ -42,10 +42,10 @@ must be committed/reconciled before extraction.
 
 ## Standalone root status — 2026-08-01
 
-Root workspace metadata now exists, but it deliberately contains only the
-dependency-complete `crates/desktop/mde-web-wire` contract. Its locked test is
-therefore a narrow provenance/build sanity check, not full Browser-stack
-acceptance:
+Root workspace metadata now contains the dependency-complete
+`crates/desktop/mde-web-wire` contract and the already-present pure
+`crates/services/mde-adblock` engine. Its locked test is therefore a narrow
+provenance/build sanity check, not full Browser-stack acceptance:
 
 ```text
 cargo test --workspace --locked

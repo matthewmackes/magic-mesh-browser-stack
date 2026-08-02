@@ -6,16 +6,21 @@ are recorded in [`docs/design/browser-stack-extraction/UPSTREAM-SOURCE.md`](docs
 
 ## Current build scope
 
-The root workspace currently contains only `mde-web-wire`, the pure-`std`
-length-prefixed socket contract shared by the Browser helper boundaries:
+The root workspace currently contains two dependency-complete crates:
+`mde-web-wire`, the pure-`std` length-prefixed socket contract, and
+`mde-adblock`, the headless filter engine. Both are present in this checkout
+and resolve only against crates.io dependencies:
 
 ```text
 cargo test --workspace --locked
 ```
 
-This command is an honest clean-clone check for the root workspace. No CI is
-declared yet because the complete extracted stack is not independently
-buildable.
+This command is an honest clean-clone check for the admitted root workspace.
+The same boundary is enforced by
+[`install-helpers/verify-standalone-workspace.sh`](install-helpers/verify-standalone-workspace.sh)
+and `.github/workflows/standalone.yml`. The complete extracted stack is not
+yet independently buildable, so this CI does not overclaim native helper
+acceptance.
 
 ## Why the workspace is intentionally narrow
 

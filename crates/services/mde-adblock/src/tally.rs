@@ -47,8 +47,7 @@ impl BlockTally {
         };
         self.total += 1;
         let domain = host_of(request_url)
-            .map(|h| registrable_domain(&h))
-            .unwrap_or_else(|| UNKNOWN_DOMAIN.to_string());
+            .map_or_else(|| UNKNOWN_DOMAIN.to_string(), |h| registrable_domain(&h));
         *self.by_domain.entry(domain).or_insert(0) += 1;
         *self.by_filter.entry(filter.to_string()).or_insert(0) += 1;
     }

@@ -1,0 +1,24 @@
+name: standalone-browser-stack
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  admitted-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - name: verify standalone boundaries
+        run: install-helpers/verify-standalone-workspace.sh
+      - name: test admitted workspace
+        run: cargo test --workspace --locked
+      - name: lint admitted workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

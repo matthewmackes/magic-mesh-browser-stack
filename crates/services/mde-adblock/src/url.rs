@@ -184,7 +184,7 @@ fn label_confusable_reason(label: &str) -> Option<ConfusableReason> {
 /// Is `c` in the Cyrillic (U+0400–U+04FF) or Greek (U+0370–U+03FF) block —
 /// the two scripts most commonly used for Latin-lookalike homographs?
 fn is_confusable_block_char(c: char) -> bool {
-    matches!(c as u32, 0x0370..=0x03FF | 0x0400..=0x04FF)
+    matches!(c as u32, 0x0370..=0x04FF)
 }
 
 #[cfg(test)]
