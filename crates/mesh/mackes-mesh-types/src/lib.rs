@@ -29,6 +29,7 @@
 #![allow(clippy::format_push_string)]
 #![allow(clippy::literal_string_with_formatting_args)]
 #![allow(clippy::match_same_arms)]
+#![allow(clippy::match_wildcard_for_single_variants)]
 #![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::redundant_clone)]
 #![allow(clippy::too_long_first_doc_paragraph)]

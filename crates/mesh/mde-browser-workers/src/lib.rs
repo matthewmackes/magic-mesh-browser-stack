@@ -17,13 +17,19 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::decimal_bitwise_operands)]
 #![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::no_effect_underscore_binding)]
+#![allow(clippy::or_fun_call)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::semicolon_if_nothing_returned)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_long_first_doc_paragraph)]
 #![allow(clippy::unreadable_literal)]
-#![cfg_attr(test, allow(clippy::all))]
+#![allow(clippy::dead_code)]
+#![allow(clippy::panic)]
+#![allow(clippy::unwrap_used)]
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
