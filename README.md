@@ -39,7 +39,8 @@ must not be treated as proof that the host Browser has been removed.
 
 ## Provenance status
 
-The local candidate has not been published at
-`matthewmackes/magic-mesh-browser-stack`. The target remote, a history-complete
-extraction commit, full clean-clone build evidence, and live guest cutover
-evidence remain open gates.
+The history-bearing repository is published at
+[`matthewmackes/magic-mesh-browser-stack`](https://github.com/matthewmackes/magic-mesh-browser-stack)
+from commit `25c9e5bc`. The admitted root has clean-clone build evidence; the
+native helper workspaces, complete extraction cleanup, and live guest cutover
+remain open gates.

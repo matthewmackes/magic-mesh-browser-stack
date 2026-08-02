@@ -1,9 +1,9 @@
 # Legacy host Browser extraction provenance
 
 This is the Phase 0 prerequisite for `WL-ARCH-008`. It records the current
-host Browser inventory without deleting source, creating a clone, rewriting
-history, or publishing `matthewmackes/magic-mesh-browser-stack`. Publication
-and the later removal/cutover remain operator-gated work.
+host Browser inventory without deleting source or rewriting the live
+`magic-mesh` history. The history-bearing standalone repository is published;
+the later source removal and VM cutover remain open work.
 
 ## Immutable source snapshot
 
@@ -22,9 +22,10 @@ and the later removal/cutover remain operator-gated work.
   immutable source blob, and verifies clean worktree bytes exactly. A dirty
   mixed/shared row is required to remain divergent from the source snapshot,
   while its recorded worktree hash remains an audit-time observation.
-- Current safety posture: no clone, filter operation, GitHub publication, or
-  source deletion has been performed. The verifier rejects untracked Browser
-  candidates and Browser paths changed since the anchored source snapshot.
+- Current safety posture: the standalone publication is recorded below; no
+  source deletion or live-worktree history rewrite has been performed. The
+  verifier rejects untracked Browser candidates and Browser paths changed since
+  the anchored source snapshot.
 
 The manifest has three classes:
 
@@ -40,7 +41,7 @@ or a changed source blob fails closed. Dirty `browser-owned` paths fail closed;
 dirty `mixed-purpose`/`shared` paths are recorded as `worktree_state=dirty` and
 must be committed/reconciled before extraction.
 
-## Standalone root status — 2026-08-01
+## Standalone root status — 2026-08-02
 
 Root workspace metadata now contains the dependency-complete
 `crates/desktop/mde-web-wire` contract and the already-present pure
@@ -54,9 +55,11 @@ cargo test --workspace --locked
 The remaining extracted manifests are not admitted to the root workspace
 because they still reference shared crates absent from this repository:
 `mde-egui`, `mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`.
-No placeholder implementations were added. Full workspace metadata, CI, and
-publication remain blocked until those dependencies are extracted or replaced
-with explicit standalone contracts.
+No placeholder implementations were added. The admitted root workspace has
+locked test/clippy CI and is published at
+`matthewmackes/magic-mesh-browser-stack` (publication commit `25c9e5bc`). Full
+workspace buildability remains open until the omitted dependencies are
+extracted or replaced with explicit standalone contracts.
 
 ## Current workspace, package, and process inventory
 
@@ -130,12 +133,13 @@ worker, package, and clean-clone checks without a sibling `magic-mesh`
 checkout. This manifest is the source-to-destination evidence needed to make
 that extraction auditable.
 
-## Operator-gated next actions
+## Remaining extraction and cutover actions
 
 1. Review this manifest and the persistent-data inventory.
-2. In a disposable checkout, perform the history-preserving extraction and
-   record the resulting standalone commit and `UPSTREAM-SOURCE.md` there.
-3. Build/test the standalone repository from a clean clone, preserve
-   `LICENSE`/`NOTICE`, and obtain operator authority before publication.
-4. Only after that proof may `magic-mesh` remove host Browser code and cut over
-   `Surface::Browser` to the VM-backed path.
+2. Complete the history-preserving extraction in this repository, including
+   the omitted helper/worker/package dependencies, while preserving
+   `LICENSE`/`NOTICE` and updating this provenance record.
+3. Build/test the complete standalone repository from a clean clone, then
+   remove the corresponding host Browser source from `magic-mesh`.
+4. Finish the live Browser VM image, VDI attachment, guest Chromium rendering,
+   input, audio/video, reconnect, performance, and six-node acceptance gates.
