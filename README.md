@@ -6,11 +6,9 @@ are recorded in [`docs/design/browser-stack-extraction/UPSTREAM-SOURCE.md`](docs
 
 ## Current build scope
 
-The root workspace contains three dependency-complete crates: `mde-web-wire`,
-the pure-`std` length-prefixed socket contract; `mde-adblock`, the headless
-filter engine; and `mde-web-preview-client`, the shell-side IPC, shared-memory
-frame, input, and crash-state bridge. They resolve only against crates.io and
-the extracted wire crate:
+The root workspace contains the dependency-complete wire, policy, preview
+client, worker core, Bus, seal, mesh-type, and Browser worker crates. They
+resolve only against crates.io and extracted standalone crates:
 
 ```text
 cargo test --workspace --locked
@@ -31,29 +29,26 @@ cargo clippy --workspace --lib --locked --offline -- -D warnings
 cargo clippy -p mde-web-preview-client --all-targets --locked --offline -- -D warnings
 ```
 
-Those checks cover the preserved Servo, CEF, sandbox, and shell-side bridge
-source. They are compile/lint evidence only: a vendored CEF payload and live
-guest/seat acceptance are separate gates.
+Those checks cover the preserved Servo, CEF, sandbox, shell-side bridge, and
+worker runtime source. They are compile/lint evidence only: a vendored CEF
+payload and live guest/seat acceptance are separate gates.
 
 ## Why the workspace is intentionally split
 
-The extracted worker manifest still requires shared platform crates that are
-not present in this repository: `mde-worker-core`, `mde-bus`,
-`mackes-mesh-types`, and `mde-seal`. It remains outside the root workspace
-until those contracts are extracted. The client no longer points at the
-root-only `mde-egui` harness; it uses the public `egui` data types directly.
-No placeholder crates were added.
+The worker family and its shared platform crates are now part of the root
+workspace. The client no longer points at the root-only `mde-egui` harness; it
+uses the public `egui` data types directly. No placeholder crates were added.
 
 The nested Servo, CEF, and sandbox manifests remain separate workspaces because
 of their native/runtime constraints. Their committed locks and farm checks
-resolve against the extracted wire crate and crates.io. The worker family and
-live runtime/image acceptance remain open; this repository therefore proves
-the preserved helper/client build boundary, not production Chromium readiness.
+resolve against the extracted wire crate and crates.io. Live runtime/image
+acceptance remains open; this repository therefore proves the preserved
+helper/client/worker build boundary, not production Chromium readiness.
 
 ## Provenance status
 
 The history-bearing repository is published at
 [`matthewmackes/magic-mesh-browser-stack`](https://github.com/matthewmackes/magic-mesh-browser-stack)
-from commit `db37bc4a`. The root and native helper build boundaries have clean
-clone/farm evidence; worker extraction, complete source cleanup, and live
-guest cutover remain open gates.
+from commit `3b06da0d`. The root and native helper build boundaries have clean
+clone/farm evidence; complete source cleanup and live guest cutover remain open
+gates.

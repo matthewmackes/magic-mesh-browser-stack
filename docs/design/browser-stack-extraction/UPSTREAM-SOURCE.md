@@ -3,7 +3,7 @@
 This is the Phase 0 prerequisite for `WL-ARCH-008`. It records the current
 host Browser inventory without deleting source or rewriting the live
 `magic-mesh` history. The history-bearing standalone repository is published;
-the later source removal and VM cutover remain open work.
+the later retained-source removal and VM acceptance remain open work.
 
 ## Immutable source snapshot
 
@@ -45,8 +45,9 @@ must be committed/reconciled before extraction.
 
 Root workspace metadata now contains the dependency-complete
 `crates/desktop/mde-web-wire` contract, the pure
-`crates/services/mde-adblock` engine, and the standalone
-`crates/desktop/mde-web-preview-client` IPC/frame/input bridge:
+`crates/services/mde-adblock` engine, the standalone
+`crates/desktop/mde-web-preview-client` IPC/frame/input bridge, and the
+extracted worker core, Bus, seal, mesh-type, and Browser worker crates:
 
 ```text
 cargo test --workspace --locked
@@ -54,22 +55,21 @@ cargo test --workspace --locked
 
 The Servo, CEF, and sandbox helper roots are separately locked and independently
 checked because their native dependency graphs must not be joined to the root
-workspace. BigBoy farm evidence for the current publication is:
+workspace. BigBoy farm evidence for the current publication at `3b06da0d` is:
 
 ```text
-cargo test --workspace --locked                         # 135 tests
-cargo clippy --workspace --all-targets --locked ...     # root + client
+cargo test --workspace --locked
+cargo clippy --workspace --lib --locked --offline -- -D warnings
+cargo clippy -p mde-web-preview-client --all-targets --locked --offline -- -D warnings
 cargo check --manifest-path .../mde-web-sandbox/...     # passed
 cargo check --manifest-path .../mde-web-cef/...         # passed
 cargo check --manifest-path .../mde-web-preview/...    # passed
-cargo clippy --manifest-path .../mde-web-preview-client/... # passed
 ```
 
-The worker family remains outside the standalone workspace because it still
-needs `mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`. No
-placeholder implementations were added. The publication commit is
-`db37bc4a`; these are build-boundary checks, not live guest Chromium or seat
-acceptance.
+The full locked workspace test gate, runtime/library clippy gate, client
+all-targets clippy gate, and all three native helper checks passed on BigBoy.
+The worker family is admitted without placeholder implementations. These are
+build-boundary checks, not live guest Chromium or seat acceptance.
 
 ## Current workspace, package, and process inventory
 
@@ -146,11 +146,7 @@ that extraction auditable.
 ## Remaining extraction and cutover actions
 
 1. Review this manifest and the persistent-data inventory.
-2. Complete the history-preserving extraction in this repository, including
-   the omitted helper/worker/package dependencies, while preserving
-   `LICENSE`/`NOTICE` and updating this provenance record.
-3. Extract the worker family's shared platform contracts, build/test the
-   complete standalone repository from a clean clone, then remove the
-   corresponding host Browser source from `magic-mesh`.
-4. Finish the live Browser VM image, VDI attachment, guest Chromium rendering,
-   input, audio/video, reconnect, performance, and six-node acceptance gates.
+2. Finish the live Browser VM image/payload, VDI attachment, guest Chromium
+   rendering, focused input, audio/video, reconnect, and performance gates.
+3. Run six-node acceptance on seat 15 and Dell, then remove the retained host
+   Browser source from `magic-mesh` after the live evidence is accepted.
