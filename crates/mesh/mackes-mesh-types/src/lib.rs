@@ -14,6 +14,10 @@
 //! import via `use mackes_mesh_types::peer_probe::*;`.
 
 #![forbid(unsafe_code)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::unnested_or_patterns)]
+#![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used))]
 
 /// WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI snapshots.
 pub mod air_quality;

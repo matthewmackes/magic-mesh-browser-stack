@@ -28,6 +28,9 @@
 // `.unwrap()`/`.expect()` on that path is a remote-triggerable panic (DoS-adjacent),
 // so deny both in non-test code. Test code keeps them for terse assertions.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::doc_lazy_continuation)]
+#![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used))]
 
 pub mod audit;
 pub mod broker;
