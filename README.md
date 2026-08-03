@@ -49,6 +49,6 @@ helper/client/worker build boundary, not production Chromium readiness.
 
 The history-bearing repository is published at
 [`matthewmackes/magic-mesh-browser-stack`](https://github.com/matthewmackes/magic-mesh-browser-stack)
-from commit `ea9e669596953ef35bf276ed8d718e91c8a88f1e`. The root and native helper build boundaries have clean
+from commit `996d3d27cfc4c52776c2289a0069d92e2bede66d`. The root and native helper build boundaries have clean
 clone/farm evidence; complete source cleanup and live guest cutover remain open
 gates.
